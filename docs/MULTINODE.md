@@ -3,8 +3,11 @@
 Implemented by node-core, 2026-10-03. Pattern: existing Rust gateway, SQLite
 ownership catalog, private Unix worker, Firecracker/Btrfs under ADR 0001.
 Architecture decision: [ADR 0002](adr/0002-bounded-linux-multinode.md).
-Independent HTTP/guest/browser acceptance passed; final stable-commit source
-review and planner merge/deployment are separate gates. No existing service/data/ingress has been changed by this implementation.
+Independent HTTP/guest/browser acceptance and stable-commit source review passed.
+The implementation was merged locally as `4a48600`. Actual local deployment,
+original-catalog preservation and rollback status are recorded separately in the
+[planner handoff](plans/multinode-handoff.md) and
+[verification results](plans/multinode-verification-results.md).
 
 ## What works
 
@@ -215,7 +218,9 @@ old binary/config and runtime data. The old v2 binary cannot read v3. Rollback
 requires the pre-upgrade catalog backup and old binary, with all writers stopped.
 Do not restore a backup that predates newly created workspaces and then silently
 adopt their disks. No destructive migration or automatic downgrade is provided.
-This task did not open or migrate the existing prototype catalog.
+Builder acceptance used disposable catalogs. The separately authorized local
+rollout preserves the original prototype catalog after an offline backup and
+copy-upgrade check; consult the deployment records above before rollback.
 
 To stop a disposable topology, terminate only its owned agent/controller/gateway
 processes, then `ow --local --data-dir DEDICATED_WORKER_ROOT down` on each worker.

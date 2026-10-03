@@ -1,8 +1,14 @@
-# Proposed architecture
+# Architecture
 
 Status: the broader architecture remains a proposal. The local Rust prototype uses
 Firecracker and Btrfs under [ADR 0001](adr/0001-local-runtime-and-storage.md).
 See [implemented behavior and limitations](LOCAL_PROTOTYPE.md).
+
+The bounded outbound Linux multi-node slice is implemented and independently
+accepted on two workers on this development host. See [ADR 0002](adr/0002-bounded-linux-multinode.md),
+the [operator guide](MULTINODE.md) and [current deployment handoff](plans/multinode-handoff.md).
+Second physical-host/NAT behavior and production hardening remain unverified.
+The PostgreSQL, object-storage and service decomposition below remain proposals.
 
 ## Runtime decision
 
@@ -17,8 +23,9 @@ Default candidate: a Rust product layer around Firecracker. Evaluate Ignition fi
 Backend capability discovery should expose hardware isolation, memory capture, independent disk clone, hibernation, and runtime version. Refuse unsupported operations explicitly.
 
 The current single-machine prototype is one Rust binary with a local Unix-socket
-worker, CLI, authenticated browser dashboard/API and loopback gateway. It uses a durable JSON registry and serial guest
-command transport rather than the proposed PostgreSQL/API/guest-agent stack below.
+worker, CLI, authenticated browser dashboard/API and loopback gateway. It uses a
+SQLite ownership/placement/operation catalog, a worker JSON runtime registry and
+serial guest command transport rather than the proposed PostgreSQL/API/guest-agent stack below.
 That narrow slice validates real VM behavior before adding those services.
 The dashboard serves embedded HTML/CSS/JavaScript from Rust and exposes only the
 owner's VM lifecycle/exec operations. See [dashboard boundaries](DASHBOARD.md).
