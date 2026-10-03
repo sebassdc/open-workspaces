@@ -1,6 +1,8 @@
 # Instructions for implementation agents
 
-Read README.md and docs/HANDOFF.md before changing code. The repository is currently a documentation handoff, not an implemented service.
+Read README.md and docs/HANDOFF.md before changing code. The repository now has
+a local Rust/Firecracker prototype; broader service architecture and hardening
+remain pending. See docs/LOCAL_PROTOTYPE.md and docs/experiments/runtime-spike.md.
 
 ## Scope and engineering
 
@@ -19,6 +21,15 @@ Read README.md and docs/HANDOFF.md before changing code. The repository is curre
 ## Deployment boundaries
 
 The user authorized creating this research repository. Deploying infrastructure or changing existing services is outside this initial handoff task. Future instructions may authorize those actions.
+
+The owner subsequently authorized building and running the local prototype on
+this development machine. That does not authorize changes to existing Hostinger
+services or cloud infrastructure. Preserve the desktop and unrelated services.
+
+The owner later authorized dedicated Cloudflare Tunnel/Access resources for this
+project and selected the zone through browser login. That authorization covers
+the project subdomain and access gate, not unrelated apps, global SSL settings or
+shared ingress. Keep deployment identifiers and credentials in ignored storage.
 
 On the owner's existing Hostinger host, obey parent AGENTS.md and read the local dokku-cloudflare.md before changing apps or domains. OpenClaw configuration is protected. Tailscale Funnel is reserved for existing OpenClaw/webhook ingress; never disable its shared HTTPS listener. Existing Cloudflare Flexible SSL must not be changed globally as part of this project.
 

@@ -1,6 +1,21 @@
 # Deployment proposal
 
-No deployment has been performed. The repository is documentation only.
+A dedicated authenticated guest-app ingress has been deployed. A Rust/Firecracker prototype
+runs on the development machine; see [local setup](LOCAL_PROTOTYPE.md) and
+[runtime spike](experiments/runtime-spike.md).
+
+The owner subsequently authorized dedicated authenticated Internet access through
+Cloudflare. The local single-app JWT gateway, named tunnel, Access policy and
+dedicated DNS route are running. Public anonymous/forged browser requests redirect
+to login and invalid origin assertions are denied. Positive owner login and
+session revocation checks remain pending. See
+[remote access](REMOTE_ACCESS.md). This authorization does not include changing
+unrelated Hostinger services or shared ingress.
+
+The same project hostname now serves the [browser dashboard](DASHBOARD.md),
+replacing the guest counter page. It connects to the local Unix worker through
+an explicit data directory. No additional hostname/domain, cloud service, shared
+listener or existing workspace state was changed for this UI deployment.
 
 ## Development machine
 

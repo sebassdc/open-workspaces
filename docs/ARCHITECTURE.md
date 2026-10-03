@@ -1,6 +1,8 @@
 # Proposed architecture
 
-Status: proposal. Confirm runtime and storage after the feasibility spike.
+Status: the broader architecture remains a proposal. The local Rust prototype uses
+Firecracker and Btrfs under [ADR 0001](adr/0001-local-runtime-and-storage.md).
+See [implemented behavior and limitations](LOCAL_PROTOTYPE.md).
 
 ## Runtime decision
 
@@ -13,6 +15,13 @@ Default candidate: a Rust product layer around Firecracker. Evaluate Ignition fi
 | Container backend | Runs trusted workspaces without nested virtualization | Shared kernel; no promise of full-memory snapshots, live fork, or equivalent isolation |
 
 Backend capability discovery should expose hardware isolation, memory capture, independent disk clone, hibernation, and runtime version. Refuse unsupported operations explicitly.
+
+The current single-machine prototype is one Rust binary with a local Unix-socket
+worker, CLI, authenticated browser dashboard/API and loopback gateway. It uses a durable JSON registry and serial guest
+command transport rather than the proposed PostgreSQL/API/guest-agent stack below.
+That narrow slice validates real VM behavior before adding those services.
+The dashboard serves embedded HTML/CSS/JavaScript from Rust and exposes only the
+owner's VM lifecycle/exec operations. See [dashboard boundaries](DASHBOARD.md).
 
 ## Components
 
@@ -91,3 +100,5 @@ Do not promise socket continuity across hibernation or migration. Snapshot porta
 Use explicit running-task leases and configurable idle policies so silent compute jobs are not suspended accidentally. Wake requests need bounded queues and a single in-flight wake per workspace. External schedules/events must wake sleeping guests; guest cron alone cannot do that reliably.
 
 Later automation delivery should define at-least-once semantics, idempotency, retries/backoff, dead-letter handling and tenant isolation. Do not advertise exactly-once external effects.
+
+The current pilot now includes rootless slirp4netns egress with namespace-local nftables source/destination policy and a native HTTPS/WSS remote CLI. See [networking and installer](NETWORKING.md) for the implemented boundary and remaining production work.

@@ -6,6 +6,47 @@ The owner wants an open-source alternative covering Boxd's publicly documented f
 
 This handoff creates documentation only. No runtime was installed, upstream repository compiled, cloud resource provisioned, or existing application changed.
 
+## Implementation continuation
+
+The owner subsequently authorized this development machine as the sandbox and
+prioritized fast remote Linux computers, paired RAM+disk snapshots, independent
+full-state forks, and resource consumption measurements in the first local pilot.
+The runtime spike produced a runnable local Rust/Firecracker prototype; see
+[usage and limits](LOCAL_PROTOTYPE.md), [evidence](experiments/runtime-spike.md),
+and [runtime decision](adr/0001-local-runtime-and-storage.md). The KVM firmware
+blocker was resolved by the owner. Broader alpha, recovery and security gates
+remain open.
+The original handoff statement above describes the repository at handoff time.
+
+The owner next authorized authenticated Internet access using a dedicated
+Cloudflare setup. `ow serve` now provides a local single-app Access JWT gate;
+tunnel login, dedicated tunnel/Access configuration and public DNS routing succeeded.
+Public denial/redirect checks pass; positive owner login and session revocation
+remain pending. See [remote access](REMOTE_ACCESS.md)
+for enforcement, validation and the remaining acceptance checks. The browser
+dashboard is now implemented and replaces the guest demo on the existing project
+hostname. See [dashboard features and validation](DASHBOARD.md). Authenticated WebSocket streaming with a native Rust guest PTY is now implemented
+and tested locally through a TLS terminator; see [terminal details](TERMINALS.md).
+Remote CLI login and native macOS Apple Silicon/Intel clients plus a portable Linux x86-64 curl installer are now implemented;
+public owner WebSocket verification and per-workspace multi-user roles remain open.
+Filtered rootless guest Internet egress is implemented and tested across Alpine,
+Arch and Ubuntu, including source-spoofing denial and fork/hibernate recovery.
+See [networking, installer and remote CLI](NETWORKING.md).
+
+The owner additionally requested headless Omarchy/Arch and small Ubuntu options.
+Omaterm is archived and Omarchy Server is announced but not available on its
+current official page. Headless Arch and Ubuntu Base profiles are implemented;
+see [image provenance and acceptance checks](GUEST_IMAGES.md). These use the
+shared microVM kernel/minimal init and do not claim full Omaterm tool parity.
+The owner next requested developer-ready Ubuntu and Arch: both now include
+Git, curl, Neovim, GCC/native build tools, mise-managed Node/Python/Rust, normal
+signed distribution repositories, and a `dev` user with guest-only passwordless
+sudo. New templates have sparse 8 GiB disks; existing minimal guests are retained.
+Both developer images passed signed package installation, compilation, real PTY,
+paired RAM/disk snapshot/fork, hibernation, restore and cold-restart checks. The
+latest real VM/browser and HTTPS/WSS CLI regression also passed.
+See [developer packages, permissions and consumption](GUEST_IMAGES.md#developer-tools-and-permissions).
+
 ## Current findings
 
 - Boxd combines persistent Linux microVM workspaces, full-state branching, remote human access, and an integration/automation platform.
@@ -39,6 +80,11 @@ This handoff creates documentation only. No runtime was installed, upstream repo
 ## Next implementation slice
 
 After the runtime decision, introduce a Rust workspace with shared types, API, worker, CLI, and guest agent. Implement create -> wait-ready -> exec -> write file -> stop/start -> verify file -> publish HTTP -> backup -> replace worker -> restore. Start with one operator and one worker, but authenticate all externally reachable control operations.
+
+The initial local pilot now also includes snapshot -> fork multiple independent
+children -> validate RAM and disk state -> hibernate/restore, with resource
+limits and measurements. Keep public networking and production hardening behind
+their own acceptance gates.
 
 The proposed component names and API in ARCHITECTURE.md are design sketches, not existing code. Do not spend the first iteration scaffolding enterprise services, Kubernetes operators, billing, or a connector catalog.
 

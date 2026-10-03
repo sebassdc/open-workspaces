@@ -1,6 +1,6 @@
 # Boxd research and feature inventory
 
-Research date: 2026-10-01. Based on public documentation and repository inspection through web reads; the hosted product and upstream builds have not been tested. Documentation can change. The docs index endpoint failed during research; the combined docs and individual pages were accessible. This inventory groups the documented product capabilities rather than claiming an exhaustive list of every API flag.
+Research date: 2026-10-01. Based on public documentation and repository inspection through web reads; the hosted product has not been tested. Subsequent local upstream build results are recorded in the [runtime spike](experiments/runtime-spike.md). Documentation can change. The docs index endpoint failed during research; the combined docs and individual pages were accessible. This inventory groups the documented product capabilities rather than claiming an exhaustive list of every API flag.
 
 ## Sources
 
@@ -43,8 +43,8 @@ Phase labels refer to ROADMAP.md. These are proposed priorities, not implemented
 | WS-05 | File upload/download and directory operations | Agent exchanges source and output with callers | Alpha |
 | WS-06 | Persistent copy-on-write root disks | User restarts a workspace without losing files; clones diverge | Alpha/beta |
 | WS-07 | Additional disks with per-attachment mount modes | User keeps a dataset separate from disposable workspaces | Beta |
-| WS-08 | Live fork including RAM and running processes | Agent branches several attempts from one initialized state | Stateful beta |
-| WS-09 | Named/versioned RAM+disk snapshots | Team reuses a prepared environment without reinstallation | Stateful beta |
+| WS-08 | Live fork including RAM and running processes | Agent branches several attempts from one initialized state | Initial local pilot; hardening beta |
+| WS-09 | Named/versioned RAM+disk snapshots | Team reuses a prepared environment without reinstallation | Initial local pilot; hardening beta |
 | WS-10 | In-place RAM+disk checkpoints | Developer rewinds an experiment while keeping workspace endpoints | Stateful beta |
 | WS-11 | Pause/resume, hibernate/wake, configurable automatic idle transitions | User returns to a sleeping workspace with process state retained | Stateful beta |
 | WS-12 | Golden environment refreshed from code changes | Team starts new workspaces from a current known-good base | Stateful beta |

@@ -2,9 +2,37 @@
 
 An open-source platform for persistent Linux workspaces for developers and AI agents, designed for self-hosting on a single machine and eventual deployment to AWS or Kubernetes.
 
-**Status: research and implementation planning. No runnable platform exists yet.**
+**Status: runnable local Rust/Firecracker prototype. Production hardening is pending.**
 
-The owner has another machine available for development. Its hardware, OS, KVM support, storage, and capacity have not been inspected. Start there with a runtime feasibility spike.
+KVM now works on the development machine. Real-VM tests pass for exec, files,
+HTTP access, persistence, paired RAM/disk snapshots, independent forks,
+hibernation, corruption rejection and worker restart recovery.
+
+```bash
+./ow up
+./ow create my-box
+./ow exec my-box -- 'uname -r; echo hello'
+./ow snapshot my-box prepared
+./ow fork my-box branch --snapshot prepared
+./ow hibernate branch
+./ow stats
+```
+
+See the [local prototype guide](docs/LOCAL_PROTOTYPE.md),
+[runtime measurements](docs/experiments/runtime-spike.md), and
+[runtime/storage decision](docs/adr/0001-local-runtime-and-storage.md).
+
+The browser dashboard is running behind Cloudflare Access on the existing
+project hostname: create machines, run commands, capture snapshots, fork,
+hibernate/resume and view memory use. See the [dashboard guide](docs/DASHBOARD.md)
+and [Internet access setup](docs/REMOTE_ACCESS.md). **Open Terminal** now provides
+a real guest PTY over authenticated WebSocket; `./ow shell` uses the same guest
+backend locally. See [terminal details](docs/TERMINALS.md). Owner browser
+verification of the updated UI remains pending.
+
+Headless Arch and Ubuntu Base guest profiles are also available from the New
+machine dialog or `./ow create NAME --image arch` or `--image ubuntu`. See [image sources,
+Omarchy findings and compatibility tests](docs/GUEST_IMAGES.md).
 
 ## Read first
 
@@ -18,10 +46,10 @@ The owner has another machine available for development. Its hardware, OS, KVM s
 ## Proposed direction
 
 - Rust API, scheduler, worker, guest agent, and CLI.
-- Firecracker as the provisional microVM engine; evaluate Ignition before confirming.
+- Firecracker v1.17.0 for the local prototype under ADR 0001; broader deployment suitability remains under evaluation.
 - PostgreSQL for control-plane state; local copy-on-write storage for active disks; S3-compatible storage for durable artifacts.
 - TypeScript dashboard and SDK, followed by a Python SDK.
-- Persistent workspaces and reliable recovery first; live forks, hibernation, teams, desktop, and integrations follow.
+- First local pilot: persistent remote workspaces, full-state snapshots/forks, hibernation and resource measurements. Broader recovery hardening, teams, desktop and integrations follow.
 - A container backend may support trusted workloads on hosts without KVM, with its reduced capabilities explicitly advertised.
 
 This is an independent implementation inspired by public product behavior. There is no affiliation with Boxd and no claim of API compatibility or performance parity. The name is provisional.
@@ -29,3 +57,9 @@ This is an independent implementation inspired by public product behavior. There
 ## Licensing
 
 Original material in this repository is licensed under Apache-2.0. Upstream components keep their own licenses. Ignition is AGPL-3.0: evaluating it does not authorize incorporating its code into an Apache-only implementation. Record a licensing decision before reusing upstream code.
+
+Guest Internet access and the remote CLI curl installer are implemented. See [networking and remote connection](docs/NETWORKING.md).
+
+New Ubuntu and Arch machines include Git, curl, Neovim, GCC and mise-managed
+Node/Python/Rust, with guest-only passwordless sudo for the `dev` account. See
+[developer image details](docs/GUEST_IMAGES.md#developer-tools-and-permissions).
