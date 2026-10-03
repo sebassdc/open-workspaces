@@ -283,7 +283,7 @@ async fn handle(app: &App, request: Request) -> Response {
     let Some((expires, identity)) = authorized_until(app, request.headers()).await else {
         return (StatusCode::UNAUTHORIZED, "Cloudflare Access login required").into_response();
     };
-    if let Some(root) = &app.dashboard
+    if let Some(_root) = &app.dashboard
         && request.uri().path().starts_with("/api/terminal/")
     {
         if request
@@ -305,13 +305,13 @@ async fn handle(app: &App, request: Request) -> Response {
         let id = crate::dashboard::with_catalog(
             app.catalog.clone(),
             identity.clone(),
-            move |catalog, user| catalog.terminal_id(user, &name),
+            move |catalog, user| catalog.terminal_target(user, &name),
         )
         .await;
-        let Ok(id) = id else {
+        let Ok((target_root, id)) = id else {
             return (StatusCode::NOT_FOUND, "Machine not found").into_response();
         };
-        return crate::terminal::upgrade(root, request, expires, id).await;
+        return crate::terminal::upgrade(&target_root, request, expires, id).await;
     }
     if !matches!(
         *request.method(),
@@ -1095,6 +1095,8 @@ mod tests {
             2
         );
         wire::request(&root, json!({"op":"stop","id":"legacy"})).unwrap();
+        drop(gateway);
+        drop(catalog);
         let mut reopened = Catalog::open(&root, &cfg.issuer(), Some("bob@example.test")).unwrap();
         let user = reopened
             .user(&Identity {

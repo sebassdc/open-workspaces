@@ -20,6 +20,10 @@ use std::sync::{Arc, Mutex};
 struct Operation {
     op: String,
     #[serde(default)]
+    node: Option<String>,
+    #[serde(default)]
+    operation_key: Option<String>,
+    #[serde(default)]
     id: String,
     #[serde(default)]
     name: Option<String>,
@@ -30,6 +34,10 @@ struct Operation {
     #[serde(default)]
     command: Option<String>,
     #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
     memory_mib: Option<u32>,
     #[serde(default)]
     image: Option<String>,
@@ -39,8 +47,20 @@ struct Operation {
 
 fn validated(bytes: &[u8]) -> Result<Value> {
     let operation: Operation = serde_json::from_slice(bytes)?;
+    ensure!(
+        matches!(operation.op.as_str(), "put" | "get") || bytes.len() <= 16384,
+        "operation too large"
+    );
     runtime::identifier(&operation.id)?;
     let mut request = json!({"op":operation.op,"id":operation.id});
+    if let Some(key) = operation.operation_key {
+        runtime::identifier(&key)?;
+        request["operation_key"] = json!(key);
+    }
+    if let Some(node) = operation.node {
+        runtime::identifier(&node)?;
+        request["node"] = json!(node);
+    }
     match operation.op.as_str() {
         "create" => {
             let image = operation.image.as_deref().unwrap_or("alpine");
@@ -73,6 +93,31 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             if let Some(snapshot) = operation.snapshot {
                 runtime::identifier(&snapshot)?;
                 request["snapshot"] = json!(snapshot);
+            }
+        }
+        "put" | "get" => {
+            let path = operation
+                .path
+                .ok_or_else(|| anyhow::anyhow!("guest path required"))?;
+            ensure!(
+                !path.contains('\n') && path.len() < 500,
+                "invalid guest path"
+            );
+            request["path"] = json!(path);
+            if operation.op == "put" {
+                use base64::Engine;
+                let data = operation
+                    .data
+                    .ok_or_else(|| anyhow::anyhow!("file bytes required"))?;
+                ensure!(
+                    data.len() <= 350000
+                        && base64::engine::general_purpose::STANDARD
+                            .decode(&data)?
+                            .len()
+                            <= 262144,
+                    "file too large"
+                );
+                request["data"] = json!(data);
             }
         }
         "exec" => {
@@ -256,7 +301,7 @@ pub async fn handle(
     {
         return secure((StatusCode::FORBIDDEN, "Dashboard JSON request required").into_response());
     }
-    let Ok(bytes) = to_bytes(request.into_body(), 16384).await else {
+    let Ok(bytes) = to_bytes(request.into_body(), 384 * 1024).await else {
         return secure((StatusCode::PAYLOAD_TOO_LARGE, "Operation too large").into_response());
     };
     let operation = match validated(&bytes) {
@@ -280,6 +325,9 @@ pub async fn handle(
         // Worker diagnostics may contain host paths; keep detailed error text in operator logs.
         Err(error) => {
             eprintln!("Dashboard workspace operation failed: {error:#}");
+            if let Some(failure) = error.downcast_ref::<crate::catalog::OperationFailure>() {
+                return secure((StatusCode::CONFLICT,Json(json!({"ok":false,"error":"Operation did not complete. Check its status before retrying; use the same retry key.","operation":failure.0}))).into_response());
+            }
             (StatusCode::CONFLICT,Json(json!({"ok":false,"error":"Operation could not complete. Check machine state, capacity, snapshot ownership and names, then refresh before retrying."}))).into_response()
         }
     })

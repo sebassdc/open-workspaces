@@ -9,6 +9,8 @@ mod host;
 #[cfg(target_os = "linux")]
 mod network;
 #[cfg(target_os = "linux")]
+mod nodes;
+#[cfg(target_os = "linux")]
 mod remote;
 #[cfg(target_os = "linux")]
 mod runtime;
@@ -33,6 +35,9 @@ struct Cli {
     /// Use a remote HTTPS workspace dashboard.
     #[arg(long, global = true)]
     server: Option<String>,
+    /// Retry a remote side effect using its original owner-scoped key.
+    #[arg(long, global = true)]
+    operation_key: Option<String>,
     /// Ignore a saved remote login and use the local worker.
     #[arg(long = "local", global = true, conflicts_with = "server")]
     local_mode: bool,
@@ -60,6 +65,46 @@ enum Action {
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: std::net::SocketAddr,
     },
+    /// Dedicated node listener; use TLS except explicit loopback tests.
+    NodeController {
+        #[arg(long, default_value = "127.0.0.1:8790")]
+        listen: std::net::SocketAddr,
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
+        #[arg(long)]
+        insecure_loopback_test: bool,
+    },
+    /// Mint a private, expiring, single-use enrollment file.
+    NodeJoin {
+        node: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 600)]
+        ttl: u64,
+        #[arg(long, default_value_t = 1024)]
+        memory: u32,
+        #[arg(long, default_value_t = 2)]
+        slots: u32,
+    },
+    NodeRevoke {
+        node: String,
+    },
+    Nodes,
+    /// Connect this worker outbound; credentials are stored outside the guest.
+    NodeAgent {
+        #[arg(long)]
+        controller: String,
+        #[arg(long)]
+        credential: PathBuf,
+        #[arg(long)]
+        join: Option<PathBuf>,
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
+        #[arg(long)]
+        insecure_loopback_test: bool,
+    },
     Up,
     Down,
     Status,
@@ -76,6 +121,9 @@ enum Action {
         memory: u32,
         #[arg(long, default_value_t = 1)]
         cpus: u32,
+        /// Placement on a connected node (remote controller only).
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Change a stopped workspace's resources; next start is a cold boot.
     Resize {
@@ -166,7 +214,12 @@ fn main_result() -> anyhow::Result<i32> {
         .or_else(|| std::env::var("OW_SERVER").ok());
     let internal = matches!(
         cli.command,
-        Action::Worker
+        Action::NodeController { .. }
+            | Action::NodeJoin { .. }
+            | Action::NodeRevoke { .. }
+            | Action::Nodes
+            | Action::NodeAgent { .. }
+            | Action::Worker
             | Action::Supervisor
             | Action::Gateway { .. }
             | Action::Dashboard { .. }
@@ -180,7 +233,7 @@ fn main_result() -> anyhow::Result<i32> {
         client::saved_server()?
     };
     if let Some(server) = server {
-        return client::run(&server, cli.command);
+        return client::run(&server, cli.command, cli.operation_key);
     }
     #[cfg(target_os = "linux")]
     {

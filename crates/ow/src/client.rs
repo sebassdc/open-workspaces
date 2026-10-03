@@ -109,6 +109,27 @@ fn token(url: &str) -> Result<String> {
     Ok(token)
 }
 fn request(url: &str, token: &str, operation: Option<Value>) -> Result<Value> {
+    if let Some(operation) = &operation {
+        let key = operation["operation_key"]
+            .as_str()
+            .context("operation key required")?;
+        let dir = config()?.parent().unwrap().join("operations");
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        let path = dir.join(format!("{key}.json"));
+        if !path.exists() {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            file.write_all(operation.to_string().as_bytes())?;
+            file.sync_all()?;
+        }
+        eprintln!(
+            "Operation retry key: {key} (reuse --operation-key {key} after an uncertain response)"
+        );
+    }
     let client = reqwest::blocking::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -124,11 +145,7 @@ fn request(url: &str, token: &str, operation: Option<Value>) -> Result<Value> {
         client.get(format!("{url}/api/state"))
     };
     let mut response = request.header("cf-access-token", token).send()?;
-    ensure!(
-        response.status().is_success(),
-        "remote request returned {}; run ow login {url} if your session expired",
-        response.status()
-    );
+    let status = response.status();
     let mut data = Vec::new();
     response
         .by_ref()
@@ -138,13 +155,14 @@ fn request(url: &str, token: &str, operation: Option<Value>) -> Result<Value> {
     let result: Value = serde_json::from_slice(&data)
         .context("expected workspace API response; check server and login")?;
     ensure!(
-        result["ok"] == true,
-        "remote operation failed: {}",
-        result["error"].as_str().unwrap_or("unknown error")
+        status.is_success() && result["ok"] == true,
+        "remote operation failed: {} (operation {})",
+        result["error"].as_str().unwrap_or("unknown error"),
+        result["operation"]
     );
     Ok(result["result"].clone())
 }
-pub fn run(url: &str, action: Action) -> Result<i32> {
+pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
     let url = server(url)?;
     // Validate scope before asking for a credential.
     ensure!(
@@ -157,6 +175,8 @@ pub fn run(url: &str, action: Action) -> Result<i32> {
                 | Action::Inspect { .. }
                 | Action::Shell { .. }
                 | Action::Exec { .. }
+                | Action::Put { .. }
+                | Action::Get { .. }
                 | Action::Create { .. }
                 | Action::Start { .. }
                 | Action::Stop { .. }
@@ -168,7 +188,9 @@ pub fn run(url: &str, action: Action) -> Result<i32> {
         "this command is local-only; use --local for the local worker"
     );
     let token = token(&url)?;
-    let operation = match action {
+    let key = retry.unwrap_or(common::nonce()?);
+    common::identifier(&key)?;
+    let mut operation = match action {
         Action::Shell { id } => return shell(&url, &token, &id),
         Action::List
         | Action::Stats
@@ -200,8 +222,35 @@ pub fn run(url: &str, action: Action) -> Result<i32> {
             memory,
             image,
             cpus,
+            node,
         } => {
-            json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus})
+            json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"node":node})
+        }
+        Action::Put { id, local, guest } => {
+            use base64::Engine;
+            ensure!(
+                fs::metadata(&local)?.len() <= 262144,
+                "uploads limited to 256 KiB"
+            );
+            json!({"op":"put","id":id,"path":guest,"data":base64::engine::general_purpose::STANDARD.encode(fs::read(local)?)})
+        }
+        Action::Get { id, guest, local } => {
+            use base64::Engine;
+            let result = request(
+                &url,
+                &token,
+                Some(json!({"op":"get","id":id,"path":guest,"operation_key":key})),
+            )?;
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(result["data"].as_str().context("missing file bytes")?)?;
+            ensure!(data.len() <= 262144, "download too large");
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(local)?;
+            file.write_all(&data)?;
+            return Ok(0);
         }
         Action::Start { id } => json!({"op":"start","id":id}),
         Action::Stop { id } => json!({"op":"stop","id":id}),
@@ -232,13 +281,14 @@ pub fn run(url: &str, action: Action) -> Result<i32> {
             let result = request(
                 &url,
                 &token,
-                Some(json!({"op":"exec","id":id,"command":command})),
+                Some(json!({"op":"exec","id":id,"command":command,"operation_key":key})),
             )?;
             print!("{}", result["output"].as_str().unwrap_or(""));
             return Ok(result["exit_code"].as_i64().unwrap_or(1) as i32);
         }
         _ => unreachable!(),
     };
+    operation["operation_key"] = json!(key);
     println!(
         "{}",
         serde_json::to_string_pretty(&request(&url, &token, Some(operation))?)?

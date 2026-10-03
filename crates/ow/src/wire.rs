@@ -51,3 +51,12 @@ pub fn response(result: anyhow::Result<Value>) -> Value {
         Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
     }
 }
+
+/// Preserve the worker error envelope so callers can distinguish a rejection from transport loss.
+pub fn request_envelope(root: &Path, request: &Value) -> Result<Value> {
+    let mut stream = UnixStream::connect(root.join("control.sock"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    send(&mut stream, request)?;
+    line(&mut stream)
+}

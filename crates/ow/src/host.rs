@@ -60,7 +60,7 @@ fn data_root(value: Option<PathBuf>) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn assert_owner(stream: &UnixStream) -> Result<()> {
+pub(crate) fn assert_owner(stream: &UnixStream) -> Result<()> {
     let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
     let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let rc = unsafe {
@@ -524,6 +524,50 @@ fn execute(root: &Path, id: &str, command: &str, operation: &str) -> Result<i32>
 pub fn run(cli: Cli) -> Result<i32> {
     let root = data_root(cli.data_dir)?;
     let request = match cli.command {
+        Action::NodeController {
+            listen,
+            tls_cert,
+            tls_key,
+            insecure_loopback_test,
+        } => {
+            crate::nodes::controller(&root, listen, tls_cert, tls_key, insecure_loopback_test)?;
+            return Ok(0);
+        }
+        Action::NodeJoin {
+            node,
+            output,
+            ttl,
+            memory,
+            slots,
+        } => {
+            crate::nodes::mint(&root, &node, &output, ttl, memory, slots)?;
+            return Ok(0);
+        }
+        Action::NodeRevoke { node } => {
+            crate::nodes::revoke(&root, &node)?;
+            return Ok(0);
+        }
+        Action::Nodes => {
+            println!("{}", crate::nodes::inventory(&root)?);
+            return Ok(0);
+        }
+        Action::NodeAgent {
+            controller,
+            credential,
+            join,
+            ca_cert,
+            insecure_loopback_test,
+        } => {
+            crate::nodes::agent(
+                &root,
+                &controller,
+                &credential,
+                join.as_deref(),
+                ca_cert.as_deref(),
+                insecure_loopback_test,
+            )?;
+            return Ok(0);
+        }
         Action::Dashboard { config, listen } => {
             remote::run(&config, listen, Some(root))?;
             return Ok(0);
@@ -592,7 +636,9 @@ pub fn run(cli: Cli) -> Result<i32> {
             memory,
             image,
             cpus,
+            node,
         } => {
+            ensure!(node.is_none(), "--node requires a remote controller");
             json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus})
         }
         Action::Resize { id, memory, cpus } => {

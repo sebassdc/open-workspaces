@@ -14,6 +14,32 @@ use std::{
 
 const MAX_RUNNING: usize = 8;
 const MAX_MEMORY_MIB: u32 = 4096;
+fn parse_limit(value: &str, maximum: u32) -> Result<u32> {
+    let n = value.parse::<u32>().context("invalid worker limit")?;
+    ensure!(
+        n > 0 && n <= maximum,
+        "invalid worker limit; refusing to relax a configured budget"
+    );
+    Ok(n)
+}
+fn limit(name: &str, default: u32) -> u32 {
+    match std::env::var_os(name) {
+        None => default,
+        Some(value) => value
+            .to_str()
+            .and_then(|s| parse_limit(s, default).ok())
+            .unwrap_or(0),
+    }
+}
+fn max_memory() -> u32 {
+    limit("OW_MAX_MEMORY_MIB", MAX_MEMORY_MIB)
+}
+fn max_running() -> usize {
+    limit("OW_MAX_RUNNING", MAX_RUNNING as u32) as usize
+}
+fn max_cpus() -> u32 {
+    limit("OW_MAX_VCPUS", 16)
+}
 const MAX_SNAPSHOTS: usize = 24;
 const MAX_WORKSPACES: usize = 32;
 
@@ -44,6 +70,13 @@ pub fn image_profile(image: &str) -> Result<()> {
 #[cfg(test)]
 mod image_tests {
     use super::*;
+    #[test]
+    fn worker_limits_fail_closed() {
+        for value in ["", "garbage", "0", "4097", "-1"] {
+            assert!(parse_limit(value, 4096).is_err());
+        }
+        assert_eq!(parse_limit("512", 4096).unwrap(), 512);
+    }
     #[test]
     fn existing_workspaces_keep_the_alpine_profile() {
         let workspace: Workspace = serde_json::from_value(json!({"id":"existing","index":1,"state":"hibernated","memory_mib":256,"source":null,"hibernation":"saved"})).unwrap();
@@ -263,6 +296,15 @@ impl Runtime {
         Ok(tcp)
     }
     pub fn new(root: PathBuf, assets: PathBuf) -> Result<Self> {
+        for (name, maximum) in [
+            ("OW_MAX_MEMORY_MIB", 4096),
+            ("OW_MAX_RUNNING", 8),
+            ("OW_MAX_VCPUS", 16),
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                parse_limit(value.to_str().context("invalid worker limit")?, maximum)?;
+            }
+        }
         for directory in ["machines", "snapshots"] {
             fs::create_dir_all(root.join(directory))?;
         }
@@ -323,7 +365,7 @@ impl Runtime {
 
     fn capacity(&self, memory: u32, cpus: u32) -> Result<()> {
         ensure!(
-            self.machines.len() < MAX_RUNNING,
+            self.machines.len() < max_running(),
             "running workspace limit ({MAX_RUNNING}) reached"
         );
         let used: u32 = self
@@ -337,11 +379,11 @@ impl Runtime {
             .map(|id| self.state.workspaces[id].vcpu_count)
             .sum();
         ensure!(
-            used_cpus + cpus <= 16,
+            used_cpus + cpus <= max_cpus(),
             "CPU reservation limit (16 vCPUs) reached"
         );
         ensure!(
-            used + memory <= MAX_MEMORY_MIB,
+            used + memory <= max_memory(),
             "memory reservation limit ({MAX_MEMORY_MIB} MiB) reached"
         );
         Ok(())
@@ -403,6 +445,22 @@ impl Runtime {
         Ok(())
     }
 
+    fn storage_headroom(&self, extra: u64) -> Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let path = CString::new(self.root.as_os_str().as_bytes())?;
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        ensure!(
+            unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } == 0,
+            "storage capacity unavailable"
+        );
+        let stats = unsafe { stats.assume_init() };
+        ensure!(
+            stats.f_bavail.saturating_mul(stats.f_frsize) >= 128 * 1024 * 1024 + extra,
+            "storage headroom exhausted"
+        );
+        Ok(())
+    }
     fn create(
         &mut self,
         id: &str,
@@ -426,6 +484,7 @@ impl Runtime {
             return Ok(json!(existing));
         }
         self.capacity(memory, cpus)?;
+        self.storage_headroom(0)?;
         ensure!(
             self.state.workspaces.len() < MAX_WORKSPACES,
             "workspace limit ({MAX_WORKSPACES}) reached"
@@ -519,6 +578,7 @@ impl Runtime {
     fn capture(&mut self, id: &str, name: &str) -> Result<Value> {
         identifier(name)?;
         let workspace = self.workspace(id)?;
+        self.storage_headroom(workspace.memory_mib as u64 * 1024 * 1024)?;
         let destination = self.snapshot_dir(name);
         if destination.join("manifest.json").exists() {
             let previous: Snapshot =
@@ -617,7 +677,7 @@ impl Runtime {
             "status" => Ok(
                 json!({"runtime":"Firecracker v1.17.0","running":self.machines.len(),
                 "worker_pid":std::process::id(),
-                "max_running":MAX_RUNNING,"max_memory_mib":MAX_MEMORY_MIB,"max_workspaces":MAX_WORKSPACES,
+                "max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,
                 "max_snapshots":MAX_SNAPSHOTS,"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
             "list" => Ok(json!(self.state.workspaces.values().collect::<Vec<_>>())),
@@ -652,7 +712,7 @@ impl Runtime {
                 }
                 Ok(
                     json!({"running":running,"total_pss_kib":total_pss,"reserved_memory_mib":reserved,
-                    "limit_memory_mib":MAX_MEMORY_MIB,"note":"PSS is process memory; excludes additional host page cache and kernel overhead"}),
+                    "limit_memory_mib":max_memory(),"note":"PSS is process memory; excludes additional host page cache and kernel overhead"}),
                 )
             }
             "inspect" => Ok(json!(self.workspace(id)?)),
