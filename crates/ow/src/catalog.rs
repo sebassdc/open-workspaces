@@ -43,13 +43,22 @@ impl Catalog {
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 1, "catalog schema is newer than this binary");
+        ensure!(version <= 2, "catalog schema is newer than this binary");
         db.execute_batch("BEGIN IMMEDIATE;
           CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, issuer TEXT NOT NULL, subject TEXT, email TEXT NOT NULL, UNIQUE(issuer,subject), UNIQUE(issuer,email));
-          CREATE TABLE IF NOT EXISTS resources(owner INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL CHECK(kind IN ('machine','snapshot')), name TEXT NOT NULL, physical TEXT NOT NULL UNIQUE, metadata TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(owner,kind,name));
+          CREATE TABLE IF NOT EXISTS resources(owner INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL CHECK(kind IN ('machine','snapshot')), name TEXT NOT NULL, physical TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(owner,kind,name), UNIQUE(kind,physical));
           CREATE TABLE IF NOT EXISTS operations(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL REFERENCES users(id), op TEXT NOT NULL, resource TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, finished_at TEXT);
           CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-          PRAGMA user_version=1; COMMIT;")?;
+          ")?;
+        if version == 1 {
+            // Machine and snapshot IDs occupy separate worker directories and may match.
+            db.execute_batch("CREATE TABLE resources_v2(owner INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL CHECK(kind IN ('machine','snapshot')), name TEXT NOT NULL, physical TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(owner,kind,name), UNIQUE(kind,physical));
+              INSERT INTO resources_v2 SELECT * FROM resources;
+              DROP TABLE resources;
+              ALTER TABLE resources_v2 RENAME TO resources;
+")?;
+        }
+        db.execute_batch("PRAGMA user_version=2; COMMIT;")?;
         let mut catalog = Self {
             db,
             root: root.into(),
@@ -176,10 +185,10 @@ impl Catalog {
         )?;
         Ok(id)
     }
-    fn save(&mut self, physical: &str, value: &Value) -> Result<()> {
+    fn save(&mut self, kind: &str, physical: &str, value: &Value) -> Result<()> {
         self.db.execute(
-            "UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE physical=?2",
-            params![value.to_string(), physical],
+            "UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE physical=?2 AND kind=?3",
+            params![value.to_string(), physical, kind],
         )?;
         Ok(())
     }
@@ -210,7 +219,7 @@ impl Catalog {
         let machines = wire::request(&self.root, json!({"op":"list"}))?;
         let snapshots = wire::request(&self.root, json!({"op":"snapshots"}))?;
         for m in machines.as_array().context("invalid machines")? {
-            self.save(m["id"].as_str().context("invalid machine")?, m)?;
+            self.save("machine", m["id"].as_str().context("invalid machine")?, m)?;
         }
         // Worker-generated hibernation/fork snapshots inherit only their registered parent owner.
         for s in snapshots.as_array().context("invalid snapshots")? {
@@ -228,7 +237,7 @@ impl Catalog {
                 // Never overwrite a user's different same-name checkpoint.
                 let name=if self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND physical<>?2)",params![owner,physical],|r|r.get::<_,bool>(0))? { format!("auto-{}",&common::nonce()?[..24]) } else {physical.to_owned()};
                 self.db.execute("INSERT OR IGNORE INTO resources(owner,kind,name,physical,metadata) VALUES(?1,'snapshot',?2,?3,?4)",params![owner,name,physical,s.to_string()])?;
-                self.save(physical, s)?;
+                self.save("snapshot", physical, s)?;
             }
         }
         Ok((machines, snapshots))
@@ -360,6 +369,8 @@ mod tests {
                 let req = wire::line(&mut stream).unwrap();
                 let value = if legacy && req["op"] == "list" {
                     json!([{"id":"legacy","state":"running","image":"ubuntu","memory_mib":1024,"vcpu_count":1}])
+                } else if legacy && req["op"] == "snapshots" {
+                    json!([{"name":"legacy","workspace":"legacy","state":"ready","memory_mib":1024}])
                 } else {
                     json!([])
                 };
@@ -385,6 +396,21 @@ mod tests {
         assert!(c.terminal_id(b, "legacy").is_err());
         let a = c.user(&alice).unwrap();
         assert_eq!(c.terminal_id(a, "legacy").unwrap(), "legacy");
+        assert_eq!(c.physical(a, "snapshot", "legacy").unwrap(), "legacy");
+        c.save(
+            "snapshot",
+            "legacy",
+            &json!({"name":"legacy","state":"ready"}),
+        )
+        .unwrap();
+        let machine_state: String =
+            c.db.query_row(
+                "SELECT metadata FROM resources WHERE kind='machine' AND physical='legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(machine_state.contains("running"));
         let a_id = c.reserve(a, "machine", "demo").unwrap();
         let b_id = c.reserve(b, "machine", "demo").unwrap();
         assert_ne!(a_id, b_id);
@@ -405,6 +431,30 @@ mod tests {
         drop(c);
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn version_one_upgrade_preserves_rows_and_separates_kinds() {
+        let root = fixture(false);
+        let owner = identity("owner-sub", "owner@example.test");
+        let mut c = Catalog::open(&root, &owner.issuer, None).unwrap();
+        let user = c.user(&owner).unwrap();
+        let physical = c.reserve(user, "machine", "demo").unwrap();
+        c.db.execute_batch(
+            "CREATE UNIQUE INDEX legacy_physical ON resources(physical); PRAGMA user_version=1;",
+        )
+        .unwrap();
+        drop(c);
+        let c = Catalog::open(&root, &owner.issuer, None).unwrap();
+        let version: i64 =
+            c.db.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(c.terminal_id(user, "demo").unwrap(), physical);
+        c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata) VALUES(?1,'snapshot','demo',?2,'{}')",params![user,physical]).unwrap();
+        assert_eq!(c.physical(user, "snapshot", "demo").unwrap(), physical);
+        drop(c);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn legacy_import_requires_explicit_owner() {
         let root = fixture(true);

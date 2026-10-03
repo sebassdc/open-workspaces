@@ -31,7 +31,7 @@ administration, database access, host filesystem access or hypervisor sockets.
 - Snapshot metadata, with its source workspace and resource shape.
 - Operation IDs, owner, operation/resource name, timestamps and pending/succeeded/failed status.
 
-The catalog uses schema version 1, foreign keys, uniqueness constraints, WAL and
+The catalog uses schema version 2, foreign keys, uniqueness constraints, WAL and
 FULL synchronous writes. Its database must be an owned regular file with mode
 600; SQLite sidecars inherit private permissions. SQL parameters are bound,
 and request bodies cannot specify an owner. Ownership is committed before
@@ -41,7 +41,8 @@ Worker-generated hibernation/fork checkpoints inherit their registered parent
 owner. New locally-created unregistered machines are hidden from remote users.
 
 The worker's `state.json` and snapshot manifests are **still its private runtime
-recovery journal**. SQLite is authoritative for remote ownership/names and the
+recovery journal**. Machine and snapshot worker IDs are unique within their separate kinds, so
+legacy resources may safely share the same name. SQLite is authoritative for remote ownership/names and the
 control-plane catalog; it does not replace paired RAM/disk snapshot artifacts.
 Stopping/restarting the gateway retains ownership. Do not delete the database to
 reset login or copy a live WAL database as an ordinary file backup: use SQLite's
@@ -84,11 +85,12 @@ teams, administration roles and workload tokens are not implemented.
 
 Automated tests verify explicit legacy migration, identity binding, rejection of
 email reuse with a different subject, and ownership persistence after reopening
-the database. A signed two-identity gateway regression boots real microVMs and
+the database. Schema-upgrade tests also check that a machine and checkpoint
+can share a legacy name while retaining separate metadata. A signed two-identity gateway regression boots real microVMs and
 checks same-name machines/checkpoints/forks with independent guest files, all
 cross-owner lifecycle/exec denials, private snapshot/fork/restore denial, physical
 ID denial, WSS ownership denial before a worker connection, scoped statistics
-and catalog restart persistence. Artifacts: `data/users-ba1c425f` (ignored).
+and catalog restart persistence. Artifacts: `data/users-0c8bda74` (ignored).
 
 The real VM browser/TLS/WSS CLI regression also passed after ownership was
 introduced (`data/ui-32df3eb7`, 21 checks). These local signed-token tests do not
