@@ -105,3 +105,6 @@ Upstream references: [Linux openpty](https://man7.org/linux/man-pages/man3/openp
 [xterm.js flow control](https://xtermjs.org/docs/guides/flowcontrol/).
 
 Remote `ow login`, API operations and `ow shell` over verified HTTPS/WSS are now implemented. The dashboard includes a copyable curl installer for Linux x86-64; see [setup and limits](NETWORKING.md).
+
+WSS terminal names are resolved through the authenticated user's SQLite
+ownership mapping before opening the worker connection. See [user isolation](USERS.md).

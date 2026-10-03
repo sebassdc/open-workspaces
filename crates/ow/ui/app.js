@@ -20,6 +20,7 @@ function select(id) { selected = id; render(); }
 function machine() { return data.workspaces.find(item => item.id === selected); }
 function setView(next) { view = next; for (const id of ['machines', 'snapshots', 'usage']) $(id + '-view').hidden = id !== view; document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view)); const names = {machines: ['Your machines.', 'A place to build, experiment, and pick up where you left off.', 'Machines'], snapshots: ['Pick up from here.', 'Saved memory and disk state, ready to restore or fork.', 'Snapshots'], usage: ['Room to grow.', 'See what your machines use, and free capacity when you need it.', 'Resource usage']}; $('page-title').textContent = names[view][0]; $('page-description').textContent = names[view][1]; $('breadcrumb').textContent = 'Your sandbox / ' + names[view][2]; }
 function render() {
+  if (data.user) { $('account-email').textContent = data.user.email; $('account-avatar').textContent = data.user.email.slice(0,1).toUpperCase(); }
   if (!selected && data.workspaces.length) selected = data.workspaces[0].id;
   if (selected && !machine()) selected = null;
   const running = data.workspaces.filter(item => item.state === 'running').length, stats = data.stats;
@@ -33,7 +34,7 @@ function render() {
   for (const item of data.workspaces) {
     const card = element('button', undefined, 'machine-card' + (item.id === selected ? ' selected' : '')); card.dataset.machine = item.id; card.setAttribute('aria-pressed', String(item.id === selected));
     const top = element('div', undefined, 'card-top'); top.append(element('span', '▣', 'machine-icon'), element('span', item.state, `state ${['running','hibernated','stopped','failed'].includes(item.state) ? item.state : 'stopped'}`));
-    const meta = element('div', undefined, 'card-meta'); meta.append(element('span', '1 vCPU'), element('span', mib(item.memory_mib)));
+    const meta = element('div', undefined, 'card-meta'); meta.append(element('span', `${item.vcpu_count || 1} vCPU`), element('span', mib(item.memory_mib)));
     card.append(top, element('h3', item.id), meta, element('span', item.source ? `Forked from ${item.source}` : (imageNames[item.image || 'alpine'] || 'Linux machine'), 'card-lineage'));
     card.addEventListener('click', () => select(item.id)); $('machine-grid').append(card);
   }

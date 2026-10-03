@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod catalog;
 mod client;
 mod common;
 #[cfg(target_os = "linux")]
@@ -72,6 +74,16 @@ enum Action {
         image: String,
         #[arg(long, default_value_t = 256)]
         memory: u32,
+        #[arg(long, default_value_t = 1)]
+        cpus: u32,
+    },
+    /// Change a stopped workspace's resources; next start is a cold boot.
+    Resize {
+        id: String,
+        #[arg(long)]
+        memory: u32,
+        #[arg(long)]
+        cpus: u32,
     },
     Start {
         id: String,

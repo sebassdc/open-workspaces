@@ -47,7 +47,7 @@ Omarchy findings and compatibility tests](docs/GUEST_IMAGES.md).
 
 - Rust API, scheduler, worker, guest agent, and CLI.
 - Firecracker v1.17.0 for the local prototype under ADR 0001; broader deployment suitability remains under evaluation.
-- PostgreSQL for control-plane state; local copy-on-write storage for active disks; S3-compatible storage for durable artifacts.
+- SQLite for the current single-host ownership/catalog; PostgreSQL proposed for a broader control plane; local copy-on-write storage for active disks; S3-compatible storage for durable artifacts.
 - TypeScript dashboard and SDK, followed by a Python SDK.
 - First local pilot: persistent remote workspaces, full-state snapshots/forks, hibernation and resource measurements. Broader recovery hardening, teams, desktop and integrations follow.
 - A container backend may support trusted workloads on hosts without KVM, with its reduced capabilities explicitly advertised.
@@ -63,3 +63,7 @@ Guest Internet access and the remote CLI curl installer are implemented. See [ne
 New Ubuntu and Arch machines include Git, curl, Neovim, GCC and mise-managed
 Node/Python/Rust, with guest-only passwordless sudo for the `dev` account. See
 [developer image details](docs/GUEST_IMAGES.md#developer-tools-and-permissions).
+
+Dashboard and remote CLI machines now belong to the authenticated user. Names,
+snapshots, terminal access and usage are scoped through a durable SQLite catalog.
+See [ownership, migration and database limits](docs/USERS.md).

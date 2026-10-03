@@ -200,3 +200,8 @@ References:
 ## Public CLI installer
 
 Only three fixed `/cli/` installer artifacts now bypass Access; dashboard/API/terminal requests still require owner login. See [exact routing, installer and remote CLI](NETWORKING.md).
+
+The gateway now enforces per-user machine/snapshot ownership via its private
+SQLite catalog. The deployed allowlist still contains only the invited owner;
+new users need explicit Access policy and gateway allowlist admission. See
+[ownership migration and adding users](USERS.md#existing-machines-and-adding-users).

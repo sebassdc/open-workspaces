@@ -31,6 +31,8 @@ struct Config {
     audience: String,
     allowed_emails: Vec<String>,
     upstream: String,
+    #[serde(default)]
+    bootstrap_owner_email: Option<String>,
 }
 
 impl Config {
@@ -55,6 +57,14 @@ impl Config {
                     .all(|e| e.contains('@') && e.len() <= 254),
             "an explicit email allowlist is required"
         );
+        if let Some(owner) = &self.bootstrap_owner_email {
+            ensure!(
+                self.allowed_emails
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(owner)),
+                "bootstrap owner must be allowed to log in"
+            );
+        }
         let url = reqwest::Url::parse(&self.upstream)?;
         ensure!(
             url.scheme() == "http"
@@ -95,6 +105,7 @@ struct Keys {
 #[derive(Clone)]
 struct App {
     dashboard: Option<PathBuf>,
+    catalog: Option<Arc<std::sync::Mutex<crate::catalog::Catalog>>>,
     config: Config,
     client: reqwest::Client,
     keys: Arc<RwLock<Keys>>,
@@ -127,7 +138,10 @@ async fn fetch_keys(client: &reqwest::Client, config: &Config) -> Result<JwkSet>
     Ok(set)
 }
 
-async fn authorized_until(app: &App, headers: &HeaderMap) -> Option<u64> {
+async fn authorized_until(
+    app: &App,
+    headers: &HeaderMap,
+) -> Option<(u64, crate::catalog::Identity)> {
     let mut assertions = headers.get_all("cf-access-jwt-assertion").iter();
     let token = assertions.next().and_then(|v| v.to_str().ok())?;
     if assertions.next().is_some() || token.len() > 16384 {
@@ -163,7 +177,14 @@ async fn authorized_until(app: &App, headers: &HeaderMap) -> Option<u64> {
             .allowed_emails
             .iter()
             .any(|email| email.eq_ignore_ascii_case(&token.claims.email));
-    allowed.then_some(token.claims.exp)
+    allowed.then_some((
+        token.claims.exp,
+        crate::catalog::Identity {
+            issuer: app.config.issuer(),
+            subject: token.claims.sub,
+            email: token.claims.email,
+        },
+    ))
 }
 
 // Hop-by-hop headers and credentials must never enter a guest or escape from it.
@@ -259,7 +280,7 @@ async fn handle(app: &App, request: Request) -> Response {
         )
         .await;
     }
-    let Some(expires) = authorized_until(app, request.headers()).await else {
+    let Some((expires, identity)) = authorized_until(app, request.headers()).await else {
         return (StatusCode::UNAUTHORIZED, "Cloudflare Access login required").into_response();
     };
     if let Some(root) = &app.dashboard
@@ -273,7 +294,24 @@ async fn handle(app: &App, request: Request) -> Response {
         {
             return (StatusCode::FORBIDDEN, "Same-origin terminal required").into_response();
         }
-        return crate::terminal::upgrade(root, request, expires).await;
+        let name = request
+            .uri()
+            .path()
+            .trim_start_matches("/api/terminal/")
+            .to_owned();
+        if request.uri().query().is_some() || crate::common::identifier(&name).is_err() {
+            return (StatusCode::BAD_REQUEST, "Invalid terminal target").into_response();
+        }
+        let id = crate::dashboard::with_catalog(
+            app.catalog.clone(),
+            identity.clone(),
+            move |catalog, user| catalog.terminal_id(user, &name),
+        )
+        .await;
+        let Ok(id) = id else {
+            return (StatusCode::NOT_FOUND, "Machine not found").into_response();
+        };
+        return crate::terminal::upgrade(root, request, expires, id).await;
     }
     if !matches!(
         *request.method(),
@@ -296,8 +334,8 @@ async fn handle(app: &App, request: Request) -> Response {
         )
             .into_response();
     }
-    if let Some(root) = &app.dashboard {
-        return crate::dashboard::handle(root, request).await;
+    if app.dashboard.is_some() {
+        return crate::dashboard::handle(app.catalog.clone(), identity, request).await;
     }
     let (parts, body) = request.into_parts();
     let path = parts
@@ -379,6 +417,17 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
     );
     let config: Config = serde_json::from_slice(&fs::read(path)?)?;
     config.validate()?;
+    let catalog = dashboard
+        .as_ref()
+        .map(|root| {
+            crate::catalog::Catalog::open(
+                root,
+                &config.issuer(),
+                config.bootstrap_owner_email.as_deref(),
+            )
+        })
+        .transpose()?
+        .map(|c| Arc::new(std::sync::Mutex::new(c)));
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -394,6 +443,7 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
                 .context("loading Cloudflare Access signing keys")?;
             let app = App {
                 dashboard: dashboard.clone(),
+                catalog,
                 config,
                 client,
                 keys: Arc::new(RwLock::new(Keys {
@@ -491,6 +541,7 @@ mod tests {
             audience: "test-audience".into(),
             allowed_emails: vec!["owner@example.test".into()],
             upstream,
+            bootstrap_owner_email: None,
         }
     }
 
@@ -575,6 +626,7 @@ mod tests {
         let (key, set) = signing_key();
         let app = App {
             dashboard: None,
+            catalog: None,
             config: config(upstream),
             client: reqwest::Client::builder()
                 .no_proxy()
@@ -728,6 +780,7 @@ mod tests {
         let (key, set) = signing_key();
         let app = App {
             dashboard: Some(PathBuf::from("/tmp/ow-no-worker-test")),
+            catalog: None,
             config: config("http://127.0.0.1:1234".into()),
             client: reqwest::Client::new(),
             keys: Arc::new(RwLock::new(Keys {
@@ -838,6 +891,225 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Needs prepared real microVM assets and release worker"]
+    async fn users_isolated_real_vm() {
+        use crate::{
+            catalog::{Catalog, Identity},
+            wire,
+        };
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let root = repo
+            .join("data")
+            .join(format!("users-{}", &crate::common::nonce().unwrap()[..8]));
+        let binary = repo.join("target/release/ow");
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new(&self.0)
+                    .args(["--local", "--data-dir", self.1.to_str().unwrap(), "down"])
+                    .output();
+            }
+        }
+        let _cleanup = Cleanup(binary.clone(), root.clone());
+        let result = Command::new(&binary)
+            .args(["--local", "--data-dir", root.to_str().unwrap(), "up"])
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        wire::request(&root, json!({"op":"create","id":"legacy","memory_mib":256})).unwrap();
+        let (key, keys) = signing_key();
+        let mut cfg = config("http://127.0.0.1:1234".into());
+        cfg.allowed_emails.push("bob@example.test".into());
+        let catalog = Arc::new(std::sync::Mutex::new(
+            Catalog::open(&root, &cfg.issuer(), Some("owner@example.test")).unwrap(),
+        ));
+        let app = App {
+            dashboard: Some(root.clone()),
+            catalog: Some(catalog.clone()),
+            config: cfg.clone(),
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set: keys,
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        };
+        let gateway = router(app);
+        let alice = token(&key, &claims());
+        let mut bob_claims = claims();
+        bob_claims["sub"] = json!("bob-subject");
+        bob_claims["email"] = json!("bob@example.test");
+        let bob = token(&key, &bob_claims);
+        async fn api(gateway: &Router, jwt: &str, body: Option<Value>) -> (StatusCode, Value) {
+            let mut req = Request::builder()
+                .uri(if body.is_some() {
+                    "/api/operation"
+                } else {
+                    "/api/state"
+                })
+                .method(if body.is_some() {
+                    Method::POST
+                } else {
+                    Method::GET
+                })
+                .header("host", "app.example.test")
+                .header("cf-access-jwt-assertion", jwt)
+                .header("origin", "https://app.example.test")
+                .header("x-ow-request", "dashboard")
+                .header("content-type", "application/json")
+                .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+                .unwrap();
+            let response = gateway
+                .clone()
+                .oneshot(std::mem::replace(&mut req, Request::new(Body::empty())))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        let (_, a) = api(&gateway, &alice, None).await;
+        assert_eq!(a["result"]["workspaces"][0]["id"], "legacy");
+        let (_, b) = api(&gateway, &bob, None).await;
+        assert_eq!(b["result"]["workspaces"], json!([]));
+        assert_eq!(b["result"]["stats"]["running"], json!({}));
+        for op in [
+            "exec",
+            "start",
+            "stop",
+            "hibernate",
+            "snapshot",
+            "fork",
+            "restore",
+        ] {
+            let (code,_)=api(&gateway,&bob,Some(json!({"op":op,"id":"legacy","name":"checkpoint","child":"stolen","command":"true"}))).await;
+            assert_eq!(code, StatusCode::CONFLICT, "{op}");
+        }
+        let req = Request::builder()
+            .uri("/api/terminal/legacy")
+            .header("host", "app.example.test")
+            .header("cf-access-jwt-assertion", &bob)
+            .header("origin", "https://app.example.test")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            gateway.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        for (jwt, label) in [(&alice, "ALICE"), (&bob, "BOB")] {
+            let (code, value) = api(
+                &gateway,
+                jwt,
+                Some(json!({"op":"create","id":"demo","memory_mib":256})),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{value}");
+            assert_eq!(value["result"]["id"], "demo");
+            assert!(value["result"].get("index").is_none());
+            let(code,value)=api(&gateway,jwt,Some(json!({"op":"exec","id":"demo","command":format!("echo {label} > /persist/owner; cat /persist/owner")}))).await;
+            assert_eq!(code, StatusCode::OK, "{value}");
+            assert!(value["result"]["output"].as_str().unwrap().contains(label));
+            let (code, value) = api(
+                &gateway,
+                jwt,
+                Some(json!({"op":"snapshot","id":"demo","name":"checkpoint"})),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{value}");
+            assert_eq!(value["result"]["name"], "checkpoint");
+            let (code, value) = api(
+                &gateway,
+                jwt,
+                Some(json!({"op":"fork","id":"demo","child":"branch","snapshot":"checkpoint"})),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{value}");
+            assert_eq!(value["result"]["id"], "branch");
+            assert_eq!(value["result"]["source"], "demo");
+            let (_, value) = api(
+                &gateway,
+                jwt,
+                Some(json!({"op":"exec","id":"branch","command":"cat /persist/owner"})),
+            )
+            .await;
+            assert!(value["result"]["output"].as_str().unwrap().contains(label));
+            let (_, state) = api(&gateway, jwt, None).await;
+            assert!(
+                state["result"]["workspaces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|m| ["demo", "branch", "legacy"].contains(&m["id"].as_str().unwrap()))
+            );
+        }
+        let (_, value) = api(
+            &gateway,
+            &alice,
+            Some(json!({"op":"snapshot","id":"demo","name":"private"})),
+        )
+        .await;
+        assert_eq!(value["ok"], true);
+        for body in [
+            json!({"op":"restore","id":"demo","name":"private"}),
+            json!({"op":"fork","id":"demo","child":"leak","snapshot":"private"}),
+        ] {
+            assert_eq!(
+                api(&gateway, &bob, Some(body)).await.0,
+                StatusCode::CONFLICT
+            );
+        }
+        let physical = {
+            let mut c = catalog.lock().unwrap();
+            let u = c
+                .user(&Identity {
+                    issuer: cfg.issuer(),
+                    subject: "test-subject".into(),
+                    email: "owner@example.test".into(),
+                })
+                .unwrap();
+            c.terminal_id(u, "demo").unwrap()
+        };
+        assert_eq!(
+            api(
+                &gateway,
+                &bob,
+                Some(json!({"op":"exec","id":physical,"command":"true"}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let (_, state) = api(&gateway, &bob, None).await;
+        assert_eq!(state["result"]["workspaces"].as_array().unwrap().len(), 2);
+        assert_eq!(state["result"]["stats"]["reserved_memory_mib"], 512);
+        assert_eq!(
+            state["result"]["stats"]["running"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        wire::request(&root, json!({"op":"stop","id":"legacy"})).unwrap();
+        let mut reopened = Catalog::open(&root, &cfg.issuer(), Some("bob@example.test")).unwrap();
+        let user = reopened
+            .user(&Identity {
+                issuer: cfg.issuer(),
+                subject: "bob-subject".into(),
+                email: "bob@example.test".into(),
+            })
+            .unwrap();
+        assert!(reopened.terminal_id(user, "legacy").is_err());
+        assert!(reopened.terminal_id(user, "demo").is_ok());
+        std::fs::write(root.join("users-result.json"),json!({"passed":true,"checks":["explicit legacy owner import","verified distinct subjects","same machine/snapshot/fork names for two users","independent guest files","all lifecycle and exec cross-owner denial","cross-owner snapshot/fork/restore denial","physical ID denial","WSS ownership denial before worker connection","owner-only stats and metadata","database reopen preserves ownership"]}).to_string()).unwrap();
+        println!("User isolation artifacts: {}", root.display());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "Real VM/browser integration: build release binary and install project-local Playwright first"]
     async fn dashboard_browser_real_vm() {
         let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -878,6 +1150,9 @@ mod tests {
         cfg.hostname = public_address.to_string();
         let app = App {
             dashboard: Some(root.clone()),
+            catalog: Some(Arc::new(std::sync::Mutex::new(
+                crate::catalog::Catalog::open(&root, &cfg.issuer(), None).unwrap(),
+            ))),
             config: cfg,
             client: reqwest::Client::new(),
             keys: Arc::new(RwLock::new(Keys {

@@ -11,7 +11,7 @@ product decisions can materially change them.
 - Real guest boot, exec/exit status, binary file transfer and loopback HTTP access.
 - Persistent disk, immutable paired RAM/disk snapshots, independent full-state
   forks and hibernation/resume with HTTP process memory retained.
-- Rust CLI/worker/gateway with owner-only control access, basic namespace
+- Rust CLI/worker/gateway with user-scoped authenticated control access, basic namespace
   networking, conservative resource admission and live memory statistics.
 - Repeated operations, tampered artifacts, guest-root network attempts, cold
   restart and abrupt worker-loss recovery exercised by real-VM regression.
@@ -99,3 +99,11 @@ Gate: end-to-end automation survives sleeping guests and service restarts, uses 
 - Defer broad enterprise scaffolding and a hundred-service catalog until the core vertical slice works.
 
 The current pilot also implements filtered rootless IPv4 egress and remote CLI login/WSS terminals with a public, fixed-file Linux x86-64 curl installer. See [acceptance evidence and remaining networking limits](NETWORKING.md). Production network quotas, immediate session revocation and authenticated owner CLI acceptance remain open.
+
+## Current user-isolation slice
+
+Implemented: SQLite ownership/metadata catalog, explicit legacy owner migration,
+verified issuer/subject binding, personal machine/snapshot names, and owner checks
+for API/CLI/WSS operations. Two-user real-VM regressions pass. GitHub issues track
+resource shapes (#2), per-user machines (#3) and remaining hardening (#4).
+See [identity, database and recovery boundaries](USERS.md).

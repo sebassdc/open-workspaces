@@ -166,6 +166,15 @@ def configure(args):
         raise RuntimeError('Access policy verification failed; no public route was created')
     gateway = {'hostname': args.hostname, 'team_domain': team, 'audience': app['aud'],
         'allowed_emails': emails, 'upstream': args.upstream}
+    # Preserve the explicit legacy owner when adding users; never choose the first new email.
+    previous_path = PRIVATE / 'gateway.json'
+    previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
+    owner = previous.get('bootstrap_owner_email')
+    if owner:
+        if owner.lower() not in emails: raise RuntimeError('Keep the bootstrap owner allowed until ownership migration is complete')
+        gateway['bootstrap_owner_email'] = owner
+    elif len(emails) == 1:
+        gateway['bootstrap_owner_email'] = emails[0]
     private_write(PRIVATE / 'gateway.json', gateway)
     tunnel = json.loads((PRIVATE / 'created-tunnel.json').read_text())
     credentials = PRIVATE / 'credentials/tunnel.json'

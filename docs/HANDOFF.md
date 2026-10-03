@@ -47,6 +47,16 @@ paired RAM/disk snapshot/fork, hibernation, restore and cold-restart checks. The
 latest real VM/browser and HTTPS/WSS CLI regression also passed.
 See [developer packages, permissions and consumption](GUEST_IMAGES.md#developer-tools-and-permissions).
 
+The owner subsequently requested a GitHub backup/issue tracker and per-user
+machines with durable metadata, then prioritized resizing the active Ubuntu
+machine. Source/docs were pushed in commit `4b1ba4d`; GitHub issues now track the
+prototype, resource shapes, user isolation and hardening. CPU/RAM metadata and
+cold resize are implemented and tested; the requested machine was resized with
+disk preserved. Per-user ownership and metadata now use SQLite at the gateway,
+with verified issuer/subject identity, scoped logical names, explicit legacy owner
+migration and cross-owner denial before worker calls. The worker still keeps its
+private runtime recovery journal. See [user scope and limitations](USERS.md).
+
 ## Current findings
 
 - Boxd combines persistent Linux microVM workspaces, full-state branching, remote human access, and an integration/automation platform.

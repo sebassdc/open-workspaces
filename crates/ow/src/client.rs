@@ -195,8 +195,13 @@ pub fn run(url: &str, action: Action) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(0);
         }
-        Action::Create { id, memory, image } => {
-            json!({"op":"create","id":id,"memory_mib":memory,"image":image})
+        Action::Create {
+            id,
+            memory,
+            image,
+            cpus,
+        } => {
+            json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus})
         }
         Action::Start { id } => json!({"op":"start","id":id}),
         Action::Stop { id } => json!({"op":"stop","id":id}),

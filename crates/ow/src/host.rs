@@ -587,8 +587,16 @@ pub fn run(cli: Cli) -> Result<i32> {
         Action::Stats => json!({"op":"stats"}),
         Action::List => json!({"op":"list"}),
         Action::Inspect { id } => json!({"op":"inspect","id":id}),
-        Action::Create { id, memory, image } => {
-            json!({"op":"create","id":id,"memory_mib":memory,"image":image})
+        Action::Create {
+            id,
+            memory,
+            image,
+            cpus,
+        } => {
+            json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus})
+        }
+        Action::Resize { id, memory, cpus } => {
+            json!({"op":"resize","id":id,"memory_mib":memory,"vcpu_count":cpus})
         }
         Action::Start { id } => json!({"op":"start","id":id}),
         Action::Stop { id } => json!({"op":"stop","id":id}),

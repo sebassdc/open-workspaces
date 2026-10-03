@@ -1,5 +1,8 @@
-//! Owner-only workspace controls. Auth, Host and Origin checks run before this handler.
-use crate::{runtime, wire};
+//! User-scoped workspace controls. Auth, Host and Origin checks run before this handler.
+use crate::{
+    catalog::{Catalog, Identity},
+    runtime,
+};
 use anyhow::{Result, bail, ensure};
 use axum::{
     Json,
@@ -10,7 +13,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +33,8 @@ struct Operation {
     memory_mib: Option<u32>,
     #[serde(default)]
     image: Option<String>,
+    #[serde(default)]
+    vcpu_count: Option<u32>,
 }
 
 fn validated(bytes: &[u8]) -> Result<Value> {
@@ -43,10 +48,13 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             request["image"] = json!(image);
             let memory = operation.memory_mib.unwrap_or(256);
             ensure!(
-                [256, 512, 1024].contains(&memory),
-                "Choose 256, 512 or 1024 MiB"
+                [256, 512, 1024, 2048].contains(&memory),
+                "Choose 256, 512, 1024 or 2048 MiB"
             );
             request["memory_mib"] = json!(memory);
+            let cpus = operation.vcpu_count.unwrap_or(1);
+            ensure!((1..=4).contains(&cpus), "Choose 1–4 CPUs");
+            request["vcpu_count"] = json!(cpus);
         }
         "start" | "stop" | "hibernate" => {}
         "snapshot" | "restore" => {
@@ -166,7 +174,27 @@ pub async fn public_download(origin: &str, request: Request) -> Response {
     })
 }
 
-pub async fn handle(root: &Path, request: Request) -> Response {
+pub async fn with_catalog<T: Send + 'static>(
+    catalog: Option<Arc<Mutex<Catalog>>>,
+    identity: Identity,
+    operation: impl FnOnce(&mut Catalog, i64) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let catalog = catalog.ok_or_else(|| anyhow::anyhow!("ownership catalog unavailable"))?;
+    tokio::task::spawn_blocking(move || {
+        let mut catalog = catalog
+            .lock()
+            .map_err(|_| anyhow::anyhow!("catalog lock poisoned"))?;
+        let user = catalog.user(&identity)?;
+        operation(&mut catalog, user)
+    })
+    .await?
+}
+
+pub async fn handle(
+    catalog: Option<Arc<Mutex<Catalog>>>,
+    identity: Identity,
+    request: Request,
+) -> Response {
     let path = request.uri().path();
     let method = request.method().clone();
     if request.uri().scheme().is_some() || request.uri().authority().is_some() {
@@ -198,17 +226,10 @@ pub async fn handle(root: &Path, request: Request) -> Response {
             return secure(([("content-type", kind)], body).into_response());
         }
     }
-    let root = root.to_path_buf();
     if path == "/api/state" && method == Method::GET {
-        let result = tokio::task::spawn_blocking(move || -> Result<Value> {
-            let workspaces = wire::request(&root, json!({"op":"list"}))?;
-            let snapshots = wire::request(&root, json!({"op":"snapshots"}))?;
-            let stats = wire::request(&root, json!({"op":"stats"}))?;
-            Ok(json!({"workspaces":workspaces,"snapshots":snapshots,"stats":stats}))
-        })
-        .await;
+        let result = with_catalog(catalog, identity, |catalog, user| catalog.state(user)).await;
         return secure(match result {
-            Ok(Ok(value)) => Json(json!({"ok":true,"result":value})).into_response(),
+            Ok(value) => Json(json!({"ok":true,"result":value})).into_response(),
             _ => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"ok":false,"error":"Workspace worker unavailable. Try refreshing."})),
@@ -250,19 +271,17 @@ pub async fn handle(root: &Path, request: Request) -> Response {
             );
         }
     };
-    let result = tokio::task::spawn_blocking(move || wire::request(&root, operation)).await;
+    let result = with_catalog(catalog, identity, move |catalog, user| {
+        catalog.operation(user, operation)
+    })
+    .await;
     secure(match result {
-        Ok(Ok(value)) => Json(json!({"ok":true,"result":value})).into_response(),
+        Ok(value) => Json(json!({"ok":true,"result":value})).into_response(),
         // Worker diagnostics may contain host paths; keep detailed error text in operator logs.
-        Ok(Err(error)) => {
+        Err(error) => {
             eprintln!("Dashboard workspace operation failed: {error:#}");
             (StatusCode::CONFLICT,Json(json!({"ok":false,"error":"Operation could not complete. Check machine state, capacity, snapshot ownership and names, then refresh before retrying."}))).into_response()
         }
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"ok":false,"error":"Worker unavailable; refresh before retrying."})),
-        )
-            .into_response(),
     })
 }
 

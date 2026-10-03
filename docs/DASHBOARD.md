@@ -124,3 +124,7 @@ export CARGO_HOME="$PWD/data/runtime-spike/cargo"
 The browser test closes its own worker, retains ignored screenshots/results and
 never changes the owner's live machines. It uses the installed Chromium binary;
 Playwright and its package metadata stay in ignored test storage.
+
+Remote operations now pass through the SQLite ownership catalog; see
+[per-user names, migration, identity and metadata](USERS.md). Existing remote
+users no longer receive global machine/snapshot lists or other users' usage.

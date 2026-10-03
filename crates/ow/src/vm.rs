@@ -232,11 +232,11 @@ impl Vm {
         Ok(output)
     }
 
-    pub fn boot(&mut self, kernel: &Path, memory: u32) -> Result<()> {
+    pub fn boot(&mut self, kernel: &Path, memory: u32, cpus: u32) -> Result<()> {
         self.api(
             "PUT",
             "/machine-config",
-            json!({"vcpu_count":1,"mem_size_mib":memory}),
+            json!({"vcpu_count":cpus,"mem_size_mib":memory}),
         )?;
         self.api("PUT", "/boot-source", json!({"kernel_image_path":kernel,"boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"}))?;
         self.api("PUT", "/drives/rootfs", json!({"drive_id":"rootfs","path_on_host":"disk.ext4","is_root_device":true,"is_read_only":false}))?;

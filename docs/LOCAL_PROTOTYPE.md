@@ -198,3 +198,30 @@ are in [runtime-spike.md](experiments/runtime-spike.md).
 Additional headless Arch and Ubuntu Base images can be chosen with
 `./ow create NAME --image arch` or `--image ubuntu`; see [image preparation and
 limits](GUEST_IMAGES.md). Existing workspaces keep their original Alpine profile.
+
+## CPU/RAM sizes and cold resize
+
+CPU count is stored per workspace and in RAM checkpoint metadata. Existing
+records/checkpoints without the field default to one vCPU. New machines accept
+`--cpus 1` through `4` and memory 256/512/1024/2048 MiB, subject to the worker's
+4 GiB memory, 16 vCPU and eight-running-machine admission limits. These are
+reservations, not a CPU utilization guarantee. Forks inherit the checkpoint's
+CPU/RAM shape. Restore rejects a mismatched shape before stopping a machine.
+
+CPU changes require a cold boot. The local operator can change a **stopped**
+workspace; running/hibernated resize is rejected. Existing disk contents stay
+intact. Save a checkpoint first if rollback is needed; returning to its RAM state
+requires returning to its original CPU/RAM shape.
+
+```bash
+./ow --local snapshot my-box before-resize
+./ow --local stop my-box
+./ow --local resize my-box --cpus 2 --memory 2048
+./ow --local start my-box
+```
+
+Observed real-VM resource tests passed: two-vCPU/2-GiB boot, running resize
+rejection, snapshot/fork resource inheritance, stopped resize preserving disk,
+and incompatible restore rejection without stopping the guest. Private artifacts:
+`data/resize-test-4n4cjym2`. Resize is local operator maintenance; remote resize
+is not exposed yet.

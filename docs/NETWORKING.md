@@ -112,3 +112,9 @@ client binaries/checksums, not SDK or build tools. Both resulting Mach-O executa
 Silicon binary has an ad-hoc Mach-O signature, not an Apple developer notarization.
 Native macOS execution, Keychain trust loading and browser login require checking
 on a Mac; cross-compilation alone does not establish those behaviors.
+
+Dashboard/CLI/WSS requests now resolve machine names through a SQLite per-user
+catalog before contacting the worker. [User isolation](USERS.md) describes the
+identity binding and owner-scoped metadata. The portable Linux build now uses
+pinned Zig musl headers for bundled SQLite; macOS keeps SQLite and the Linux
+worker out of its native remote-client build.

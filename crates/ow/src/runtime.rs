@@ -17,6 +17,19 @@ const MAX_MEMORY_MIB: u32 = 4096;
 const MAX_SNAPSHOTS: usize = 24;
 const MAX_WORKSPACES: usize = 32;
 
+fn default_cpus() -> u32 {
+    1
+}
+
+fn resources(memory: u32, cpus: u32) -> Result<()> {
+    ensure!(
+        [256, 512, 1024, 2048].contains(&memory),
+        "memory must be 256, 512, 1024 or 2048 MiB"
+    );
+    ensure!((1..=4).contains(&cpus), "CPU count must be 1–4");
+    Ok(())
+}
+
 fn default_image() -> String {
     "alpine".into()
 }
@@ -46,6 +59,8 @@ pub struct Workspace {
     pub index: u32,
     pub state: String,
     pub memory_mib: u32,
+    #[serde(default = "default_cpus")]
+    pub vcpu_count: u32,
     #[serde(default = "default_image")]
     pub image: String,
     pub source: Option<String>,
@@ -63,6 +78,8 @@ struct Snapshot {
     name: String,
     workspace: String,
     memory_mib: u32,
+    #[serde(default = "default_cpus")]
+    vcpu_count: u32,
     #[serde(default = "default_image")]
     image: String,
     runtime: String,
@@ -73,7 +90,7 @@ struct Snapshot {
 
 impl Snapshot {
     fn summary(&self) -> Value {
-        json!({"name":self.name,"workspace":self.workspace,"memory_mib":self.memory_mib,"image":self.image,"state":"ready"})
+        json!({"name":self.name,"workspace":self.workspace,"memory_mib":self.memory_mib,"vcpu_count":self.vcpu_count,"image":self.image,"state":"ready"})
     }
 }
 
@@ -304,7 +321,7 @@ impl Runtime {
         self.assets.join("downloads/vmlinux-6.1.186")
     }
 
-    fn capacity(&self, memory: u32) -> Result<()> {
+    fn capacity(&self, memory: u32, cpus: u32) -> Result<()> {
         ensure!(
             self.machines.len() < MAX_RUNNING,
             "running workspace limit ({MAX_RUNNING}) reached"
@@ -314,6 +331,15 @@ impl Runtime {
             .keys()
             .map(|id| self.state.workspaces[id].memory_mib)
             .sum();
+        let used_cpus: u32 = self
+            .machines
+            .keys()
+            .map(|id| self.state.workspaces[id].vcpu_count)
+            .sum();
+        ensure!(
+            used_cpus + cpus <= 16,
+            "CPU reservation limit (16 vCPUs) reached"
+        );
         ensure!(
             used + memory <= MAX_MEMORY_MIB,
             "memory reservation limit ({MAX_MEMORY_MIB} MiB) reached"
@@ -345,7 +371,7 @@ impl Runtime {
     }
 
     fn spawn(&mut self, workspace: &Workspace, snapshot: Option<&Path>, fork: bool) -> Result<()> {
-        self.capacity(workspace.memory_mib)?;
+        self.capacity(workspace.memory_mib, workspace.vcpu_count)?;
         let mut machine = Vm::spawn(
             &self.binary(),
             &self.machine_dir(&workspace.id),
@@ -354,7 +380,7 @@ impl Runtime {
         if let Some(snapshot) = snapshot {
             machine.restore(snapshot)?;
         } else {
-            machine.boot(&self.kernel(), workspace.memory_mib)?;
+            machine.boot(&self.kernel(), workspace.memory_mib, workspace.vcpu_count)?;
         }
         machine.network(&workspace.id, workspace.index, fork)?;
         if workspace.image != "alpine" {
@@ -381,26 +407,25 @@ impl Runtime {
         &mut self,
         id: &str,
         memory: u32,
+        cpus: u32,
         image: &str,
         source: Option<String>,
         snapshot: Option<&str>,
     ) -> Result<Value> {
         identifier(id)?;
         image_profile(image)?;
-        ensure!(
-            [256, 512, 1024].contains(&memory),
-            "memory must be 256, 512 or 1024 MiB"
-        );
+        resources(memory, cpus)?;
         if let Some(existing) = self.state.workspaces.get(id) {
             ensure!(
                 existing.memory_mib == memory
+                    && existing.vcpu_count == cpus
                     && existing.source == source
                     && existing.image == image,
                 "ID already exists with different parameters"
             );
             return Ok(json!(existing));
         }
-        self.capacity(memory)?;
+        self.capacity(memory, cpus)?;
         ensure!(
             self.state.workspaces.len() < MAX_WORKSPACES,
             "workspace limit ({MAX_WORKSPACES}) reached"
@@ -434,6 +459,7 @@ impl Runtime {
             index: self.state.next_index,
             state: "starting".into(),
             memory_mib: memory,
+            vcpu_count: cpus,
             image: image.into(),
             source,
             hibernation: None,
@@ -524,6 +550,7 @@ impl Runtime {
             name: name.into(),
             workspace: id.into(),
             memory_mib: workspace.memory_mib,
+            vcpu_count: workspace.vcpu_count,
             image: workspace.image,
             runtime: "firecracker-v1.17.0".into(),
             cpu: self.cpu.clone(),
@@ -631,11 +658,32 @@ impl Runtime {
             "inspect" => Ok(json!(self.workspace(id)?)),
             "create" => self.create(
                 id,
-                request["memory_mib"].as_u64().unwrap_or(256) as u32,
+                u32::try_from(request["memory_mib"].as_u64().unwrap_or(256))?,
+                u32::try_from(request["vcpu_count"].as_u64().unwrap_or(1))?,
                 request["image"].as_str().unwrap_or("alpine"),
                 None,
                 None,
             ),
+            "resize" => {
+                let memory =
+                    u32::try_from(request["memory_mib"].as_u64().context("missing memory")?)?;
+                let cpus = u32::try_from(
+                    request["vcpu_count"]
+                        .as_u64()
+                        .context("missing CPU count")?,
+                )?;
+                resources(memory, cpus)?;
+                let existing = self.workspace(id)?;
+                ensure!(
+                    !self.machines.contains_key(id) && existing.state == "stopped",
+                    "Stop the machine before resizing; RAM checkpoints cannot change CPU or RAM size"
+                );
+                let workspace = self.state.workspaces.get_mut(id).unwrap();
+                workspace.memory_mib = memory;
+                workspace.vcpu_count = cpus;
+                self.save()?;
+                Ok(json!(self.state.workspaces[id]))
+            }
             "start" => self.start(id),
             "stop" => self.stop(id),
             "exec" => {
@@ -729,7 +777,7 @@ impl Runtime {
                     );
                     return Ok(json!(existing));
                 }
-                self.capacity(parent.memory_mib)?;
+                self.capacity(parent.memory_mib, parent.vcpu_count)?;
                 let supplied = request["snapshot"].as_str();
                 let generated = format!("fork-{}", vm::nonce()?);
                 let name = supplied.unwrap_or(&generated);
@@ -746,6 +794,7 @@ impl Runtime {
                 self.create(
                     child,
                     snapshot.memory_mib,
+                    snapshot.vcpu_count,
                     &snapshot.image,
                     Some(id.into()),
                     Some(name),
@@ -774,6 +823,7 @@ impl Runtime {
                 ensure!(
                     snapshot.workspace == id
                         && snapshot.memory_mib == workspace.memory_mib
+                        && snapshot.vcpu_count == workspace.vcpu_count
                         && snapshot.image == workspace.image,
                     "snapshot belongs to another workspace"
                 );

@@ -137,18 +137,13 @@ pub fn local(root: &Path, id: &str) -> anyhow::Result<i32> {
     }
 }
 
-pub async fn upgrade(root: &Path, request: Request, expires: u64) -> Response {
+pub async fn upgrade(root: &Path, request: Request, expires: u64, id: String) -> Response {
     if request.uri().query().is_some()
         || request.uri().scheme().is_some()
         || request.uri().authority().is_some()
     {
         return (StatusCode::BAD_REQUEST, "Invalid terminal target").into_response();
     }
-    let id = request
-        .uri()
-        .path()
-        .trim_start_matches("/api/terminal/")
-        .to_string();
     if runtime::identifier(&id).is_err() {
         return (StatusCode::BAD_REQUEST, "Invalid machine name").into_response();
     }
