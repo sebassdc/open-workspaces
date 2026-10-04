@@ -19,8 +19,9 @@ ow host status
 Join asks for a hidden invitation paste, consent, a disjoint guest RAM budget,
 running slots, guest vCPU budget and minimum free disk GiB. The invitation carries
 a validated HTTPS controller origin. Default acceptance is 512 MiB / 2 slots /
-2 CPU; an initial guest can use 256 MiB / 1 CPU. The server clamps claims to the
-invitation's persisted RAM/slot/CPU caps. Other workers and desktop reserve must
+2 CPU; an initial guest can use 256 MiB / 1 CPU. The downloaded pilot bundle
+advertises Alpine only; Ubuntu and Arch remain available on existing prepared
+nodes. The server clamps claims to the invitation's persisted RAM/slot/CPU caps. Other workers and desktop reserve must
 be accounted for by the operator. `--storage-gib` is a free-space admission
 threshold, not a disk quota or reserved allocation.
 
@@ -76,8 +77,12 @@ invalidates older secrets; enrolled/revoked IDs require fresh IDs.
 
 ## Release preparation and scoped rollout
 
-Release is held for planner review and independent frozen-artifact acceptance.
-These scripts prepare local outputs only; they do not deploy.
+The bounded trusted-pool release is merged and deployed on the existing project
+domain. Independent focused V1–V6 acceptance and actual public default-TLS node
+enrollment/channel/revocation checks passed; physical second-host/NAT acceptance
+remains pending. See [verification](plans/host-verification-results.md) and
+[planner handoff](plans/host-onboarding-handoff.md). The preparation scripts below
+produce local outputs only; scoped deployment is an operator action.
 
 Use a dedicated owned 0700 ignored build root with `.ow-host-build` containing
 `open-workspaces dedicated host build v1` plus newline. Select separate target,
@@ -141,9 +146,11 @@ The rollback generator compensates app-created/route-failed state, supports
 repetition and preserves unrelated later routes. Review and apply only its owned
 delta. Restore prior scoped gateway/controller binaries/config and reconnect
 channels; no routine catalog restore or worker/Ubuntu stop. New participant
-reservations remain conservatively registered after rollback. Live capture,
-actual cloud apply/rollback, a/b rollout reconnect and public-domain/NAT are
-pending planner work, not results of offline fixture tests.
+reservations remain conservatively registered after rollback. Actual complete
+live capture, scoped cloud apply, a/b native reconnect and
+public default-TLS enrollment/channel checks have passed. Rollback compensation
+and repeat behavior were exercised offline; a real rollback and physical
+second-host/NAT remain untested. See the verification report for scope.
 
 The gateway's host manifest/blob handler selects `OW_HOST_BUNDLE_DIR`, defaulting
 to `OW_ASSET_DIR/host-public`. Its existing Linux/macOS CLI handler separately
