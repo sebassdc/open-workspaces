@@ -63,9 +63,9 @@ def ingress_checks(base):
     approved={k:copy.deepcopy(state[k]) for k in ['account_id','zone_id','tunnel_id','hostname','dashboard_app_id','cli_app_id','dashboard_audience','team_domain']}
     approved.update(dashboard_app=copy.deepcopy(apps[0]),cli_app=copy.deepcopy(apps[1]),native={'caPool':str(ca),'originServerName':'controller.test','serverCert':str(ca),'ca_sha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'server_cert_sha256':hashlib.sha256(ca.read_bytes()).hexdigest()})
     # Actual route language: fixed optional Ubuntu asset, no wildcard/traversal expansion.
-    for path in ['/cli/install.sh','/cli/host-manifest.json','/cli/host/base.ext4','/cli/host/ubuntu.ext4','/cli/host/network-tools.tar.gz','/cli/ow-linux-amd64.sha256']:
+    for path in ['/cli/install.sh','/cli/host-manifest.json','/cli/host-compressed-manifest.json','/cli/host/ubuntu.ext4.zst','/cli/host/base.ext4','/cli/host/ubuntu.ext4','/cli/host/network-tools.tar.gz','/cli/ow-linux-amd64.sha256']:
         assert re.fullmatch(module.CLI_REGEX,path),path
-    for path in ['/cli/host/arch.ext4','/cli/host/ubuntuXext4','/cli/host/ubuntu.ext4/extra','/cli/api/state','/cli/host/../ubuntu.ext4','/api/state']:
+    for path in ['/cli/host/arch.ext4','/cli/host/ubuntu.ext4.zst/extra','/cli/host/ubuntu.ext4Xzst','/cli/host/ubuntuXext4','/cli/host/ubuntu.ext4/extra','/cli/api/state','/cli/host/../ubuntu.ext4','/api/state']:
         assert not re.fullmatch(module.CLI_REGEX,path),path
     prior=copy.deepcopy(state);prior['tunnel']['ingress'][0]['path']=module.PRIOR_HOST_CLI_REGEX
     prior_plan=module.prepare(prior,approved)

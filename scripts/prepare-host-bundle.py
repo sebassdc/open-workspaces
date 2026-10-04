@@ -107,6 +107,11 @@ def prepare(source, output, cli, build_root, ubuntu_dev=False):
         for file in bundle.iterdir():
             with file.open('rb') as f:
                 os.fsync(f.fileno())
+        fd = os.open(bundle, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.rename(bundle, output)
         fd = os.open(output.parent, os.O_DIRECTORY)
         try:

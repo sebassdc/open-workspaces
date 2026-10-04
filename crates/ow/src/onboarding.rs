@@ -61,6 +61,102 @@ struct Asset {
     size: u64,
     sha256: String,
 }
+// Transport metadata is separate from the canonical expanded local manifest.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompressedManifest {
+    version: u32,
+    manifest: Manifest,
+    ubuntu: EncodedAsset,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EncodedAsset {
+    name: String,
+    codec: String,
+    size: u64,
+    sha256: String,
+}
+fn validate_compressed(m: &CompressedManifest) -> Result<()> {
+    validate_manifest(&m.manifest)?;
+    ensure!(
+        m.version == 1
+            && m.manifest.version == 2
+            && m.manifest.files.iter().any(|a| a.name == "ubuntu.ext4")
+            && m.ubuntu.name == "ubuntu.ext4.zst"
+            && m.ubuntu.codec == "zstd"
+            && m.ubuntu.size > 0
+            && m.ubuntu.size <= 8 * 1024 * 1024 * 1024
+            && m.ubuntu.sha256.len() == 64
+            && m.ubuntu
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid compressed transport manifest"
+    );
+    Ok(())
+}
+// Fixed 64 MiB window; no dictionaries, skippable frames, or multiple streams.
+// The bundled codec allocates only its bounded window and fixed streaming buffers.
+fn decode_ubuntu(input: &Path, output: &mut fs::File, asset: &Asset) -> Result<()> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    let mut reader = BufReader::with_capacity(65536, fs::File::open(input)?);
+    let h = reader.fill_buf()?;
+    ensure!(
+        h.len() >= 6 && h[..4] == [0x28, 0xb5, 0x2f, 0xfd],
+        "ordinary zstd frame required"
+    );
+    ensure!(h[4] & 0x1b == 0, "zstd dictionary/reserved header refused");
+    if h[4] & 0x20 == 0 {
+        let window = (1u64 << (10 + (h[5] >> 3))) * (8 + (h[5] & 7) as u64) / 8;
+        ensure!(window <= 1 << 26, "zstd window exceeds 64 MiB");
+    } else {
+        // Single-segment frames use their content size as the window size.
+        let width = [1, 2, 4, 8][(h[4] >> 6) as usize];
+        ensure!(h.len() >= 5 + width, "truncated zstd frame header");
+        let mut content_size = 0u64;
+        for i in 0..width {
+            content_size |= (h[5 + i] as u64) << (8 * i);
+        }
+        if width == 2 {
+            content_size += 256;
+        }
+        ensure!(
+            content_size <= 1 << 26,
+            "zstd single-segment window exceeds 64 MiB"
+        );
+    }
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(reader)?.single_frame();
+    decoder.window_log_max(26)?;
+    let mut size = 0u64;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = decoder.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        size += n as u64;
+        ensure!(size <= asset.size, "decoded Ubuntu oversized");
+        hash.update(&buffer[..n]);
+        if buffer[..n].iter().all(|b| *b == 0) {
+            output.seek(SeekFrom::Current(n as i64))?;
+        } else {
+            output.write_all(&buffer[..n])?;
+        }
+    }
+    ensure!(
+        decoder.finish().fill_buf()?.is_empty(),
+        "trailing/concatenated zstd stream refused"
+    );
+    ensure!(
+        size == asset.size && format!("{:x}", hash.finalize()) == asset.sha256,
+        "decoded Ubuntu corrupt/incomplete"
+    );
+    output.set_len(size)?;
+    output.sync_all()?;
+    Ok(())
+}
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -748,8 +844,16 @@ fn downloads(
     }
     let client = builder.build()?;
     let response = client
-        .get(format!("{origin}/cli/host-manifest.json"))
+        .get(format!("{origin}/cli/host-compressed-manifest.json"))
         .send()?;
+    let legacy = response.status() == reqwest::StatusCode::NOT_FOUND;
+    let response = if legacy {
+        client
+            .get(format!("{origin}/cli/host-manifest.json"))
+            .send()?
+    } else {
+        response
+    };
     ensure!(
         response.status().is_success(),
         "runtime manifest unavailable"
@@ -757,7 +861,13 @@ fn downloads(
     let mut bytes = Vec::new();
     response.take(16385).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 16384, "runtime manifest too large");
-    let mut manifest: Manifest = serde_json::from_slice(&bytes)?;
+    let (mut manifest, encoded) = if legacy {
+        (serde_json::from_slice::<Manifest>(&bytes)?, None)
+    } else {
+        let transport: CompressedManifest = serde_json::from_slice(&bytes)?;
+        validate_compressed(&transport)?;
+        (transport.manifest, Some(transport.ubuntu))
+    };
     validate_manifest(&manifest)?;
     if ubuntu {
         ensure!(
@@ -770,9 +880,27 @@ fn downloads(
             .retain(|a| !matches!(a.name.as_str(), "ubuntu.ext4" | "network-tools.tar.gz"));
     }
     let bytes = serde_json::to_vec(&manifest)?;
-    let transfer: u64 = manifest.files.iter().map(|a| a.size).sum();
+    let expanded: u64 = manifest.files.iter().map(|a| a.size).sum();
+    let encoded = encoded.filter(|_| ubuntu);
+    let transfer = expanded
+        - encoded
+            .as_ref()
+            .map(|_| {
+                manifest
+                    .files
+                    .iter()
+                    .find(|a| a.name == "ubuntu.ext4")
+                    .unwrap()
+                    .size
+            })
+            .unwrap_or(0)
+        + encoded.as_ref().map(|a| a.size).unwrap_or(0);
     ensure!(
-        download_headroom(free_bytes(root)?, transfer, reserve_gib),
+        download_headroom(
+            free_bytes(root)?,
+            expanded + encoded.as_ref().map(|a| a.size).unwrap_or(0),
+            reserve_gib
+        ),
         "insufficient space for bounded asset download"
     );
     println!(
@@ -786,20 +914,31 @@ fn downloads(
     let result = (|| -> Result<()> {
         for (name, dest, _, executable) in selected_files(&manifest) {
             let a = manifest.files.iter().find(|a| a.name == name).unwrap();
-            progress.file(name, a.size);
-            let response = client.get(format!("{origin}/cli/host/{name}")).send()?;
+            let compressed = encoded.as_ref().filter(|_| name == "ubuntu.ext4");
+            let wire_name = compressed.map(|e| e.name.as_str()).unwrap_or(name);
+            let wire_size = compressed.map(|e| e.size).unwrap_or(a.size);
+            let wire_hash = compressed.map(|e| e.sha256.as_str()).unwrap_or(&a.sha256);
+            progress.file(wire_name, wire_size);
+            let response = client
+                .get(format!("{origin}/cli/host/{wire_name}"))
+                .send()?;
             ensure!(
                 response.status().is_success(),
                 "runtime asset unavailable: {name}"
             );
             let path = staging.join(dest);
+            let encoded_path = staging.join("ubuntu.ext4.zst");
             fs::create_dir_all(path.parent().unwrap())?;
             let mut f = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(if executable { 0o700 } else { 0o600 })
-                .open(path)?;
-            let mut reader = response.take(a.size + 1);
+                .open(if compressed.is_some() {
+                    &encoded_path
+                } else {
+                    &path
+                })?;
+            let mut reader = response.take(wire_size + 1);
             let mut hash = Sha256::new();
             let mut size = 0u64;
             let mut buffer = [0u8; 65536];
@@ -809,7 +948,7 @@ fn downloads(
                     break;
                 }
                 size += n as u64;
-                ensure!(size <= a.size, "runtime asset oversized");
+                ensure!(size <= wire_size, "runtime asset oversized");
                 hash.update(&buffer[..n]);
                 // Preserve sparse zero ranges without weakening hash/length validation.
                 if buffer[..n].iter().all(|b| *b == 0) {
@@ -818,16 +957,26 @@ fn downloads(
                 } else {
                     f.write_all(&buffer[..n])?;
                 }
-                progress.advance(name, n as u64);
+                progress.advance(wire_name, n as u64);
             }
-            progress.render(name, true);
+            progress.render(wire_name, true);
             progress.line(&format!("Verifying {name}"));
             f.set_len(size)?;
             ensure!(
-                size == a.size && format!("{:x}", hash.finalize()) == a.sha256,
+                size == wire_size && format!("{:x}", hash.finalize()) == wire_hash,
                 "runtime asset corrupt/incomplete: {name}"
             );
             f.sync_all()?;
+            if compressed.is_some() {
+                progress.line("Decoding and verifying ubuntu.ext4 (64 MiB maximum window)");
+                let mut output = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)?;
+                decode_ubuntu(&encoded_path, &mut output, a)?;
+                fs::remove_file(encoded_path)?;
+            }
         }
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -1764,6 +1913,8 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
 
 pub fn public_path(path: &str) -> bool {
     path == "/cli/host-manifest.json"
+        || path == "/cli/host-compressed-manifest.json"
+        || path == "/cli/host/ubuntu.ext4.zst"
         || FILES
             .iter()
             .any(|(n, _, _, _)| path == format!("/cli/host/{n}"))
@@ -1880,12 +2031,15 @@ fn verified_public_file_before_lock(
     Ok(())
 }
 pub async fn public_download(path: &str, head: bool) -> axum::response::Response {
+    let root = std::env::var_os("OW_HOST_BUNDLE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(crate::assets().join("host-public"));
+    public_download_from(root, path, head).await
+}
+async fn public_download_from(root: PathBuf, path: &str, head: bool) -> axum::response::Response {
     use axum::{body::Body, http::StatusCode, response::IntoResponse};
     let path = path.to_owned();
-    let result = tokio::task::spawn_blocking(move || -> Result<(fs::File, u64)> {
-        let root = std::env::var_os("OW_HOST_BUNDLE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or(crate::assets().join("host-public"));
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<(fs::File, u64)>> {
         ensure!(
             fs::symlink_metadata(&root)?.is_dir(),
             "unsafe bundle directory"
@@ -1895,6 +2049,41 @@ pub async fn public_download(path: &str, head: bool) -> axum::response::Response
         validate_manifest(&manifest)?;
         let (name, size, expected) = if path == "/cli/host-manifest.json" {
             ("manifest.json".to_owned(), bytes.len() as u64, None)
+        } else if matches!(
+            path.as_str(),
+            "/cli/host-compressed-manifest.json" | "/cli/host/ubuntu.ext4.zst"
+        ) {
+            let transport_bytes = match bounded_file(&root.join("compressed-manifest.json"), 16384)
+            {
+                Ok(bytes) => bytes,
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let transport: CompressedManifest = serde_json::from_slice(&transport_bytes)?;
+            validate_compressed(&transport)?;
+            ensure!(
+                serde_json::to_vec(&transport.manifest)? == serde_json::to_vec(&manifest)?,
+                "raw/compressed manifest mismatch"
+            );
+            if path == "/cli/host-compressed-manifest.json" {
+                (
+                    "compressed-manifest.json".to_owned(),
+                    transport_bytes.len() as u64,
+                    None,
+                )
+            } else {
+                (
+                    transport.ubuntu.name,
+                    transport.ubuntu.size,
+                    Some(transport.ubuntu.sha256),
+                )
+            }
         } else {
             let name = path
                 .strip_prefix("/cli/host/")
@@ -1922,11 +2111,11 @@ pub async fn public_download(path: &str, head: bool) -> axum::response::Response
         if let Some(expected) = expected {
             verified_public_file(&mut file, size, &expected)?;
         }
-        Ok((file, size))
+        Ok(Some((file, size)))
     })
     .await;
     match result {
-        Ok(Ok((file, size))) => {
+        Ok(Ok(Some((file, size)))) => {
             let mut response = axum::response::Response::new(if head {
                 Body::empty()
             } else {
@@ -1943,6 +2132,11 @@ pub async fn public_download(path: &str, head: bool) -> axum::response::Response
                 .insert("content-length", size.to_string().parse().unwrap());
             response
         }
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            "Compressed host runtime bundle unavailable",
+        )
+            .into_response(),
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             "Host runtime bundle unavailable",
@@ -1954,6 +2148,178 @@ pub async fn public_download(path: &str, head: bool) -> axum::response::Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn compressed_gateway_preserves_raw_and_checks_transport() {
+        let root =
+            std::env::temp_dir().join(format!("ow-public-codec-{}", common::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let manifest = Manifest {
+            version: 2,
+            runtime: "firecracker-v1.17.0".into(),
+            arch: "x86_64".into(),
+            files: FILES
+                .iter()
+                .map(|(name, _, _, _)| Asset {
+                    name: (*name).into(),
+                    size: 1,
+                    sha256: format!("{:x}", Sha256::digest(b"x")),
+                })
+                .collect(),
+        };
+        for (name, _, _, _) in FILES {
+            fs::write(root.join(name), b"x").unwrap();
+        }
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        for path in [
+            "/cli/host-compressed-manifest.json",
+            "/cli/host/ubuntu.ext4.zst",
+        ] {
+            assert_eq!(
+                public_download_from(root.clone(), path, true)
+                    .await
+                    .status(),
+                404
+            );
+        }
+        assert_eq!(
+            public_download_from(root.clone(), "/cli/host/ubuntu.ext4", true)
+                .await
+                .status(),
+            200
+        );
+        let legacy = json!({"version": 1, "runtime": manifest.runtime, "arch": manifest.arch, "files": &manifest.files[..5]});
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            public_download_from(root.clone(), "/cli/host-compressed-manifest.json", true)
+                .await
+                .status(),
+            404
+        );
+        assert_eq!(
+            public_download_from(root.clone(), "/cli/host-manifest.json", true)
+                .await
+                .status(),
+            200
+        );
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("compressed-manifest.json"), b"{}").unwrap();
+        assert_eq!(
+            public_download_from(root.clone(), "/cli/host-compressed-manifest.json", true)
+                .await
+                .status(),
+            503
+        );
+        fs::remove_file(root.join("compressed-manifest.json")).unwrap();
+        std::os::unix::fs::symlink("missing", root.join("compressed-manifest.json")).unwrap();
+        assert_eq!(
+            public_download_from(root.clone(), "/cli/host-compressed-manifest.json", true)
+                .await
+                .status(),
+            503
+        );
+        fs::remove_file(root.join("compressed-manifest.json")).unwrap();
+        let encoded = zstd::stream::encode_all(&b"x"[..], 19).unwrap();
+        fs::write(root.join("ubuntu.ext4.zst"), &encoded).unwrap();
+        let mut transport = CompressedManifest {
+            version: 1,
+            manifest,
+            ubuntu: EncodedAsset {
+                name: "ubuntu.ext4.zst".into(),
+                codec: "zstd".into(),
+                size: encoded.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&encoded)),
+            },
+        };
+        fs::write(
+            root.join("compressed-manifest.json"),
+            serde_json::to_vec(&transport).unwrap(),
+        )
+        .unwrap();
+        for path in [
+            "/cli/host-manifest.json",
+            "/cli/host/ubuntu.ext4",
+            "/cli/host-compressed-manifest.json",
+            "/cli/host/ubuntu.ext4.zst",
+        ] {
+            let response = public_download_from(root.clone(), path, true).await;
+            assert_eq!(response.status(), 200, "{path}");
+            assert!(response.headers().contains_key("content-length"));
+        }
+        transport.manifest.files[5].sha256 = "0".repeat(64);
+        fs::write(
+            root.join("compressed-manifest.json"),
+            serde_json::to_vec(&transport).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            public_download_from(root.clone(), "/cli/host/ubuntu.ext4.zst", true)
+                .await
+                .status(),
+            503
+        );
+        assert_eq!(
+            public_download_from(root.clone(), "/cli/host/ubuntu.ext4", true)
+                .await
+                .status(),
+            200
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compressed_decoder_rejects_stream_surprises() {
+        let root = std::env::temp_dir().join(format!("ow-codec-{}", common::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let data = vec![0u8; 1024 * 1024];
+        let encoded = zstd::stream::encode_all(data.as_slice(), 19).unwrap();
+        let asset = Asset {
+            name: "ubuntu.ext4".into(),
+            size: data.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&data)),
+        };
+        let attempt = |bytes: &[u8], a: &Asset| {
+            fs::write(root.join("encoded"), bytes).unwrap();
+            let mut f = fs::File::create(root.join("decoded")).unwrap();
+            decode_ubuntu(&root.join("encoded"), &mut f, a)
+        };
+        attempt(&encoded, &asset).unwrap();
+        let stat = fs::metadata(root.join("decoded")).unwrap();
+        assert!(stat.blocks() * 512 < stat.len());
+        assert!(attempt(&encoded[..encoded.len() - 1], &asset).is_err());
+        for suffix in [
+            &encoded[..],
+            &[0u8][..],
+            &[0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0][..],
+        ] {
+            let mut bad = encoded.clone();
+            bad.extend_from_slice(suffix);
+            assert!(attempt(&bad, &asset).is_err());
+        }
+        let mut bad = encoded.clone();
+        bad[4] |= 1;
+        assert!(attempt(&bad, &asset).is_err());
+        bad[..4].copy_from_slice(&[0x50, 0x2a, 0x4d, 0x18]);
+        assert!(attempt(&bad, &asset).is_err());
+        let short = Asset { size: 1, ..asset };
+        assert!(attempt(&encoded, &short).is_err());
+        assert!(public_path("/cli/host/ubuntu.ext4.zst"));
+        assert!(!public_path("/cli/host/ubuntu.ext4.zst/extra"));
+        assert!(!public_path("/cli/host/../ubuntu.ext4.zst"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn validates_caps_policy_origin_and_manifest() {
         let now = std::time::SystemTime::now()

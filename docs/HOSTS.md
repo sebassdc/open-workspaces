@@ -116,13 +116,27 @@ ow --data-dir HOST_ROOT host rollback-assets --revision assets-rollback-NONCE
 
 V1 Alpine and opt-out v2 use five files; complete Ubuntu v2 requires seven files,
 including the pinned guest network-tools archive. It is not extracted on the host.
-Only verified manifest-selected images are advertised. Ubuntu delivery is optional
-and raw: 8,589,934,592 image bytes plus the helper/common files, despite sparse
-physical storage. The verified v3 complete bundle transfers 8,778,379,912 asset
-bytes; Alpine selection transfers 186,049,272. Admission requires full selected
-logical bytes plus the saved disk reserve and 512 MiB staging overhead, retaining
-prior assets. Each TLS file download has a 1,800-second deadline. Interrupted
-transfers are restarted; no compressed/resumable delivery claim.
+Only verified manifest-selected images are advertised. Existing deployed clients
+and `/cli/host-manifest.json` retain raw delivery: 8,589,934,592 Ubuntu bytes plus
+helper/common files (8,778,379,912 total for the accepted complete bundle).
+
+The prepared compressed-delivery candidate requests
+`/cli/host-compressed-manifest.json`, falling back to the old raw endpoint only
+on HTTP 404. The gateway returns 404 when compressed capability is genuinely
+absent; malformed/unsafe metadata remains an error. The separate transport-v1
+wrapper embeds the original canonical v2 manifest and fixed `ubuntu.ext4.zst`
+encoded length/SHA-256. Only Ubuntu is compressed. The reviewed bundle transfers
+631,333,954 total bytes, including 442,888,634 encoded Ubuntu bytes. A built-in
+pinned zstd decoder verifies encoded bytes before sparse decoding, bounds its
+window to 64 MiB and output to the expanded manifest length, verifies the original
+SHA-256, and refuses dictionaries, skippable/concatenated frames or trailing bytes.
+The locally published canonical manifest contains expanded names, hashes and
+lengths; enrollment and existing disks are preserved. Admission reserves expanded
+logical bytes plus encoded staging, saved disk reserve and 512 MiB overhead.
+Transfer progress counts encoded bytes and is followed by explicit decode/verify
+and publication phases. Each TLS file download has a 1,800-second deadline.
+Interrupted transfers restart. Parent review/publication remains pending; see
+[measurements, compatibility and release pins](plans/compressed-assets-report.md).
 
 Host asset downloads show aggregate progress, the current filename and average
 transfer rate on stderr. Terminals get a single-line bar refreshed at most five
@@ -156,6 +170,7 @@ compiled source input and refuses changes during build:
 ```sh
 bash scripts/build-host-cli.sh
 python3 scripts/prepare-host-bundle.py --help
+python3 scripts/prepare-compressed-host-bundle.py --help
 ```
 
 Prepare pinned runtime bytes only under dedicated source storage: official
