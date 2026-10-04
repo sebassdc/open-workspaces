@@ -506,15 +506,18 @@ impl Catalog {
         memory: u64,
         image: &str,
         cpus: u64,
+        local_status: &Value,
     ) -> Result<String> {
         let inventory = nodes::inventory(&self.root)?;
         if inventory.as_array().unwrap().is_empty() && requested.is_none() {
+            common::guest_shape(local_status, memory, cpus)?;
             return Ok("local".into());
         }
         let mut candidates = Vec::new();
         for n in inventory.as_array().unwrap() {
             let id = n["id"].as_str().unwrap();
             if requested.is_some_and(|r| r != id)
+                || common::guest_shape(&n["capabilities"], memory, cpus).is_err()
                 || n["online"] != true
                 || !n["capabilities"]["images"]
                     .as_array()
@@ -547,9 +550,10 @@ impl Catalog {
         memory: u64,
         cpus: u64,
         image: &str,
+        local_status: &Value,
     ) -> Result<()> {
         if node == "local" {
-            return Ok(());
+            return common::guest_shape(local_status, memory, cpus);
         }
         nodes::online(&self.root, node)?;
         let inventory = nodes::inventory(&self.root)?;
@@ -559,6 +563,7 @@ impl Catalog {
             .iter()
             .find(|n| n["id"] == node)
             .context("node")?;
+        common::guest_shape(&n["capabilities"], memory, cpus)?;
         let (limit, slots) = (
             n["memory_mib"].as_u64().unwrap_or(0),
             n["slots"].as_u64().unwrap_or(0),
@@ -588,7 +593,34 @@ impl Catalog {
         op: &str,
         request: &Value,
         metadata: &Value,
+        local_status: &Value,
     ) -> Result<()> {
+        if op == "resize" {
+            let (ram, cpus) = common::requested_resources(request)?;
+            ensure!(
+                metadata["state"] == "stopped",
+                "resize requires a positively stopped workspace"
+            );
+            let reserved: bool = self.db.query_row("SELECT reserved_mib>0 OR reserved_cpus>0 OR EXISTS(SELECT 1 FROM operations WHERE node=?2 AND state IN ('pending','uncertain')) FROM resources WHERE physical=?1 AND kind='machine'",params![target,node],|r|r.get(0))?;
+            ensure!(!reserved, "resize has unresolved reservations/effects");
+            if node == "local" {
+                common::guest_shape(local_status, ram as u64, cpus as u64)?;
+            } else {
+                let pool = nodes::inventory(&self.root)?;
+                let n = pool
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|n| n["id"] == node)
+                    .context("node")?;
+                common::guest_shape(&n["capabilities"], ram as u64, cpus as u64)?;
+                ensure!(
+                    ram as u64 <= n["memory_mib"].as_u64().unwrap_or(0)
+                        && cpus as u64 <= n["capabilities"]["vcpus"].as_u64().unwrap_or(0),
+                    "resize exceeds effective host budget"
+                );
+            }
+        }
         let shape = if op == "fork" && request["snapshot"].is_string() {
             let metadata: String = self.db.query_row(
                 "SELECT metadata FROM resources WHERE kind='snapshot' AND physical=?1",
@@ -615,7 +647,7 @@ impl Catalog {
             } else {
                 shape["image"].as_str().unwrap_or("alpine")
             };
-            self.capacity(&node, &target, memory, cpus, image)?;
+            self.capacity(node, target, memory, cpus, image, local_status)?;
             self.db.execute("UPDATE resources SET reserved_mib=?1,reserved_cpus=?2 WHERE kind='machine' AND physical=?3",params![memory as i64,cpus as i64,target])?;
         }
         Ok(())
@@ -625,6 +657,7 @@ impl Catalog {
         ensure!(
             [
                 "create",
+                "resize",
                 "start",
                 "stop",
                 "exec",
@@ -638,6 +671,9 @@ impl Catalog {
             .contains(&op.as_str()),
             "unsupported user operation"
         );
+        if matches!(op.as_str(), "create" | "resize") {
+            common::requested_resources(&request)?;
+        }
         let name = request["id"].as_str().context("id")?.to_owned();
         common::identifier(&name)?;
         let input = request.clone();
@@ -662,6 +698,16 @@ impl Catalog {
             nodes::online(&self.root, node)?;
         }
         self.reconcile()?;
+        // Optional protocol-v1 status fields; query outside the SQLite writer. A missing
+        // legacy response conservatively retains the original 2 GiB/4 CPU ceiling.
+        let local_status = if matches!(
+            op.as_str(),
+            "create" | "resize" | "start" | "fork" | "restore"
+        ) {
+            wire::request(&self.root, json!({"op":"status"})).unwrap_or_else(|_| json!({}))
+        } else {
+            json!({})
+        };
         // BEGIN IMMEDIATE serializes placement, operation fingerprint and memory/slot reservation
         // across gateway processes. No network I/O occurs inside this transaction.
         self.db.execute_batch("BEGIN IMMEDIATE")?;
@@ -700,6 +746,7 @@ impl Catalog {
                         request["memory_mib"].as_u64().unwrap_or(256),
                         request["image"].as_str().unwrap_or("alpine"),
                         request["vcpu_count"].as_u64().unwrap_or(1),
+                        &local_status,
                     )?;
                     self.db.execute(
                         "UPDATE resources SET node=?1 WHERE kind='machine' AND physical=?2",
@@ -837,7 +884,7 @@ impl Catalog {
                     "operation previously rejected; use a new operation_key for deliberate retry"
                 );
                 if state == "not_dispatched" {
-                    self.admit(&node, &target, &op, &request, &metadata)?;
+                    self.admit(&node, &target, &op, &request, &metadata, &local_status)?;
                     self.db
                         .execute("UPDATE operations SET state='pending' WHERE id=?1", [id])?;
                 }
@@ -845,7 +892,7 @@ impl Catalog {
                 return Ok((physical, node, target, id, None));
             }
             nodes::online(&self.root, &node)?;
-            self.admit(&node, &target, &op, &request, &metadata)?;
+            self.admit(&node, &target, &op, &request, &metadata, &local_status)?;
             let resource = if op == "fork" {
                 input["child"].as_str().unwrap_or(&name)
             } else if op == "snapshot" {

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import signal
 import subprocess
@@ -61,6 +62,21 @@ def ingress_checks(base):
     state={'capture_schema':1,'app_inventory_complete':True,'hostname':'pool.example.test','account_id':'test-account','zone_id':'test-zone','tunnel_id':'test-tunnel','dashboard_app_id':'dashboard-id','cli_app_id':'cli-id','dashboard_audience':['test-aud'],'team_domain':'team.cloudflareaccess.com','apps':apps,'native_trust':{'caPool':str(ca),'originServerName':'controller.test'},'ownership':{'account_id':'test-account','zone_id':'test-zone','tunnel_id':'test-tunnel','hostname':'pool.example.test'},'tunnel':{'tunnel':'test-tunnel','ingress':[{'hostname':'pool.example.test','path':module.OLD_CLI_REGEX,'service':'http://127.0.0.1:8787','originRequest':{'access':{'required':False}}},{'hostname':'pool.example.test','service':'http://127.0.0.1:8787','originRequest':{'access':{'required':True,'audTag':['test-aud']}}},{'service':'http_status:404'}]}}
     approved={k:copy.deepcopy(state[k]) for k in ['account_id','zone_id','tunnel_id','hostname','dashboard_app_id','cli_app_id','dashboard_audience','team_domain']}
     approved.update(dashboard_app=copy.deepcopy(apps[0]),cli_app=copy.deepcopy(apps[1]),native={'caPool':str(ca),'originServerName':'controller.test','serverCert':str(ca),'ca_sha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'server_cert_sha256':hashlib.sha256(ca.read_bytes()).hexdigest()})
+    # Actual route language: fixed optional Ubuntu asset, no wildcard/traversal expansion.
+    for path in ['/cli/install.sh','/cli/host-manifest.json','/cli/host/base.ext4','/cli/host/ubuntu.ext4','/cli/host/network-tools.tar.gz','/cli/ow-linux-amd64.sha256']:
+        assert re.fullmatch(module.CLI_REGEX,path),path
+    for path in ['/cli/host/arch.ext4','/cli/host/ubuntuXext4','/cli/host/ubuntu.ext4/extra','/cli/api/state','/cli/host/../ubuntu.ext4','/api/state']:
+        assert not re.fullmatch(module.CLI_REGEX,path),path
+    prior=copy.deepcopy(state);prior['tunnel']['ingress'][0]['path']=module.PRIOR_HOST_CLI_REGEX
+    prior_plan=module.prepare(prior,approved)
+    upgraded=copy.deepcopy(prior);upgraded['tunnel']=prior_plan['tunnel_after'];upgraded['node_app_id']='new-node-id';upgraded['apps'].append(dict(prior_plan['node_app_create'],id='new-node-id',account_id='test-account'))
+    assert module.prepare(upgraded,approved)['tunnel_after']==upgraded['tunnel']
+    foreign_route={'hostname':'unrelated.example.test','service':'http://127.0.0.1:9999'}
+    upgraded['tunnel']['ingress'].insert(0,foreign_route)
+    rolled=module.rollback(prior_plan,upgraded,'new-node-id')
+    assert foreign_route in rolled['tunnel']['ingress']
+    assert any(r.get('path')==module.PRIOR_HOST_CLI_REGEX for r in rolled['tunnel']['ingress'])
+    assert module.rollback(prior_plan,rolled,'new-node-id')==rolled
     plan=module.prepare(state,approved)
     after=copy.deepcopy(state);after['tunnel']=plan['tunnel_after'];after['node_app_id']='new-node-id';after['apps'].append(dict(plan['node_app_create'],id='new-node-id',account_id='test-account'))
     assert module.prepare(after,approved)['node_app_create'] is None

@@ -36,7 +36,7 @@ def regular(path, maximum):
         raise ValueError('Missing/nonregular/oversized source')
     return info.st_size
 
-def prepare(source, output, cli, build_root):
+def prepare(source, output, cli, build_root, ubuntu_dev=False):
     if not build_root.is_absolute() or (build_root / '.ow-host-build').read_text() != 'open-workspaces dedicated host build v1\n':
         raise ValueError('Explicit marked dedicated build root required')
     for path in [source, output, cli]:
@@ -62,19 +62,29 @@ def prepare(source, output, cli, build_root):
         raise ValueError('Build source manifest hash mismatch')
     if build.get('cli_sha256') != cli_hash or build.get('guest_sha256') != digest(source / 'guest/ow-guest'):
         raise ValueError('CLI/guest does not match recorded source build')
+    files = dict(FILES)
+    if ubuntu_dev:
+        # Reviewed independent developer-v1 template; never accept arbitrary matching caller metadata.
+        regular(source / 'guest/ubuntu.json', 16384)
+        provenance = json.loads((source / 'guest/ubuntu.json').read_text())
+        approved = '87ba61583f33e129f08776d1a4b8c1557322f146a7de0ed44581e2000f3f3f6b'
+        if not (provenance.get('profile') == 'ubuntu' and provenance.get('revision') == 'developer-v1' and provenance.get('disk_mib') == 8192 and provenance.get('developer_user') == 'dev' and provenance.get('sudo') == 'guest-only passwordless' and provenance.get('source') == 'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-amd64.tar.gz' and provenance.get('source_sha256') == 'e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86' and provenance.get('image_sha256') == approved and provenance.get('package_inventory_sha256') == '5138ec41754e0b7ae48a430a744fea09bd88dad3854ac3034f1e73fd96400e4c'):
+            raise ValueError('Reviewed pristine Ubuntu developer-v1 provenance required')
+        files['ubuntu.ext4'] = ('guest/ubuntu.ext4', 8 << 30, approved)
+        files['network-tools.tar.gz'] = ('guest/network-tools.tar.gz', 32 << 20, 'aedb91f6409189bb6a32184268824e21efd672b3c5a37f64ecd7075f8e6ceb37')
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='host-bundle-', dir=output.parent) as stage:
         bundle = Path(stage) / 'bundle'
         bundle.mkdir(mode=0o700)
-        manifest = {'version': 1, 'runtime': 'firecracker-v1.17.0', 'arch': 'x86_64', 'files': []}
-        for name, (relative, maximum, pinned) in FILES.items():
+        manifest = {'version': 2 if ubuntu_dev else 1, 'runtime': 'firecracker-v1.17.0', 'arch': 'x86_64', 'files': []}
+        for name, (relative, maximum, pinned) in files.items():
             path = source / relative
             size = regular(path, maximum)
             actual = digest(path)
             expected = pinned or (clean['sha256'] if name == 'base.ext4' else actual)
             if actual != expected:
                 raise ValueError(f'Hash mismatch: {name}')
-            shutil.copyfile(path, bundle / name)
+            subprocess.run(['cp', '--sparse=auto', '--reflink=auto', '--', str(path), str(bundle / name)], check=True)
             (bundle / name).chmod(0o400)
             # Verify the copied bytes before publication.
             if digest(bundle / name) != actual:
@@ -107,11 +117,12 @@ def prepare(source, output, cli, build_root):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--ubuntu-dev', action='store_true', help='Include reviewed pristine Ubuntu developer template; clients opt in')
     p.add_argument('--source', required=True, type=Path)
     p.add_argument('--build-root', required=True, type=Path)
     p.add_argument('--output', required=True, type=Path)
     p.add_argument('--linux-cli', required=True, type=Path)
     a = p.parse_args()
     os.umask(0o077)
-    prepare(a.source.absolute(), a.output.absolute(), a.linux_cli.absolute(), a.build_root.absolute())
+    prepare(a.source.absolute(), a.output.absolute(), a.linux_cli.absolute(), a.build_root.absolute(), a.ubuntu_dev)
     print('Prepared immutable fixed host bundle and matching Linux CLI; deployment remains planner-owned.')

@@ -17,7 +17,7 @@ use std::{
 };
 
 // Fixed wire names and private runtime destinations. No extraction or arbitrary paths.
-pub const FILES: [(&str, &str, u64, bool); 5] = [
+pub const FILES: [(&str, &str, u64, bool); 7] = [
     (
         "firecracker",
         "official/release-v1.17.0-x86_64/firecracker-v1.17.0-x86_64",
@@ -33,8 +33,20 @@ pub const FILES: [(&str, &str, u64, bool); 5] = [
     ("base.ext4", "guest/base.ext4", 256 * 1024 * 1024, false),
     ("ow-guest", "guest/ow-guest", 32 * 1024 * 1024, true),
     ("slirp4netns", "bin/slirp4netns", 32 * 1024 * 1024, true),
+    (
+        "ubuntu.ext4",
+        "guest/ubuntu.ext4",
+        8 * 1024 * 1024 * 1024,
+        false,
+    ),
+    (
+        "network-tools.tar.gz",
+        "guest/network-tools.tar.gz",
+        32 * 1024 * 1024,
+        false,
+    ),
 ];
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     version: u32,
@@ -42,7 +54,7 @@ struct Manifest {
     arch: String,
     files: Vec<Asset>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Asset {
     name: String,
@@ -143,12 +155,10 @@ fn bounded_file(path: &Path, max: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn limits(memory: u32, slots: u32, cpus: u32, storage: u32) -> Result<()> {
+    common::host_limits(memory, slots, cpus)?;
     ensure!(
-        (256..=4096).contains(&memory)
-            && (1..=8).contains(&slots)
-            && (1..=16).contains(&cpus)
-            && (1..=1024).contains(&storage),
-        "host limits out of range"
+        (1..=1024).contains(&storage),
+        "storage reserve out of range"
     );
     Ok(())
 }
@@ -309,7 +319,7 @@ fn doctor(root: &Path) -> Result<Value> {
         );
     }
     Ok(
-        json!({"build_source_sha256":option_env!("OW_BUILD_SOURCE_SHA256"),"supported":errors.is_empty(),"diagnostics":errors,"free_gib":free_bytes(root)?/(1024*1024*1024),"demand":existing_demand()?}),
+        json!({"cpu_logical_available":std::thread::available_parallelism()?.get(),"cpu_topology":fixed_command("lscpu").args(["--json"]).output().ok().filter(|o|o.status.success()).and_then(|o|serde_json::from_slice::<Value>(&o.stdout).ok()),"build_source_sha256":option_env!("OW_BUILD_SOURCE_SHA256"),"supported":errors.is_empty(),"diagnostics":errors,"free_gib":free_bytes(root)?/(1024*1024*1024),"demand":existing_demand()?}),
     )
 }
 fn preflight(root: &Path, c: &Config) -> Result<()> {
@@ -487,13 +497,23 @@ fn envelope(v: &Value) -> Result<(String, u32, u32, u32)> {
     limits(memory, slots, cpus, 1)?;
     Ok((controller, memory, slots, cpus))
 }
+fn selected_files(
+    m: &Manifest,
+) -> impl Iterator<Item = (&'static str, &'static str, u64, bool)> + '_ {
+    FILES
+        .into_iter()
+        .filter(|(name, _, _, _)| m.files.iter().any(|a| a.name == *name))
+}
 fn validate_manifest(m: &Manifest) -> Result<()> {
     ensure!(
-        m.version == 1
+        (m.version == 1 || m.version == 2)
             && m.runtime == "firecracker-v1.17.0"
-            && m.arch == "x86_64"
-            && m.files.len() == FILES.len(),
+            && m.arch == "x86_64",
         "unsupported runtime manifest"
+    );
+    ensure!(
+        m.files.len() == 5 || (m.version == 2 && m.files.len() == 7),
+        "unsupported asset set"
     );
     for (name, _, max, _) in FILES {
         let found = m
@@ -501,7 +521,14 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
             .iter()
             .filter(|a| a.name == name)
             .collect::<Vec<_>>();
-        ensure!(found.len() == 1, "manifest missing/duplicate asset");
+        if matches!(name, "ubuntu.ext4" | "network-tools.tar.gz") && found.is_empty() {
+            continue;
+        }
+        ensure!(
+            found.len() == 1
+                && (!matches!(name, "ubuntu.ext4" | "network-tools.tar.gz") || m.version == 2),
+            "manifest missing/duplicate asset"
+        );
         let a = found[0];
         ensure!(
             a.size > 0
@@ -513,16 +540,54 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
             "invalid asset size/hash"
         );
     }
+    ensure!(
+        m.files.iter().any(|a| a.name == "ubuntu.ext4")
+            == m.files.iter().any(|a| a.name == "network-tools.tar.gz"),
+        "Ubuntu requires verified network tools"
+    );
+    ensure!(
+        m.files
+            .iter()
+            .all(|a| FILES.iter().any(|(n, _, _, _)| *n == a.name)),
+        "unknown asset"
+    );
     Ok(())
 }
-fn verify_assets(root: &Path) -> Result<()> {
-    let m: Manifest =
-        serde_json::from_slice(&bounded_file(&root.join("assets/manifest.json"), 16384)?)?;
+fn verify_file(path: &Path, size: u64, expected: &str) -> Result<()> {
+    let m = fs::symlink_metadata(path)?;
+    ensure!(m.is_file() && m.len() == size, "invalid asset length/type");
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut hash = Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = f.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        count += n as u64;
+        ensure!(count <= size, "asset oversized");
+        hash.update(&buffer[..n]);
+    }
+    ensure!(
+        count == size && format!("{:x}", hash.finalize()) == expected,
+        "runtime asset corrupt or incomplete"
+    );
+    Ok(())
+}
+pub(crate) fn verify_assets(root: &Path) -> Result<()> {
+    verify_asset_dir(root, &root.join("assets"))
+}
+fn verify_asset_dir(root: &Path, assets: &Path) -> Result<()> {
+    let m: Manifest = serde_json::from_slice(&bounded_file(&assets.join("manifest.json"), 16384)?)?;
     validate_manifest(&m)?;
-    private_dir(&root.join("assets"))?;
-    for (name, dest, _, executable) in FILES {
+    private_dir(assets)?;
+    for (name, dest, _, executable) in selected_files(&m) {
         let a = m.files.iter().find(|a| a.name == name).unwrap();
-        let path = root.join("assets").join(dest);
+        let path = assets.join(dest);
         // Reject symlink components even if the final file looks regular.
         let mut parent = path.parent();
         while let Some(p) = parent {
@@ -537,11 +602,7 @@ fn verify_assets(root: &Path) -> Result<()> {
             metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0,
             "unsafe asset ownership/permissions"
         );
-        let bytes = bounded_file(&path, a.size)?;
-        ensure!(
-            bytes.len() as u64 == a.size && format!("{:x}", Sha256::digest(&bytes)) == a.sha256,
-            "runtime asset corrupt or incomplete: {name}"
-        );
+        verify_file(&path, a.size, &a.sha256).with_context(|| format!("asset {name}"))?;
         ensure!(
             !executable || metadata.mode() & 0o100 != 0,
             "runtime executable permission missing"
@@ -549,9 +610,39 @@ fn verify_assets(root: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn downloads(root: &Path, controller: &str, ca: Option<&Path>) -> Result<()> {
+pub(crate) fn verified_images(root: &Path) -> Result<Vec<&'static str>> {
+    verify_assets(root)?;
+    let m: Manifest =
+        serde_json::from_slice(&bounded_file(&root.join("assets/manifest.json"), 16384)?)?;
+    let mut images = vec!["alpine"];
+    if m.files.iter().any(|a| a.name == "ubuntu.ext4") {
+        images.push("ubuntu");
+    }
+    Ok(images)
+}
+fn download_headroom(available: u64, transfer: u64, reserve_gib: u32) -> bool {
+    transfer
+        .checked_add(reserve_gib as u64 * 1024 * 1024 * 1024)
+        .and_then(|n| n.checked_add(512 * 1024 * 1024))
+        .is_some_and(|required| available > required)
+}
+fn downloads(
+    root: &Path,
+    controller: &str,
+    ca: Option<&Path>,
+    ubuntu: bool,
+    refresh: bool,
+    reserve_gib: u32,
+) -> Result<()> {
     if root.join("assets").exists() {
-        return verify_assets(root);
+        verify_assets(root)?;
+        if !refresh {
+            ensure!(
+                !ubuntu || verified_images(root)?.contains(&"ubuntu"),
+                "use host update-assets --ubuntu-dev to add Ubuntu to existing assets"
+            );
+            return Ok(());
+        }
     }
     let mut u = reqwest::Url::parse(controller)?;
     u.set_path("");
@@ -561,7 +652,7 @@ fn downloads(root: &Path, controller: &str, ca: Option<&Path>) -> Result<()> {
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(120));
+        .timeout(Duration::from_secs(1800));
     if let Some(ca) = ca {
         builder = builder
             .add_root_certificate(reqwest::Certificate::from_pem(&bounded_file(ca, 65536)?)?);
@@ -577,13 +668,33 @@ fn downloads(root: &Path, controller: &str, ca: Option<&Path>) -> Result<()> {
     let mut bytes = Vec::new();
     response.take(16385).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 16384, "runtime manifest too large");
-    let manifest: Manifest = serde_json::from_slice(&bytes)?;
+    let mut manifest: Manifest = serde_json::from_slice(&bytes)?;
     validate_manifest(&manifest)?;
+    if ubuntu {
+        ensure!(
+            manifest.files.iter().any(|a| a.name == "ubuntu.ext4"),
+            "selected bundle lacks Ubuntu dev"
+        );
+    } else {
+        manifest
+            .files
+            .retain(|a| !matches!(a.name.as_str(), "ubuntu.ext4" | "network-tools.tar.gz"));
+    }
+    let bytes = serde_json::to_vec(&manifest)?;
+    let transfer: u64 = manifest.files.iter().map(|a| a.size).sum();
+    ensure!(
+        download_headroom(free_bytes(root)?, transfer, reserve_gib),
+        "insufficient space for bounded asset download"
+    );
+    println!(
+        "Verified bundle selection: {} bytes to transfer; per-file TLS deadline 1800 seconds",
+        transfer
+    );
     let staging = root.join(format!("assets-stage-{}", common::nonce()?));
     fs::create_dir(&staging)?;
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
     let result = (|| -> Result<()> {
-        for (name, dest, _, executable) in FILES {
+        for (name, dest, _, executable) in selected_files(&manifest) {
             let a = manifest.files.iter().find(|a| a.name == name).unwrap();
             let response = client.get(format!("{origin}/cli/host/{name}")).send()?;
             ensure!(
@@ -609,8 +720,15 @@ fn downloads(root: &Path, controller: &str, ca: Option<&Path>) -> Result<()> {
                 size += n as u64;
                 ensure!(size <= a.size, "runtime asset oversized");
                 hash.update(&buffer[..n]);
-                f.write_all(&buffer[..n])?;
+                // Preserve sparse zero ranges without weakening hash/length validation.
+                if buffer[..n].iter().all(|b| *b == 0) {
+                    use std::io::{Seek, SeekFrom};
+                    f.seek(SeekFrom::Current(n as i64))?;
+                } else {
+                    f.write_all(&buffer[..n])?;
+                }
             }
+            f.set_len(size)?;
             ensure!(
                 size == a.size && format!("{:x}", hash.finalize()) == a.sha256,
                 "runtime asset corrupt/incomplete: {name}"
@@ -624,8 +742,8 @@ fn downloads(root: &Path, controller: &str, ca: Option<&Path>) -> Result<()> {
             .open(staging.join("manifest.json"))?;
         f.write_all(&bytes)?;
         f.sync_all()?;
-        fs::rename(&staging, root.join("assets"))?;
-        fs::File::open(root)?.sync_all()?;
+        verify_asset_dir(root, &staging)?;
+        publish_assets(root, &staging, |_| Ok(()))?;
         Ok(())
     })();
     if result.is_err() {
@@ -1094,6 +1212,171 @@ fn finish_enrollment(root: &Path) -> Result<Config> {
     fs::File::open(root)?.sync_all()?;
     Ok(c)
 }
+fn sync_asset_tree(root: &Path, assets: &Path) -> Result<()> {
+    verify_asset_dir(root, assets)?;
+    let m: Manifest = serde_json::from_slice(&bounded_file(&assets.join("manifest.json"), 16384)?)?;
+    let mut directories = std::collections::BTreeSet::new();
+    directories.insert(assets.to_path_buf());
+    for (_, dest, _, _) in selected_files(&m) {
+        let path = assets.join(dest);
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?
+            .sync_all()?;
+        let mut p = path.parent();
+        while let Some(dir) = p {
+            directories.insert(dir.to_path_buf());
+            if dir == assets {
+                break;
+            }
+            p = dir.parent();
+        }
+    }
+    fs::File::open(assets.join("manifest.json"))?.sync_all()?;
+    // Children before parents, then publication syncs the host root.
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for directory in directories {
+        fs::File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+// Journaled rename boundaries: before activation recover old, after activation verify new.
+fn publish_assets(
+    root: &Path,
+    staging: &Path,
+    mut boundary: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    sync_asset_tree(root, staging)?;
+    if root.join("assets").exists() {
+        let backup = format!("assets-rollback-{}", common::nonce()?);
+        nodes::write_private(
+            &root.join("asset-update.pending.json"),
+            &json!({"backup":backup}),
+        )?;
+        boundary("intent")?;
+        fs::rename(root.join("assets"), root.join(backup))?;
+        fs::File::open(root)?.sync_all()?;
+        boundary("old-renamed")?;
+    }
+    fs::rename(staging, root.join("assets"))?;
+    boundary("new-renamed")?;
+    fs::File::open(root)?.sync_all()?;
+    boundary("synced")?;
+    if root.join("asset-update.pending.json").exists() {
+        fs::remove_file(root.join("asset-update.pending.json"))?;
+        boundary("receipt-removed")?;
+        fs::File::open(root)?.sync_all()?;
+    }
+    Ok(())
+}
+fn require_stopped(root: &Path) -> Result<()> {
+    read_config(root)?;
+    nodes::private(&root.join("node.json"))?;
+    ensure!(
+        !held_lock(&root.join("worker.lock"))?
+            && !agent_running(root)?
+            && !root.join("control.sock").exists()
+            && no_guest_processes(root)?,
+        "host must be positively stopped; no configuration signals sent"
+    );
+    ensure!(
+        root.join("worker.lock").exists()
+            || (!root.join("worker.log").exists() && !root.join("state.json").exists()),
+        "missing worker ownership evidence"
+    );
+    if root.join("state.json").exists() {
+        let state: Value =
+            serde_json::from_slice(&bounded_file(&root.join("state.json"), 1024 * 1024)?)?;
+        ensure!(
+            state["workspaces"].as_object().is_some(),
+            "unresolved worker journal"
+        );
+        // After a crash the journal may still claim running guests; require operator recovery first.
+        ensure!(
+            state["workspaces"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|w| matches!(
+                    w["state"].as_str(),
+                    Some("stopped" | "hibernated" | "failed")
+                )),
+            "worker journal has unresolved running demand; recover explicitly before configure"
+        );
+    }
+    Ok(())
+}
+fn recover_asset_update(root: &Path) -> Result<()> {
+    let pending = root.join("asset-update.pending.json");
+    if !pending.exists() {
+        return Ok(());
+    }
+    require_stopped(root)?;
+    nodes::private(&pending)?;
+    let v: Value = serde_json::from_slice(&bounded_file(&pending, 4096)?)?;
+    let backup = v["backup"].as_str().context("asset recovery backup")?;
+    ensure!(
+        backup
+            .strip_prefix("assets-rollback-")
+            .is_some_and(nonce_name),
+        "invalid asset recovery path"
+    );
+    if !root.join("assets").exists() {
+        private_dir(&root.join(backup))?;
+        fs::rename(root.join(backup), root.join("assets"))?;
+    }
+    if verify_assets(root).is_err() {
+        verify_asset_dir(root, &root.join(backup))?;
+        fs::rename(
+            root.join("assets"),
+            root.join(format!("assets-rejected-{}", common::nonce()?)),
+        )?;
+        fs::rename(root.join(backup), root.join("assets"))?;
+        verify_assets(root)?;
+    }
+    fs::File::open(root)?.sync_all()?;
+    fs::remove_file(pending)?;
+    fs::File::open(root)?.sync_all()?;
+    Ok(())
+}
+fn configure(
+    root: &Path,
+    memory: u32,
+    slots: u32,
+    cpus: u32,
+    storage: Option<u32>,
+    consent: bool,
+) -> Result<()> {
+    require_stopped(root)?;
+    ensure!(
+        consent,
+        "explicit --accept-shared-pool consent required; budgets must be disjoint"
+    );
+    let mut c = read_config(root)?;
+    c.memory = memory;
+    c.slots = slots;
+    c.cpus = cpus;
+    if let Some(storage) = storage {
+        c.storage_gib = storage;
+    }
+    limits(c.memory, c.slots, c.cpus, c.storage_gib)?;
+    preflight(root, &c)?;
+    verify_assets(root)?;
+    let staging = root.join(format!("config-{}.tmp", common::nonce()?));
+    nodes::write_private(&staging, &serde_json::to_value(&c)?)?;
+    // Retain exact prior consent/config as a private immutable rollback artifact.
+    let backup = root.join(format!("host-config-{}.json", common::nonce()?));
+    fs::hard_link(root.join("host.json"), &backup)?;
+    fs::File::open(root)?.sync_all()?;
+    fs::rename(staging, root.join("host.json"))?;
+    fs::File::open(root)?.sync_all()?;
+    println!(
+        "Saved stopped-host budgets; credentials/disks retained. Owner ceilings still apply. Start explicitly when ready."
+    );
+    Ok(())
+}
 pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
     let root = root(explicit)?;
     if matches!(action, HostAction::Doctor) {
@@ -1115,6 +1398,7 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
         return Ok(0);
     }
     let _lock = lock(&root)?;
+    recover_asset_update(&root)?;
     if matches!(action, HostAction::Join { .. } | HostAction::Start) {
         clean_remnants(&root)?;
     }
@@ -1129,6 +1413,7 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
             storage_gib,
             accept_shared_pool,
             no_start,
+            ubuntu_dev,
         } => {
             if root.join("node.json").exists() {
                 let c = finish_enrollment(&root)?;
@@ -1237,7 +1522,14 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
                 }
                 c.ca_cert = Some(stored);
             }
-            downloads(&root, &c.controller, c.ca_cert.as_deref())?;
+            downloads(
+                &root,
+                &c.controller,
+                c.ca_cert.as_deref(),
+                ubuntu_dev,
+                false,
+                c.storage_gib,
+            )?;
             let pending = root.join("host.pending.json");
             if pending.exists() {
                 nodes::private(&pending)?;
@@ -1257,6 +1549,56 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
             if !no_start {
                 start(&root, &c)?;
             }
+        }
+        HostAction::Configure {
+            memory,
+            slots,
+            cpus,
+            storage_gib,
+            accept_shared_pool,
+        } => configure(&root, memory, slots, cpus, storage_gib, accept_shared_pool)?,
+        HostAction::UpdateAssets { ubuntu_dev } => {
+            require_stopped(&root)?;
+            let c = read_config(&root)?;
+            let ubuntu = ubuntu_dev || verified_images(&root)?.contains(&"ubuntu");
+            downloads(
+                &root,
+                &c.controller,
+                c.ca_cert.as_deref(),
+                ubuntu,
+                true,
+                c.storage_gib,
+            )?;
+            verify_assets(&root)?;
+            println!(
+                "Runtime assets updated while stopped; immutable assets-rollback-* retained. Start explicitly."
+            );
+        }
+        HostAction::RollbackAssets { revision } => {
+            require_stopped(&root)?;
+            ensure!(
+                revision
+                    .strip_prefix("assets-rollback-")
+                    .is_some_and(nonce_name),
+                "select an exact retained assets-rollback revision name"
+            );
+            let previous = root.join(revision);
+            verify_asset_dir(&root, &previous)?;
+            let staging = root.join(format!("assets-stage-{}", common::nonce()?));
+            ensure!(
+                fixed_command("cp")
+                    .args(["-a", "--reflink=always", "--sparse=auto", "--"])
+                    .arg(previous)
+                    .arg(&staging)
+                    .status()?
+                    .success(),
+                "rollback staging failed; existing assets retained"
+            );
+            verify_asset_dir(&root, &staging)?;
+            publish_assets(&root, &staging, |_| Ok(()))?;
+            println!(
+                "Verified prior assets selected while stopped; current assets retained for rollback. Guest disks unchanged."
+            );
         }
         HostAction::Start => {
             let c = finish_enrollment(&root)?;
@@ -1356,6 +1698,85 @@ impl http_body::Body for AssetBody {
         http_body::SizeHint::with_exact(self.remaining)
     }
 }
+// Bounded cache for immutable selected bundle bytes. Every request opens a fresh FD
+// and validates ownership/type/size. Rewrites, chmod, replacement and manifest digest
+// changes invalidate via inode/stat/digest identity; no path-only trust or stale FD.
+fn verified_public_file(file: &mut fs::File, size: u64, expected: &str) -> Result<()> {
+    verified_public_file_before_lock(file, size, expected, || {})
+}
+fn verified_public_file_before_lock(
+    file: &mut fs::File,
+    size: u64,
+    expected: &str,
+    before_lock: impl FnOnce(),
+) -> Result<()> {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    fn identity(m: &fs::Metadata, expected: &str) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+            m.uid(),
+            m.mode(),
+            expected
+        )
+    }
+    let before = file.metadata()?;
+    ensure!(
+        before.is_file()
+            && before.len() == size
+            && before.uid() == unsafe { libc::geteuid() }
+            && before.mode() & 0o022 == 0,
+        "unsafe opened published asset"
+    );
+    let key = identity(&before, expected);
+    // Serialize first verification to avoid simultaneous large-image hash amplification.
+    before_lock();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("asset verification cache"))?;
+    ensure!(
+        identity(&file.metadata()?, expected) == key,
+        "published asset changed while queued for verification"
+    );
+    if !cache.contains(&key) {
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        let mut count = 0u64;
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            count += n as u64;
+            ensure!(count <= size, "published asset grew");
+            hash.update(&buffer[..n]);
+        }
+        ensure!(
+            count == size && format!("{:x}", hash.finalize()) == expected,
+            "published asset hash mismatch"
+        );
+        ensure!(
+            identity(&file.metadata()?, expected) == key,
+            "published asset changed during verification"
+        );
+        if cache.len() >= 32 {
+            cache.clear();
+        }
+        cache.insert(key);
+    }
+    use std::io::Seek;
+    file.rewind()?;
+    Ok(())
+}
 pub async fn public_download(path: &str, head: bool) -> axum::response::Response {
     use axum::{body::Body, http::StatusCode, response::IntoResponse};
     let path = path.to_owned();
@@ -1397,21 +1818,7 @@ pub async fn public_download(path: &str, head: bool) -> axum::response::Response
             .custom_flags(libc::O_NOFOLLOW)
             .open(p)?;
         if let Some(expected) = expected {
-            let mut hash = Sha256::new();
-            let mut buffer = [0u8; 65536];
-            loop {
-                let n = file.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buffer[..n]);
-            }
-            ensure!(
-                format!("{:x}", hash.finalize()) == expected,
-                "published asset hash mismatch"
-            );
-            use std::io::Seek;
-            file.rewind()?;
+            verified_public_file(&mut file, size, &expected)?;
         }
         Ok((file, size))
     })
@@ -1458,7 +1865,7 @@ mod tests {
             ("controller", json!("https://example.test/evil")),
             ("controller", json!("https://user:pass@example.test/_nodes")),
             ("expires", json!(now)),
-            ("cpus", json!(17)),
+            ("cpus", json!(65)),
             ("memory", json!(u64::MAX)),
         ] {
             let mut bad = v.clone();
@@ -1467,6 +1874,7 @@ mod tests {
         }
         let files = FILES
             .iter()
+            .filter(|(name, _, _, _)| !matches!(*name, "ubuntu.ext4" | "network-tools.tar.gz"))
             .map(|(n, _, _, _)| json!({"name":n,"size":1,"sha256":"a".repeat(64)}))
             .collect::<Vec<_>>();
         let good =
@@ -1486,7 +1894,10 @@ mod tests {
         fs::create_dir(root.join("assets")).unwrap();
         fs::set_permissions(root.join("assets"), fs::Permissions::from_mode(0o700)).unwrap();
         let mut files = Vec::new();
-        for (name, dest, _, executable) in FILES {
+        for (name, dest, _, executable) in FILES
+            .into_iter()
+            .filter(|(name, _, _, _)| !matches!(*name, "ubuntu.ext4" | "network-tools.tar.gz"))
+        {
             let p = root.join("assets").join(dest);
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(&p, name.as_bytes()).unwrap();
@@ -1513,6 +1924,278 @@ mod tests {
             ca_cert: None,
         };
         (root, c)
+    }
+    #[test]
+    fn queued_verified_cache_hit_rechecks_opened_file_identity() {
+        let (root, _) = fixture();
+        let path = root.join("queued-cache");
+        fs::write(&path, b"good").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"good"));
+        verified_public_file(&mut fs::File::open(&path).unwrap(), 4, &expected).unwrap();
+        let opened = fs::File::open(&path).unwrap();
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let queued = std::thread::spawn(move || {
+            let mut f = opened;
+            verified_public_file_before_lock(&mut f, 4, &expected, || {
+                ready.send(()).unwrap();
+                resume.recv().unwrap();
+            })
+        });
+        waiting.recv().unwrap();
+        fs::write(&path, b"evil").unwrap();
+        release.send(()).unwrap();
+        assert!(queued.join().unwrap().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn verified_public_cache_invalidates_same_length_rewrites_and_replacement() {
+        let (root, _) = fixture();
+        let path = root.join("cache-test");
+        fs::write(&path, b"good").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"good"));
+        for _ in 0..2 {
+            let mut f = fs::File::open(&path).unwrap();
+            verified_public_file(&mut f, 4, &expected).unwrap();
+        }
+        fs::write(&path, b"evil").unwrap();
+        assert!(verified_public_file(&mut fs::File::open(&path).unwrap(), 4, &expected).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"good").unwrap();
+        verified_public_file(&mut fs::File::open(&path).unwrap(), 4, &expected).unwrap();
+        assert!(
+            verified_public_file(&mut fs::File::open(&path).unwrap(), 4, &"f".repeat(64)).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn downloaded_assets_retain_operator_disk_reserve() {
+        let gib = 1024 * 1024 * 1024;
+        assert!(!download_headroom(9 * gib, 8 * gib, 2));
+        assert!(!download_headroom(10 * gib + gib / 2, 8 * gib, 2));
+        assert!(download_headroom(11 * gib, 8 * gib, 2));
+        assert!(!download_headroom(u64::MAX, u64::MAX, 2));
+    }
+    #[test]
+    fn unlisted_images_are_never_managed_capabilities() {
+        let (root, _) = fixture();
+        for name in ["ubuntu.ext4", "arch.ext4"] {
+            let path = root.join("assets/guest").join(name);
+            fs::write(&path, b"unverified").unwrap();
+            assert_eq!(verified_images(&root).unwrap(), vec!["alpine"]);
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            assert_eq!(verified_images(&root).unwrap(), vec!["alpine"]);
+            fs::remove_dir(&path).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", &path).unwrap();
+            assert_eq!(verified_images(&root).unwrap(), vec!["alpine"]);
+            fs::remove_file(&path).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn asset_publication_recovers_each_exact_boundary_preserving_credentials() {
+        for fail in [
+            "intent",
+            "old-renamed",
+            "new-renamed",
+            "synced",
+            "receipt-removed",
+        ] {
+            let (root, c) = fixture();
+            nodes::write_private(&root.join("host.json"), &serde_json::to_value(c).unwrap())
+                .unwrap();
+            nodes::write_private(
+                &root.join("node.json"),
+                &json!({"node":"friend","credential":"b".repeat(64)}),
+            )
+            .unwrap();
+            let credentials = fs::read(root.join("node.json")).unwrap();
+            let config = fs::read(root.join("host.json")).unwrap();
+            require_stopped(&root).unwrap();
+            let (other, _) = fixture();
+            let stage = root.join(format!("assets-stage-{}", common::nonce().unwrap()));
+            fs::rename(other.join("assets"), &stage).unwrap();
+            let mut m: Manifest =
+                serde_json::from_slice(&fs::read(stage.join("manifest.json")).unwrap()).unwrap();
+            fs::write(stage.join("guest/base.ext4"), b"new").unwrap();
+            let a = m.files.iter_mut().find(|a| a.name == "base.ext4").unwrap();
+            a.size = 3;
+            a.sha256 = format!("{:x}", Sha256::digest(b"new"));
+            fs::write(stage.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+            assert!(
+                publish_assets(&root, &stage, |point| {
+                    if point == fail {
+                        bail!("injected {point}")
+                    }
+                    Ok(())
+                })
+                .is_err()
+            );
+            recover_asset_update(&root).unwrap();
+            verify_assets(&root).unwrap();
+            let selected = fs::read(root.join("assets/guest/base.ext4")).unwrap();
+            assert_eq!(
+                selected,
+                if matches!(fail, "intent" | "old-renamed") {
+                    b"base.ext4".as_slice()
+                } else {
+                    b"new".as_slice()
+                }
+            );
+            assert_eq!(credentials, fs::read(root.join("node.json")).unwrap());
+            assert_eq!(config, fs::read(root.join("host.json")).unwrap());
+            assert!(!root.join("asset-update.pending.json").exists());
+            fs::remove_dir_all(root).unwrap();
+            fs::remove_dir_all(other).unwrap();
+        }
+    }
+    #[test]
+    fn rollback_preserves_retained_revision_when_reflink_is_unavailable() {
+        let (root, c) = fixture();
+        nodes::write_private(&root.join("host.json"), &serde_json::to_value(c).unwrap()).unwrap();
+        nodes::write_private(
+            &root.join("node.json"),
+            &json!({"node":"friend","credential":"b".repeat(64)}),
+        )
+        .unwrap();
+        let (other, _) = fixture();
+        let revision = format!("assets-rollback-{}", common::nonce().unwrap());
+        fs::rename(other.join("assets"), root.join(&revision)).unwrap();
+        fs::write(root.join("assets/guest/base.ext4"), b"corrupt").unwrap();
+        let probe = root.join("reflink-probe");
+        let reflink = fixed_command("cp")
+            .args(["--reflink=always", "--"])
+            .arg(root.join(&revision).join("guest/base.ext4"))
+            .arg(&probe)
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        let result = run(
+            Some(root.clone()),
+            HostAction::RollbackAssets {
+                revision: revision.clone(),
+            },
+        );
+        if reflink {
+            result.unwrap();
+            verify_assets(&root).unwrap();
+        } else {
+            assert!(result.is_err());
+            assert_eq!(
+                fs::read(root.join("assets/guest/base.ext4")).unwrap(),
+                b"corrupt"
+            );
+        }
+        assert_eq!(
+            fs::read(root.join(&revision).join("guest/base.ext4")).unwrap(),
+            b"base.ext4"
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other).unwrap();
+    }
+    #[test]
+    fn corrupt_new_asset_publication_restores_verified_old_selection() {
+        let (root, c) = fixture();
+        nodes::write_private(&root.join("host.json"), &serde_json::to_value(c).unwrap()).unwrap();
+        nodes::write_private(
+            &root.join("node.json"),
+            &json!({"node":"friend","credential":"b".repeat(64)}),
+        )
+        .unwrap();
+        let (other, _) = fixture();
+        let stage = root.join(format!("assets-stage-{}", common::nonce().unwrap()));
+        fs::rename(other.join("assets"), &stage).unwrap();
+        assert!(
+            publish_assets(&root, &stage, |point| {
+                if point == "new-renamed" {
+                    bail!("injected")
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        fs::write(root.join("assets/guest/base.ext4"), b"corrupt").unwrap();
+        recover_asset_update(&root).unwrap();
+        verify_assets(&root).unwrap();
+        assert_eq!(
+            fs::read(root.join("assets/guest/base.ext4")).unwrap(),
+            b"base.ext4"
+        );
+        assert!(fs::read_dir(&root).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .starts_with("assets-rejected-")
+        }));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other).unwrap();
+    }
+    #[test]
+    fn optional_ubuntu_manifest_and_streamed_verification() {
+        let (root, _) = fixture();
+        let mut m: Manifest =
+            serde_json::from_slice(&fs::read(root.join("assets/manifest.json")).unwrap()).unwrap();
+        let path = root.join("assets/guest/ubuntu.ext4");
+        let bytes = vec![0u8; 1024 * 1024];
+        fs::write(&path, &bytes).unwrap();
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        m.files.push(Asset {
+            name: "ubuntu.ext4".into(),
+            size: bytes.len() as u64,
+            sha256: hash,
+        });
+        assert!(validate_manifest(&m).is_err()); // legacy manifest cannot claim Ubuntu
+        m.version = 2;
+        assert!(validate_manifest(&m).is_err()); // image alone lacks runtime-required helper
+        fs::write(root.join("assets/guest/network-tools.tar.gz"), b"tools").unwrap();
+        m.files.push(Asset {
+            name: "network-tools.tar.gz".into(),
+            size: 5,
+            sha256: format!("{:x}", Sha256::digest(b"tools")),
+        });
+        assert!(validate_manifest(&m).is_ok());
+        fs::write(
+            root.join("assets/manifest.json"),
+            serde_json::to_vec(&m).unwrap(),
+        )
+        .unwrap();
+        assert!(verify_assets(&root).is_ok());
+        fs::write(&path, b"truncated").unwrap();
+        assert!(verify_assets(&root).is_err());
+        m.files.push(Asset {
+            name: "ubuntu.ext4".into(),
+            size: 1,
+            sha256: "a".repeat(64),
+        });
+        assert!(validate_manifest(&m).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn stopped_configure_refuses_active_unknown_and_unconsented_states() {
+        let (root, c) = fixture();
+        nodes::write_private(&root.join("host.json"), &serde_json::to_value(c).unwrap()).unwrap();
+        nodes::write_private(
+            &root.join("node.json"),
+            &json!({"node":"friend","credential":"b".repeat(64)}),
+        )
+        .unwrap();
+        let before = fs::read(root.join("host.json")).unwrap();
+        assert!(configure(&root, 4096, 2, 2, None, false).is_err());
+        let listener = std::os::unix::net::UnixListener::bind(root.join("control.sock")).unwrap();
+        assert!(require_stopped(&root).is_err());
+        drop(listener);
+        fs::remove_file(root.join("control.sock")).unwrap();
+        fs::write(
+            root.join("state.json"),
+            json!({"workspaces":{"guest":{"state":"running","memory_mib":4096}}}).to_string(),
+        )
+        .unwrap();
+        assert!(require_stopped(&root).is_err());
+        assert_eq!(before, fs::read(root.join("host.json")).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn persisted_credential_recovers_config_and_marker_without_redemption() {

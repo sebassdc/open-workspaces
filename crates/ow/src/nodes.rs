@@ -64,6 +64,8 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
       CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY, credential_hash TEXT, revoked INTEGER NOT NULL DEFAULT 0, heartbeat INTEGER NOT NULL DEFAULT 0, memory_mib INTEGER NOT NULL, slots INTEGER NOT NULL, capabilities TEXT NOT NULL DEFAULT '{}', session TEXT);
       CREATE TABLE IF NOT EXISTS node_joins(secret_hash TEXT PRIMARY KEY, node TEXT NOT NULL REFERENCES nodes(id), expires INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS node_limits(node TEXT PRIMARY KEY REFERENCES nodes(id), vcpu_cap INTEGER NOT NULL CHECK(vcpu_cap BETWEEN 1 AND 16));")?;
+    // Additive larger-cap authority; legacy readers retain conservative CPU limits.
+    db.execute_batch("CREATE TABLE IF NOT EXISTS node_capacity_limits(node TEXT PRIMARY KEY REFERENCES nodes(id), vcpu_cap INTEGER NOT NULL CHECK(vcpu_cap BETWEEN 1 AND 64));")?;
     Ok(db)
 }
 pub(crate) fn private(path: &Path) -> Result<()> {
@@ -126,13 +128,8 @@ pub fn invitation(
 ) -> Result<Value> {
     common::identifier(node)?;
     ensure!(node != "local", "local is reserved");
-    ensure!(
-        (1..=3600).contains(&ttl)
-            && (256..=4096).contains(&memory)
-            && (1..=8).contains(&slots)
-            && (1..=16).contains(&cpus),
-        "invalid enrollment limits"
-    );
+    ensure!((1..=3600).contains(&ttl), "invalid enrollment expiry");
+    common::host_limits(memory, slots, cpus)?;
     let mut db = db(root)?;
     let secret = random_secret()?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -149,7 +146,8 @@ pub fn invitation(
         "INSERT INTO node_joins(secret_hash,node,expires) VALUES(?1,?2,?3)",
         params![digest(&secret), node, now() + ttl as i64],
     )?;
-    tx.execute("INSERT INTO node_limits(node,vcpu_cap) VALUES(?1,?2) ON CONFLICT(node) DO UPDATE SET vcpu_cap=?2",params![node,cpus])?;
+    tx.execute("INSERT INTO node_limits(node,vcpu_cap) VALUES(?1,?2) ON CONFLICT(node) DO UPDATE SET vcpu_cap=?2",params![node,cpus.min(16)])?;
+    tx.execute("INSERT INTO node_capacity_limits(node,vcpu_cap) VALUES(?1,?2) ON CONFLICT(node) DO UPDATE SET vcpu_cap=?2",params![node,cpus])?;
     // Reissuing an unused invitation invalidates the older invitations for this node.
     tx.execute(
         "UPDATE node_joins SET consumed=1 WHERE node=?1 AND secret_hash<>?2",
@@ -176,6 +174,112 @@ fn enroll(root: &Path, value: Value) -> Result<Value> {
     tx.commit()?;
     Ok(json!({"node":node,"credential":credential}))
 }
+/// Inventory transport has an absolute deadline; no SQLite writer is held here.
+fn budget_inventory(root: &Path, node: &str) -> Result<Value> {
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(route(root, node)?.join("control.sock"))?;
+    stream.set_write_timeout(Some(Duration::from_millis(250)))?;
+    wire::send(&mut stream, &json!({"op":"list"}))?;
+    stream.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now();
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        ensure!(
+            deadline.elapsed() < Duration::from_secs(3),
+            "idle inventory deadline exceeded; budget unchanged"
+        );
+        match stream.read(&mut buffer) {
+            Ok(0) => anyhow::bail!("idle inventory disconnected"),
+            Ok(n) => {
+                bytes.extend_from_slice(&buffer[..n]);
+                ensure!(bytes.len() <= 1024 * 1024, "idle inventory oversized");
+                if let Some(end) = bytes.iter().position(|b| *b == b'\n') {
+                    let envelope: Value = serde_json::from_slice(&bytes[..end])?;
+                    ensure!(envelope["ok"] == true, "idle inventory rejected");
+                    return Ok(envelope["result"].clone());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+/// Owner authority only. Caller serializes with catalog admission.
+pub fn budget(root: &Path, node: &str, memory: u32, slots: u32, cpus: u32) -> Result<Value> {
+    common::identifier(node)?;
+    common::host_limits(memory, slots, cpus)?;
+    let mut db = db(root)?;
+    let sql = "SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16),session FROM nodes WHERE id=?1 AND credential_hash IS NOT NULL AND revoked=0";
+    let prior: (u32, u32, u32, Option<String>) = db
+        .query_row(sql, [node], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .context("active enrolled node required")?;
+    let lowering = memory < prior.0 || slots < prior.1 || cpus < prior.2;
+    if lowering {
+        let inventory = budget_inventory(root, node)?;
+        ensure!(
+            inventory
+                .as_array()
+                .is_some_and(|a| a.iter().all(|m| matches!(
+                    m["state"].as_str(),
+                    Some("stopped" | "hibernated" | "failed")
+                ))),
+            "lowering requires positively idle inventory"
+        );
+    }
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current: (u32, u32, u32, Option<String>) = tx
+        .query_row(sql, [node], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .context("active enrolled node required")?;
+    ensure!(
+        prior == current,
+        "node authority/session changed during inventory; retry deliberately"
+    );
+    if lowering {
+        let fresh: bool = tx.query_row(
+            "SELECT heartbeat>?1 AND heartbeat<=?2 FROM nodes WHERE id=?3",
+            params![now() - OFFLINE, now(), node],
+            |r| r.get(0),
+        )?;
+        ensure!(fresh, "idle inventory no longer online");
+        let unresolved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE node=?1 AND (reserved_mib>0 OR reserved_cpus>0)) OR EXISTS(SELECT 1 FROM operations WHERE node=?1 AND state IN ('pending','uncertain'))",[node],|r|r.get(0))?;
+        let extra: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM node_usage WHERE node=?1 AND (extra_mib>0 OR extra_cpus>0 OR extra_slots>0))",[node],|r|r.get(0))?;
+        ensure!(!extra, "lowering rejected: unregistered host reservations");
+        ensure!(
+            !unresolved,
+            "lowering rejected: running or unresolved catalog demand"
+        );
+    }
+    tx.execute(
+        "UPDATE nodes SET memory_mib=?1,slots=?2 WHERE id=?3",
+        params![memory, slots, node],
+    )?;
+    tx.execute("INSERT INTO node_capacity_limits(node,vcpu_cap) VALUES(?1,?2) ON CONFLICT(node) DO UPDATE SET vcpu_cap=?2",params![node,cpus])?;
+    tx.execute("INSERT INTO node_limits(node,vcpu_cap) VALUES(?1,?2) ON CONFLICT(node) DO UPDATE SET vcpu_cap=?2",params![node,cpus.min(16)])?;
+    // Clamp already-reported capabilities immediately; increases still need the next heartbeat.
+    let capabilities: String =
+        tx.query_row("SELECT capabilities FROM nodes WHERE id=?1", [node], |r| {
+            r.get(0)
+        })?;
+    let mut cap: Value = serde_json::from_str(&capabilities)?;
+    for (key, bound) in [("memory_mib", memory), ("slots", slots), ("vcpus", cpus)] {
+        cap[key] = json!(cap[key].as_u64().unwrap_or(0).min(bound as u64));
+    }
+    tx.execute(
+        "UPDATE nodes SET capabilities=?1 WHERE id=?2",
+        params![cap.to_string(), node],
+    )?;
+    tx.commit()?;
+    Ok(
+        json!({"node":node,"memory":memory,"slots":slots,"cpus":cpus,"operator_configuration_required":true}),
+    )
+}
 pub fn revoke(root: &Path, node: &str) -> Result<()> {
     ensure!(
         db(root)?.execute("UPDATE nodes SET revoked=1,heartbeat=0 WHERE id=?1", [node])? == 1,
@@ -185,14 +289,23 @@ pub fn revoke(root: &Path, node: &str) -> Result<()> {
 }
 pub fn inventory(root: &Path) -> Result<Value> {
     let db = db(root)?;
-    let mut stmt = db.prepare(
-        "SELECT id,revoked,heartbeat,memory_mib,slots,capabilities FROM nodes ORDER BY id",
-    )?;
-    let rows = stmt.query_map([], |r|Ok(json!({"id":r.get::<_,String>(0)?,"revoked":r.get::<_,bool>(1)?,"online": !r.get::<_,bool>(1)? && r.get::<_,i64>(2)?>now()-OFFLINE,"memory_mib":r.get::<_,u32>(3)?.min(serde_json::from_str::<Value>(&r.get::<_,String>(5)?).unwrap_or_default()["memory_mib"].as_u64().unwrap_or(0) as u32),"slots":r.get::<_,u32>(4)?.min(serde_json::from_str::<Value>(&r.get::<_,String>(5)?).unwrap_or_default()["slots"].as_u64().unwrap_or(0) as u32),"capabilities":serde_json::from_str::<Value>(&r.get::<_,String>(5)?).unwrap_or_default()})))?;
+    let mut stmt = db.prepare("SELECT id,revoked,heartbeat,memory_mib,slots,capabilities,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16) FROM nodes ORDER BY id")?;
+    let rows = stmt.query_map([], |r| {
+        let ram:u32 = r.get(3)?;
+        let slots:u32 = r.get(4)?;
+        let cpus:u32 = r.get(6)?;
+        let mut cap:Value = serde_json::from_str(&r.get::<_,String>(5)?).unwrap_or(json!({}));
+        if !cap.is_object() { cap=json!({}); }
+        for (key,bound) in [("memory_mib",ram),("slots",slots),("vcpus",cpus)] {
+            cap[key]=json!(cap[key].as_u64().unwrap_or(0).min(bound as u64));
+        }
+        Ok(json!({"id":r.get::<_,String>(0)?,"revoked":r.get::<_,bool>(1)?,"online":!r.get::<_,bool>(1)? && r.get::<_,i64>(2)?>now()-OFFLINE && r.get::<_,i64>(2)?<=now(),"memory_mib":cap["memory_mib"],"slots":cap["slots"],"capabilities":cap,"owner_limits":{"memory":ram,"slots":slots,"cpus":cpus}}))
+    })?;
     Ok(Value::Array(
         rows.collect::<std::result::Result<Vec<_>, _>>()?,
     ))
 }
+
 pub fn online(root: &Path, node: &str) -> Result<()> {
     if node == "local" {
         return Ok(());
@@ -335,12 +448,12 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             msg=socket.recv()=>{
                 match msg {Some(Ok(Message::Text(text)))=>{
                     let Ok(v)=serde_json::from_str::<Value>(&text) else {break;};
-                    if v["type"]!="heartbeat" || v["protocol"]!=1 || v["backend"]!="firecracker" || v["arch"]!="x86_64" || v["runtime"]!="firecracker-v1.17.0" || !(256..=4096).contains(&v["memory_mib"].as_u64().unwrap_or(0)) || !(1..=8).contains(&v["slots"].as_u64().unwrap_or(0)) || !(1..=16).contains(&v["vcpus"].as_u64().unwrap_or(0)) || !v["images"].as_array().is_some_and(|a|a.len()<=3 && a.iter().all(|i|matches!(i.as_str(),Some("alpine"|"arch"|"ubuntu")))) {break;}
+                    if common::guest_limits(&v).is_err() || v["type"]!="heartbeat" || v["protocol"]!=1 || v["backend"]!="firecracker" || v["arch"]!="x86_64" || v["runtime"]!="firecracker-v1.17.0" || !(256..=common::HOST_MEMORY_MIB as u64).contains(&v["memory_mib"].as_u64().unwrap_or(0)) || !(1..=common::HOST_SLOTS as u64).contains(&v["slots"].as_u64().unwrap_or(0)) || !(1..=common::HOST_CPUS as u64).contains(&v["vcpus"].as_u64().unwrap_or(0)) || !v["images"].as_array().is_some_and(|a|a.len()<=3 && a.iter().all(|i|matches!(i.as_str(),Some("alpine"|"arch"|"ubuntu")))) {break;}
                     last=tokio::time::Instant::now();
                     if !c.root.join("nodes").join(&node).join("control.sock").exists(){continue;}
                     if let Ok(db)=db(&c.root)
-                        && let Ok((ram,slots,cpus)) = db.query_row("SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16) FROM nodes WHERE id=?1",[&node],|r|Ok((r.get::<_,u32>(0)? as u64,r.get::<_,u32>(1)? as u64,r.get::<_,u32>(2)? as u64))) {
-                            let cap=json!({"protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":v["memory_mib"].as_u64().unwrap().min(ram),"slots":v["slots"].as_u64().unwrap().min(slots),"vcpus":v["vcpus"].as_u64().unwrap().min(cpus),"images":v["images"]});
+                        && let Ok((ram,slots,cpus)) = db.query_row("SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16) FROM nodes WHERE id=?1",[&node],|r|Ok((r.get::<_,u32>(0)? as u64,r.get::<_,u32>(1)? as u64,r.get::<_,u32>(2)? as u64))) {
+                            let cap=json!({"protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":v["memory_mib"].as_u64().unwrap().min(ram),"slots":v["slots"].as_u64().unwrap().min(slots),"vcpus":v["vcpus"].as_u64().unwrap().min(cpus),"images":v["images"],"max_guest_memory_mib":common::guest_limits(&v).unwrap().0,"max_guest_vcpus":common::guest_limits(&v).unwrap().1});
                             if db.execute("UPDATE nodes SET heartbeat=?1,capabilities=?2 WHERE id=?3 AND session=?4 AND revoked=0",params![now(),cap.to_string(),node,generation]).is_ok_and(|n|n==1) {
                                 // Old native agents expect job IDs only; acknowledge only the guided agent's optional extension.
                                 if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break;}}
@@ -880,22 +993,26 @@ pub fn agent(
         .to_owned();
     ensure!(credential.len() == 64, "invalid credential file");
     let status = wire::request(root, json!({"op":"status"}))?;
-    let images = ["alpine", "arch", "ubuntu"]
-        .into_iter()
-        .filter(|image| {
-            crate::assets()
-                .join(if *image == "alpine" {
-                    "guest/base.ext4"
-                } else if *image == "arch" {
-                    "guest/arch.ext4"
-                } else {
-                    "guest/ubuntu.ext4"
-                })
-                .exists()
-        })
-        .collect::<Vec<_>>();
     let guided = root.join("host.json").exists();
-    let hello=json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images}).to_string();
+    let images = if guided {
+        crate::onboarding::verified_images(root)?
+    } else {
+        // Legacy unmanaged nodes retain their separately configured asset contract.
+        ["alpine", "arch", "ubuntu"]
+            .into_iter()
+            .filter(|image| {
+                crate::assets()
+                    .join(match *image {
+                        "alpine" => "guest/base.ext4",
+                        "arch" => "guest/arch.ext4",
+                        _ => "guest/ubuntu.ext4",
+                    })
+                    .exists()
+            })
+            .collect::<Vec<_>>()
+    };
+    let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
+    let hello=json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus}).to_string();
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
@@ -1004,6 +1121,7 @@ fn agent_job(
             "snapshots",
             "inspect",
             "create",
+            "resize",
             "start",
             "stop",
             "exec",

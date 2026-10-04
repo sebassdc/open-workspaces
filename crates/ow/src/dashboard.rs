@@ -3,7 +3,7 @@ use crate::{
     catalog::{Catalog, Identity},
     runtime,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Json,
     body::to_bytes,
@@ -46,7 +46,11 @@ struct Operation {
 }
 
 fn validated(bytes: &[u8]) -> Result<Value> {
-    let operation: Operation = serde_json::from_slice(bytes)?;
+    let raw: Value = serde_json::from_slice(bytes)?;
+    if matches!(raw["op"].as_str(), Some("create" | "resize")) {
+        crate::common::requested_resources(&raw)?;
+    }
+    let operation: Operation = serde_json::from_value(raw)?;
     ensure!(
         matches!(operation.op.as_str(), "put" | "get") || bytes.len() <= 16384,
         "operation too large"
@@ -67,13 +71,16 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             runtime::image_profile(image)?;
             request["image"] = json!(image);
             let memory = operation.memory_mib.unwrap_or(256);
-            ensure!(
-                [256, 512, 1024, 2048].contains(&memory),
-                "Choose 256, 512, 1024 or 2048 MiB"
-            );
-            request["memory_mib"] = json!(memory);
             let cpus = operation.vcpu_count.unwrap_or(1);
-            ensure!((1..=4).contains(&cpus), "Choose 1–4 CPUs");
+            crate::common::resources(memory, cpus)?;
+            request["memory_mib"] = json!(memory);
+            request["vcpu_count"] = json!(cpus);
+        }
+        "resize" => {
+            let memory = operation.memory_mib.context("memory required")?;
+            let cpus = operation.vcpu_count.context("CPU required")?;
+            crate::common::resources(memory, cpus)?;
+            request["memory_mib"] = json!(memory);
             request["vcpu_count"] = json!(cpus);
         }
         "start" | "stop" | "hibernate" => {}
@@ -347,6 +354,32 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn larger_shapes_and_malformed_resources() {
+        for op in ["create", "resize"] {
+            assert!(
+                validated(
+                    json!({"op":op,"id":"large","memory_mib":4096,"vcpu_count":2})
+                        .to_string()
+                        .as_bytes()
+                )
+                .is_ok()
+            );
+            for bad in [
+                json!(null),
+                json!("2"),
+                json!(-1),
+                json!(1.5),
+                json!(u64::MAX),
+            ] {
+                for key in ["memory_mib", "vcpu_count"] {
+                    let mut v = json!({"op":op,"id":"large","memory_mib":4096,"vcpu_count":2});
+                    v[key] = bad.clone();
+                    assert!(validated(v.to_string().as_bytes()).is_err(), "{v}");
+                }
+            }
+        }
+    }
     #[test]
     fn dashboard_cannot_forward_arbitrary_worker_operations() {
         for op in ["shutdown", "tunnel", "put", "get", "shell-exec", "status"] {

@@ -22,23 +22,31 @@ fn parse_limit(value: &str, maximum: u32) -> Result<u32> {
     );
     Ok(n)
 }
-fn limit(name: &str, default: u32) -> u32 {
+fn limit(name: &str, default: u32, maximum: u32) -> u32 {
     match std::env::var_os(name) {
         None => default,
         Some(value) => value
             .to_str()
-            .and_then(|s| parse_limit(s, default).ok())
+            .and_then(|s| parse_limit(s, maximum).ok())
             .unwrap_or(0),
     }
 }
 fn max_memory() -> u32 {
-    limit("OW_MAX_MEMORY_MIB", MAX_MEMORY_MIB)
+    limit(
+        "OW_MAX_MEMORY_MIB",
+        MAX_MEMORY_MIB,
+        crate::common::HOST_MEMORY_MIB,
+    )
 }
 fn max_running() -> usize {
-    limit("OW_MAX_RUNNING", MAX_RUNNING as u32) as usize
+    limit(
+        "OW_MAX_RUNNING",
+        MAX_RUNNING as u32,
+        crate::common::HOST_SLOTS,
+    ) as usize
 }
 fn max_cpus() -> u32 {
-    limit("OW_MAX_VCPUS", 16)
+    limit("OW_MAX_VCPUS", 16, crate::common::HOST_CPUS)
 }
 fn minimum_free_gib() -> Result<u32> {
     match std::env::var("OW_MIN_FREE_GIB") {
@@ -65,12 +73,7 @@ fn default_cpus() -> u32 {
 }
 
 fn resources(memory: u32, cpus: u32) -> Result<()> {
-    ensure!(
-        [256, 512, 1024, 2048].contains(&memory),
-        "memory must be 256, 512, 1024 or 2048 MiB"
-    );
-    ensure!((1..=4).contains(&cpus), "CPU count must be 1–4");
-    Ok(())
+    crate::common::resources(memory, cpus)
 }
 
 fn default_image() -> String {
@@ -314,9 +317,9 @@ impl Runtime {
     }
     pub fn new(root: PathBuf, assets: PathBuf) -> Result<Self> {
         for (name, maximum) in [
-            ("OW_MAX_MEMORY_MIB", 4096),
-            ("OW_MAX_RUNNING", 8),
-            ("OW_MAX_VCPUS", 16),
+            ("OW_MAX_MEMORY_MIB", crate::common::HOST_MEMORY_MIB),
+            ("OW_MAX_RUNNING", crate::common::HOST_SLOTS),
+            ("OW_MAX_VCPUS", crate::common::HOST_CPUS),
         ] {
             if let Some(value) = std::env::var_os(name) {
                 parse_limit(value.to_str().context("invalid worker limit")?, maximum)?;
@@ -695,7 +698,7 @@ impl Runtime {
             "status" => Ok(
                 json!({"runtime":"Firecracker v1.17.0","running":self.machines.len(),
                 "worker_pid":std::process::id(),
-                "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,
+                "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
             "list" => Ok(json!(self.state.workspaces.values().collect::<Vec<_>>())),

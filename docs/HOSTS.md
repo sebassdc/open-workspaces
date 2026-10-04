@@ -19,9 +19,10 @@ ow host status
 Join asks for a hidden invitation paste, consent, a disjoint guest RAM budget,
 running slots, guest vCPU budget and minimum free disk GiB. The invitation carries
 a validated HTTPS controller origin. Default acceptance is 512 MiB / 2 slots /
-2 CPU; an initial guest can use 256 MiB / 1 CPU. The downloaded pilot bundle
-advertises Alpine only; Ubuntu and Arch remain available on existing prepared
-nodes. The server clamps claims to the invitation's persisted RAM/slot/CPU caps. Other workers and desktop reserve must
+2 CPU; an initial guest can use 256 MiB / 1 CPU. Default downloaded hosts advertise Alpine only. The capacity release candidate
+adds opt-in clean Ubuntu dev with `host join --ubuntu-dev` or stopped-host
+`host update-assets --ubuntu-dev`; Arch remains limited to previously prepared
+unmanaged nodes. The server clamps claims to durable owner RAM/slot/CPU caps. Other workers and desktop reserve must
 be accounted for by the operator. `--storage-gib` is a free-space admission
 threshold, not a disk quota or reserved allocation.
 
@@ -64,16 +65,70 @@ credentials. Revoked IDs cannot be reissued.
 Configure gateway `node_owner_subject` and `node_owner_user_id` together, binding
 an existing catalog user to the verified configured Access-team issuer/subject.
 Missing configuration fails closed; email allowlisting alone is insufficient.
-The owner dashboard provides invitation/revoke controls. CLI equivalents:
+The owner dashboard provides invitation, per-node budget and revoke controls. CLI equivalents:
 
 ```sh
 ow --server https://PROJECT_DOMAIN host invite friend-one --memory 512 --slots 2 --cpus 2 --output PRIVATE_FILE
+ow --server https://PROJECT_DOMAIN host budget friend-one --memory 8192 --slots 2 --cpus 4
 ow --server https://PROJECT_DOMAIN host revoke friend-one
 ```
 
 Invitation output contains a secret: share privately and avoid logs/shell history.
 Use the wizard's hidden paste on the invited host. Replacing an unused invite
-invalidates older secrets; enrolled/revoked IDs require fresh IDs.
+invalidates older secrets; editing an enrolled budget preserves its ID/credentials; revoked IDs require fresh IDs.
+
+## Adjusting saved participation
+
+Ceilings: worker 65,536 MiB / 64 vCPU / 8 running slots. Workspace shapes:
+256/512/1024/2048/4096/8192/16384 MiB and 1–16 vCPU. Existing conservative
+defaults remain. Owner caps and local operator consent both bound admission;
+raising one never raises the other. Doctor reports logical CPU availability and
+optional `lscpu` topology; it does not select or promise a physical capacity budget.
+
+For an increase, owner saves the enrolled budget first. For a decrease, the
+operator first stops that host's guests while keeping participation online, and
+the owner lowers only with fresh idle inventory and zero registered/unregistered
+reservations or pending/uncertain effects. Offline lowering deliberately fails.
+Then the operator explicitly stops participation and updates saved consent:
+
+```sh
+ow --data-dir HOST_ROOT host stop
+# Install the planner-published CLI with the existing /cli/install.sh.
+# Installer replaces the CLI/helper only; enrollment/config/assets/disks remain.
+ow --data-dir HOST_ROOT host update-assets --ubuntu-dev
+ow --data-dir HOST_ROOT host configure --memory 8192 --slots 2 --cpus 4 --accept-shared-pool
+ow --data-dir HOST_ROOT host start
+ow --data-dir HOST_ROOT host status
+```
+
+Numbers above are examples requiring an explicit disjoint host budget. Configure
+and asset updates require positively stopped owned worker/agent, no sockets or
+guest processes and a resolved stopped journal; they never signal processes.
+Do not point them at legacy owner roots. A failed update before activation
+recovers old assets; after verified activation it may roll forward. A corrupt new
+selection is retained and the verified old selection restored. Config, credentials,
+trust and guest disks are preserved; exact prior consent and asset revisions are
+retained privately. Supported asset rollback, while stopped:
+
+```sh
+ow --data-dir HOST_ROOT host rollback-assets --revision assets-rollback-NONCE
+```
+
+V1 Alpine and opt-out v2 use five files; complete Ubuntu v2 requires seven files,
+including the pinned guest network-tools archive. It is not extracted on the host.
+Only verified manifest-selected images are advertised. Ubuntu delivery is optional
+and raw: 8,589,934,592 image bytes plus the helper/common files, despite sparse
+physical storage. The verified v3 complete bundle transfers 8,778,379,912 asset
+bytes; Alpine selection transfers 186,049,272. Admission requires full selected
+logical bytes plus the saved disk reserve and 512 MiB staging overhead, retaining
+prior assets. Each TLS file download has a 1,800-second deadline. Interrupted
+transfers are restarted; no compressed/resumable delivery claim.
+
+Cold resize remains explicit stop → `ow resize NAME --memory 4096 --cpus 2` →
+start. New guests can select `ow create NAME --image ubuntu --memory 4096 --cpus 2
+--node NODE`; their fixed placement and ownership remain. This release candidate
+has local 4 GiB/2 CPU Ubuntu persistence evidence, not physical remote upgrade or
+deployment acceptance; see [capacity report](plans/host-capacity-report.md).
 
 ## Release preparation and scoped rollout
 
@@ -161,3 +216,17 @@ rollout. Merely setting the bundle directory does not update the served CLI.
 Compare both served and installed Linux hashes to the accepted build receipt;
 retain existing macOS files and prior Linux artifacts. Core has prepared these
 bytes in ignored storage and has not changed any live selection.
+
+Mixed worker versions use protocol-v1 optional `max_guest_memory_mib` and
+`max_guest_vcpus` capabilities. Missing fields mean the legacy per-guest ceiling
+of 2048 MiB / 4 CPU, even when the enrolled host advertises a larger total budget.
+New workers report 16384 MiB / 16 CPU. Placement and owning-route create, resize,
+start, fork and restore admission enforce both the guest ceiling and host budget
+before durable intent. Upgrade the worker before requesting larger shapes.
+
+For a managed physical host upgrade, stop guests intentionally and run
+**the old installed CLI's `ow --data-dir HOST_ROOT host stop` before replacing
+that CLI**. Then install the reviewed new binary, configure/update assets while
+stopped, and start. The installer preserves saved host/node configuration,
+assets and workspace disks. Do not rely on a newly installed executable to stop
+a worker still executing the deleted old binary inode.

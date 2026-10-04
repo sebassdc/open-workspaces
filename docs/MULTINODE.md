@@ -85,7 +85,7 @@ mode permits loopback only, on both controller and agent.
 
 Mint one node-bound join file, transport it securely to the node's private
 operator directory, and start the outbound agent. `--ttl` is 1–3600 seconds,
-`--memory` 256–4096 MiB and `--slots` 1–8. Actual worker capabilities further
+`--memory` 256–65536 MiB and `--slots` 1–8; guided owner CPU caps are 1–64. Actual worker capabilities further
 reduce controller admission. The operator's shared-host budgets remain mandatory.
 The controller needs outbound-reachable TLS; no guest or worker Unix socket is
 exposed. The node agent runs on the host, outside the worker network namespace.

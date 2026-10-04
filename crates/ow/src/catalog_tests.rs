@@ -301,3 +301,91 @@ fn start_restore_rejection_releases_only_positive_stopped_demand() {
     let info = c.state(a).unwrap();
     assert_eq!(info["operations"][0]["state"], "failed");
 }
+
+#[test]
+fn mixed_version_shapes_reject_before_durable_intent() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let user = c.user(&identity("owner")).unwrap();
+    // Literal local without a new optional status response retains legacy bounds.
+    assert!(
+        c.operation(
+            user,
+            json!({"op":"create","id":"local-large","memory_mib":4096,"vcpu_count":2})
+        )
+        .is_err()
+    );
+    fake.worker("legacy");
+    let db = nodes::db(&fake.root).unwrap();
+    let legacy = json!({"memory_mib":16384,"slots":2,"vcpus":16,"images":["alpine"]});
+    db.execute(
+        "UPDATE nodes SET memory_mib=16384,capabilities=?1 WHERE id='legacy'",
+        [legacy.to_string()],
+    )
+    .unwrap();
+    for request in [
+        json!({"op":"create","id":"auto-large","memory_mib":4096,"vcpu_count":2}),
+        json!({"op":"create","id":"pinned-large","node":"legacy","memory_mib":4096,"vcpu_count":2}),
+        json!({"op":"create","id":"cpu-large","node":"legacy","memory_mib":256,"vcpu_count":5}),
+    ] {
+        assert!(c.operation(user, request).is_err());
+    }
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM operations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM resources", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    // Existing owning routes must also reject start, resize, fork and restore.
+    let physical = c.reserve(user, "machine", "existing").unwrap();
+    c.db.execute(
+        "UPDATE resources SET node='legacy' WHERE physical=?1",
+        [&physical],
+    )
+    .unwrap();
+    let metadata = json!({"state":"stopped","memory_mib":4096,"vcpu_count":2,"image":"alpine"});
+    for op in ["start", "restore", "fork", "resize"] {
+        assert!(
+            c.admit(
+                "legacy",
+                &physical,
+                op,
+                &json!({"memory_mib":4096,"vcpu_count":2}),
+                &metadata,
+                &json!({})
+            )
+            .is_err()
+        );
+        assert!(
+            c.admit(
+                "local",
+                &physical,
+                op,
+                &json!({"memory_mib":4096,"vcpu_count":2}),
+                &metadata,
+                &json!({})
+            )
+            .is_err()
+        );
+    }
+    let mut modern = legacy;
+    modern["max_guest_memory_mib"] = json!(16384);
+    modern["max_guest_vcpus"] = json!(16);
+    db.execute(
+        "UPDATE nodes SET capabilities=?1 WHERE id='legacy'",
+        [modern.to_string()],
+    )
+    .unwrap();
+    assert!(
+        c.operation(
+            user,
+            json!({"op":"create","id":"new-large","node":"legacy","memory_mib":4096,"vcpu_count":2})
+        )
+        .is_ok()
+    );
+}

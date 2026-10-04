@@ -601,3 +601,150 @@ async fn public_aliases_share_native_generation_and_clamp_forged_capacity() {
         }
     }
 }
+
+#[test]
+fn enrolled_budget_is_durable_preserves_identity_and_reclamps_stale_heartbeat() {
+    let root = root();
+    enrollment(&root, "friend");
+    let before: String = db(&root)
+        .unwrap()
+        .query_row(
+            "SELECT credential_hash FROM nodes WHERE id='friend'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    budget(&root, "friend", 65536, 8, 64).unwrap();
+    let connection = db(&root).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT vcpu_cap FROM node_capacity_limits WHERE node='friend'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+        64
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT credential_hash FROM nodes WHERE id='friend'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        before
+    );
+    assert!(budget(&root, "friend", 65537, 8, 64).is_err());
+    assert!(budget(&root, "local", 65536, 8, 64).is_err());
+    assert!(budget(&root, "missing", 65536, 8, 64).is_err());
+    // Offline demand remains unknown, even with a large owner ceiling.
+    assert!(budget(&root, "friend", 32768, 8, 32).is_err());
+    // Simulate a heartbeat that read old ceilings before an owner edit.
+    connection
+        .execute(
+            "UPDATE nodes SET memory_mib=512,slots=1,capabilities=?1 WHERE id='friend'",
+            [json!({"memory_mib":65536,"slots":8,"vcpus":64,"images":["alpine"]}).to_string()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE node_capacity_limits SET vcpu_cap=2 WHERE node='friend'",
+            [],
+        )
+        .unwrap();
+    let n = &inventory(&root).unwrap()[0];
+    assert_eq!(n["memory_mib"], 512);
+    assert_eq!(n["slots"], 1);
+    assert_eq!(n["capabilities"]["vcpus"], 2);
+    revoke(&root, "friend").unwrap();
+    assert!(budget(&root, "friend", 65536, 8, 64).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lowering_needs_fresh_idle_inventory_and_zero_all_demand_dimensions() {
+    let root = root();
+    let _catalog =
+        crate::catalog::Catalog::open(&root, "https://example.cloudflareaccess.com", None).unwrap();
+    enrollment(&root, "friend");
+    budget(&root, "friend", 8192, 4, 16).unwrap();
+    let db = db(&root).unwrap();
+    db.execute("UPDATE nodes SET heartbeat=?1 WHERE id='friend'", [now()])
+        .unwrap();
+    fs::create_dir_all(root.join("nodes/friend")).unwrap();
+    let listener =
+        std::os::unix::net::UnixListener::bind(root.join("nodes/friend/control.sock")).unwrap();
+    let mock = std::thread::spawn(move || {
+        for i in 0..5 {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert_eq!(wire::line(&mut stream).unwrap()["op"], "list");
+            let machines = if i == 0 {
+                json!([{"id":"unknown","state":"running","memory_mib":256,"vcpu_count":1}])
+            } else {
+                json!([])
+            };
+            wire::send(&mut stream, &json!({"ok":true,"result":machines})).unwrap();
+        }
+    });
+    assert!(budget(&root, "friend", 4096, 2, 2).is_err());
+    for (ram, cpu, slots) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+        db.execute("INSERT INTO node_usage(node,extra_mib,extra_cpus,extra_slots) VALUES('friend',?1,?2,?3) ON CONFLICT(node) DO UPDATE SET extra_mib=?1,extra_cpus=?2,extra_slots=?3",params![ram,cpu,slots]).unwrap();
+        assert!(budget(&root, "friend", 4096, 2, 2).is_err());
+    }
+    db.execute(
+        "UPDATE node_usage SET extra_mib=0,extra_cpus=0,extra_slots=0",
+        [],
+    )
+    .unwrap();
+    assert!(budget(&root, "friend", 4096, 2, 2).is_ok());
+    mock.join().unwrap();
+    assert_eq!(
+        inventory(&root).unwrap()[0]["owner_limits"],
+        json!({"memory":4096,"slots":2,"cpus":2})
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lowering_inventory_has_absolute_deadline_without_sqlite_writer_hold() {
+    let root = root();
+    let _catalog =
+        crate::catalog::Catalog::open(&root, "https://example.cloudflareaccess.com", None).unwrap();
+    enrollment(&root, "friend");
+    budget(&root, "friend", 8192, 4, 16).unwrap();
+    db(&root)
+        .unwrap()
+        .execute("UPDATE nodes SET heartbeat=?1 WHERE id='friend'", [now()])
+        .unwrap();
+    fs::create_dir_all(root.join("nodes/friend")).unwrap();
+    let listener =
+        std::os::unix::net::UnixListener::bind(root.join("nodes/friend/control.sock")).unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let mock = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        wire::line(&mut stream).unwrap();
+        sent.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(3200));
+    });
+    let selected = root.clone();
+    let start = std::time::Instant::now();
+    let edit = std::thread::spawn(move || budget(&selected, "friend", 4096, 2, 2));
+    received.recv_timeout(Duration::from_secs(1)).unwrap();
+    let writer = std::time::Instant::now();
+    db(&root)
+        .unwrap()
+        .execute("UPDATE nodes SET heartbeat=?1 WHERE id='friend'", [now()])
+        .unwrap();
+    revoke(&root, "friend").unwrap();
+    assert!(
+        writer.elapsed() < Duration::from_secs(1),
+        "transport held SQLite writer"
+    );
+    assert!(edit.join().unwrap().is_err());
+    assert!(start.elapsed() < Duration::from_secs(4));
+    assert_eq!(inventory(&root).unwrap()[0]["owner_limits"]["memory"], 8192);
+    mock.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}

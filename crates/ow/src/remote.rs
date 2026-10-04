@@ -476,12 +476,25 @@ async fn host_admin(app: &App, identity: crate::catalog::Identity, request: Requ
         slots: Option<u32>,
         cpus: Option<u32>,
     }
-    let Ok(input) = serde_json::from_slice::<Input>(&bytes) else {
+    let Ok(raw) = serde_json::from_slice::<Value>(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if ["memory", "slots", "cpus", "ttl"]
+        .iter()
+        .any(|key| raw.get(key).is_some_and(|v| v.as_u64().is_none()))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Ok(input) = serde_json::from_value::<Input>(raw) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let root = app.dashboard.clone().unwrap();
     let controller = format!("https://{}/_nodes", app.config.hostname);
+    let catalog = app.catalog.clone().context("catalog").unwrap();
     let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let _admission = catalog
+            .lock()
+            .map_err(|_| anyhow::anyhow!("catalog lock"))?;
         match path.as_str() {
             "/api/hosts/invite" => crate::nodes::invitation(
                 &root,
@@ -493,6 +506,16 @@ async fn host_admin(app: &App, identity: crate::catalog::Identity, request: Requ
                 Some(&controller),
                 |_| Ok(()),
             ),
+            "/api/hosts/budget" => {
+                ensure!(input.ttl.is_none(), "budget does not accept expiry");
+                crate::nodes::budget(
+                    &root,
+                    &input.node,
+                    input.memory.context("memory required")?,
+                    input.slots.context("slots required")?,
+                    input.cpus.context("cpus required")?,
+                )
+            }
             "/api/hosts/revoke" => {
                 ensure!(
                     input.ttl.is_none()
@@ -1311,6 +1334,121 @@ mod tests {
         drop(cleanup);
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires parent-exclusive one-guest 4 GiB turn, explicit dedicated root/binary/assets and headroom inventory"]
+    async fn capacity_ubuntu_4gib_real_vm() {
+        let root =
+            PathBuf::from(std::env::var("OW_CAPACITY_TEST_ROOT").expect("dedicated root required"));
+        let binary =
+            PathBuf::from(std::env::var("OW_CAPACITY_BINARY").expect("pinned binary required"));
+        let test_parent = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        assert!(
+            root.is_absolute()
+                && root.parent() == Some(test_parent.as_path())
+                && root.file_name().unwrap() == "v"
+        );
+        assert!(!root.exists(), "new root only; preserve existing artifacts");
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new(&self.0)
+                    .args(["--local", "--data-dir"])
+                    .arg(&self.1)
+                    .arg("down")
+                    .output();
+            }
+        }
+        let cleanup = Cleanup(binary.clone(), root.clone());
+        let local = |action: &str| {
+            let o = Command::new(&binary)
+                .args(["--local", "--data-dir"])
+                .arg(&root)
+                .arg(action)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        };
+        local("up");
+        let (key, set) = signing_key();
+        let cfg = config("http://127.0.0.1:1".into());
+        let app = App {
+            dashboard: Some(root.clone()),
+            catalog: Some(Arc::new(std::sync::Mutex::new(
+                crate::catalog::Catalog::open(&root, &cfg.issuer(), None).unwrap(),
+            ))),
+            config: cfg,
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set,
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        };
+        async fn operation(app: &App, signed: &str, body: Value) -> Value {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/operation")
+                .header("host", "app.example.test")
+                .header("origin", "https://app.example.test")
+                .header("content-type", "application/json")
+                .header("x-ow-request", "dashboard")
+                .header("cf-access-jwt-assertion", signed)
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = handle(app, req).await;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["ok"], true, "{v}");
+            v["result"].clone()
+        }
+        let signed = token(&key, &claims());
+        let created=operation(&app,&signed,json!({"op":"create","id":"capacity-ubuntu","image":"ubuntu","memory_mib":4096,"vcpu_count":2})).await;
+        assert_eq!(created["memory_mib"], 4096);
+        assert_eq!(created["vcpu_count"], 2);
+        assert_eq!(created["state"], "running");
+        let exec=operation(&app,&signed,json!({"op":"exec","id":"capacity-ubuntu","command":"cat /etc/os-release; nproc; git --version; gcc --version | head -1; mise exec -- node --version; mise exec -- python --version; mise exec -- rustc --version; sudo -n true; printf capacity-persistent > /persist/capacity-proof; cat /persist/capacity-proof"})).await;
+        assert_eq!(exec["exit_code"], 0);
+        assert!(exec["output"].as_str().unwrap().contains("Ubuntu"));
+        assert!(
+            exec["output"]
+                .as_str()
+                .unwrap()
+                .contains("capacity-persistent")
+        );
+        operation(&app, &signed, json!({"op":"stop","id":"capacity-ubuntu"})).await;
+        let resized = operation(
+            &app,
+            &signed,
+            json!({"op":"resize","id":"capacity-ubuntu","memory_mib":4096,"vcpu_count":2}),
+        )
+        .await;
+        assert_eq!(resized["state"], "stopped");
+        assert_eq!(resized["memory_mib"], 4096);
+        local("down");
+        local("up");
+        let restarted =
+            operation(&app, &signed, json!({"op":"start","id":"capacity-ubuntu"})).await;
+        assert_eq!(restarted["memory_mib"], 4096);
+        assert_eq!(restarted["vcpu_count"], 2);
+        let persisted=operation(&app,&signed,json!({"op":"exec","id":"capacity-ubuntu","command":"cat /persist/capacity-proof; nproc; grep MemTotal /proc/meminfo"})).await;
+        assert_eq!(persisted["exit_code"], 0);
+        assert!(
+            persisted["output"]
+                .as_str()
+                .unwrap()
+                .contains("capacity-persistent")
+        );
+        operation(&app, &signed, json!({"op":"stop","id":"capacity-ubuntu"})).await;
+        local("down");
+        fs::write(root.join("capacity-result.json"),json!({"passed":true,"requested_memory_mib":4096,"requested_vcpus":2,"max_new_guests":1,"create":created,"dev_exec":exec,"resized":resized,"cold_start":restarted,"persistence":persisted,"cleanup":"dedicated guest/worker stopped; disks and all artifacts retained"}).to_string()).unwrap();
+        drop(app);
+        drop(cleanup);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_admin_requires_verified_subject_and_exact_bound_catalog_id() {
         use crate::catalog::{Catalog, Identity};
         use std::os::unix::fs::PermissionsExt;
@@ -1364,6 +1502,12 @@ mod tests {
                 response.status(),
                 StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
             ));
+            let mut request = make(Some(token(&key, &c)), "denied");
+            *request.uri_mut() = "/api/hosts/budget".parse().unwrap();
+            assert!(matches!(
+                handle(&app, request).await.status(),
+                StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+            ));
         }
         assert_eq!(
             handle(&app, make(None, "denied")).await.status(),
@@ -1394,6 +1538,22 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["result"]["cpus"], 1);
         assert_eq!(v["result"]["controller"], "https://app.example.test/_nodes");
+        crate::nodes::db(&root)
+            .unwrap()
+            .execute(
+                "UPDATE nodes SET credential_hash='synthetic-preserved' WHERE id='friend'",
+                [],
+            )
+            .unwrap();
+        let mut request = make(Some(token(&key, &claims())), "friend");
+        *request.uri_mut() = "/api/hosts/budget".parse().unwrap();
+        *request.body_mut() =
+            Body::from(json!({"node":"friend","memory":8192,"slots":4,"cpus":32}).to_string());
+        assert_eq!(handle(&app, request).await.status(), StatusCode::OK);
+        assert_eq!(
+            crate::nodes::inventory(&root).unwrap()[0]["owner_limits"],
+            json!({"memory":8192,"slots":4,"cpus":32})
+        );
         drop(app);
         fs::remove_dir_all(root).unwrap();
     }

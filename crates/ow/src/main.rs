@@ -236,6 +236,32 @@ enum HostAction {
         /// Prepare enrollment/config only; do not start processes.
         #[arg(long)]
         no_start: bool,
+        /// Opt in to the verified Ubuntu developer disk (up to 8 GiB transfer).
+        #[arg(long)]
+        ubuntu_dev: bool,
+    },
+    /// Save operator budgets only after participation and guests are fully stopped.
+    Configure {
+        #[arg(long)]
+        memory: u32,
+        #[arg(long)]
+        slots: u32,
+        #[arg(long)]
+        cpus: u32,
+        #[arg(long)]
+        storage_gib: Option<u32>,
+        #[arg(long)]
+        accept_shared_pool: bool,
+    },
+    /// Refresh verified runtime assets while stopped; retain previous assets for rollback.
+    UpdateAssets {
+        #[arg(long)]
+        ubuntu_dev: bool,
+    },
+    /// Select verified retained assets while fully stopped; guest disks are preserved.
+    RollbackAssets {
+        #[arg(long)]
+        revision: String,
     },
     Start,
     Status,
@@ -252,6 +278,16 @@ enum HostAction {
         #[arg(long, default_value_t = 2)]
         slots: u32,
         #[arg(long, default_value_t = 2)]
+        cpus: u32,
+    },
+    /// Designated owner: edit durable upper bounds for an existing enrolled ID.
+    Budget {
+        node: String,
+        #[arg(long)]
+        memory: u32,
+        #[arg(long)]
+        slots: u32,
+        #[arg(long)]
         cpus: u32,
     },
     Revoke {
@@ -272,7 +308,7 @@ fn main_result() -> anyhow::Result<i32> {
     if let Action::Host { command } = cli.command {
         if matches!(
             command,
-            HostAction::Invite { .. } | HostAction::Revoke { .. }
+            HostAction::Invite { .. } | HostAction::Revoke { .. } | HostAction::Budget { .. }
         ) {
             let selected = cli.server.or_else(|| std::env::var("OW_SERVER").ok());
             let server = match selected {

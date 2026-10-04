@@ -16,7 +16,8 @@ import re
 
 NODE_REGEX = r'^/_nodes/(enroll|node/[A-Za-z0-9_-]+|job/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+)$'
 OLD_CLI_REGEX = r'^/cli/(install\.sh|ow-(linux-amd64|darwin-(arm64|amd64))(\.sha256)?)$'
-CLI_REGEX = r'^/cli/(install\.sh|ow-(linux-amd64|darwin-(arm64|amd64))(\.sha256)?|host-manifest\.json|host/(firecracker|vmlinux|base\.ext4|ow-guest|slirp4netns))$'
+CLI_REGEX = r'^/cli/(install\.sh|ow-(linux-amd64|darwin-(arm64|amd64))(\.sha256)?|host-manifest\.json|host/(firecracker|vmlinux|base\.ext4|ubuntu\.ext4|network-tools\.tar\.gz|ow-guest|slirp4netns))$'
+PRIOR_HOST_CLI_REGEX = CLI_REGEX.replace(r'|ubuntu\.ext4|network-tools\.tar\.gz', '')
 PUBLIC_POLICY = {'name': 'Fixed node protocol only', 'decision': 'bypass', 'include': [{'everyone': {}}], 'exclude': [], 'require': [], 'precedence': 1}
 
 def fingerprint(state):
@@ -126,6 +127,7 @@ def validate(state, approved, allow_partial=False):
     if not trust.get('caPool', '').startswith('/') or not re.fullmatch(r'[A-Za-z0-9.-]+', trust.get('originServerName', '')) or trust.get('noTLSVerify'):
         raise ValueError('Explicit existing private-CA TLS trust/server name required')
     cli = {'hostname': host, 'path': OLD_CLI_REGEX, 'service': 'http://127.0.0.1:8787', 'originRequest': {'access': {'required': False}}}
+    cli_prior = dict(cli, path=PRIOR_HOST_CLI_REGEX)
     cli_new = dict(cli, path=CLI_REGEX)
     node = {'hostname': host, 'path': NODE_REGEX, 'service': 'https://127.0.0.1:8790', 'originRequest': {**trust, 'noTLSVerify': False, 'access': {'required': False}}}
     selected = []
@@ -137,14 +139,15 @@ def validate(state, approved, allow_partial=False):
         if not route.get('hostname') and i < fallback[0]:
             raise ValueError('Earlier global fallback shadows project')
         if route.get('hostname') == host and route.get('path'):
-            if route not in [cli, cli_new, node] or i > fallback[0]:
+            if route not in [cli, cli_prior, cli_new, node] or i > fallback[0]:
                 raise ValueError('Foreign/drifted/shadowed project path ingress')
             selected.append(route)
-    if sum(r in [cli, cli_new] for r in selected) != 1 or selected.count(node) > 1:
+    if sum(r in [cli, cli_prior, cli_new] for r in selected) != 1 or selected.count(node) > 1:
         raise ValueError('Missing/duplicate exact owned ingress')
     if not allow_partial and bool(nodes) != (node in selected):
         raise ValueError('Partial node state: apply only recorded compensation before re-planning')
-    return cli, cli_new, node
+    original_cli = next(r for r in selected if r in [cli, cli_prior, cli_new])
+    return original_cli, cli_new, node
 
 def prepare(state, approved):
     old, cli, node = validate(state, approved)
@@ -178,8 +181,8 @@ def rollback(plan, current, created_app_id=None):
             raise ValueError('Owned node route changed; rollback refused')
         if owned:
             routes.remove(node)
-    original_cli = next(r for r in before['tunnel']['ingress'] if r.get('hostname') == before['hostname'] and r.get('path') in [OLD_CLI_REGEX, CLI_REGEX])
-    owned_cli = [r for r in routes if r.get('hostname') == before['hostname'] and r.get('path') in [OLD_CLI_REGEX, CLI_REGEX]]
+    original_cli = next(r for r in before['tunnel']['ingress'] if r.get('hostname') == before['hostname'] and r.get('path') in [OLD_CLI_REGEX, PRIOR_HOST_CLI_REGEX, CLI_REGEX])
+    owned_cli = [r for r in routes if r.get('hostname') == before['hostname'] and r.get('path') in [OLD_CLI_REGEX, PRIOR_HOST_CLI_REGEX, CLI_REGEX]]
     if owned_cli not in [[cli], [original_cli]]:
         raise ValueError('Owned CLI route changed; rollback refused')
     if cli in routes:

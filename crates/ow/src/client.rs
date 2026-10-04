@@ -177,6 +177,16 @@ pub fn host_admin(url: &str, action: crate::HostAction) -> Result<i32> {
             json!({"node":node,"ttl":ttl,"memory":memory,"slots":slots,"cpus":cpus}),
             output,
         ),
+        crate::HostAction::Budget {
+            node,
+            memory,
+            slots,
+            cpus,
+        } => (
+            "budget",
+            json!({"node":node,"memory":memory,"slots":slots,"cpus":cpus}),
+            None,
+        ),
         crate::HostAction::Revoke { node } => ("revoke", json!({"node":node}), None),
         _ => bail!("invalid host administration command"),
     };
@@ -233,7 +243,7 @@ pub fn host_admin(url: &str, action: crate::HostAction) -> Result<i32> {
         .send()?;
     ensure!(
         response.status().is_success(),
-        "owner host operation rejected or response uncertain; re-invite invalidates the prior unused invitation"
+        "owner host operation rejected or response uncertain; inspect owner pool state before retrying"
     );
     let mut bytes = Vec::new();
     response.take(4097).read_to_end(&mut bytes)?;
@@ -281,6 +291,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Put { .. }
                 | Action::Get { .. }
                 | Action::Create { .. }
+                | Action::Resize { .. }
                 | Action::Start { .. }
                 | Action::Stop { .. }
                 | Action::Hibernate { .. }
@@ -328,6 +339,9 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             node,
         } => {
             json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"node":node})
+        }
+        Action::Resize { id, memory, cpus } => {
+            json!({"op":"resize","id":id,"memory_mib":memory,"vcpu_count":cpus})
         }
         Action::Put { id, local, guest } => {
             use base64::Engine;
