@@ -21,6 +21,7 @@ rustls = { version = "0.23", features = ["ring"], default-features = false }
 sha2 = "0.10"
 hyper-util = { version = "0.1", features = ["tokio"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+http-body = "1"
 axum = { version = "0.8", features = ["ws"] }
 jsonwebtoken = "9.3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util"] }

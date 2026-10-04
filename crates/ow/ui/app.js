@@ -14,7 +14,7 @@ async function api(path, body) {
   if (!response.ok || !value.ok) throw Error((value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : ''));
   return value.result;
 }
-async function refresh() { try { data = await api('/api/state'); render(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; } }
+async function refresh() { try { data = await api('/api/state'); $('host-controls').hidden = !data.host_controls; $('pool-policy').textContent = data.pool_policy || ''; render(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; } }
 function action(label, callback, disabled = false) { const button = element('button', label, 'button secondary'); button.disabled = disabled || busy; button.addEventListener('click', () => Promise.resolve(callback()).catch(() => {})); return button; }
 function select(id) { selected = id; render(); }
 function machine() { return data.workspaces.find(item => item.id === selected); }
@@ -133,3 +133,10 @@ $('copy-install').addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(installCommand); $('copy-install').textContent = 'Copied'; setTimeout(() => { $('copy-install').textContent = 'Copy command'; }, 2000); }
   catch { notice('Select the install command and copy it to your terminal.'); }
 });
+
+$('host-invite').addEventListener('click', () => { $('host-form').reset(); $('host-envelope').value=''; $('host-envelope').hidden=true; $('host-instructions').hidden=true; $('host-submit').disabled=false; $('host-error').textContent=''; $('host-dialog').showModal(); });
+function clearHostInvitation() { $('host-envelope').value=''; $('host-envelope').hidden=true; $('host-instructions').hidden=true; }
+$('host-close').addEventListener('click', () => { clearHostInvitation(); $('host-dialog').close(); });
+$('host-dialog').addEventListener('close', clearHostInvitation);
+$('host-form').addEventListener('submit', async event => { event.preventDefault(); $('host-submit').disabled=true; $('host-error').textContent=''; const fields=new FormData(event.target); const body={node:fields.get('node')}; for(const key of ['memory','slots','cpus','ttl']) body[key]=Number(fields.get(key)); try {const invite=await api('/api/hosts/invite',body); $('host-envelope').value=JSON.stringify(invite); $('host-envelope').hidden=false; $('host-instructions').hidden=false;} catch(error) {$('host-error').textContent=error.message+' If the response was lost, creating another invitation for this unused node invalidates the first.'; $('host-submit').disabled=false;} });
+$('host-revoke').addEventListener('click', async () => {const node=window.prompt('Node label to revoke. Already accepted effects cannot be undone; the host operator must stop running guests.'); if(!node)return;try{await api('/api/hosts/revoke',{node});notice('Node revoked. Ask its operator to stop participation.');await refresh();}catch(error){notice(error.message,true);}});

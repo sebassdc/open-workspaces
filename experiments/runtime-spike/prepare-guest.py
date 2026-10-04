@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Build a disposable Alpine guest image without mounting filesystems as root."""
+import argparse
+import json
+import tarfile
+import posixpath
 import hashlib
 import os
 from pathlib import Path
@@ -7,7 +11,12 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA = ROOT / 'data/runtime-spike'
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--data-dir', type=Path, default=ROOT / 'data/runtime-spike')
+parser.add_argument('--toolchain-root', type=Path, default=ROOT / 'data/runtime-spike')
+args = parser.parse_args()
+DATA = args.data_dir.absolute()
+TOOLS = args.toolchain_root.absolute()
 ASSETS = {
     'alpine-minirootfs-3.24.2-x86_64.tar.gz': (
         'https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.2-x86_64.tar.gz',
@@ -35,8 +44,32 @@ if image.exists():
 with tempfile.TemporaryDirectory(prefix='build-', dir=image_dir) as temporary:
     tree = Path(temporary) / 'root'
     tree.mkdir()
-    subprocess.run(['tar', '-xzf', str(DATA / 'downloads/alpine-minirootfs-3.24.2-x86_64.tar.gz'),
-                    '-C', str(tree), '--no-same-owner'], check=True)
+    # Pinned upstream archive, bounded members, no special files or escaping links.
+    with tarfile.open(DATA / 'downloads/alpine-minirootfs-3.24.2-x86_64.tar.gz') as archive:
+        members = archive.getmembers()
+        if len(members) > 4096 or sum(m.size for m in members) > 64 * 1024 * 1024:
+            raise SystemExit('Unsafe expanded Alpine archive size')
+        seen = set()
+        for member in members:
+            name = member.name.removeprefix('./').rstrip('/')
+            if not name:
+                continue
+            if name in seen or name.startswith('/') or '..' in Path(name).parts or not (member.isfile() or member.isdir() or member.issym()):
+                raise SystemExit('Unsafe Alpine archive member')
+            seen.add(name)
+            if member.issym():
+                # Alpine's absolute BusyBox links are guest-root paths. Convert to
+                # relative links within the new tree; never expose host absolute links.
+                target = member.linkname
+                if target.startswith('/'):
+                    target = target.lstrip('/')
+                else:
+                    target = posixpath.join(posixpath.dirname(name), target)
+                target = posixpath.normpath(target)
+                if target == '..' or target.startswith('../'):
+                    raise SystemExit('Escaping Alpine link refused')
+                member.linkname = posixpath.relpath(target, posixpath.dirname(name) or '.')
+        archive.extractall(tree, members=members, filter='data')
     for directory in ('proc', 'sys', 'dev', 'run', 'persist', 'www'):
         (tree / directory).mkdir(exist_ok=True)
     (tree / 'www/index.html').write_text('open-workspaces guest HTTP ready\n')
@@ -54,8 +87,8 @@ exec /bin/sh -i
 ''')
     init.chmod(0o755)
     environment = dict(os.environ)
-    environment.update(RUSTUP_HOME=str(DATA / 'rustup'), CARGO_HOME=str(DATA / 'cargo'))
-    subprocess.run([str(DATA / 'cargo/bin/rustc'), '+1.97.0', '--edition=2024',
+    environment.update(RUSTUP_HOME=str(TOOLS / 'rustup'), CARGO_HOME=str(TOOLS / 'cargo'))
+    subprocess.run([str(TOOLS / 'cargo/bin/rustc'), '+1.97.0', '--edition=2024',
                     '--target', 'x86_64-unknown-linux-musl', '-C', 'opt-level=2',
                     str(ROOT / 'experiments/runtime-spike/http-fixture.rs'),
                     '-o', str(tree / 'http-fixture')], env=environment, check=True)
@@ -63,4 +96,7 @@ exec /bin/sh -i
         stream.truncate(128 * 1024 * 1024)
     subprocess.run(['mkfs.ext4', '-q', '-F', '-O', '^metadata_csum_seed,^orphan_file',
                     '-E', 'root_owner=0:0', '-d', str(tree), str(image)], check=True)
+with image.open('rb') as stream:
+    digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+(image_dir / 'clean-alpine.json').write_text(json.dumps({'recipe': 'alpine-minirootfs-3.24.2-minimal-v1', 'sha256': digest}))
 print(image)

@@ -176,6 +176,13 @@ impl Catalog {
         Ok(catalog)
     }
 
+    pub(crate) fn bound_identity(&self, id: i64, identity: &Identity) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND issuer=?2 AND subject=?3)",
+            params![id, identity.issuer, identity.subject],
+            |r| r.get(0),
+        )?)
+    }
     pub fn user(&mut self, identity: &Identity) -> Result<i64> {
         ensure!(
             !identity.subject.is_empty()

@@ -40,6 +40,23 @@ fn max_running() -> usize {
 fn max_cpus() -> u32 {
     limit("OW_MAX_VCPUS", 16)
 }
+fn minimum_free_gib() -> Result<u32> {
+    match std::env::var("OW_MIN_FREE_GIB") {
+        Ok(v) => {
+            let n = v.parse::<u32>()?;
+            ensure!(
+                (1..=1024).contains(&n),
+                "invalid minimum free disk threshold"
+            );
+            Ok(n)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+fn minimum_free_bytes() -> Result<u64> {
+    Ok((minimum_free_gib()? as u64 * 1024 * 1024 * 1024).max(128 * 1024 * 1024))
+}
 const MAX_SNAPSHOTS: usize = 24;
 const MAX_WORKSPACES: usize = 32;
 
@@ -305,6 +322,7 @@ impl Runtime {
                 parse_limit(value.to_str().context("invalid worker limit")?, maximum)?;
             }
         }
+        minimum_free_gib()?;
         for directory in ["machines", "snapshots"] {
             fs::create_dir_all(root.join(directory))?;
         }
@@ -456,7 +474,7 @@ impl Runtime {
         );
         let stats = unsafe { stats.assume_init() };
         ensure!(
-            stats.f_bavail.saturating_mul(stats.f_frsize) >= 128 * 1024 * 1024 + extra,
+            stats.f_bavail.saturating_mul(stats.f_frsize) >= minimum_free_bytes()? + extra,
             "storage headroom exhausted"
         );
         Ok(())
@@ -677,7 +695,7 @@ impl Runtime {
             "status" => Ok(
                 json!({"runtime":"Firecracker v1.17.0","running":self.machines.len(),
                 "worker_pid":std::process::id(),
-                "max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,
+                "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,
                 "max_snapshots":MAX_SNAPSHOTS,"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
             "list" => Ok(json!(self.state.workspaces.values().collect::<Vec<_>>())),

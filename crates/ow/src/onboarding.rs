@@ -1,0 +1,1599 @@
+//! Guided trusted-host participation. Local authority, never human login.
+use crate::{HostAction, common, nodes, wire};
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    io::{self, Read, Write},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::Duration,
+};
+
+// Fixed wire names and private runtime destinations. No extraction or arbitrary paths.
+pub const FILES: [(&str, &str, u64, bool); 5] = [
+    (
+        "firecracker",
+        "official/release-v1.17.0-x86_64/firecracker-v1.17.0-x86_64",
+        32 * 1024 * 1024,
+        true,
+    ),
+    (
+        "vmlinux",
+        "downloads/vmlinux-6.1.186",
+        64 * 1024 * 1024,
+        false,
+    ),
+    ("base.ext4", "guest/base.ext4", 256 * 1024 * 1024, false),
+    ("ow-guest", "guest/ow-guest", 32 * 1024 * 1024, true),
+    ("slirp4netns", "bin/slirp4netns", 32 * 1024 * 1024, true),
+];
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    version: u32,
+    runtime: String,
+    arch: String,
+    files: Vec<Asset>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Asset {
+    name: String,
+    size: u64,
+    sha256: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    version: u32,
+    controller: String,
+    memory: u32,
+    slots: u32,
+    cpus: u32,
+    storage_gib: u32,
+    policy: String,
+    #[serde(default)]
+    ca_cert: Option<PathBuf>,
+}
+
+fn private_dir(path: &Path) -> Result<()> {
+    let m = fs::symlink_metadata(path)?;
+    ensure!(
+        m.is_dir() && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o077 == 0,
+        "host root must be an owned private directory, not a symlink"
+    );
+    Ok(())
+}
+fn root(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    let path = match explicit {
+        Some(path) => path,
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME required")?).join(".ow-host"),
+    };
+    ensure!(
+        path.is_absolute() && path.as_os_str().len() < 60,
+        "choose an absolute private host root shorter than 60 bytes with --data-dir"
+    );
+    if !path.exists() {
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
+    private_dir(&path)?;
+    let path = fs::canonicalize(path)?;
+    ensure!(path.as_os_str().len() < 60, "canonical host root too long");
+    Ok(path)
+}
+fn lock(root: &Path) -> Result<fs::File> {
+    let path = root.join("host-lifecycle.lock");
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    nodes::private(&path)?;
+    ensure!(
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "another host lifecycle command is running"
+    );
+    Ok(f)
+}
+fn read_config(root: &Path) -> Result<Config> {
+    private_dir(root)?;
+    nodes::private(&root.join("host.json"))?;
+    let c: Config = serde_json::from_slice(&bounded_file(&root.join("host.json"), 4096)?)?;
+    ensure!(
+        c.version == 1 && c.policy == nodes::POOL_POLICY,
+        "unsupported host config/consent"
+    );
+    nodes::origin(&c.controller, false)?;
+    limits(c.memory, c.slots, c.cpus, c.storage_gib)?;
+    if let Some(path) = &c.ca_cert {
+        ensure!(
+            *path == root.join("controller-ca.pem"),
+            "CA must be the saved private host-root trust file"
+        );
+        nodes::private(path)?;
+        reqwest::Certificate::from_pem(&bounded_file(path, 65536)?)?;
+    }
+    Ok(c)
+}
+fn bounded_file(path: &Path, max: u64) -> Result<Vec<u8>> {
+    let m = fs::symlink_metadata(path)?;
+    ensure!(
+        m.is_file() && m.len() <= max,
+        "invalid or oversized regular file"
+    );
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut f)
+        .take(max + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= max, "file too large");
+    Ok(bytes)
+}
+fn limits(memory: u32, slots: u32, cpus: u32, storage: u32) -> Result<()> {
+    ensure!(
+        (256..=4096).contains(&memory)
+            && (1..=8).contains(&slots)
+            && (1..=16).contains(&cpus)
+            && (1..=1024).contains(&storage),
+        "host limits out of range"
+    );
+    Ok(())
+}
+fn fixed_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut c = Command::new(program);
+    c.env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LANG", "C");
+    c
+}
+fn command(root: &Path, c: &Config, action: &str) -> Result<Command> {
+    let mut cmd = fixed_command(std::env::current_exe()?);
+    cmd.env("OW_HOST_MANAGED", "1")
+        .env(
+            "OW_HOST_ASSET_HASH",
+            format!(
+                "{:x}",
+                Sha256::digest(bounded_file(&root.join("assets/manifest.json"), 16384)?)
+            ),
+        )
+        .env("OW_ASSET_DIR", root.join("assets"))
+        .env("OW_MAX_MEMORY_MIB", c.memory.to_string())
+        .env("OW_MAX_RUNNING", c.slots.to_string())
+        .env("OW_MAX_VCPUS", c.cpus.to_string())
+        .env("OW_MIN_FREE_GIB", c.storage_gib.to_string());
+    cmd.arg("--local").arg("--data-dir").arg(root);
+    if action == "run" {
+        cmd.arg("host").arg("run");
+    } else {
+        cmd.arg(action);
+    }
+    Ok(cmd)
+}
+fn free_bytes(root: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = std::ffi::CString::new(root.as_os_str().as_bytes())?;
+    let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    ensure!(
+        unsafe { libc::statvfs(p.as_ptr(), info.as_mut_ptr()) } == 0,
+        "cannot inspect storage capacity"
+    );
+    let info = unsafe { info.assume_init() };
+    Ok(info.f_bavail * info.f_frsize)
+}
+fn mem_available() -> Result<u64> {
+    let info = fs::read_to_string("/proc/meminfo")?;
+    Ok(info
+        .lines()
+        .find(|l| l.starts_with("MemAvailable:"))
+        .context("MemAvailable unavailable")?
+        .split_whitespace()
+        .nth(1)
+        .context("MemAvailable value")?
+        .parse::<u64>()?
+        / 1024)
+}
+fn existing_demand() -> Result<Value> {
+    // Current global process evidence. RSS includes actual committed guest pages;
+    // MemAvailable includes other workers, page cache, desktop and helper demand.
+    let mut count = 0u64;
+    let mut rss = 0u64;
+    for entry in fs::read_dir("/proc")? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .unwrap()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        if let Ok(name) = fs::read_to_string(path.join("comm"))
+            && name.trim().starts_with("firecracker")
+        {
+            count += 1;
+            if let Ok(status) = fs::read_to_string(path.join("status")) {
+                rss += status
+                    .lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    / 1024;
+            }
+        }
+    }
+    Ok(
+        json!({"existing_vmm_count":count,"existing_vmm_rss_mib":rss,"host_available_mib":mem_available()?,"reservation_inventory":"RSS is not configured RAM. Unresolved/offline reservations require operator inventory; budgets must be disjoint."}),
+    )
+}
+fn doctor(root: &Path) -> Result<Value> {
+    let mut errors = Vec::new();
+    if std::env::consts::ARCH != "x86_64" {
+        errors.push("Linux x86-64 required".to_owned());
+    }
+    if fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_err()
+    {
+        errors.push("KVM unavailable: enable virtualization and obtain operator /dev/kvm access; no automatic privileged repair".to_owned());
+    }
+    for tool in ["ip", "nft", "unshare", "cp", "curl", "sha256sum"] {
+        if !fixed_command("sh")
+            .args(["-c", &format!("command -v {tool} >/dev/null")])
+            .status()?
+            .success()
+        {
+            errors.push(format!(
+                "Install host tool {tool} through your OS package manager"
+            ));
+        }
+    }
+    if !fixed_command("unshare")
+        .args(["--user", "--map-root-user", "--net", "true"])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        errors.push("Unprivileged user/network namespaces unavailable; ask the host administrator about supported policy".to_owned());
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let p = std::ffi::CString::new(root.as_os_str().as_bytes())?;
+    let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(p.as_ptr(), info.as_mut_ptr()) } != 0
+        || unsafe { info.assume_init() }.f_type != 0x9123683e
+    {
+        errors.push("Host root must be on Btrfs; choose an existing supported filesystem with --data-dir. No formatting or repartitioning is performed".to_owned());
+    }
+    let source = root.join(format!("doctor-{}", common::nonce()?));
+    let target = source.with_extension("clone");
+    let reflink = (|| -> Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&source)?;
+        f.write_all(&[0u8; 4096])?;
+        ensure!(
+            fixed_command("cp")
+                .arg("--reflink=always")
+                .arg(&source)
+                .arg(&target)
+                .stderr(Stdio::null())
+                .status()?
+                .success(),
+            "Btrfs reflink clone unavailable"
+        );
+        Ok(())
+    })();
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(target);
+    if reflink.is_err() {
+        errors.push(
+            "Btrfs reflink probe failed; select a supported private data directory".to_owned(),
+        );
+    }
+    Ok(
+        json!({"build_source_sha256":option_env!("OW_BUILD_SOURCE_SHA256"),"supported":errors.is_empty(),"diagnostics":errors,"free_gib":free_bytes(root)?/(1024*1024*1024),"demand":existing_demand()?}),
+    )
+}
+fn preflight(root: &Path, c: &Config) -> Result<()> {
+    let report = doctor(root)?;
+    ensure!(
+        report["supported"] == true,
+        "unsupported host: {}",
+        report["diagnostics"]
+    );
+    ensure!(
+        mem_available()? > c.memory as u64 + 1024,
+        "insufficient measured memory headroom; leave at least 1024 MiB beyond this disjoint worker budget and account for other workers/reservations"
+    );
+    ensure!(
+        free_bytes(root)? > c.storage_gib as u64 * 1024 * 1024 * 1024 + 512 * 1024 * 1024,
+        "insufficient disk headroom above selected minimum-free-space threshold"
+    );
+    Ok(())
+}
+fn input(prompt: &str, hidden: bool) -> Result<String> {
+    ensure!(
+        unsafe { libc::isatty(libc::STDIN_FILENO) } == 1,
+        "guided input needs a terminal; use --invite-file and explicit capacity/consent flags for private non-interactive input"
+    );
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    extern "C" fn interrupted(_: libc::c_int) {
+        INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    struct Restore {
+        terminal: libc::termios,
+        signals: Vec<(i32, libc::sigaction)>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe {
+                libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.terminal);
+                for (signal, action) in &self.signals {
+                    libc::sigaction(*signal, action, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+    let mut state = std::mem::MaybeUninit::<libc::termios>::uninit();
+    ensure!(
+        unsafe { libc::tcgetattr(libc::STDIN_FILENO, state.as_mut_ptr()) } == 0,
+        "cannot configure terminal"
+    );
+    let old = unsafe { state.assume_init() };
+    let mut restore = Restore {
+        terminal: old,
+        signals: Vec::new(),
+    };
+    let mut next = old;
+    INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        let mut handler: libc::sigaction = unsafe { std::mem::zeroed() };
+        handler.sa_sigaction = interrupted as *const () as usize;
+        let mut previous = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        ensure!(
+            unsafe { libc::sigaction(signal, &handler, previous.as_mut_ptr()) } == 0,
+            "cannot install cancellation handler"
+        );
+        restore
+            .signals
+            .push((signal, unsafe { previous.assume_init() }));
+    }
+    let _restore = restore;
+    // Treat Ctrl-C as input so echo restoration happens before cancellation.
+    next.c_lflag &= !(libc::ISIG | libc::ICANON);
+    if hidden {
+        next.c_lflag &= !libc::ECHO;
+    }
+    ensure!(
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &next) } == 0,
+        "cannot configure input"
+    );
+    let mut bytes = Vec::new();
+    loop {
+        ensure!(
+            !INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst),
+            "join cancelled by signal"
+        );
+        let mut b = [0u8];
+        let n = unsafe { libc::read(libc::STDIN_FILENO, b.as_mut_ptr().cast(), 1) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e.into());
+        }
+        if n == 0 || b[0] == 4 {
+            bail!("input cancelled at EOF");
+        }
+        if b[0] == 3 {
+            bail!("join cancelled");
+        }
+        if b[0] == b'\n' || b[0] == b'\r' {
+            break;
+        }
+        if matches!(b[0], 8 | 127) {
+            bytes.pop();
+            continue;
+        }
+        ensure!(
+            bytes.len() < 4096,
+            "input too long; paste one invitation line"
+        );
+        bytes.push(b[0]);
+    }
+    // A pasted second line is never handed back to the shell. Discard queued input.
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+    if hidden {
+        eprintln!();
+    }
+    Ok(String::from_utf8(bytes)?.trim().to_owned())
+}
+fn choose(value: Option<u32>, label: &str, default: u32, max: u32, min: u32) -> Result<u32> {
+    let v = if let Some(v) = value {
+        v
+    } else {
+        let text = input(
+            &format!("{label} [{default}, allowed {min}–{max}]: "),
+            false,
+        )?;
+        if text.is_empty() {
+            default
+        } else {
+            text.parse().context("enter a whole number")?
+        }
+    };
+    ensure!(
+        (min..=max).contains(&v),
+        "selected {label} exceeds invitation/host bounds"
+    );
+    Ok(v)
+}
+fn envelope(v: &Value) -> Result<(String, u32, u32, u32)> {
+    let node = v["node"].as_str().context("invitation node missing")?;
+    common::identifier(node)?;
+    ensure!(node != "local", "reserved node");
+    ensure!(
+        v["secret"]
+            .as_str()
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+        "invalid invitation secret"
+    );
+    ensure!(
+        v["policy"] == nodes::POOL_POLICY,
+        "missing or unsupported shared-pool policy"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    ensure!(
+        v["expires"]
+            .as_u64()
+            .is_some_and(|e| e > now && e <= now + 3600),
+        "invitation expired or invalid expiry"
+    );
+    let controller = nodes::origin(
+        v["controller"]
+            .as_str()
+            .context("self-contained invitation controller missing")?,
+        false,
+    )?;
+    let memory = u32::try_from(v["memory"].as_u64().context("invitation RAM missing")?)?;
+    let slots = u32::try_from(v["slots"].as_u64().context("invitation slots missing")?)?;
+    let cpus = u32::try_from(v["cpus"].as_u64().context("invitation CPU cap missing")?)?;
+    limits(memory, slots, cpus, 1)?;
+    Ok((controller, memory, slots, cpus))
+}
+fn validate_manifest(m: &Manifest) -> Result<()> {
+    ensure!(
+        m.version == 1
+            && m.runtime == "firecracker-v1.17.0"
+            && m.arch == "x86_64"
+            && m.files.len() == FILES.len(),
+        "unsupported runtime manifest"
+    );
+    for (name, _, max, _) in FILES {
+        let found = m
+            .files
+            .iter()
+            .filter(|a| a.name == name)
+            .collect::<Vec<_>>();
+        ensure!(found.len() == 1, "manifest missing/duplicate asset");
+        let a = found[0];
+        ensure!(
+            a.size > 0
+                && a.size <= max
+                && a.sha256.len() == 64
+                && a.sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid asset size/hash"
+        );
+    }
+    Ok(())
+}
+fn verify_assets(root: &Path) -> Result<()> {
+    let m: Manifest =
+        serde_json::from_slice(&bounded_file(&root.join("assets/manifest.json"), 16384)?)?;
+    validate_manifest(&m)?;
+    private_dir(&root.join("assets"))?;
+    for (name, dest, _, executable) in FILES {
+        let a = m.files.iter().find(|a| a.name == name).unwrap();
+        let path = root.join("assets").join(dest);
+        // Reject symlink components even if the final file looks regular.
+        let mut parent = path.parent();
+        while let Some(p) = parent {
+            if p == root {
+                break;
+            }
+            ensure!(fs::symlink_metadata(p)?.is_dir(), "unsafe asset parent");
+            parent = p.parent();
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0,
+            "unsafe asset ownership/permissions"
+        );
+        let bytes = bounded_file(&path, a.size)?;
+        ensure!(
+            bytes.len() as u64 == a.size && format!("{:x}", Sha256::digest(&bytes)) == a.sha256,
+            "runtime asset corrupt or incomplete: {name}"
+        );
+        ensure!(
+            !executable || metadata.mode() & 0o100 != 0,
+            "runtime executable permission missing"
+        );
+    }
+    Ok(())
+}
+fn downloads(root: &Path, controller: &str, ca: Option<&Path>) -> Result<()> {
+    if root.join("assets").exists() {
+        return verify_assets(root);
+    }
+    let mut u = reqwest::Url::parse(controller)?;
+    u.set_path("");
+    let origin = u.as_str().trim_end_matches('/');
+    let mut builder = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(120));
+    if let Some(ca) = ca {
+        builder = builder
+            .add_root_certificate(reqwest::Certificate::from_pem(&bounded_file(ca, 65536)?)?);
+    }
+    let client = builder.build()?;
+    let response = client
+        .get(format!("{origin}/cli/host-manifest.json"))
+        .send()?;
+    ensure!(
+        response.status().is_success(),
+        "runtime manifest unavailable"
+    );
+    let mut bytes = Vec::new();
+    response.take(16385).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 16384, "runtime manifest too large");
+    let manifest: Manifest = serde_json::from_slice(&bytes)?;
+    validate_manifest(&manifest)?;
+    let staging = root.join(format!("assets-stage-{}", common::nonce()?));
+    fs::create_dir(&staging)?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
+    let result = (|| -> Result<()> {
+        for (name, dest, _, executable) in FILES {
+            let a = manifest.files.iter().find(|a| a.name == name).unwrap();
+            let response = client.get(format!("{origin}/cli/host/{name}")).send()?;
+            ensure!(
+                response.status().is_success(),
+                "runtime asset unavailable: {name}"
+            );
+            let path = staging.join(dest);
+            fs::create_dir_all(path.parent().unwrap())?;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(if executable { 0o700 } else { 0o600 })
+                .open(path)?;
+            let mut reader = response.take(a.size + 1);
+            let mut hash = Sha256::new();
+            let mut size = 0u64;
+            let mut buffer = [0u8; 65536];
+            loop {
+                let n = reader.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                size += n as u64;
+                ensure!(size <= a.size, "runtime asset oversized");
+                hash.update(&buffer[..n]);
+                f.write_all(&buffer[..n])?;
+            }
+            ensure!(
+                size == a.size && format!("{:x}", hash.finalize()) == a.sha256,
+                "runtime asset corrupt/incomplete: {name}"
+            );
+            f.sync_all()?;
+        }
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(staging.join("manifest.json"))?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        fs::rename(&staging, root.join("assets"))?;
+        fs::File::open(root)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+fn worker_matches(root: &Path, status: &Value, c: &Config) -> bool {
+    status["max_memory_mib"] == c.memory
+        && status["max_running"] == c.slots
+        && status["max_vcpus"] == c.cpus
+        && status["host_managed"] == true
+        && status["min_free_gib"] == c.storage_gib
+        && bounded_file(&root.join("assets/manifest.json"), 16384)
+            .is_ok_and(|b| status["host_asset_hash"] == format!("{:x}", Sha256::digest(b)))
+}
+fn held_lock(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    nodes::private(path)?;
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    ensure!(
+        error.raw_os_error() == Some(libc::EWOULDBLOCK),
+        "cannot determine process lock state"
+    );
+    Ok(true)
+}
+fn agent_running(root: &Path) -> Result<bool> {
+    held_lock(&root.join("node-agent.lock"))
+}
+// Resolve only independently supervised non-runtime processes. Every other
+// unreadable same-operator process remains UNKNOWN; PID/command alone is insufficient.
+fn supervisor_properties(
+    program: &str,
+    args: &[&str],
+) -> Result<std::collections::HashMap<String, String>> {
+    let metadata = fs::metadata(program)?;
+    ensure!(
+        metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+        "untrusted supervisor tool"
+    );
+    let mut child = Command::new(program)
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if deadline.elapsed() > Duration::from_secs(2) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("supervisor identity query timed out");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    ensure!(status.success(), "supervisor identity query failed");
+    let mut bytes = Vec::new();
+    child
+        .stdout
+        .take()
+        .context("supervisor output")?
+        .take(4097)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 4096, "supervisor output too large");
+    let mut result = std::collections::HashMap::new();
+    for line in std::str::from_utf8(&bytes)?.lines() {
+        let (key, value) = line
+            .split_once('=')
+            .context("invalid supervisor property")?;
+        ensure!(
+            result.insert(key.to_owned(), value.to_owned()).is_none(),
+            "duplicate supervisor property"
+        );
+    }
+    Ok(result)
+}
+fn unrelated_supervisor(path: &Path) -> Result<bool> {
+    let stat = fs::read_to_string(path.join("stat"))?;
+    let fields: Vec<_> = stat
+        .rsplit_once(')')
+        .context("process stat")?
+        .1
+        .split_whitespace()
+        .collect();
+    let parent = *fields.get(1).context("process parent")?;
+    let pid = path
+        .file_name()
+        .context("process PID")?
+        .to_str()
+        .context("PID encoding")?;
+    let comm = fs::read_to_string(path.join("comm"))?;
+    let cmd = fs::read(path.join("cmdline"))?;
+    let group = fs::read_to_string(path.join("cgroup"))?;
+    let Some(group) = group.trim().strip_prefix("0::") else {
+        return Ok(false);
+    };
+    let manager_unit = format!("user@{}.service", unsafe { libc::geteuid() });
+    let manager = supervisor_properties(
+        "/usr/bin/systemctl",
+        &[
+            "--no-pager",
+            "show",
+            &manager_unit,
+            "-p",
+            "MainPID",
+            "-p",
+            "ControlGroup",
+        ],
+    )?;
+    let manager_pid = manager.get("MainPID").context("manager PID")?;
+    let manager_group = format!(
+        "{}/init.scope",
+        manager.get("ControlGroup").context("manager cgroup")?
+    );
+    if group == manager_group {
+        if pid == manager_pid
+            && parent == "1"
+            && comm.trim() == "systemd"
+            && cmd == b"/usr/lib/systemd/systemd\0--user\0"
+        {
+            return Ok(true);
+        }
+        if parent == manager_pid && comm.trim() == "(sd-pam)" && cmd == b"(sd-pam)\0" {
+            return Ok(true);
+        }
+    }
+    if comm.trim() != "tailscaled" || !cmd.starts_with(b"/usr/bin/tailscaled\0be-child\0ssh\0") {
+        return Ok(false);
+    }
+    let tailscale = supervisor_properties(
+        "/usr/bin/systemctl",
+        &["--no-pager", "show", "tailscaled.service", "-p", "MainPID"],
+    )?;
+    if tailscale.get("MainPID").is_none_or(|p| p != parent)
+        || fs::metadata(format!("/proc/{parent}"))?.uid() != 0
+    {
+        return Ok(false);
+    }
+    let Some(scope) = group.rsplit('/').next() else {
+        return Ok(false);
+    };
+    let Some(session) = scope
+        .strip_prefix("session-")
+        .and_then(|s| s.strip_suffix(".scope"))
+    else {
+        return Ok(false);
+    };
+    common::identifier(session)?;
+    let login = supervisor_properties(
+        "/usr/bin/loginctl",
+        &[
+            "--no-pager",
+            "show-session",
+            session,
+            "-p",
+            "Leader",
+            "-p",
+            "Service",
+            "-p",
+            "Remote",
+            "-p",
+            "Scope",
+            "-p",
+            "User",
+        ],
+    )?;
+    Ok(login.get("Leader").is_some_and(|v| v == pid)
+        && login.get("Service").is_some_and(|v| v == "tailscaled")
+        && login.get("Remote").is_some_and(|v| v == "yes")
+        && login.get("Scope").is_some_and(|v| v == scope)
+        && login
+            .get("User")
+            .is_some_and(|v| v == &unsafe { libc::geteuid() }.to_string()))
+}
+fn no_guest_processes(root: &Path) -> Result<bool> {
+    for e in fs::read_dir("/proc")? {
+        let path = e?.path();
+        if !path
+            .file_name()
+            .unwrap()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let metadata = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            continue;
+        }
+        match fs::read_link(path.join("cwd")) {
+            Ok(cwd) => {
+                if cwd.starts_with(root.join("machines")) {
+                    return Ok(false);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                ensure!(
+                    unrelated_supervisor(&path).unwrap_or(false),
+                    "same-operator process inventory unreadable; guest exit UNKNOWN"
+                );
+            }
+        }
+    }
+    Ok(true)
+}
+fn transport_status(root: &Path) -> Value {
+    bounded_file(&root.join("node-channel.json"), 4096)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .unwrap_or(json!({"state":"unknown"}))
+}
+fn ready(root: &Path) -> bool {
+    let status = transport_status(root);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if status["state"] != "dispatchable"
+        || !status["updated"]
+            .as_u64()
+            .is_some_and(|n| n <= now && n + 15 > now)
+        || !agent_running(root).unwrap_or(false)
+    {
+        return false;
+    }
+    let live = (|| -> Result<bool> {
+        nodes::private(&root.join("node-agent.lock"))?;
+        let agent: Value =
+            serde_json::from_slice(&bounded_file(&root.join("node-agent.lock"), 4096)?)?;
+        ensure!(
+            agent["instance"] == status["instance"] && agent["instance"].as_str().is_some(),
+            "stale agent instance"
+        );
+        common::identifier(
+            status["generation"]
+                .as_str()
+                .context("missing generation")?,
+        )?;
+        let pid = agent["pid"].as_u64().context("agent pid missing")?;
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let start = stat
+            .rsplit_once(')')
+            .context("stat")?
+            .1
+            .split_whitespace()
+            .nth(19)
+            .context("process start")?;
+        ensure!(agent["start"] == start, "agent process identity changed");
+        ensure!(
+            fs::read_link(format!("/proc/{pid}/exe"))? == std::env::current_exe()?,
+            "agent executable differs"
+        );
+        let credential: Value =
+            serde_json::from_slice(&bounded_file(&root.join("node.json"), 4096)?)?;
+        ensure!(
+            status["node"] == credential["node"] && status["node"].as_str().is_some(),
+            "stale node acknowledgement"
+        );
+        let c = read_config(root)?;
+        let worker = wire::request(root, json!({"op":"status"}))?;
+        Ok(worker_matches(root, &worker, &c))
+    })();
+    live.unwrap_or(false)
+}
+fn start(root: &Path, c: &Config) -> Result<()> {
+    verify_assets(root)?;
+    if let Ok(status) = wire::request(root, json!({"op":"status"})) {
+        ensure!(
+            worker_matches(root, &status, c),
+            "existing worker does not match managed host assets/budgets; refusing reuse"
+        );
+        if agent_running(root)? {
+            println!(
+                "Host worker and agent already running with saved limits. Check host status for controller acknowledgement."
+            );
+            return Ok(());
+        }
+    }
+    preflight(root, c)?;
+    ensure!(
+        command(root, c, "up")?
+            .stdin(Stdio::null())
+            .status()?
+            .success(),
+        "worker startup failed"
+    );
+    ensure!(
+        worker_matches(root, &wire::request(root, json!({"op":"status"}))?, c),
+        "worker effective assets/budgets differ after startup; refusing agent launch"
+    );
+    let log = root.join("host-agent.log");
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&log)?;
+    nodes::private(&log)?;
+    let mut cmd = command(root, c, "run")?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(f.try_clone()?))
+        .stderr(Stdio::from(f));
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    // A prior acknowledgement cannot satisfy startup before the new instance exists.
+    if root.join("node-channel.json").exists() {
+        nodes::private(&root.join("node-channel.json"))?;
+        fs::remove_file(root.join("node-channel.json"))?;
+    }
+    let mut child = cmd.spawn()?;
+    for _ in 0..100 {
+        if agent_running(root)? && ready(root) {
+            println!(
+                "Host online: controller acknowledged dispatchable participation with saved limits."
+            );
+            return Ok(());
+        }
+        if child.try_wait()?.is_some() {
+            bail!(
+                "agent startup failed; inspect private host-agent.log; worker may still be running"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!(
+        "Host enrollment saved; participation PENDING: no controller dispatchable acknowledgement yet. Worker/agent may be running. Use ow host status or ow host stop."
+    );
+    Ok(())
+}
+fn clean_remnants(root: &Path) -> Result<()> {
+    // Lifecycle lock held. Remove only exact nonce staging names owned by this wizard.
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .context("unexpected root filename")?;
+        let staging = name.strip_prefix("assets-stage-").is_some_and(nonce_name);
+        let temporary = ["node.", "host.pending.", "host.", "marker-"]
+            .iter()
+            .any(|prefix| {
+                name.strip_prefix(prefix)
+                    .and_then(|n| n.strip_suffix(".tmp"))
+                    .is_some_and(nonce_name)
+            });
+        if staging {
+            private_dir(&path)?;
+            fn check(tree: &Path, base: &Path) -> Result<()> {
+                for entry in fs::read_dir(tree)? {
+                    let p = entry?.path();
+                    let m = fs::symlink_metadata(&p)?;
+                    ensure!(
+                        m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o022 == 0,
+                        "unsafe staging owner/permissions"
+                    );
+                    let rel = p.strip_prefix(base)?;
+                    ensure!(
+                        FILES.iter().any(|(_, dest, _, _)| Path::new(dest) == rel
+                            || Path::new(dest).starts_with(rel))
+                            || rel == Path::new("manifest.json"),
+                        "unrecognized staging content; preserve for inspection"
+                    );
+                    if m.is_dir() {
+                        check(&p, base)?;
+                    } else {
+                        ensure!(m.is_file(), "unsafe staging link/type");
+                    }
+                }
+                Ok(())
+            }
+            check(&path, &path)?;
+            fs::remove_dir_all(path)?;
+        } else if temporary {
+            nodes::private(&path)?;
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+fn nonce_name(value: &str) -> bool {
+    value.len() == 24
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn publish_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let root = path.parent().context("parent required")?;
+    let temporary = root.join(format!("marker-{}.tmp", common::nonce()?));
+    let result = (|| -> Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::hard_link(&temporary, path)?;
+        fs::File::open(root)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(temporary);
+    result
+}
+fn finish_enrollment(root: &Path) -> Result<Config> {
+    nodes::private(&root.join("node.json"))?;
+    let credential: Value = serde_json::from_slice(&bounded_file(&root.join("node.json"), 4096)?)?;
+    common::identifier(credential["node"].as_str().context("node missing")?)?;
+    ensure!(
+        credential["credential"]
+            .as_str()
+            .is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())),
+        "invalid saved credential"
+    );
+    if !root.join("host.json").exists() {
+        nodes::private(&root.join("host.pending.json"))?;
+        let pending: Value =
+            serde_json::from_slice(&bounded_file(&root.join("host.pending.json"), 8192)?)?;
+        ensure!(
+            pending["node"] == credential["node"],
+            "saved enrollment does not match pending config"
+        );
+        nodes::write_private(&root.join("host.json"), &pending["config"])?;
+    }
+    let c = read_config(root)?;
+    verify_assets(root)?;
+    let marker = root.join(".ow-data");
+    if !marker.exists() {
+        publish_bytes(&marker, b"open-workspaces local prototype v1\n")?;
+    }
+    ensure!(
+        bounded_file(&marker, 128)? == b"open-workspaces local prototype v1\n",
+        "unexpected data marker"
+    );
+    let _ = fs::remove_file(root.join("host.pending.json"));
+    fs::File::open(root)?.sync_all()?;
+    Ok(c)
+}
+pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
+    let root = root(explicit)?;
+    if matches!(action, HostAction::Doctor) {
+        let report = doctor(&root)?;
+        println!("{report}");
+        return Ok(if report["supported"] == true { 0 } else { 1 });
+    }
+    if matches!(action, HostAction::Run) {
+        let c = read_config(&root)?;
+        verify_assets(&root)?;
+        nodes::agent(
+            &root,
+            &c.controller,
+            &root.join("node.json"),
+            None,
+            c.ca_cert.as_deref(),
+            false,
+        )?;
+        return Ok(0);
+    }
+    let _lock = lock(&root)?;
+    if matches!(action, HostAction::Join { .. } | HostAction::Start) {
+        clean_remnants(&root)?;
+    }
+    match action {
+        HostAction::Join {
+            controller,
+            invite_file,
+            ca_cert,
+            memory,
+            slots,
+            cpus,
+            storage_gib,
+            accept_shared_pool,
+            no_start,
+        } => {
+            if root.join("node.json").exists() {
+                let c = finish_enrollment(&root)?;
+                println!("Saved enrollment completed without redeeming another invitation.");
+                if !no_start {
+                    start(&root, &c)?;
+                }
+                return Ok(0);
+            }
+            ensure!(
+                !root.join("host.json").exists(),
+                "config without credentials: recovery required; do not overwrite enrollment"
+            );
+            // Never adopt a legacy worker/root or user files.
+            for e in fs::read_dir(&root)? {
+                let name = e?.file_name();
+                ensure!(
+                    name == "host-lifecycle.lock"
+                        || name == "assets"
+                        || name == "host.pending.json"
+                        || name == "controller-ca.pem",
+                    "join requires a new dedicated host root"
+                );
+            }
+            let v: Value = if let Some(path) = invite_file {
+                nodes::private(&path)?;
+                private_dir(
+                    path.parent()
+                        .context("private invitation directory required")?,
+                )?;
+                serde_json::from_slice(&bounded_file(&path, 4096)?)?
+            } else {
+                serde_json::from_str(&input("Paste invitation (hidden), then Enter: ", true)?)
+                    .context("invalid invitation JSON")?
+            };
+            let (included, cap_ram, cap_slots, cap_cpu) = envelope(&v)?;
+            let origin = if let Some(controller) = controller {
+                let c = nodes::origin(&controller, false)?;
+                ensure!(
+                    c == included,
+                    "controller override must match invitation origin"
+                );
+                c
+            } else {
+                included
+            };
+            println!("{}\nController: {origin}", nodes::POOL_POLICY);
+            if !accept_shared_pool {
+                ensure!(
+                    input("Participate in this shared pool? Type yes: ", false)? == "yes",
+                    "join cancelled without redeeming invitation"
+                );
+            }
+            let report = doctor(&root)?;
+            println!("Host diagnostics: {report}");
+            ensure!(
+                report["supported"] == true,
+                "resolve the diagnostics before joining; no privileged repair performed"
+            );
+            let available = mem_available()?.saturating_sub(1024).min(cap_ram as u64) as u32;
+            ensure!(available >= 256, "not enough measured memory headroom");
+            let c = Config {
+                version: 1,
+                controller: origin,
+                memory: choose(
+                    memory,
+                    "Disjoint guest RAM budget (MiB; leave other workers/desktop reserve)",
+                    512.min(available),
+                    available,
+                    256,
+                )?,
+                slots: choose(slots, "Running guest slots", 2.min(cap_slots), cap_slots, 1)?,
+                cpus: choose(
+                    cpus,
+                    "Guest vCPU budget",
+                    2.min(cap_cpu)
+                        .min(std::thread::available_parallelism()?.get() as u32),
+                    cap_cpu.min(std::thread::available_parallelism()?.get() as u32),
+                    1,
+                )?,
+                storage_gib: choose(
+                    storage_gib,
+                    "Minimum free disk GiB to retain (preflight threshold, not a quota)",
+                    2,
+                    1024,
+                    1,
+                )?,
+                policy: nodes::POOL_POLICY.to_owned(),
+                ca_cert,
+            };
+            let mut c = c;
+            preflight(&root, &c)?;
+            if let Some(path) = c.ca_cert.take() {
+                nodes::private(&path)?;
+                let bytes = bounded_file(&path, 65536)?;
+                reqwest::Certificate::from_pem(&bytes)?;
+                let stored = root.join("controller-ca.pem");
+                if stored.exists() {
+                    nodes::private(&stored)?;
+                    ensure!(
+                        bounded_file(&stored, 65536)? == bytes,
+                        "saved CA differs; preserve trust and use a new dedicated root"
+                    );
+                } else {
+                    publish_bytes(&stored, &bytes)?;
+                }
+                c.ca_cert = Some(stored);
+            }
+            downloads(&root, &c.controller, c.ca_cert.as_deref())?;
+            let pending = root.join("host.pending.json");
+            if pending.exists() {
+                nodes::private(&pending)?;
+                fs::remove_file(&pending)?;
+            }
+            nodes::write_private(&pending, &json!({"node":v["node"],"config":c}))?;
+            let credentials = nodes::redeem(
+                &c.controller,
+                &json!({"node":v["node"],"secret":v["secret"]}),
+                c.ca_cert.as_deref(),
+            )?;
+            nodes::write_private(&root.join("node.json"),&credentials).context("enrollment consumed but credential publication failed; ask owner to revoke and re-invite a fresh node ID")?;
+            let c=finish_enrollment(&root).context("credentials saved: run host join again to finish locally without another redemption")?;
+            println!(
+                "Host enrolled; private credentials and limits saved. No human login was requested."
+            );
+            if !no_start {
+                start(&root, &c)?;
+            }
+        }
+        HostAction::Start => {
+            let c = finish_enrollment(&root)?;
+            start(&root, &c)?;
+        }
+        HostAction::Status => {
+            let c = read_config(&root)?;
+            let worker = wire::request(&root, json!({"op":"status"})).ok();
+            println!(
+                "{}",
+                json!({"worker":worker,"worker_matches_saved_limits":worker.as_ref().is_some_and(|s|worker_matches(&root,s,&c)),"agent_running":agent_running(&root)?,"node_channel":transport_status(&root),"controller_dispatchable":ready(&root),"controller_status":"Not inferred from local PID; owner pool state is authoritative. Offline/revoked channels do not prove guests stopped.","demand":existing_demand()?})
+            );
+        }
+        HostAction::Stop => {
+            let c = read_config(&root)?;
+            let worker_lock = root.join("worker.lock");
+            match wire::request(&root, json!({"op":"status"})) {
+                Ok(status) => {
+                    ensure!(
+                        worker_matches(&root, &status, &c),
+                        "refusing to stop an unrelated or mismatched worker"
+                    );
+                    ensure!(
+                        held_lock(&worker_lock)?,
+                        "worker ownership lock missing; stop state unknown"
+                    );
+                    wire::request(&root, json!({"op":"shutdown"}))?;
+                }
+                Err(_) => {
+                    ensure!(
+                        !root.join("control.sock").exists()
+                            && !held_lock(&worker_lock)?
+                            && !agent_running(&root)?
+                            && no_guest_processes(&root)?,
+                        "worker unavailable with unresolved process demand; stop state UNKNOWN, no signals sent"
+                    );
+                    ensure!(
+                        worker_lock.exists()
+                            || (!root.join("worker.log").exists()
+                                && !root.join("state.json").exists()),
+                        "worker ownership evidence missing; stop state UNKNOWN"
+                    );
+                }
+            }
+            for _ in 0..100 {
+                if !held_lock(&worker_lock)? && !agent_running(&root)? && no_guest_processes(&root)?
+                {
+                    println!(
+                        "Host participation stopped; owned worker/agent locks released and no guest process in this root; disks retained."
+                    );
+                    return Ok(0);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            bail!("stop pending; process exit unconfirmed; do not signal persisted PIDs");
+        }
+        _ => bail!("invalid local host action"),
+    }
+    Ok(0)
+}
+
+pub fn public_path(path: &str) -> bool {
+    path == "/cli/host-manifest.json"
+        || FILES
+            .iter()
+            .any(|(n, _, _, _)| path == format!("/cli/host/{n}"))
+}
+struct AssetBody {
+    file: fs::File,
+    remaining: u64,
+}
+impl http_body::Body for AssetBody {
+    type Data = axum::body::Bytes;
+    type Error = io::Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.remaining == 0 {
+            return std::task::Poll::Ready(None);
+        }
+        let mut buffer = vec![0u8; self.remaining.min(65536) as usize];
+        match self.file.read(&mut buffer) {
+            Ok(0) => std::task::Poll::Ready(Some(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "asset truncated",
+            )))),
+            Ok(n) => {
+                self.remaining -= n as u64;
+                buffer.truncate(n);
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(buffer.into()))))
+            }
+            Err(e) => std::task::Poll::Ready(Some(Err(e))),
+        }
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
+}
+pub async fn public_download(path: &str, head: bool) -> axum::response::Response {
+    use axum::{body::Body, http::StatusCode, response::IntoResponse};
+    let path = path.to_owned();
+    let result = tokio::task::spawn_blocking(move || -> Result<(fs::File, u64)> {
+        let root = std::env::var_os("OW_HOST_BUNDLE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or(crate::assets().join("host-public"));
+        ensure!(
+            fs::symlink_metadata(&root)?.is_dir(),
+            "unsafe bundle directory"
+        );
+        let bytes = bounded_file(&root.join("manifest.json"), 16384)?;
+        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        validate_manifest(&manifest)?;
+        let (name, size, expected) = if path == "/cli/host-manifest.json" {
+            ("manifest.json".to_owned(), bytes.len() as u64, None)
+        } else {
+            let name = path
+                .strip_prefix("/cli/host/")
+                .context("fixed asset path required")?;
+            let a = manifest
+                .files
+                .iter()
+                .find(|a| a.name == name)
+                .context("fixed asset required")?;
+            (a.name.clone(), a.size, Some(a.sha256.clone()))
+        };
+        let p = root.join(name);
+        let m = fs::symlink_metadata(&p)?;
+        ensure!(
+            m.is_file()
+                && m.len() == size
+                && m.mode() & 0o022 == 0
+                && m.uid() == unsafe { libc::geteuid() },
+            "unsafe published asset"
+        );
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(p)?;
+        if let Some(expected) = expected {
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 65536];
+            loop {
+                let n = file.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buffer[..n]);
+            }
+            ensure!(
+                format!("{:x}", hash.finalize()) == expected,
+                "published asset hash mismatch"
+            );
+            use std::io::Seek;
+            file.rewind()?;
+        }
+        Ok((file, size))
+    })
+    .await;
+    match result {
+        Ok(Ok((file, size))) => {
+            let mut response = axum::response::Response::new(if head {
+                Body::empty()
+            } else {
+                Body::new(AssetBody {
+                    file,
+                    remaining: size,
+                })
+            });
+            response
+                .headers_mut()
+                .insert("content-type", "application/octet-stream".parse().unwrap());
+            response
+                .headers_mut()
+                .insert("content-length", size.to_string().parse().unwrap());
+            response
+        }
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Host runtime bundle unavailable",
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn validates_caps_policy_origin_and_manifest() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let v = json!({"node":"friend","secret":"a".repeat(64),"expires":now+600,"controller":"https://example.test/_nodes","memory":512,"slots":2,"cpus":2,"policy":nodes::POOL_POLICY});
+        assert!(envelope(&v).is_ok());
+        for (key, value) in [
+            ("policy", json!("private")),
+            ("controller", json!("https://example.test/evil")),
+            ("controller", json!("https://user:pass@example.test/_nodes")),
+            ("expires", json!(now)),
+            ("cpus", json!(17)),
+            ("memory", json!(u64::MAX)),
+        ] {
+            let mut bad = v.clone();
+            bad[key] = value;
+            assert!(envelope(&bad).is_err());
+        }
+        let files = FILES
+            .iter()
+            .map(|(n, _, _, _)| json!({"name":n,"size":1,"sha256":"a".repeat(64)}))
+            .collect::<Vec<_>>();
+        let good =
+            json!({"version":1,"runtime":"firecracker-v1.17.0","arch":"x86_64","files":files});
+        assert!(validate_manifest(&serde_json::from_value(good.clone()).unwrap()).is_ok());
+        let mut bad = good.clone();
+        bad["files"][0]["name"] = json!("../etc/passwd");
+        assert!(validate_manifest(&serde_json::from_value(bad).unwrap()).is_err());
+        let mut bad = good;
+        bad["files"][0]["size"] = json!(u64::MAX);
+        assert!(validate_manifest(&serde_json::from_value(bad).unwrap()).is_err());
+    }
+    fn fixture() -> (PathBuf, Config) {
+        let root = std::env::temp_dir().join(format!("ow-h-{}", common::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(root.join("assets")).unwrap();
+        fs::set_permissions(root.join("assets"), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut files = Vec::new();
+        for (name, dest, _, executable) in FILES {
+            let p = root.join("assets").join(dest);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, name.as_bytes()).unwrap();
+            fs::set_permissions(
+                &p,
+                fs::Permissions::from_mode(if executable { 0o700 } else { 0o600 }),
+            )
+            .unwrap();
+            files.push(json!({"name":name,"size":name.len(),"sha256":format!("{:x}",Sha256::digest(name.as_bytes()))}));
+        }
+        nodes::write_private(
+            &root.join("assets/manifest.json"),
+            &json!({"version":1,"runtime":"firecracker-v1.17.0","arch":"x86_64","files":files}),
+        )
+        .unwrap();
+        let c = Config {
+            version: 1,
+            controller: "https://pool.example/_nodes".into(),
+            memory: 512,
+            slots: 2,
+            cpus: 2,
+            storage_gib: 2,
+            policy: nodes::POOL_POLICY.into(),
+            ca_cert: None,
+        };
+        (root, c)
+    }
+    #[test]
+    fn persisted_credential_recovers_config_and_marker_without_redemption() {
+        let (root, c) = fixture();
+        nodes::write_private(
+            &root.join("node.json"),
+            &json!({"node":"friend","credential":"b".repeat(64)}),
+        )
+        .unwrap();
+        nodes::write_private(
+            &root.join("host.pending.json"),
+            &json!({"node":"friend","config":c}),
+        )
+        .unwrap();
+        let recovered = finish_enrollment(&root).unwrap();
+        assert_eq!(recovered.memory, 512);
+        assert!(root.join(".ow-data").exists());
+        assert!(!root.join("host.pending.json").exists());
+        assert!(finish_enrollment(&root).is_ok());
+        let cmd = command(&root, &recovered, "run").unwrap();
+        let env = cmd.get_envs().collect::<Vec<_>>();
+        assert!(
+            env.iter()
+                .any(|(k, v)| *k == "OW_MAX_MEMORY_MIB" && *v == Some(std::ffi::OsStr::new("512")))
+        );
+        assert!(
+            !env.iter()
+                .any(|(k, _)| *k == "HOME" || *k == "OW_SERVER" || *k == "LD_PRELOAD")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn corrupt_assets_symlinks_and_exact_crash_remnants_fail_safely() {
+        let (root, _) = fixture();
+        assert!(verify_assets(&root).is_ok());
+        let base = root.join("assets/guest/base.ext4");
+        fs::write(&base, b"corrupt").unwrap();
+        assert!(verify_assets(&root).is_err());
+        fs::remove_file(&base).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", &base).unwrap();
+        assert!(verify_assets(&root).is_err());
+        let stage = root.join(format!("assets-stage-{}", common::nonce().unwrap()));
+        fs::create_dir(&stage).unwrap();
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(stage.join("guest")).unwrap();
+        fs::write(stage.join("guest/base.ext4"), b"partial").unwrap();
+        let tmp = root.join(format!("marker-{}.tmp", common::nonce().unwrap()));
+        fs::write(&tmp, b"partial").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).unwrap();
+        let unrelated = root.join("my-notes");
+        fs::write(&unrelated, b"keep").unwrap();
+        clean_remnants(&root).unwrap();
+        assert!(!stage.exists());
+        assert!(!tmp.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+        assert!(root.join("assets").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn stop_and_ready_do_not_infer_success_from_missing_rpc_or_stale_ack() {
+        let (root, c) = fixture();
+        nodes::write_private(&root.join("host.json"), &serde_json::to_value(&c).unwrap()).unwrap();
+        let worker = root.join("worker.lock");
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&worker)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(held_lock(&worker).unwrap());
+        assert!(run(Some(root.clone()), HostAction::Stop).is_err());
+        nodes::write_private(&root.join("node-channel.json"),&json!({"state":"dispatchable","updated":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),"instance":"old","generation":"gen"})).unwrap();
+        assert!(!ready(&root));
+        let link = root.join("bad.lock");
+        std::os::unix::fs::symlink(&worker, &link).unwrap();
+        assert!(held_lock(&link).is_err());
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+}

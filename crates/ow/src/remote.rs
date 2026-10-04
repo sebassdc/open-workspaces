@@ -33,6 +33,10 @@ struct Config {
     upstream: String,
     #[serde(default)]
     bootstrap_owner_email: Option<String>,
+    #[serde(default)]
+    node_owner_subject: Option<String>,
+    #[serde(default)]
+    node_owner_user_id: Option<i64>,
 }
 
 impl Config {
@@ -63,6 +67,18 @@ impl Config {
                     .iter()
                     .any(|e| e.eq_ignore_ascii_case(owner)),
                 "bootstrap owner must be allowed to log in"
+            );
+        }
+        ensure!(
+            self.node_owner_subject.is_some() == self.node_owner_user_id.is_some(),
+            "node owner subject and catalog ID must be configured together"
+        );
+        if let Some(subject) = &self.node_owner_subject {
+            ensure!(
+                !subject.is_empty()
+                    && subject.len() <= 512
+                    && self.node_owner_user_id.unwrap_or(0) > 0,
+                "invalid node owner binding"
             );
         }
         let url = reqwest::Url::parse(&self.upstream)?;
@@ -334,8 +350,12 @@ async fn handle(app: &App, request: Request) -> Response {
         )
             .into_response();
     }
+    if request.uri().path().starts_with("/api/hosts/") && app.dashboard.is_some() {
+        return host_admin(app, identity, request).await;
+    }
     if app.dashboard.is_some() {
-        return crate::dashboard::handle(app.catalog.clone(), identity, request).await;
+        let controls = owner_controls(app, &identity).await;
+        return crate::dashboard::handle(app.catalog.clone(), identity, request, controls).await;
     }
     let (parts, body) = request.into_parts();
     let path = parts
@@ -396,6 +416,106 @@ async fn handle(app: &App, request: Request) -> Response {
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
+    response
+}
+
+fn designated_owner(app: &App, identity: &crate::catalog::Identity) -> bool {
+    identity.issuer == app.config.issuer()
+        && app.config.node_owner_subject.as_deref() == Some(identity.subject.as_str())
+        && app.config.node_owner_user_id.is_some()
+}
+async fn owner_controls(app: &App, identity: &crate::catalog::Identity) -> bool {
+    if !designated_owner(app, identity) {
+        return false;
+    }
+    let Some(catalog) = app.catalog.clone() else {
+        return false;
+    };
+    let identity = identity.clone();
+    let expected = app.config.node_owner_user_id.unwrap();
+    tokio::task::spawn_blocking(move || {
+        catalog
+            .lock()
+            .ok()
+            .is_some_and(|c| c.bound_identity(expected, &identity).unwrap_or(false))
+    })
+    .await
+    .unwrap_or(false)
+}
+async fn host_admin(app: &App, identity: crate::catalog::Identity, request: Request) -> Response {
+    use serde_json::{Value, json};
+    // Identity comes only from verified JWT claims. Never bind authority by email.
+    if !owner_controls(app, &identity).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let path = request.uri().path().to_owned();
+    if request.uri().query().is_some()
+        || request.method() != Method::POST
+        || request
+            .headers()
+            .get("x-ow-request")
+            .and_then(|h| h.to_str().ok())
+            != Some("dashboard")
+        || request
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            != Some("application/json")
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Ok(bytes) = to_bytes(request.into_body(), 4096).await else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        node: String,
+        ttl: Option<u64>,
+        memory: Option<u32>,
+        slots: Option<u32>,
+        cpus: Option<u32>,
+    }
+    let Ok(input) = serde_json::from_slice::<Input>(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let root = app.dashboard.clone().unwrap();
+    let controller = format!("https://{}/_nodes", app.config.hostname);
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        match path.as_str() {
+            "/api/hosts/invite" => crate::nodes::invitation(
+                &root,
+                &input.node,
+                input.ttl.unwrap_or(600),
+                input.memory.unwrap_or(512),
+                input.slots.unwrap_or(2),
+                input.cpus.unwrap_or(2),
+                Some(&controller),
+                |_| Ok(()),
+            ),
+            "/api/hosts/revoke" => {
+                ensure!(
+                    input.ttl.is_none()
+                        && input.memory.is_none()
+                        && input.slots.is_none()
+                        && input.cpus.is_none(),
+                    "invalid revoke"
+                );
+                crate::common::identifier(&input.node)?;
+                crate::nodes::revoke(&root, &input.node)?;
+                Ok(json!({"revoked":input.node}))
+            }
+            _ => anyhow::bail!("unknown host operation"),
+        }
+    })
+    .await;
+    let mut response=match result { Ok(Ok(value)) => axum::Json(json!({"ok":true,"result":value})).into_response(), _ => (StatusCode::CONFLICT,axum::Json(json!({"ok":false,"error":"Host operation rejected; check node ID, expiry and capacity."}))).into_response() };
+    response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     response
 }
 
@@ -542,6 +662,8 @@ mod tests {
             allowed_emails: vec!["owner@example.test".into()],
             upstream,
             bootstrap_owner_email: None,
+            node_owner_subject: None,
+            node_owner_user_id: None,
         }
     }
 
@@ -1187,5 +1309,92 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         drop(cleanup);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_admin_requires_verified_subject_and_exact_bound_catalog_id() {
+        use crate::catalog::{Catalog, Identity};
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("ow-host-auth-{}", crate::common::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut catalog =
+            Catalog::open(&root, "https://test-team.cloudflareaccess.com", None).unwrap();
+        let identity = Identity {
+            issuer: "https://test-team.cloudflareaccess.com".into(),
+            subject: "test-subject".into(),
+            email: "owner@example.test".into(),
+        };
+        let owner = catalog.user(&identity).unwrap();
+        let (key, set) = signing_key();
+        let mut config = config("http://127.0.0.1:1".into());
+        config.node_owner_subject = Some(identity.subject.clone());
+        config.node_owner_user_id = Some(owner);
+        let mut app = App {
+            dashboard: Some(root.clone()),
+            catalog: Some(Arc::new(std::sync::Mutex::new(catalog))),
+            config,
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set,
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        };
+        let make = |jwt: Option<String>, node: &str| {
+            let mut r = Request::builder()
+                .method(Method::POST)
+                .uri("/api/hosts/invite")
+                .header("host", "app.example.test")
+                .header("origin", "https://app.example.test")
+                .header("content-type", "application/json")
+                .header("x-ow-request", "dashboard")
+                .header("cf-access-authenticated-user-email", "owner@example.test");
+            if let Some(jwt) = jwt {
+                r = r.header("cf-access-jwt-assertion", jwt);
+            }
+            r.body(Body::from(json!({"node":node,"cpus":1}).to_string()))
+                .unwrap()
+        };
+        for subject in ["other-subject", ""] {
+            let mut c = claims();
+            c["sub"] = json!(subject);
+            let response = handle(&app, make(Some(token(&key, &c)), "denied")).await;
+            assert!(matches!(
+                response.status(),
+                StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+            ));
+        }
+        assert_eq!(
+            handle(&app, make(None, "denied")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        app.config.node_owner_user_id = Some(owner + 1);
+        assert_eq!(
+            handle(&app, make(Some(token(&key, &claims())), "denied"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        app.config.node_owner_user_id = None;
+        app.config.node_owner_subject = None;
+        assert_eq!(
+            handle(&app, make(Some(token(&key, &claims())), "denied"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(crate::nodes::inventory(&root).unwrap(), json!([]));
+        app.config.node_owner_subject = Some(identity.subject);
+        app.config.node_owner_user_id = Some(owner);
+        let response = handle(&app, make(Some(token(&key, &claims())), "friend")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["result"]["cpus"], 1);
+        assert_eq!(v["result"]["controller"], "https://app.example.test/_nodes");
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
     }
 }

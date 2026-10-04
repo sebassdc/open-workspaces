@@ -11,6 +11,8 @@ mod network;
 #[cfg(target_os = "linux")]
 mod nodes;
 #[cfg(target_os = "linux")]
+mod onboarding;
+#[cfg(target_os = "linux")]
 mod remote;
 #[cfg(target_os = "linux")]
 mod runtime;
@@ -47,6 +49,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Invite or contribute a trusted Linux host to the shared private pool.
+    Host {
+        #[command(subcommand)]
+        command: HostAction,
+    },
     /// Sign in through Cloudflare Access and save the remote server.
     Login {
         url: String,
@@ -87,6 +94,12 @@ enum Action {
         memory: u32,
         #[arg(long, default_value_t = 2)]
         slots: u32,
+        /// Legacy default remains 16; guided invitations normally cap at 2.
+        #[arg(long, default_value_t = 16)]
+        cpus: u32,
+        /// Include a validated self-contained HTTPS controller endpoint.
+        #[arg(long)]
+        controller: Option<String>,
     },
     NodeRevoke {
         node: String,
@@ -196,6 +209,58 @@ enum Action {
     },
 }
 
+#[derive(Subcommand)]
+enum HostAction {
+    /// Check Linux/KVM/storage/tools and current host demand without starting VMs.
+    Doctor,
+    /// Guided join. Paste a private invitation at the hidden prompt.
+    Join {
+        #[arg(long)]
+        controller: Option<String>,
+        #[arg(long)]
+        invite_file: Option<PathBuf>,
+        /// Additional CA for a self-hosted controller (advanced).
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
+        #[arg(long)]
+        memory: Option<u32>,
+        #[arg(long)]
+        slots: Option<u32>,
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Minimum free disk space to retain (preflight threshold, not a quota).
+        #[arg(long)]
+        storage_gib: Option<u32>,
+        #[arg(long)]
+        accept_shared_pool: bool,
+        /// Prepare enrollment/config only; do not start processes.
+        #[arg(long)]
+        no_start: bool,
+    },
+    Start,
+    Status,
+    Stop,
+    /// Designated owner only; requires human Access login.
+    Invite {
+        node: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = 600)]
+        ttl: u64,
+        #[arg(long, default_value_t = 512)]
+        memory: u32,
+        #[arg(long, default_value_t = 2)]
+        slots: u32,
+        #[arg(long, default_value_t = 2)]
+        cpus: u32,
+    },
+    Revoke {
+        node: String,
+    },
+    #[command(hide = true)]
+    Run,
+}
+
 fn assets() -> PathBuf {
     std::env::var_os("OW_ASSET_DIR")
         .map(PathBuf::from)
@@ -204,6 +269,38 @@ fn assets() -> PathBuf {
 
 fn main_result() -> anyhow::Result<i32> {
     let cli = Cli::parse();
+    if let Action::Host { command } = cli.command {
+        if matches!(
+            command,
+            HostAction::Invite { .. } | HostAction::Revoke { .. }
+        ) {
+            let selected = cli.server.or_else(|| std::env::var("OW_SERVER").ok());
+            let server = match selected {
+                Some(server) => Some(server),
+                None => client::saved_server()?,
+            }
+            .ok_or_else(|| anyhow::anyhow!("owner administration requires ow login <server>"))?;
+            anyhow::ensure!(
+                !cli.local_mode,
+                "owner host administration uses the verified human gateway"
+            );
+            return client::host_admin(&server, command);
+        }
+        anyhow::ensure!(
+            cli.server.is_none(),
+            "host participation is local; omit --server (invitation includes controller)"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            return onboarding::run(cli.data_dir, command);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            anyhow::bail!(
+                "Host participation requires Linux x86-64; macOS remains a remote client"
+            );
+        }
+    }
     if let Action::Login { url } = &cli.command {
         client::login(url)?;
         return Ok(0);

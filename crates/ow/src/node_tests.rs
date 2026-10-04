@@ -452,3 +452,152 @@ async fn worker_accepted_lost_reply_reopens_with_one_create_and_one_exec() {
     runtime.join().unwrap();
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn invited_caps_replacement_revoked_and_publication_failure() {
+    let root = root();
+    let first = invitation(
+        &root,
+        "friend",
+        600,
+        512,
+        2,
+        2,
+        Some("https://pool.example/_nodes"),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let next = invitation(
+        &root,
+        "friend",
+        600,
+        1024,
+        3,
+        1,
+        Some("https://pool.example/_nodes"),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert!(enroll(&root, first).is_err());
+    // Publisher failure must roll back replacement and retain the prior invitation.
+    assert!(
+        invitation(&root, "friend", 600, 2048, 4, 4, None, |_| anyhow::bail!(
+            "simulated publication failure"
+        ))
+        .is_err()
+    );
+    let cap: u32 = db(&root)
+        .unwrap()
+        .query_row(
+            "SELECT vcpu_cap FROM node_limits WHERE node='friend'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cap, 1);
+    assert!(enroll(&root, next).is_ok());
+    let unused = invitation(&root, "unused", 600, 512, 2, 2, None, |_| Ok(())).unwrap();
+    revoke(&root, "unused").unwrap();
+    assert!(invitation(&root, "unused", 600, 512, 2, 2, None, |_| Ok(())).is_err());
+    assert!(enroll(&root, unused).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_aliases_share_native_generation_and_clamp_forged_capacity() {
+    let root = root();
+    let invite = invitation(&root, "friend", 600, 512, 2, 1, None, |_| Ok(())).unwrap();
+    let c = Controller {
+        root: root.clone(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        jobs: Arc::new(Mutex::new(HashMap::new())),
+        slots: Arc::new(Semaphore::new(32)),
+    };
+    // Simulated proxy presence only; no worker or VM runs in this fixture.
+    fs::create_dir_all(root.join("nodes/friend")).unwrap();
+    fs::write(root.join("nodes/friend/control.sock"), b"fixture").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let app = routes(c.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    for path in [
+        "/_nodes/api/state",
+        "/_nodes/enroll/extra",
+        "/_nodes/node/friend/extra",
+        "/_nodes//enroll",
+        "/_nodes/%65nroll",
+        "/_nodes/enroll?secret=x",
+    ] {
+        let response = client
+            .post(format!("{origin}{path}"))
+            .json(&invite)
+            .send()
+            .await
+            .unwrap();
+        assert!(!response.status().is_success(), "{path}");
+    }
+    assert_eq!(
+        client
+            .get(format!("{origin}/_nodes/enroll"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    let response = client
+        .post(format!("{origin}/_nodes/enroll"))
+        .json(&invite)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let credentials: Value = response.json().await.unwrap();
+    let root1 = root.clone();
+    let c1 = c.clone();
+    tokio::task::spawn_blocking(move||{
+        let bearer=credentials["credential"].as_str().unwrap();
+        let mut old=socket(&origin,"/node/friend",bearer,None).unwrap();timeout_socket(&old).unwrap();
+        let heartbeat=json!({"type":"heartbeat","protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":4096,"slots":8,"vcpus":16,"images":["alpine"]});
+        old.send(tungstenite::Message::Text(heartbeat.to_string().into())).unwrap();
+        for _ in 0..100{if online(&root1,"friend").is_ok(){break;}std::thread::sleep(Duration::from_millis(10));}
+        let inventory=inventory(&root1).unwrap();assert_eq!(inventory[0]["capabilities"]["vcpus"],1);assert_eq!(inventory[0]["memory_mib"],512);assert_eq!(inventory[0]["slots"],2);
+        let generation=c1.sessions.lock().unwrap()["friend"].generation.clone();
+        let mut public=socket(&origin,"/_nodes/node/friend",bearer,None).unwrap();timeout_socket(&public).unwrap();let mut ack=heartbeat;ack["ready_ack"]=json!(true);public.send(tungstenite::Message::Text(ack.to_string().into())).unwrap();
+        let deadline=std::time::Instant::now();loop{match public.read(){Ok(tungstenite::Message::Text(t))=>{let v:Value=serde_json::from_str(&t).unwrap();assert_eq!(v["type"],"ready");assert_ne!(v["generation"],generation);break;},Ok(tungstenite::Message::Ping(v))=>public.send(tungstenite::Message::Pong(v)).unwrap(),Err(e) if timed_out(&e)=>assert!(deadline.elapsed()<Duration::from_secs(5)),other=>panic!("unexpected {other:?}")}}
+        assert_ne!(c1.sessions.lock().unwrap()["friend"].generation,generation);
+        revoke(&root1,"friend").unwrap();assert!(socket(&origin,"/_nodes/node/friend",bearer,None).is_err());assert!(socket(&origin,"/node/friend",bearer,None).is_err());
+    }).await.unwrap();
+    for _ in 0..100 {
+        if c.sessions.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        c.sessions.lock().unwrap().is_empty(),
+        "fixture channels did not drain"
+    );
+    server.abort();
+    // Map removal precedes the final generation-scoped SQLite cleanup write.
+    // Delete only this disposable fixture, retrying its teardown race briefly.
+    let cleanup = std::time::Instant::now();
+    loop {
+        match fs::remove_dir_all(&root) {
+            Ok(()) => break,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && cleanup.elapsed() < Duration::from_secs(2) =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+            Err(e) => panic!("fixture cleanup failed: {e}"),
+        }
+    }
+}

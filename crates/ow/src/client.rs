@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     process::{Command, Stdio},
     time::Duration,
@@ -162,6 +162,109 @@ fn request(url: &str, token: &str, operation: Option<Value>) -> Result<Value> {
     );
     Ok(result["result"].clone())
 }
+pub fn host_admin(url: &str, action: crate::HostAction) -> Result<i32> {
+    let url = server(url)?;
+    let (path, body, output) = match action {
+        crate::HostAction::Invite {
+            node,
+            output,
+            ttl,
+            memory,
+            slots,
+            cpus,
+        } => (
+            "invite",
+            json!({"node":node,"ttl":ttl,"memory":memory,"slots":slots,"cpus":cpus}),
+            output,
+        ),
+        crate::HostAction::Revoke { node } => ("revoke", json!({"node":node}), None),
+        _ => bail!("invalid host administration command"),
+    };
+    struct OutputStage {
+        path: PathBuf,
+        file: fs::File,
+    }
+    impl Drop for OutputStage {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+    let mut stage = if let Some(output) = &output {
+        ensure!(
+            fs::symlink_metadata(output).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "invitation output exists or cannot be inspected"
+        );
+        let parent = output
+            .parent()
+            .context("private output directory required")?;
+        let m = fs::symlink_metadata(parent)?;
+        ensure!(
+            m.is_dir() && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o077 == 0,
+            "invitation output directory must be owned/private (0700)"
+        );
+        let path = parent.join(format!("invite-{}.tmp", common::nonce()?));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        Some(OutputStage { path, file })
+    } else {
+        if path == "invite" {
+            ensure!(
+                unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1,
+                "use --output PRIVATE_FILE when stdout is not a terminal"
+            );
+        }
+        None
+    };
+    let token = token(&url)?;
+    let client = reqwest::blocking::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let response = client
+        .post(format!("{url}/api/hosts/{path}"))
+        .header("cf-access-token", token)
+        .header("origin", &url)
+        .header("x-ow-request", "dashboard")
+        .json(&body)
+        .send()?;
+    ensure!(
+        response.status().is_success(),
+        "owner host operation rejected or response uncertain; re-invite invalidates the prior unused invitation"
+    );
+    let mut bytes = Vec::new();
+    response.take(4097).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 4096, "host response too large");
+    let value: Value = serde_json::from_slice(&bytes)?;
+    ensure!(value["ok"] == true, "host operation rejected");
+    if path == "invite" {
+        if let Some(output) = output {
+            let mut publish = || -> Result<()> {
+                let stage = stage.as_mut().context("private output stage missing")?;
+                stage
+                    .file
+                    .write_all(value["result"].to_string().as_bytes())?;
+                stage.file.sync_all()?;
+                fs::hard_link(&stage.path, &output)?;
+                fs::File::open(output.parent().unwrap())?.sync_all()?;
+                Ok(())
+            };
+            publish().context("server invitation was possibly replaced; local publication failed. Deliberately reissue this unused node invitation to invalidate it")?;
+            println!(
+                "Private invitation saved. Share it securely with the trusted host operator; it does not grant human login."
+            );
+        } else {
+            println!("{}", value["result"]);
+        }
+    } else {
+        println!("Node revoked; disconnected host effects already accepted cannot be undone.");
+    }
+    Ok(0)
+}
+
 pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
     let url = server(url)?;
     // Validate scope before asking for a credential.

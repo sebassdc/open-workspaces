@@ -63,9 +63,10 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY, credential_hash TEXT, revoked INTEGER NOT NULL DEFAULT 0, heartbeat INTEGER NOT NULL DEFAULT 0, memory_mib INTEGER NOT NULL, slots INTEGER NOT NULL, capabilities TEXT NOT NULL DEFAULT '{}', session TEXT);
       CREATE TABLE IF NOT EXISTS node_joins(secret_hash TEXT PRIMARY KEY, node TEXT NOT NULL REFERENCES nodes(id), expires INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS node_limits(node TEXT PRIMARY KEY REFERENCES nodes(id), vcpu_cap INTEGER NOT NULL CHECK(vcpu_cap BETWEEN 1 AND 16));")?;
     Ok(db)
 }
-fn private(path: &Path) -> Result<()> {
+pub(crate) fn private(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
     ensure!(
         m.is_file() && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o077 == 0,
@@ -73,7 +74,7 @@ fn private(path: &Path) -> Result<()> {
     );
     Ok(())
 }
-fn write_private(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn write_private(path: &Path, value: &Value) -> Result<()> {
     let parent = path.parent().context("private parent directory required")?;
     let m = fs::symlink_metadata(parent)?;
     ensure!(
@@ -81,17 +82,20 @@ fn write_private(path: &Path, value: &Value) -> Result<()> {
         "credential directory must be owned and private"
     );
     let temporary = path.with_extension(format!("{}.tmp", common::nonce()?));
-    let mut f = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    f.write_all(value.to_string().as_bytes())?;
-    f.sync_all()?;
-    let published = fs::hard_link(&temporary, path);
-    let _ = fs::remove_file(temporary);
-    published?;
-    fs::File::open(path.parent().context("parent directory")?)?.sync_all()?;
+    let result = (|| -> Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        f.write_all(value.to_string().as_bytes())?;
+        f.sync_all()?;
+        fs::hard_link(&temporary, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result?;
     Ok(())
 }
 pub fn mint(
@@ -102,10 +106,31 @@ pub fn mint(
     memory: u32,
     slots: u32,
 ) -> Result<()> {
+    let value = invitation(root, node, ttl, memory, slots, 16, None, |v| {
+        write_private(output, v)
+    })?;
+    drop(value);
+    Ok(())
+}
+pub const POOL_POLICY: &str = "Trusted shared private pool: all admitted workspace users may select this host. The host operator can inspect guest data and stop participation. This invitation grants node participation only, not human workspace management.";
+#[allow(clippy::too_many_arguments)] // Explicit owner-issued limits and transactional publication callback.
+pub fn invitation(
+    root: &Path,
+    node: &str,
+    ttl: u64,
+    memory: u32,
+    slots: u32,
+    cpus: u32,
+    controller: Option<&str>,
+    publish: impl FnOnce(&Value) -> Result<()>,
+) -> Result<Value> {
     common::identifier(node)?;
     ensure!(node != "local", "local is reserved");
     ensure!(
-        (1..=3600).contains(&ttl) && (256..=4096).contains(&memory) && (1..=8).contains(&slots),
+        (1..=3600).contains(&ttl)
+            && (256..=4096).contains(&memory)
+            && (1..=8).contains(&slots)
+            && (1..=16).contains(&cpus),
         "invalid enrollment limits"
     );
     let mut db = db(root)?;
@@ -113,20 +138,27 @@ pub fn mint(
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     ensure!(
         !tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND credential_hash IS NOT NULL)",
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND (credential_hash IS NOT NULL OR revoked=1))",
             [node],
             |r| r.get::<_, bool>(0)
         )?,
-        "node already enrolled; use a new node ID after revocation"
+        "node already enrolled or revoked; use a new node ID"
     );
     tx.execute("INSERT INTO nodes(id,memory_mib,slots) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET memory_mib=?2,slots=?3", params![node,memory,slots])?;
     tx.execute(
         "INSERT INTO node_joins(secret_hash,node,expires) VALUES(?1,?2,?3)",
         params![digest(&secret), node, now() + ttl as i64],
     )?;
-    write_private(output, &json!({"node":node,"secret":secret}))?;
+    tx.execute("INSERT INTO node_limits(node,vcpu_cap) VALUES(?1,?2) ON CONFLICT(node) DO UPDATE SET vcpu_cap=?2",params![node,cpus])?;
+    // Reissuing an unused invitation invalidates the older invitations for this node.
+    tx.execute(
+        "UPDATE node_joins SET consumed=1 WHERE node=?1 AND secret_hash<>?2",
+        params![node, digest(&secret)],
+    )?;
+    let value = json!({"node":node,"secret":secret,"expires":now()+ttl as i64,"policy":POOL_POLICY,"controller":controller,"memory":memory,"slots":slots,"cpus":cpus});
+    publish(&value)?;
     tx.commit()?;
-    Ok(())
+    Ok(value)
 }
 fn enroll(root: &Path, value: Value) -> Result<Value> {
     let node = value["node"].as_str().context("node required")?;
@@ -306,7 +338,14 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
                     if v["type"]!="heartbeat" || v["protocol"]!=1 || v["backend"]!="firecracker" || v["arch"]!="x86_64" || v["runtime"]!="firecracker-v1.17.0" || !(256..=4096).contains(&v["memory_mib"].as_u64().unwrap_or(0)) || !(1..=8).contains(&v["slots"].as_u64().unwrap_or(0)) || !(1..=16).contains(&v["vcpus"].as_u64().unwrap_or(0)) || !v["images"].as_array().is_some_and(|a|a.len()<=3 && a.iter().all(|i|matches!(i.as_str(),Some("alpine"|"arch"|"ubuntu")))) {break;}
                     last=tokio::time::Instant::now();
                     if !c.root.join("nodes").join(&node).join("control.sock").exists(){continue;}
-                    if let Ok(db)=db(&c.root) {let _=db.execute("UPDATE nodes SET heartbeat=?1,capabilities=?2 WHERE id=?3 AND session=?4 AND revoked=0",params![now(),json!({"protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":v["memory_mib"],"slots":v["slots"],"vcpus":v["vcpus"],"images":v["images"]}).to_string(),node,generation]);}
+                    if let Ok(db)=db(&c.root)
+                        && let Ok((ram,slots,cpus)) = db.query_row("SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16) FROM nodes WHERE id=?1",[&node],|r|Ok((r.get::<_,u32>(0)? as u64,r.get::<_,u32>(1)? as u64,r.get::<_,u32>(2)? as u64))) {
+                            let cap=json!({"protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":v["memory_mib"].as_u64().unwrap().min(ram),"slots":v["slots"].as_u64().unwrap().min(slots),"vcpus":v["vcpus"].as_u64().unwrap().min(cpus),"images":v["images"]});
+                            if db.execute("UPDATE nodes SET heartbeat=?1,capabilities=?2 WHERE id=?3 AND session=?4 AND revoked=0",params![now(),cap.to_string(),node,generation]).is_ok_and(|n|n==1) {
+                                // Old native agents expect job IDs only; acknowledge only the guided agent's optional extension.
+                                if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break;}}
+                            }
+                    }
                 }, Some(Ok(Message::Pong(_)))=>{}, _=>break}
             }
             id=rx.recv()=>{
@@ -498,12 +537,23 @@ where
 }
 fn routes(c: Controller) -> Router {
     Router::new()
+        .route("/_nodes/enroll", post(enrollment))
+        .route("/_nodes/node/{node}", get(session))
+        .route("/_nodes/job/{node}/{id}", get(job))
         .route("/enroll", post(enrollment))
         .route("/node/{node}", get(session))
         .route("/job/{node}/{id}", get(job))
         .layer(axum::extract::DefaultBodyLimit::max(4096))
         .layer(axum::middleware::from_fn(
             |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                let path = request.uri().path();
+                if request.uri().query().is_some()
+                    || path.contains('%')
+                    || path.contains("..")
+                    || request.uri().authority().is_some()
+                {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
                 tokio::time::timeout(Duration::from_secs(10), next.run(request))
                     .await
                     .unwrap_or_else(|_| StatusCode::REQUEST_TIMEOUT.into_response())
@@ -575,7 +625,7 @@ pub fn controller(
     })
 }
 
-fn origin(value: &str, insecure: bool) -> Result<String> {
+pub(crate) fn origin(value: &str, insecure: bool) -> Result<String> {
     let u = reqwest::Url::parse(value)?;
     let loopback = u.host_str().is_some_and(|h| {
         h == "localhost"
@@ -584,7 +634,8 @@ fn origin(value: &str, insecure: bool) -> Result<String> {
     });
     ensure!(
         (u.scheme() == "https" || (insecure && u.scheme() == "http" && loopback))
-            && u.path() == "/"
+            && matches!(u.path(), "/" | "/_nodes" | "/_nodes/")
+            && u.host_str().is_some()
             && u.query().is_none()
             && u.fragment().is_none()
             && u.username().is_empty()
@@ -710,6 +761,57 @@ fn timed_out(error: &tungstenite::Error) -> bool {
     matches!(error,tungstenite::Error::Io(e) if matches!(e.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::TimedOut))
 }
 
+fn channel_status(
+    root: &Path,
+    state: &str,
+    instance: &str,
+    generation: Option<&str>,
+) -> Result<()> {
+    let temporary = root.join(format!("channel-{}.tmp", common::nonce()?));
+    let node = fs::read(root.join("node.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .map(|v| v["node"].clone())
+        .unwrap_or(Value::Null);
+    write_private(
+        &temporary,
+        &json!({"state":state,"updated":now(),"instance":instance,"generation":generation,"node":node}),
+    )?;
+    fs::rename(&temporary, root.join("node-channel.json"))?;
+    Ok(())
+}
+pub(crate) fn redeem(origin: &str, value: &Value, ca: Option<&Path>) -> Result<Value> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(ca) = ca {
+        builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&fs::read(ca)?)?);
+    }
+    let response = builder
+        .build()?
+        .post(format!("{origin}/enroll"))
+        .json(value)
+        .send()?;
+    ensure!(
+        response.status().is_success(),
+        "enrollment rejected; if response was lost, ask owner to revoke and invite a new node ID"
+    );
+    let mut bytes = Vec::new();
+    response.take(4097).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 4096, "enrollment response too large");
+    let result: Value = serde_json::from_slice(&bytes)?;
+    common::identifier(result["node"].as_str().context("node required")?)?;
+    ensure!(
+        result["node"] == value["node"]
+            && result["credential"]
+                .as_str()
+                .is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())),
+        "invalid enrollment response"
+    );
+    Ok(result)
+}
+
 pub fn agent(
     root: &Path,
     controller: &str,
@@ -730,23 +832,41 @@ pub fn agent(
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "node agent already running"
     );
+    let instance = common::nonce()?;
+    let mut lock = &lock;
+    let start = fs::read_to_string("/proc/self/stat")?
+        .rsplit_once(')')
+        .context("process stat")?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .context("process start time")?
+        .to_owned();
+    lock.set_len(0)?;
+    lock.write_all(
+        json!({"pid":std::process::id(),"start":start,"instance":instance})
+            .to_string()
+            .as_bytes(),
+    )?;
+    lock.sync_all()?;
+    struct ChannelGuard<'a> {
+        root: &'a Path,
+        instance: &'a str,
+    }
+    impl Drop for ChannelGuard<'_> {
+        fn drop(&mut self) {
+            let _ = channel_status(self.root, "stopped", self.instance, None);
+        }
+    }
+    let _channel_guard = ChannelGuard {
+        root,
+        instance: &instance,
+    };
     if !credential_file.exists() {
         let join = join.context("join file required for first enrollment")?;
         private(join)?;
         let value: Value = serde_json::from_slice(&fs::read(join)?)?;
-        let mut builder = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none());
-        if let Some(ca) = ca {
-            builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&fs::read(ca)?)?);
-        }
-        let response = builder
-            .build()?
-            .post(format!("{origin}/enroll"))
-            .json(&value)
-            .send()?;
-        ensure!(response.status().is_success(), "enrollment rejected");
-        let credentials: Value = response.json()?;
+        let credentials = redeem(&origin, &value, ca)?;
         write_private(credential_file, &credentials)?;
         fs::remove_file(join)?;
     }
@@ -774,21 +894,40 @@ pub fn agent(
                 .exists()
         })
         .collect::<Vec<_>>();
-    let hello=json!({"type":"heartbeat","protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images}).to_string();
+    let guided = root.join("host.json").exists();
+    let hello=json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images}).to_string();
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
+        wire::request(root, json!({"op":"status"}))
+            .context("local worker stopped; host participation ended")?;
         let result = (|| -> Result<()> {
+            if guided {
+                channel_status(root, "connecting", &instance, None)?;
+            }
             let mut ws = socket(&origin, &format!("/node/{node}"), &credential, ca)?;
             timeout_socket(&ws)?;
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
             loop {
                 if heartbeat.elapsed() > Duration::from_secs(3) {
+                    wire::request(root, json!({"op":"status"})).context("local worker stopped")?;
                     ws.send(tungstenite::Message::Text(hello.clone().into()))?;
                     heartbeat = std::time::Instant::now();
                 }
                 match ws.read() {
                     Ok(tungstenite::Message::Text(id)) => {
+                        if guided && let Ok(v) = serde_json::from_str::<Value>(&id) {
+                            ensure!(
+                                v["type"] == "ready" && v["node"] == node,
+                                "invalid controller acknowledgement"
+                            );
+                            let generation = v["generation"]
+                                .as_str()
+                                .context("acknowledgement generation required")?;
+                            common::identifier(generation)?;
+                            channel_status(root, "dispatchable", &instance, Some(generation))?;
+                            continue;
+                        }
                         common::identifier(&id)?;
                         use std::sync::atomic::Ordering;
                         if active
@@ -821,6 +960,9 @@ pub fn agent(
             }
         })();
         if result.is_err() {
+            if guided {
+                let _ = channel_status(root, "disconnected", &instance, None);
+            }
             eprintln!("node channel disconnected; reconnecting");
         }
         std::thread::sleep(Duration::from_secs(2));

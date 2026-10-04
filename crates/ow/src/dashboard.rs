@@ -153,16 +153,17 @@ fn secure(mut response: Response) -> Response {
 }
 
 pub fn public_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/cli/install.sh"
-            | "/cli/ow-linux-amd64"
-            | "/cli/ow-linux-amd64.sha256"
-            | "/cli/ow-darwin-arm64"
-            | "/cli/ow-darwin-arm64.sha256"
-            | "/cli/ow-darwin-amd64"
-            | "/cli/ow-darwin-amd64.sha256"
-    )
+    crate::onboarding::public_path(path)
+        || matches!(
+            path,
+            "/cli/install.sh"
+                | "/cli/ow-linux-amd64"
+                | "/cli/ow-linux-amd64.sha256"
+                | "/cli/ow-darwin-arm64"
+                | "/cli/ow-darwin-arm64.sha256"
+                | "/cli/ow-darwin-amd64"
+                | "/cli/ow-darwin-amd64.sha256"
+        )
 }
 pub async fn public_download(origin: &str, request: Request) -> Response {
     if !matches!(*request.method(), Method::GET | Method::HEAD)
@@ -174,6 +175,9 @@ pub async fn public_download(origin: &str, request: Request) -> Response {
     }
     let head = request.method() == Method::HEAD;
     let path = request.uri().path();
+    if crate::onboarding::public_path(path) {
+        return secure(crate::onboarding::public_download(path, head).await);
+    }
     let result: Result<(&str, Vec<u8>)> = match path {
         "/cli/install.sh" => Ok((
             "text/plain; charset=utf-8",
@@ -239,6 +243,7 @@ pub async fn handle(
     catalog: Option<Arc<Mutex<Catalog>>>,
     identity: Identity,
     request: Request,
+    host_controls: bool,
 ) -> Response {
     let path = request.uri().path();
     let method = request.method().clone();
@@ -272,7 +277,13 @@ pub async fn handle(
         }
     }
     if path == "/api/state" && method == Method::GET {
-        let result = with_catalog(catalog, identity, |catalog, user| catalog.state(user)).await;
+        let result = with_catalog(catalog, identity, move |catalog, user| {
+            let mut state = catalog.state(user)?;
+            state["host_controls"] = json!(host_controls);
+            state["pool_policy"] = json!(crate::nodes::POOL_POLICY);
+            Ok(state)
+        })
+        .await;
         return secure(match result {
             Ok(value) => Json(json!({"ok":true,"result":value})).into_response(),
             _ => (

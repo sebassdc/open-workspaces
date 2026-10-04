@@ -539,8 +539,26 @@ pub fn run(cli: Cli) -> Result<i32> {
             ttl,
             memory,
             slots,
+            cpus,
+            controller,
         } => {
-            crate::nodes::mint(&root, &node, &output, ttl, memory, slots)?;
+            if cpus == 16 && controller.is_none() {
+                crate::nodes::mint(&root, &node, &output, ttl, memory, slots)?;
+            } else {
+                let controller = controller
+                    .map(|value| crate::nodes::origin(&value, false))
+                    .transpose()?;
+                crate::nodes::invitation(
+                    &root,
+                    &node,
+                    ttl,
+                    memory,
+                    slots,
+                    cpus,
+                    controller.as_deref(),
+                    |v| crate::nodes::write_private(&output, v),
+                )?;
+            }
             return Ok(0);
         }
         Action::NodeRevoke { node } => {
@@ -576,7 +594,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             remote::run(&config, listen, None)?;
             return Ok(0);
         }
-        Action::Login { .. } => unreachable!(),
+        Action::Login { .. } | Action::Host { .. } => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;
             return Ok(0);
