@@ -6,14 +6,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
     os::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 // Fixed wire names and private runtime destinations. No extraction or arbitrary paths.
@@ -626,6 +626,95 @@ fn download_headroom(available: u64, transfer: u64, reserve_gib: u32) -> bool {
         .and_then(|n| n.checked_add(512 * 1024 * 1024))
         .is_some_and(|required| available > required)
 }
+// Presentation only: stderr failures must not change download integrity or stdout.
+struct AssetProgress {
+    tty: bool,
+    total: u64,
+    received: u64,
+    started: Instant,
+    refreshed: Instant,
+    finished: bool,
+}
+impl AssetProgress {
+    fn bytes(bytes: u64) -> String {
+        if bytes >= 1024 * 1024 * 1024 {
+            format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else {
+            format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+        }
+    }
+    fn new(total: u64) -> Self {
+        let now = Instant::now();
+        let progress = Self {
+            tty: io::stderr().is_terminal(),
+            total,
+            received: 0,
+            started: now,
+            refreshed: now,
+            finished: false,
+        };
+        progress.line(&format!("Downloading assets: {total} bytes"));
+        progress
+    }
+    fn line(&self, message: &str) {
+        let mut stderr = io::stderr().lock();
+        if self.tty {
+            let _ = write!(stderr, "\r\x1b[2K");
+        }
+        let _ = writeln!(stderr, "{message}");
+        let _ = stderr.flush();
+    }
+    fn render(&mut self, name: &str, force: bool) {
+        if !self.tty || (!force && self.refreshed.elapsed() < Duration::from_millis(200)) {
+            return;
+        }
+        self.refreshed = Instant::now();
+        let percent = self.received * 100 / self.total;
+        let filled = (percent / 10) as usize;
+        let rate = self.received as f64 / self.started.elapsed().as_secs_f64().max(0.001);
+        let mut stderr = io::stderr().lock();
+        let mut display = format!(
+            "Download [{}{}] {percent:3}% {}/{} {:.1} MiB/s {name}",
+            "#".repeat(filled),
+            "-".repeat(10 - filled),
+            Self::bytes(self.received),
+            Self::bytes(self.total),
+            rate / (1024.0 * 1024.0),
+        );
+        // Keep the ASCII status on one physical row, including narrow terminals.
+        let mut window: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(stderr.as_raw_fd(), libc::TIOCGWINSZ, &mut window) } == 0
+            && window.ws_col > 0
+        {
+            display.truncate(usize::from(window.ws_col).saturating_sub(1));
+        }
+        let _ = write!(stderr, "\r\x1b[2K{display}");
+        let _ = stderr.flush();
+    }
+    fn file(&mut self, name: &str, size: u64) {
+        if self.tty {
+            self.render(name, true);
+        } else {
+            self.line(&format!("Downloading {name}: {size} bytes"));
+        }
+    }
+    fn advance(&mut self, name: &str, bytes: u64) {
+        self.received += bytes;
+        self.render(name, false);
+    }
+    fn complete(&mut self) {
+        self.line("Assets verified and published.");
+        self.finished = true;
+    }
+}
+impl Drop for AssetProgress {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.line("Asset update failed; completion was not confirmed.");
+        }
+    }
+}
+
 fn downloads(
     root: &Path,
     controller: &str,
@@ -693,9 +782,11 @@ fn downloads(
     let staging = root.join(format!("assets-stage-{}", common::nonce()?));
     fs::create_dir(&staging)?;
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
+    let mut progress = AssetProgress::new(transfer);
     let result = (|| -> Result<()> {
         for (name, dest, _, executable) in selected_files(&manifest) {
             let a = manifest.files.iter().find(|a| a.name == name).unwrap();
+            progress.file(name, a.size);
             let response = client.get(format!("{origin}/cli/host/{name}")).send()?;
             ensure!(
                 response.status().is_success(),
@@ -727,7 +818,10 @@ fn downloads(
                 } else {
                     f.write_all(&buffer[..n])?;
                 }
+                progress.advance(name, n as u64);
             }
+            progress.render(name, true);
+            progress.line(&format!("Verifying {name}"));
             f.set_len(size)?;
             ensure!(
                 size == a.size && format!("{:x}", hash.finalize()) == a.sha256,
@@ -742,8 +836,16 @@ fn downloads(
             .open(staging.join("manifest.json"))?;
         f.write_all(&bytes)?;
         f.sync_all()?;
+        progress.line(&format!(
+            "Download complete: 100%, {transfer} bytes, {:.1} MiB/s; verifying staged assets",
+            transfer as f64
+                / progress.started.elapsed().as_secs_f64().max(0.001)
+                / (1024.0 * 1024.0)
+        ));
         verify_asset_dir(root, &staging)?;
+        progress.line("Publishing verified assets");
         publish_assets(root, &staging, |_| Ok(()))?;
+        progress.complete();
         Ok(())
     })();
     if result.is_err() {

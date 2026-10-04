@@ -124,6 +124,13 @@ logical bytes plus the saved disk reserve and 512 MiB staging overhead, retainin
 prior assets. Each TLS file download has a 1,800-second deadline. Interrupted
 transfers are restarted; no compressed/resumable delivery claim.
 
+Host asset downloads show aggregate progress, the current filename and average
+transfer rate on stderr. Terminals get a single-line bar refreshed at most five
+times per second during streaming, with received/total MiB or GiB; redirected
+stderr gets concise start, per-file and phase lines without terminal escapes.
+Download completion is followed by verification and publication: 100% transferred
+does not mean the update succeeded. Existing stdout messages are unchanged.
+
 Cold resize remains explicit stop → `ow resize NAME --memory 4096 --cpus 2` →
 start. New guests can select `ow create NAME --image ubuntu --memory 4096 --cpus 2
 --node NODE`; their fixed placement and ownership remain. This release candidate
