@@ -10,6 +10,9 @@ Read AGENTS.md, README.md, docs/HANDOFF.md, docs/ARCHITECTURE.md, docs/adr/0001-
 ## Current implementation and evidence
 Rust gateway + SQLite ownership/fixed placement + outbound node channel + private worker; Linux host runtime is Firecracker/KVM with Btrfs assets. Existing macOS ARM64/Intel binaries are clients only. Current Ubuntu assets and Firecracker state are x86-64, not portable to ARM64. Two same-host Linux workers have bounded automated acceptance; owner reports creating Ubuntu on a second physical Linux host across networks. Its snapshot/restart/fork acceptance is still in progress. Existing guests, disks and credentials must remain unchanged.
 
+## SSH coordination update
+Guest SSH source is integrated in main as `f1ab6ad` (builder `a38a635`), with Linux-only native evidence and no live deployment. Read docs/SSH.md and docs/plans/ssh-guest-contract.md. Reuse additive `guest_ssh_v1` only when fixed-port stream, key/info operations, external snapshot-safe policy and fork/restore identity rules are supported by your backend. Missing capability must deny SSH. Do not assume the currently published Mac client contains these commands.
+
 ## Implementation sequence
 1. Inventory the actual Mac: `sw_vers`, `uname -m`, `sysctl -n hw.memsize`, `sysctl -n hw.logicalcpu`, `df -h "$HOME"`, `xcode-select -p`, `swift --version`, `cargo --version`. Record chip, OS/build, free RAM/storage and existing VM/service demand. Do not assume Xcode, root access or entitlements are present.
 2. Write an evidence-backed ADR for a backend using Apple's Virtualization framework (preferred candidate; existing VMM, no new hypervisor) or justify another maintained runtime. Validate signing/virtualization entitlement and actual guest boot on this Mac. Rust control may use a narrow Swift helper. Record licenses and pinned artifact provenance. Containers are not equivalent hardware isolation.
