@@ -277,6 +277,21 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    pub fn ssh(&mut self, id: &str) -> Result<(std::net::TcpStream, String)> {
+        identifier(id)?;
+        let policy = crate::ssh_guest::load(&self.root, id)?;
+        ensure!(
+            policy.ready && !policy.keys.is_empty(),
+            "SSH has no active registered keys"
+        );
+        let address = self.address(id)?;
+        let tcp = std::net::TcpStream::connect_timeout(
+            &format!("{address}:22").parse()?,
+            std::time::Duration::from_secs(5),
+        )?;
+        tcp.set_nodelay(true)?;
+        Ok((tcp, policy.generation))
+    }
     /// A dedicated guest PTY; never attach an interactive client to management serial.
     pub fn terminal(&mut self, id: &str) -> Result<std::net::TcpStream> {
         use std::{net::TcpStream, time::Duration};
@@ -461,6 +476,21 @@ impl Runtime {
         }
         if workspace.image != "alpine" {
             machine.checked("chmod 755 /etc/ssl /etc/ssl/certs /ow /ow/bin /ow/lib /ow/etc; chmod 644 /etc/ssl/certs/ca-certificates.crt")?;
+        }
+        if crate::ssh_guest::path(&self.root, &workspace.id).exists() {
+            let mut policy = crate::ssh_guest::load(&self.root, &workspace.id)?;
+            policy.generation = vm::nonce()?;
+            policy.ready = false;
+            atomic_json(
+                &crate::ssh_guest::path(&self.root, &workspace.id),
+                &json!(policy),
+            )?;
+            crate::ssh_guest::apply(&mut machine, &policy)?;
+            policy.ready = true;
+            atomic_json(
+                &crate::ssh_guest::path(&self.root, &workspace.id),
+                &json!(policy),
+            )?;
         }
         self.machines.insert(workspace.id.clone(), machine);
         Ok(())
@@ -697,7 +727,7 @@ impl Runtime {
         match op {
             "status" => Ok(
                 json!({"runtime":"Firecracker v1.17.0","running":self.machines.len(),
-                "worker_pid":std::process::id(),
+                "worker_pid":std::process::id(),"guest_ssh_v1":true,
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
@@ -767,6 +797,15 @@ impl Runtime {
             }
             "start" => self.start(id),
             "stop" => self.stop(id),
+            "ssh-info" => Ok(crate::ssh_guest::info(&crate::ssh_guest::load(
+                &self.root, id,
+            )?)),
+            "ssh-keys" => {
+                let keys = crate::ssh_guest::validate_keys(&request["keys"])?;
+                let root = self.root.clone();
+                let upgrade = request["upgrade"].as_bool().unwrap_or(false);
+                crate::ssh_guest::enroll(self.running(id)?, &root, id, keys, upgrade)
+            }
             "exec" => {
                 let command = request["command"].as_str().context("missing command")?;
                 let quoted = format!(

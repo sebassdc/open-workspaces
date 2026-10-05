@@ -16,6 +16,11 @@ mod onboarding;
 mod remote;
 #[cfg(target_os = "linux")]
 mod runtime;
+mod ssh_client;
+#[cfg(target_os = "linux")]
+mod ssh_gateway;
+#[cfg(target_os = "linux")]
+mod ssh_guest;
 #[cfg(target_os = "linux")]
 mod terminal;
 #[cfg(target_os = "linux")]
@@ -158,6 +163,36 @@ enum Action {
         command: Vec<String>,
     },
     Shell {
+        id: String,
+    },
+    /// Run ordinary OpenSSH into the guest (use -- before ssh options/command).
+    Ssh {
+        id: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Binary stdio for standard OpenSSH ProxyCommand; no diagnostics on stdout.
+    SshProxy {
+        id: String,
+    },
+    /// Print reviewable OpenSSH config without changing ~/.ssh/config.
+    SshConfig {
+        id: String,
+    },
+    /// Replace this machine's registered public keys; private keys stay local.
+    SshAuthorize {
+        id: String,
+        #[arg(long, required = true)]
+        key: Vec<PathBuf>,
+        #[arg(long)]
+        upgrade: bool,
+    },
+    /// Remove all registered keys and invalidate existing SSH streams.
+    SshRevoke {
+        id: String,
+    },
+    /// Inspect enrolled host public key and machine-specific identity.
+    SshInfo {
         id: String,
     },
     Put {

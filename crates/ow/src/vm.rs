@@ -42,6 +42,7 @@ pub struct Vm {
     pub child: Child,
     master: File,
     log: File,
+    diagnostics: Option<std::thread::JoinHandle<()>>,
     buffer: Vec<u8>,
     socket: PathBuf,
     pub tap: String,
@@ -87,15 +88,28 @@ impl Vm {
             if socket.exists() {
                 std::fs::remove_file(&socket)?;
             }
+            // VMM diagnostics can split guest command markers, particularly when
+            // a restored NIC emits packets before its TAP is exposed. Keep them
+            // off the authenticated management serial protocol.
+            let diagnostics = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join("vmm.log"))?;
             let parent_pid = std::process::id();
             let mut command = Command::new(binary);
             command
-                .args(["--api-sock"])
+                .args([
+                    "--log-path",
+                    "/proc/self/fd/2",
+                    "--level",
+                    "Warning",
+                    "--api-sock",
+                ])
                 .arg(&socket)
                 .current_dir(directory)
                 .stdin(Stdio::from(slave.try_clone()?))
                 .stdout(Stdio::from(slave.try_clone()?))
-                .stderr(Stdio::from(slave));
+                .stderr(Stdio::piped());
             unsafe {
                 command.pre_exec(move || {
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
@@ -107,7 +121,32 @@ impl Vm {
                     Ok(())
                 });
             }
-            let child = command.spawn()?;
+            let mut child = command.spawn()?;
+            let mut errors = child.stderr.take().context("VMM stderr missing")?;
+            let diagnostic_thread = std::thread::spawn(move || {
+                let mut diagnostics = diagnostics;
+                let mut bytes = [0; 8192];
+                let mut recording = true;
+                loop {
+                    let Ok(n) = errors.read(&mut bytes) else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    let remaining = (4 * 1024 * 1024u64).saturating_sub(
+                        diagnostics
+                            .metadata()
+                            .map(|m| m.len())
+                            .unwrap_or(4 * 1024 * 1024),
+                    ) as usize;
+                    if recording && diagnostics.write_all(&bytes[..n.min(remaining)]).is_err() {
+                        // A full/unavailable diagnostic sink must not block or
+                        // break the VMM's logging pipe. Drain and discard.
+                        recording = false;
+                    }
+                }
+            });
             let log = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -116,6 +155,7 @@ impl Vm {
                 child,
                 master,
                 log,
+                diagnostics: Some(diagnostic_thread),
                 buffer: Vec::new(),
                 socket,
                 tap: tap.clone(),
@@ -265,13 +305,15 @@ impl Vm {
     }
 
     pub fn network(&mut self, id: &str, index: u32, fork: bool) -> Result<()> {
+        // Restored sockets/sessions never survive as authorized external access.
+        crate::ssh_guest::kill(self)?;
         let mac = format!("02:fc:00:00:{:02x}:{:02x}", index / 256, index % 256);
         let gateway = format!("198.18.{}.{}", index / 64, index % 64 * 4 + 1);
         self.checked(&format!("ip link set eth0 down; ip addr flush dev eth0; ip link set eth0 address {mac}; ip addr add {}/30 dev eth0; ip link set eth0 up; ip route replace default via {gateway}; printf 'nameserver 10.0.2.3\\n' > /etc/resolv.conf; hostname {}", self.address, shell_quote(id)))?;
         self.checked(&format!("sed -i '/^127\\.0\\.1\\.1[[:space:]].*# ow-hostname$/d' /etc/hosts; printf '\\n127.0.1.1 {} # ow-hostname\\n' >> /etc/hosts", id))?;
         if fork {
             // VMGenID reseeds the guest kernel on restore; template has no account credentials.
-            self.checked("cat /proc/sys/kernel/random/uuid > /etc/machine-id; rm -f /etc/ssh/ssh_host_*; sync")?;
+            self.checked("cat /proc/sys/kernel/random/uuid > /etc/machine-id; rm -f /etc/ssh/ssh_host_* /etc/ow-ssh/authorized_keys; sync")?;
         } else {
             self.checked("if [ ! -s /etc/machine-id ]; then cat /proc/sys/kernel/random/uuid > /etc/machine-id; fi; sync")?;
         }
@@ -301,6 +343,9 @@ impl Drop for Vm {
         // Child belongs to this worker; never signal a PID loaded from disk.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(thread) = self.diagnostics.take() {
+            let _ = thread.join();
+        }
         let _ = host("ip", &["link", "del", &self.tap]);
         if let Ok(index) = self.tap.trim_start_matches("ow").parse() {
             crate::network::unregister(index);

@@ -87,7 +87,7 @@ pub fn login(url: &str) -> Result<()> {
     println!("Signed in to {url}. Use ow list or ow shell <machine>.");
     Ok(())
 }
-fn token(url: &str) -> Result<String> {
+pub(crate) fn token(url: &str) -> Result<String> {
     let output = Command::new(cloudflared())
         .args(["access", "token", "--app", url])
         .stderr(Stdio::null())
@@ -108,7 +108,7 @@ fn token(url: &str) -> Result<String> {
     );
     Ok(token)
 }
-fn request(url: &str, token: &str, operation: Option<Value>) -> Result<Value> {
+pub(crate) fn request(url: &str, token: &str, operation: Option<Value>) -> Result<Value> {
     if let Some(operation) = &operation {
         let key = operation["operation_key"]
             .as_str()
@@ -287,6 +287,12 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Snapshots
                 | Action::Inspect { .. }
                 | Action::Shell { .. }
+                | Action::Ssh { .. }
+                | Action::SshProxy { .. }
+                | Action::SshConfig { .. }
+                | Action::SshAuthorize { .. }
+                | Action::SshRevoke { .. }
+                | Action::SshInfo { .. }
                 | Action::Exec { .. }
                 | Action::Put { .. }
                 | Action::Get { .. }
@@ -301,11 +307,36 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         ),
         "this command is local-only; use --local for the local worker"
     );
+    if let Action::SshProxy { id } = &action {
+        return crate::ssh_client::remote_proxy(&url, id);
+    }
     let token = token(&url)?;
     let key = retry.unwrap_or(common::nonce()?);
     common::identifier(&key)?;
     let mut operation = match action {
         Action::Shell { id } => return shell(&url, &token, &id),
+        Action::Ssh { id, args } => {
+            let info = request(
+                &url,
+                &token,
+                Some(json!({"op":"ssh-info","id":id,"operation_key":key})),
+            )?;
+            return crate::ssh_client::launch(Some(&url), None, &id, &info, &args);
+        }
+        Action::SshConfig { id } => {
+            let info = request(
+                &url,
+                &token,
+                Some(json!({"op":"ssh-info","id":id,"operation_key":key})),
+            )?;
+            crate::ssh_client::config(Some(&url), None, &id, &info)?;
+            return Ok(0);
+        }
+        Action::SshAuthorize { id, key, upgrade } => {
+            json!({"op":"ssh-keys","id":id,"keys":crate::ssh_client::public_keys(&key)?,"upgrade":upgrade})
+        }
+        Action::SshRevoke { id } => json!({"op":"ssh-keys","id":id,"keys":[],"upgrade":false}),
+        Action::SshInfo { id } => json!({"op":"ssh-info","id":id}),
         Action::List
         | Action::Stats
         | Action::Status

@@ -299,6 +299,39 @@ async fn handle(app: &App, request: Request) -> Response {
     let Some((expires, identity)) = authorized_until(app, request.headers()).await else {
         return (StatusCode::UNAUTHORIZED, "Cloudflare Access login required").into_response();
     };
+    if app.dashboard.is_some() && request.uri().path().starts_with("/api/ssh/") {
+        if request
+            .headers()
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            != Some(format!("https://{}", app.config.hostname).as_str())
+        {
+            return (StatusCode::FORBIDDEN, "Same-origin SSH required").into_response();
+        }
+        let name = request
+            .uri()
+            .path()
+            .strip_prefix("/api/ssh/")
+            .unwrap()
+            .to_owned();
+        if request.uri().query().is_some() || crate::common::identifier(&name).is_err() {
+            return (StatusCode::BAD_REQUEST, "Invalid SSH target").into_response();
+        }
+        let target = crate::dashboard::with_catalog(
+            app.catalog.clone(),
+            identity.clone(),
+            move |catalog, user| catalog.ssh_target(user, &name),
+        )
+        .await;
+        let Ok((root, id)) = target else {
+            return (
+                StatusCode::NOT_FOUND,
+                "Machine not found or SSH node unavailable",
+            )
+                .into_response();
+        };
+        return crate::ssh_gateway::upgrade(&root, request, expires, id).await;
+    }
     if let Some(_root) = &app.dashboard
         && request.uri().path().starts_with("/api/terminal/")
     {
@@ -639,6 +672,7 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    include!("ssh_e2e.rs");
     fn signing_key() -> (EncodingKey, JwkSet) {
         // Ephemeral test material: no checked-in private key or Cloudflare credential.
         let generated = Command::new("openssl")
@@ -943,6 +977,7 @@ mod tests {
             "/api/state",
             "/api/operation",
             "/api/terminal/test",
+            "/api/ssh/test",
             "/cli/api/state",
             "/cli/../api/state",
             "/cli/install.sh/extra",
@@ -977,16 +1012,18 @@ mod tests {
             );
         }
         let signed = token(&key, &claims());
-        for origin in [None, Some("https://guest.example.test")] {
-            let mut req = request(Some(&signed), Method::GET, Body::empty());
-            *req.uri_mut() = "/api/terminal/test".parse().unwrap();
-            if let Some(origin) = origin {
-                req.headers_mut().insert("origin", origin.parse().unwrap());
+        for path in ["/api/terminal/test", "/api/ssh/test"] {
+            for origin in [None, Some("https://guest.example.test")] {
+                let mut req = request(Some(&signed), Method::GET, Body::empty());
+                *req.uri_mut() = path.parse().unwrap();
+                if let Some(origin) = origin {
+                    req.headers_mut().insert("origin", origin.parse().unwrap());
+                }
+                assert_eq!(
+                    gateway.clone().oneshot(req).await.unwrap().status(),
+                    StatusCode::FORBIDDEN
+                );
             }
-            assert_eq!(
-                gateway.clone().oneshot(req).await.unwrap().status(),
-                StatusCode::FORBIDDEN
-            );
         }
         let mut req = request(Some(&signed), Method::GET, Body::empty());
         *req.uri_mut() = "/".parse().unwrap();

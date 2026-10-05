@@ -43,6 +43,10 @@ struct Operation {
     image: Option<String>,
     #[serde(default)]
     vcpu_count: Option<u32>,
+    #[serde(default)]
+    keys: Option<Vec<String>>,
+    #[serde(default)]
+    upgrade: Option<bool>,
 }
 
 fn validated(bytes: &[u8]) -> Result<Value> {
@@ -83,7 +87,13 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             request["memory_mib"] = json!(memory);
             request["vcpu_count"] = json!(cpus);
         }
-        "start" | "stop" | "hibernate" => {}
+        "start" | "stop" | "hibernate" | "ssh-info" => {}
+        "ssh-keys" => {
+            let keys =
+                crate::ssh_guest::validate_keys(&json!(operation.keys.context("keys required")?))?;
+            request["keys"] = json!(keys);
+            request["upgrade"] = json!(operation.upgrade.unwrap_or(false));
+        }
         "snapshot" | "restore" => {
             let name = operation
                 .name
