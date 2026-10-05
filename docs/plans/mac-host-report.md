@@ -110,3 +110,29 @@ Warm n=1 observed readiness/capture/restore acknowledgement: 0.224/0.266/0.360 s
 not percentile measurements. Private current artifacts/receipts remain ignored.
 All test helpers/children have confirmed exits. Overall Mac-node work remains in
 progress, with pool enrollment and the other previously listed limitations open.
+
+## Acceptance-evidence review corrections — 2026-10-05
+The two subsequent P2 findings were valid weaknesses in the acceptance predicates,
+not observed virtualization defects. Restore now emits distinct exact `OW_RAM`
+and `OW_DISK` values; both must independently equal `captured`. Parent-disk,
+missing-disk, substring and duplicate-probe outputs are rejected.
+
+Shutdown now returns and records mode, helper status and guest-stop marker.
+Dedicated guest-poweroff acceptance requires mode `guest_poweroff`, the exact
+helper lifecycle marker and exit0. SIGTERM/SIGKILL fallback, exit0 without marker
+and a marker followed by a crash cannot count as guest poweroff. Bounded fallback
+cleanup remains unconditional. Final stdout drain is nonblocking and capped;
+diagnostic storage remains bounded. Native helper status begins on its own line
+so a serial prompt cannot obscure the lifecycle marker. The first tightened
+native attempt detected this formatting issue; its private log was retained and
+a fresh-root final run passed after the helper formatting correction.
+
+`python3 scripts/test-mac-host-harness.py`: 13 regressions pass, including the
+original cleanup/output tests and independent restore/shutdown evidence cases.
+Native helper and Rust CLI rebuilt; the corrected 15-check hardware acceptance
+passes in fresh `data/mac-host-evidence-final/`. Its two guest-request shutdowns
+both record guest marker=true, exit0, mode=guest_poweroff. Host SIGTERM cleanup is
+recorded separately with guest marker=false. Two native Rust tests also pass.
+Final warm n=1 readiness/capture/restore acknowledgement: 0.214/0.235/0.342 s.
+Private source/helper pins and receipts are retained in that ignored root.
+No enrolled-node, macOS-guest, merge or deployment acceptance is added.

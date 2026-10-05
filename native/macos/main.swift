@@ -10,7 +10,7 @@ func fail(_ message: String) -> Never {
     exit(1)
 }
 func status(_ message: String) {
-    FileHandle.standardError.write(Data(("ow-vz: " + message + "\n").utf8))
+    FileHandle.standardError.write(Data(("\now-vz: " + message + "\n").utf8))
 }
 
 final class Lifecycle: NSObject, VZVirtualMachineDelegate {

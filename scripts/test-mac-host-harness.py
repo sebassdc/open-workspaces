@@ -54,7 +54,9 @@ class CleanupTests(unittest.TestCase):
         helper = self.helper("import os, signal, time\nos.close(0)\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nprint('OW_READY arch=aarch64', flush=True)\ntime.sleep(30)\n")
         with patch.object(harness.subprocess, "Popen", side_effect=self.spawn):
             guest = harness.Guest(helper, self.root)
-            guest.stop()
+            shutdown = guest.stop()
+            self.assertEqual(shutdown["mode"], "sigkill")
+            with self.assertRaises(AssertionError): harness.require_guest_poweroff(shutdown)
             guest.stop()  # Cleanup stays safe after constructor/read failure.
         self.assert_clean()
         self.assertLess(self.children[0].returncode, 0)
@@ -90,6 +92,40 @@ class CleanupTests(unittest.TestCase):
         self.assertLessEqual(len(guest.log), guest.LOG_LIMIT)
         self.assert_clean()
 
+    def test_confirmed_guest_poweroff_requires_marker_and_exit0(self):
+        helper = self.helper("import sys\nprint('OW_READY arch=aarch64', flush=True)\nsys.stdin.readline()\nprint('ow-vz: guest stopped', flush=True)\n")
+        with patch.object(harness.subprocess, "Popen", side_effect=self.spawn):
+            guest = harness.Guest(helper, self.root)
+            harness.require_guest_poweroff(guest.stop())
+        self.assert_clean()
+
+    def test_exit0_without_guest_marker_is_not_poweroff(self):
+        helper = self.helper("import sys\nprint('OW_READY arch=aarch64', flush=True)\nsys.stdin.readline()\n")
+        with patch.object(harness.subprocess, "Popen", side_effect=self.spawn):
+            guest = harness.Guest(helper, self.root)
+            shutdown = guest.stop()
+            self.assertEqual(shutdown["returncode"], 0)
+            with self.assertRaises(AssertionError): harness.require_guest_poweroff(shutdown)
+        self.assert_clean()
+
+    def test_guest_marker_with_crash_is_not_poweroff(self):
+        helper = self.helper("import sys\nprint('OW_READY arch=aarch64', flush=True)\nsys.stdin.readline()\nprint('ow-vz: guest stopped', flush=True)\nsys.exit(1)\n")
+        with patch.object(harness.subprocess, "Popen", side_effect=self.spawn):
+            guest = harness.Guest(helper, self.root)
+            shutdown = guest.stop()
+            self.assertTrue(shutdown["guest_stop_marker"])
+            with self.assertRaises(AssertionError): harness.require_guest_poweroff(shutdown)
+        self.assert_clean()
+
+    def test_sigterm_cleanup_is_not_guest_poweroff(self):
+        helper = self.helper("import os, time\nos.close(0)\nprint('OW_READY arch=aarch64', flush=True)\ntime.sleep(30)\n")
+        with patch.object(harness.subprocess, "Popen", side_effect=self.spawn):
+            guest = harness.Guest(helper, self.root)
+            shutdown = guest.stop()
+            self.assertEqual(shutdown["mode"], "sigterm")
+            with self.assertRaises(AssertionError): harness.require_guest_poweroff(shutdown)
+        self.assert_clean()
+
     def test_excessive_startup_output_cleans_up(self):
         helper = self.helper("import os, time\nfor _ in range(64): os.write(1, b'a' * 65536)\ntime.sleep(30)\n")
         with patch.object(harness.subprocess, "Popen", side_effect=self.spawn):
@@ -97,5 +133,23 @@ class CleanupTests(unittest.TestCase):
                 harness.Guest(helper, self.root)
         self.assertIn("output limit exceeded", str(error.exception.__cause__))
         self.assert_clean()
+
+class RestoreEvidenceTests(unittest.TestCase):
+    def test_exact_separate_values_pass(self):
+        harness.verify_restored_state("\nOW_RAM=captured\r\nOW_DISK=captured\r\n", 0)
+
+    def test_restored_ram_with_parent_disk_fails(self):
+        with self.assertRaises(AssertionError):
+            harness.verify_restored_state("\nOW_RAM=captured\nOW_DISK=parent\n", 0)
+
+    def test_ram_marker_cannot_replace_disk_probe(self):
+        with self.assertRaises(AssertionError):
+            harness.verify_restored_state("RAM=captured\nparent\n", 0)
+
+    def test_substring_and_duplicate_probes_fail(self):
+        for output in ["OW_RAM=captured\nOW_DISK=captured-extra\n",
+                       "OW_RAM=captured\nOW_DISK=parent\nOW_DISK=captured\n"]:
+            with self.subTest(output=output), self.assertRaises(AssertionError):
+                harness.verify_restored_state(output, 0)
 
 if __name__ == "__main__": unittest.main()

@@ -48,3 +48,10 @@ cleanup/output regressions, rebuilt native artifacts, 15 hardware checks and two
 Rust tests pass. Review receipts: `data/mac-host-review/`; regression command:
 `python3 scripts/test-mac-host-harness.py`. Parent re-review remains pending;
 no main merge/deployment, and overall Mac-node task remains in progress.
+
+Second review corrections: independent exact RAM/disk probes and explicit
+shutdown mode/status/marker evidence are implemented. 13 harness regressions and
+the tightened 15 native hardware checks pass, with two confirmed guest poweroffs
+and a separately recorded host stop. Current ignored evidence/pins:
+`data/mac-host-evidence-final/`. Native lifecycle status formatting puts markers
+on their own line. Parent re-review remains pending; scope unchanged.
