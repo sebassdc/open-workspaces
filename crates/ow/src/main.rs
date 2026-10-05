@@ -6,6 +6,8 @@ mod common;
 mod dashboard;
 #[cfg(target_os = "linux")]
 mod host;
+#[cfg(target_os = "macos")]
+mod mac_host;
 #[cfg(target_os = "linux")]
 mod network;
 #[cfg(target_os = "linux")]
@@ -47,8 +49,31 @@ struct Cli {
     command: Action,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Subcommand)]
+enum MacHostAction {
+    /// Fetch official supported macOS guest requirements without downloading an IPSW.
+    MacosProbe,
+    /// Report native backend capabilities; does not start a guest.
+    Capabilities,
+    /// Start one offline ARM64 guest in a prepared private fixture root.
+    Boot,
+    /// Experimental same-machine paired state restore in the fixture root.
+    Restore {
+        /// Verified paired writable disk copy; never a Firecracker snapshot.
+        #[arg(long)]
+        disk: PathBuf,
+    },
+}
+
 #[derive(Subcommand)]
 enum Action {
+    /// Experimental local Apple Silicon runtime (separate from pool hosting).
+    #[cfg(target_os = "macos")]
+    MacHost {
+        #[command(subcommand)]
+        command: MacHostAction,
+    },
     /// Invite or contribute a trusted Linux host to the shared private pool.
     Host {
         #[command(subcommand)]
@@ -305,6 +330,14 @@ fn assets() -> PathBuf {
 
 fn main_result() -> anyhow::Result<i32> {
     let cli = Cli::parse();
+    #[cfg(target_os = "macos")]
+    if let Action::MacHost { command } = cli.command {
+        anyhow::ensure!(
+            cli.server.is_none() && cli.operation_key.is_none(),
+            "mac-host is an experimental local backend; omit --server and --operation-key"
+        );
+        return mac_host::run(cli.data_dir, command);
+    }
     if let Action::Host { command } = cli.command {
         if matches!(
             command,

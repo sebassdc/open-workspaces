@@ -33,6 +33,12 @@ memory use. Real browser/VM tests pass, including native guest PTYs over authent
 WebSocket. Remote CLI authentication and per-workspace roles
 remain unfinished. See [dashboard evidence](DASHBOARD.md).
 
+Native Mac continuation: the isolated ARM64 Linux runtime spike passes local
+boot, console, persistence and paired state recovery. Persistent developer images,
+guest-agent integration, host admission and private-pool acceptance remain pending;
+Tahoe installation needs separate allocation/licensing gates. See
+[Mac implementation report](plans/mac-host-report.md).
+
 ## Phase 0 — Feasibility (1–2 weeks)
 
 - Inspect actual development machine and record capabilities.
