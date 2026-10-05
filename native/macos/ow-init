@@ -1,0 +1,29 @@
+#!/bin/sh
+# Minimal offline fixture. The root filesystem is ephemeral; only /persist is
+# durable. Never format here: the preparer creates an empty dedicated test disk.
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+/bin/busybox --install -s /bin
+mkdir -p /proc /sys /dev /dev/pts /persist /tmp
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+modprobe virtio_blk
+modprobe vfat
+n=0
+while [ ! -b /dev/vda ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n+1)); done
+if ! mount -t vfat -o umask=077 /dev/vda /persist; then
+    echo OW_DISK_FAILED >/dev/hvc0
+    poweroff -f
+fi
+hostname ow-mac-fixture
+stty -echo </dev/hvc0
+printf '\nOW_READY arch=%s\n' "$(uname -m)" >/dev/hvc0
+# A controlling guest tty supports signals and job control; it is not yet the
+# product's guest-agent PTY protocol.
+while true; do
+    setsid -c /bin/sh -i </dev/hvc0 >/dev/hvc0 2>&1
+    sync
+    poweroff -f
+done
