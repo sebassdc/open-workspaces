@@ -7,11 +7,17 @@ mod dashboard;
 #[cfg(target_os = "linux")]
 mod host;
 #[cfg(target_os = "macos")]
+mod local_terminal;
+#[cfg(target_os = "macos")]
 mod mac_host;
+#[cfg(target_os = "macos")]
+mod mac_worker;
 #[cfg(target_os = "linux")]
 mod network;
-#[cfg(target_os = "linux")]
 mod nodes;
+#[cfg(target_os = "macos")]
+#[path = "mac_onboarding.rs"]
+mod onboarding;
 #[cfg(target_os = "linux")]
 mod onboarding;
 #[cfg(target_os = "linux")]
@@ -27,7 +33,6 @@ mod ssh_guest;
 mod terminal;
 #[cfg(target_os = "linux")]
 mod vm;
-#[cfg(target_os = "linux")]
 mod wire;
 
 use clap::{Parser, Subcommand};
@@ -158,7 +163,7 @@ enum Action {
     },
     Create {
         id: String,
-        #[arg(long, default_value = "alpine", value_parser = ["alpine", "arch", "ubuntu"])]
+        #[arg(long, default_value = "alpine", value_parser = ["alpine", "arch", "ubuntu", "ubuntu-arm64"])]
         image: String,
         #[arg(long, default_value_t = 256)]
         memory: u32,
@@ -394,11 +399,11 @@ fn main_result() -> anyhow::Result<i32> {
             cli.server.is_none(),
             "host participation is local; omit --server (invitation includes controller)"
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             return onboarding::run(cli.data_dir, command);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             anyhow::bail!(
                 "Host participation requires Linux x86-64; macOS remains a remote client"
@@ -440,9 +445,9 @@ fn main_result() -> anyhow::Result<i32> {
     {
         host::run(cli)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        anyhow::bail!("Local VM runtime requires Linux; run ow login <server> to connect remotely")
+        mac_worker::run(cli)
     }
 }
 

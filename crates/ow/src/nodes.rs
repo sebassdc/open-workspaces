@@ -320,6 +320,16 @@ pub fn online(root: &Path, node: &str) -> Result<()> {
     );
     Ok(())
 }
+pub fn operation_capable(root: &Path, node: &str, op: &str) -> Result<()> {
+    if node != "local" {
+        let cap: String =
+            db(root)?.query_row("SELECT capabilities FROM nodes WHERE id=?1", [node], |r| {
+                r.get(0)
+            })?;
+        common::node_operation(&serde_json::from_str(&cap)?, op)?;
+    }
+    Ok(())
+}
 pub fn ssh_capable(root: &Path, node: &str) -> Result<()> {
     online(root, node)?;
     if node != "local" {
@@ -462,12 +472,16 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             msg=socket.recv()=>{
                 match msg {Some(Ok(Message::Text(text)))=>{
                     let Ok(v)=serde_json::from_str::<Value>(&text) else {break;};
-                    if common::guest_limits(&v).is_err() || v["type"]!="heartbeat" || v["protocol"]!=1 || v["backend"]!="firecracker" || v["arch"]!="x86_64" || v["runtime"]!="firecracker-v1.17.0" || !(256..=common::HOST_MEMORY_MIB as u64).contains(&v["memory_mib"].as_u64().unwrap_or(0)) || !(1..=common::HOST_SLOTS as u64).contains(&v["slots"].as_u64().unwrap_or(0)) || !(1..=common::HOST_CPUS as u64).contains(&v["vcpus"].as_u64().unwrap_or(0)) || !v["images"].as_array().is_some_and(|a|a.len()<=3 && a.iter().all(|i|matches!(i.as_str(),Some("alpine"|"arch"|"ubuntu")))) {break;}
+                    if common::node_capabilities(&v).is_err() {break;}
                     last=tokio::time::Instant::now();
                     if !c.root.join("nodes").join(&node).join("control.sock").exists(){continue;}
                     if let Ok(db)=db(&c.root)
                         && let Ok((ram,slots,cpus)) = db.query_row("SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16) FROM nodes WHERE id=?1",[&node],|r|Ok((r.get::<_,u32>(0)? as u64,r.get::<_,u32>(1)? as u64,r.get::<_,u32>(2)? as u64))) {
-                            let cap=json!({"protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":v["memory_mib"].as_u64().unwrap().min(ram),"slots":v["slots"].as_u64().unwrap().min(slots),"vcpus":v["vcpus"].as_u64().unwrap().min(cpus),"images":v["images"],"max_guest_memory_mib":common::guest_limits(&v).unwrap().0,"max_guest_vcpus":common::guest_limits(&v).unwrap().1,"guest_ssh_v1":v["guest_ssh_v1"]==true});
+                            let mut cap=v.clone();
+                            cap["memory_mib"]=json!(v["memory_mib"].as_u64().unwrap().min(ram));
+                            cap["slots"]=json!(v["slots"].as_u64().unwrap().min(slots));
+                            cap["vcpus"]=json!(v["vcpus"].as_u64().unwrap().min(cpus));
+                            if let Some(o)=cap.as_object_mut(){o.remove("type");o.remove("ready_ack");}
                             if db.execute("UPDATE nodes SET heartbeat=?1,capabilities=?2 WHERE id=?3 AND session=?4 AND revoked=0",params![now(),cap.to_string(),node,generation]).is_ok_and(|n|n==1) {
                                 // Old native agents expect job IDs only; acknowledge only the guided agent's optional extension.
                                 if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break;}}
@@ -961,6 +975,7 @@ pub fn agent(
     );
     let instance = common::nonce()?;
     let mut lock = &lock;
+    #[cfg(target_os = "linux")]
     let start = fs::read_to_string("/proc/self/stat")?
         .rsplit_once(')')
         .context("process stat")?
@@ -969,6 +984,8 @@ pub fn agent(
         .nth(19)
         .context("process start time")?
         .to_owned();
+    #[cfg(target_os = "macos")]
+    let start = crate::mac_worker::process_start(std::process::id())?;
     lock.set_len(0)?;
     lock.write_all(
         json!({"pid":std::process::id(),"start":start,"instance":instance})
@@ -1026,7 +1043,10 @@ pub fn agent(
             .collect::<Vec<_>>()
     };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
+    #[cfg(target_os = "linux")]
     let hello=json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true}).to_string();
+    #[cfg(target_os = "macos")]
+    let hello=json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS}).to_string();
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
@@ -1213,6 +1233,11 @@ fn agent_job(
     }
     Ok(())
 }
+#[cfg(test)]
+pub(crate) fn review_journal_request(root: &Path, request: &Value) -> Result<Value> {
+    journal_request(root, request)
+}
+
 // Persist-before-execute: crash-pending effects are not silently repeated. Stable create/fork IDs
 // may be reconciled by the runtime's existing parameter/lineage checks; arbitrary exec is uncertain.
 fn journal_request(root: &Path, request: &Value) -> Result<Value> {
@@ -1239,6 +1264,8 @@ fn journal_request(root: &Path, request: &Value) -> Result<Value> {
     let mut db = Connection::open(path)?;
     db.busy_timeout(Duration::from_secs(5))?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS effects(key TEXT PRIMARY KEY,request TEXT NOT NULL,response TEXT);")?;
+    #[cfg(target_os = "macos")]
+    db.execute_batch("PRAGMA max_page_count=16384;")?; // 64 MiB at the default 4 KiB page size; never repeat a crash-pending effect.
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let previous: Option<(String, Option<String>)> = tx
         .query_row(
@@ -1296,10 +1323,10 @@ fn journal_request(root: &Path, request: &Value) -> Result<Value> {
     Ok(response)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 #[path = "node_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 #[path = "node_e2e.rs"]
 mod real_tests;

@@ -72,7 +72,9 @@ fn validated(bytes: &[u8]) -> Result<Value> {
     match operation.op.as_str() {
         "create" => {
             let image = operation.image.as_deref().unwrap_or("alpine");
-            runtime::image_profile(image)?;
+            if image != "ubuntu-arm64" {
+                runtime::image_profile(image)?;
+            }
             request["image"] = json!(image);
             let memory = operation.memory_mib.unwrap_or(256);
             let cpus = operation.vcpu_count.unwrap_or(1);
