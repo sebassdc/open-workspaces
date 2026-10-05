@@ -308,8 +308,19 @@ def main():
         check("PTY exits by EOF", s.recv(1) == b"")
         s.close()
         identity = (root / "m/real/machine-id").read_bytes()
+        # Inject loss of the owned guest RPC endpoint without disrupting the VM.
+        (root / "m/real/rpc.sock").unlink()
         v = request(root, {"op": "stop", "id": "real"})
+        check("unavailable guest sync remains diagnostic", bool(v["sync_error"]))
         check("positive cold stop", v["workspace"]["state"] == "stopped")
+        import fcntl
+
+        with open(root / "m/real/vm.lock", "rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            check(
+                "RPC failure still exits helper and retains disk",
+                (root / "m/real/root.ext4").stat().st_size == 4294967296,
+            )
         request(root, {"op": "start", "id": "real"})
         check(
             "cold persistent binary",
@@ -393,6 +404,8 @@ def main():
                 "vcpu_count": 2,
             },
         )
+        if small["state"] == "stopped":
+            small = request(root, {"op": "start", "id": "small"})
         check("512 MiB / 2 vCPU Ubuntu starts", small["state"] == "running")
         cpus = request(
             root, {"op": "exec", "id": "small", "command": "nproc; uname -m"}

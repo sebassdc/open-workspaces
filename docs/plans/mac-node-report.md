@@ -1,6 +1,6 @@
 # Mac node integration — local acceptance report
 Updated: 2026-10-05 | Branch: work/mac-node | State: local slice validated; live pool acceptance pending
-Base: main 9acb963. No push, PR, merge, installer update or live deployment performed.
+Base: main 9acb963. PR6 published after explicit owner authorization. No merge, installer update or live deployment performed.
 
 ## Result and scope
 The native release CLI, signed Swift helper, durable Mac worker and Linux ARM64
@@ -50,11 +50,11 @@ The Linux controller and dashboard changes need planner review and x86 execution
 ## Observed evidence
 | Check | Observed result | Limit |
 | --- | --- | --- |
-| Native hardware suite | 41 checks passed | One guest at a time, <=1024 MiB/2 CPUs in this run |
+| Native hardware suite | 43 checks passed | One guest at a time, <=1024 MiB/2 CPUs in this run |
 | Native TLS protocol suite | 16 checks passed | Isolated real controller + real guest, not deployed human gateway |
-| Native Rust unit tests | 6 passed | Shared capability/framing paths available on Mac |
+| Native Rust unit tests | 8 passed | Shared capability/framing paths available on Mac |
 | Previous offline harness | 13 passed | Subprocess regressions; not VM acceptance |
-| Linux ARM64 unit binary in real VM | 52 passed, 2 failed, 5 ignored | See baseline contrast below; not x86/KVM acceptance |
+| Linux ARM64 unit binary in real VM | 53 passed, 2 failed, 5 ignored | See baseline contrast below; not x86/KVM acceptance |
 | Linux x86-64 test binary | Cross-build passed | Execution remains planner gate |
 | Dashboard JavaScript | `node --check` passed | Browser/live dashboard acceptance pending |
 
@@ -132,3 +132,46 @@ and exact coordinated controller/frontend revision. Do not push/merge/deploy or
 change live installers/assets from this lane. Next prove actual owner-scoped
 human gateway/dashboard placement, persistence, denials, active stream fencing
 and capacity on that revision. SSH/networking remain explicitly unavailable.
+
+## PR6 feedback corrections
+The four inline findings on e0af2e8 are addressed:
+
+1. **Release/archive trust:** isolate GnuPG state, parse real primary fingerprints,
+   export the pinned release key and require permitted successful `VALIDSIG`
+   identities. Derive archive-keyring bytes directly from the authenticated root
+   tar; reject a substituted optional external keyring. All trust/checksum
+   checks raise explicit errors and remain active under `python -O`.
+2. **Incomplete-create replay:** require complete private disk/config and proved
+   running/stopped state before returning success. Incomplete/partial effects
+   retain their artifacts and emit typed uncertain envelopes through the node
+   journal; partial-copy/start errors retain the same uncertain classification.
+3. **Owned stop:** guest sync is best-effort, including nonzero exit diagnostics.
+   Always close the owned helper pipe, wait for actual exit and check the disk
+   lock before releasing capacity. Stop returns the sync error separately.
+4. **Aggregate admission:** one trusted user-wide private lock across data roots,
+   held for the entire worker lifetime and inherited by its helper through the
+   worker-death/host-shutdown interval. No PID-based adoption or signaling added.
+
+Targeted regressions use real generated GnuPG keys (spoofed UID, extra signer,
+valid signer, substituted archive keyring), interrupted-create persisted states
+before disk creation and during copy with same-key node-journal replay, a Linux
+catalog/node-journal uncertainty pipeline, and synchronized two-root fake startup
+plus an inherited fake-helper reservation. Only the stop-RPC failure uses a real
+VM: unlink the owned RPC endpoint, prove sync_error, helper exit/free disk lock,
+retained disk and successful cold restart/persistence. No concurrent real VM is
+used to test the admission race.
+
+The existing official release signatures and archive signature were reverified
+using the hardened verifier; derived image contents were not changed. A first
+resumed hardware attempt exposed a harness assumption that an existing stopped
+small guest would be running after idempotent create. Its failure receipt is
+retained; the harness now explicitly starts that stopped guest. Review validation
+and source/artifact/result hashes are recorded separately in sanitized pins.
+
+Final correction validation: **43 hardware checks, 16 TLS checks, 8 native unit
+checks, 4 trust regressions under Python -O and 13 previous harness regressions
+passed**. Current Linux ARM64 suite: **53 passed / 2 unchanged baseline failures /
+5 ignored**; the new catalog/node-journal replay test passed. Current x86 test
+binary cross-build passed, with execution still deferred to the planner. Both
+final correction native receipts have unchanged source maps equal to the final
+committed source map. No live pool acceptance, merge or deployment was performed.

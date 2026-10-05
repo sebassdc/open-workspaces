@@ -18,6 +18,98 @@ def sha(p):
     return h.hexdigest()
 
 
+UEC_FINGERPRINT = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def verify_release(key, signature, document):
+    # Isolated GnuPG home: neither user IDs nor ambient/default keyrings are trust.
+    with tempfile.TemporaryDirectory(prefix="ow-release-trust-") as home:
+
+        def gpg(*args):
+            return subprocess.check_output(
+                ["gpg", "--no-options", "--batch", "--homedir", home, *args]
+            )
+
+        gpg("--import", str(key))
+        records = (
+            gpg("--with-colons", "--fingerprint", "--list-keys").decode().splitlines()
+        )
+        primary = []
+        waiting = False
+        for record in records:
+            fields = record.split(":")
+            if fields[0] == "pub":
+                waiting = True
+            elif fields[0] == "fpr" and waiting:
+                primary.append(fields[9])
+                waiting = False
+        require(UEC_FINGERPRINT in primary, "pinned primary release key absent")
+        restricted = pathlib.Path(home) / "release.gpg"
+        restricted.write_bytes(gpg("--export", UEC_FINGERPRINT))
+        status = (
+            subprocess.check_output(
+                [
+                    "gpgv",
+                    "--homedir",
+                    home,
+                    "--status-fd",
+                    "1",
+                    "--keyring",
+                    str(restricted),
+                    str(signature),
+                    str(document),
+                ]
+            )
+            .decode()
+            .splitlines()
+        )
+        signers = [
+            line.split()[2:] for line in status if line.startswith("[GNUPG:] VALIDSIG ")
+        ]
+        require(
+            bool(signers)
+            and all(
+                fields[0] == UEC_FINGERPRINT or fields[-1] == UEC_FINGERPRINT
+                for fields in signers
+            ),
+            "unexpected successful release signer",
+        )
+
+
+def authenticated_archive_keyring(root_tar, supplied=None):
+    with tarfile.open(root_tar, "r:xz") as archive:
+        matches = [
+            member
+            for member in archive.getmembers()
+            if (member.name[2:] if member.name.startswith("./") else member.name)
+            == "usr/share/keyrings/ubuntu-archive-keyring.gpg"
+        ]
+        require(
+            len(matches) == 1 and matches[0].isreg() and matches[0].size <= 1048576,
+            "authenticated root archive keyring absent/invalid",
+        )
+        data = archive.extractfile(matches[0]).read()
+    if supplied is not None and supplied.exists():
+        require(
+            supplied.read_bytes() == data,
+            "supplied archive keyring differs from authenticated root",
+        )
+    return data
+
+
+def verify_archive(src, root_tar):
+    data = authenticated_archive_keyring(root_tar, src / "archive-keyring.gpg")
+    with tempfile.TemporaryDirectory(prefix="ow-archive-trust-") as home:
+        key = pathlib.Path(home) / "archive.gpg"
+        key.write_bytes(data)
+        run("gpgv", "--homedir", home, "--keyring", str(key), str(src / "InRelease"))
+
+
 def main():
     a = argparse.ArgumentParser()
     a.add_argument("upstream", type=pathlib.Path)
@@ -26,12 +118,8 @@ def main():
     v = a.parse_args()
     src = v.upstream.resolve()
     out = v.destination.resolve()
-    assert not out.exists(), "destination already exists"
+    require(not out.exists(), "destination already exists")
     key = src / "cloud-image.gpg"
-    fingerprints = subprocess.check_output(
-        ["gpg", "--show-keys", "--with-colons", str(key)], text=True
-    )
-    assert "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81" in fingerprints
     names = [
         "ubuntu-24.04-server-cloudimg-arm64-root.tar.xz",
         "unpacked/ubuntu-24.04-server-cloudimg-arm64-vmlinuz-generic",
@@ -39,29 +127,30 @@ def main():
     ]
     for sub in ["", "unpacked"]:
         p = src / sub
-        run(
-            "gpgv",
-            "--keyring",
-            str(key),
-            str(p / "SHA256SUMS.gpg"),
-            str(p / "SHA256SUMS"),
-        )
+        verify_release(key, p / "SHA256SUMS.gpg", p / "SHA256SUMS")
     for name in names:
         p = src / name
         manifest = (p.parent / "SHA256SUMS").read_text()
-        assert any(
-            line.split() == [sha(p), "*" + p.name] or line.split() == [sha(p), p.name]
-            for line in manifest.splitlines()
+        require(
+            any(
+                line.split() == [sha(p), "*" + p.name]
+                or line.split() == [sha(p), p.name]
+                for line in manifest.splitlines()
+            ),
+            "signed input checksum mismatch: " + name,
         )
     # The module package is verified through the archive keyring inside the signed root.
-    run("gpgv", "--keyring", str(src / "archive-keyring.gpg"), str(src / "InRelease"))
+    verify_archive(src, src / names[0])
     import lzma, re
 
     digest = sha(src / "Packages.xz")
-    assert re.search(
-        r"^ " + digest + r"\s+\d+ main/binary-arm64/Packages.xz$",
-        (src / "InRelease").read_text(),
-        re.M,
+    require(
+        re.search(
+            r"^ " + digest + r"\s+\d+ main/binary-arm64/Packages.xz$",
+            (src / "InRelease").read_text(),
+            re.M,
+        ),
+        "archive index checksum mismatch",
     )
     paragraphs = (
         lzma.decompress((src / "Packages.xz").read_bytes()).decode().split("\n\n")
@@ -74,7 +163,9 @@ def main():
     expected = next(
         x.split(": ", 1)[1] for x in entry.splitlines() if x.startswith("SHA256: ")
     )
-    assert sha(src / "linux-modules.deb") == expected
+    require(
+        sha(src / "linux-modules.deb") == expected, "module package checksum mismatch"
+    )
     out.mkdir(mode=0o700, parents=True)
     os.chmod(out, 0o700)
     mk = "/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
@@ -198,13 +289,13 @@ exec /usr/local/bin/ow-guest --vsock
             owners[p] = (1000, 1000)
         commands = []
         for p, (uid, gid) in owners.items():
-            assert not any(c in p for c in '\n"')
+            require(not any(c in p for c in '\n"'), "unsafe debugfs path")
             commands += [
                 'set_inode_field "' + p + '" uid ' + str(uid),
                 'set_inode_field "' + p + '" gid ' + str(gid),
             ]
         for p, mode in modes.items():
-            assert not any(c in p for c in '\n"')
+            require(not any(c in p for c in '\n"'), "unsafe debugfs path")
             commands.append('set_inode_field "' + p + '" mode ' + str(mode))
         batch = pathlib.Path(temp) / "owners"
         batch.write_text("\n".join(commands) + "\n")
@@ -219,7 +310,7 @@ exec /usr/local/bin/ow-guest --vsock
                 stderr=subprocess.STDOUT,
             )
     (out / "Image").write_bytes(gzip.decompress((src / names[1]).read_bytes()))
-    assert (out / "Image").read_bytes()[56:60] == b"ARMd"
+    require((out / "Image").read_bytes()[56:60] == b"ARMd", "not an ARM64 kernel")
     shutil.copyfile(src / names[2], out / "initrd")
     for name in ["Image", "initrd", "root.ext4"]:
         os.chmod(out / name, 0o600)

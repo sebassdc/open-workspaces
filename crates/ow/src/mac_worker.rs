@@ -20,6 +20,60 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Debug)]
+pub(crate) struct UncertainCreate;
+impl std::fmt::Display for UncertainCreate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "uncertain incomplete create; retain reservation and reconcile artifacts"
+        )
+    }
+}
+impl std::error::Error for UncertainCreate {}
+
+// Independent of --data-dir and HOME overrides. Held for the worker lifetime,
+// and inherited by its helper until positive exit, including worker crashes.
+fn aggregate_lock() -> Result<fs::File> {
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0u8; 16384];
+    let mut result = std::ptr::null_mut();
+    ensure!(
+        unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                &mut pwd,
+                buffer.as_mut_ptr() as *mut _,
+                buffer.len(),
+                &mut result,
+            )
+        } == 0
+            && !result.is_null(),
+        "cannot establish trusted user home"
+    );
+    let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_str()?;
+    lock_at(&Path::new(home).join(".ow-mac-admission.lock"))
+}
+fn lock_at(path: &Path) -> Result<fs::File> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let m = lock.metadata()?;
+    ensure!(
+        m.is_file() && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o077 == 0,
+        "owned private aggregate lock required"
+    );
+    ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "another native worker/helper owns aggregate admission"
+    );
+    Ok(lock)
+}
+
 pub fn process_start(pid: u32) -> Result<String> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let n = unsafe {
@@ -206,9 +260,11 @@ struct Worker {
     memory: u64,
     cpus: u64,
     free_gib: u64,
+    aggregate: fs::File,
 }
 impl Worker {
     fn new(root: PathBuf) -> Result<Self> {
+        let aggregate = aggregate_lock()?;
         let assets = verified_assets(&root)?;
         private_dir(&root.join("m"))?;
         let cfg: Value = serde_json::from_slice(&fs::read(root.join("host.json"))?)?;
@@ -239,6 +295,7 @@ impl Worker {
             memory,
             cpus,
             free_gib,
+            aggregate,
         };
         w.reconcile()?;
         Ok(w)
@@ -406,7 +463,25 @@ impl Worker {
             }
         }
         self.state(id, "starting")?;
-        let mut child = Command::new(helper()?)
+        // A dedicated high fd avoids stdio remapping; clear CLOEXEC only in the
+        // child. Both processes retain the same flock open-file description.
+        use std::os::unix::process::CommandExt;
+        let inherited =
+            unsafe { libc::fcntl(self.aggregate.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+        ensure!(inherited >= 0, "cannot retain aggregate helper reservation");
+        use std::os::fd::FromRawFd;
+        let inherited = unsafe { fs::File::from_raw_fd(inherited) };
+        let fd = inherited.as_raw_fd();
+        let mut command = Command::new(helper()?);
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
             .arg("node")
             .arg(dir.join("vm.json"))
             .stdin(Stdio::piped())
@@ -497,18 +572,22 @@ impl Worker {
         );
         Ok(r["result"].clone())
     }
-    fn stop(&mut self, id: &str) -> Result<Value> {
+    fn stop(&mut self, id: &str) -> Result<(Value, Option<String>)> {
         self.reconcile()?;
         let v = self.machine(id)?;
         if v["state"] == "stopped" {
-            return Ok(v);
+            return Ok((v, None));
         }
         ensure!(
             self.children.contains_key(id),
             "unowned native demand; wait for parent-pipe stop and reconcile"
         );
         self.state(id, "stopping")?;
-        self.rpc(id, json!({"op":"exec","command":"sync"}))?;
+        let sync_error = match self.rpc(id, json!({"op":"exec","command":"sync"})) {
+            Ok(v) if v["exit_code"] == 0 => None,
+            Ok(v) => Some(format!("guest sync failed: {v}")),
+            Err(e) => Some(format!("guest sync unavailable: {e:#}")),
+        };
         self.children.get_mut(id).unwrap().stdin.take();
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -516,7 +595,7 @@ impl Worker {
                 self.children.remove(id);
                 ensure!(self.stopped_lock(id)?, "native lock still held");
                 self.state(id, "stopped")?;
-                return self.machine(id);
+                return Ok((self.machine(id)?, sync_error));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -571,7 +650,37 @@ impl Worker {
                     serde_json::from_str::<Value>(&old)? == request,
                     "ID reused with different shape/image"
                 );
-                return self.machine(id);
+                let existing = self.machine(id)?;
+                if !matches!(existing["state"].as_str(), Some("running" | "stopped")) {
+                    return Err(UncertainCreate.into());
+                }
+                let dir = self.dir(id);
+                let complete = (|| -> Result<()> {
+                    nodes::private(&dir.join("root.ext4"))?;
+                    nodes::private(&dir.join("vm.json"))?;
+                    ensure!(
+                        dir.join("root.ext4").metadata()?.len() == 4 * 1024 * 1024 * 1024,
+                        "incomplete disk"
+                    );
+                    let cfg: Value = serde_json::from_slice(&fs::read(dir.join("vm.json"))?)?;
+                    ensure!(
+                        cfg == json!({"kernel":self.assets.join("Image"),"initrd":self.assets.join("initrd"),"memory_mib":memory,"vcpu_count":cpus}),
+                        "incomplete config"
+                    );
+                    ensure!(
+                        if existing["state"] == "running" {
+                            self.children.contains_key(id)
+                        } else {
+                            self.stopped_lock(id)?
+                        },
+                        "unproven create state"
+                    );
+                    Ok(())
+                })();
+                if complete.is_err() {
+                    return Err(UncertainCreate.into());
+                }
+                return Ok(existing);
             }
             self.admission(memory as u64, cpus as u64)?;
             ensure!(
@@ -586,15 +695,20 @@ impl Worker {
                 "INSERT INTO machines VALUES(?1,?2,'creating')",
                 params![id, request.to_string()],
             )?;
-            let dir = self.dir(id);
-            private_dir(&dir)?;
-            fs::copy(self.assets.join("root.ext4"), dir.join("root.ext4"))?;
-            fs::File::open(dir.join("root.ext4"))?.sync_all()?;
-            let cfg = json!({"kernel":self.assets.join("Image"),"initrd":self.assets.join("initrd"),"memory_mib":memory,"vcpu_count":cpus});
-            nodes::write_private(&dir.join("vm.json"), &cfg)?;
-            fs::File::open(&dir)?.sync_all()?;
-            self.state(id, "stopped")?;
-            return self.start(id);
+            let effects = (|| -> Result<Value> {
+                let dir = self.dir(id);
+                private_dir(&dir)?;
+                fs::copy(self.assets.join("root.ext4"), dir.join("root.ext4"))?;
+                fs::File::open(dir.join("root.ext4"))?.sync_all()?;
+                let cfg = json!({"kernel":self.assets.join("Image"),"initrd":self.assets.join("initrd"),"memory_mib":memory,"vcpu_count":cpus});
+                nodes::write_private(&dir.join("vm.json"), &cfg)?;
+                fs::File::open(&dir)?.sync_all()?;
+                self.state(id, "stopped")?;
+                self.start(id)
+            })();
+            return effects.map_err(|error| {
+                anyhow::Error::new(UncertainCreate).context(format!("{error:#}"))
+            });
         }
         if op == "inspect" {
             return self.machine(id);
@@ -603,7 +717,8 @@ impl Worker {
             return self.start(id);
         }
         if op == "stop" {
-            return Ok(json!({"workspace":self.stop(id)?,"sync_error":null}));
+            let (workspace, sync_error) = self.stop(id)?;
+            return Ok(json!({"workspace":workspace,"sync_error":sync_error}));
         }
         ensure!(
             self.machine(id)?["state"] == "running" && self.children.contains_key(id),
@@ -986,4 +1101,139 @@ pub fn run(cli: Cli) -> Result<i32> {
     };
     println!("{}", wire::request(&root, r)?);
     Ok(0)
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    fn fixture() -> Worker {
+        let root =
+            PathBuf::from("/tmp").join(format!("ow-mac-review-{}", common::nonce().unwrap()));
+        private_dir(&root).unwrap();
+        private_dir(&root.join("m")).unwrap();
+        let db = Connection::open(root.join("mac-worker.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE machines(id TEXT PRIMARY KEY,request TEXT NOT NULL,state TEXT NOT NULL)",
+        )
+        .unwrap();
+        Worker {
+            aggregate: lock_at(&root.join("aggregate.lock")).unwrap(),
+            assets: root.join("assets"),
+            root,
+            db,
+            children: Default::default(),
+            memory: 1024,
+            cpus: 2,
+            free_gib: 20,
+        }
+    }
+    #[test]
+    fn incomplete_create_journal_replay_remains_uncertain() {
+        for partial in [false, true] {
+            let mut w = fixture();
+            let root = w.root.clone();
+            let request = json!({"op":"create","id":"partial","image":"ubuntu-arm64","memory_mib":512,"vcpu_count":1,"operation_key":"same-key"});
+            w.db.execute(
+                "INSERT INTO machines VALUES('partial',?1,'creating')",
+                [json!({"image":"ubuntu-arm64","memory_mib":512,"vcpu_count":1}).to_string()],
+            )
+            .unwrap();
+            if partial {
+                private_dir(&w.dir("partial")).unwrap();
+                fs::write(w.dir("partial").join("root.ext4"), b"partial copy").unwrap();
+            }
+            let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+            let task = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut s, _) = listener.accept().unwrap();
+                    let r = wire::line(&mut s).unwrap();
+                    let reply = wire::response(w.request(&r));
+                    assert_eq!(reply["uncertain"], true);
+                    wire::send(&mut s, &reply).unwrap();
+                }
+                assert_eq!(w.machine("partial").unwrap()["state"], "creating");
+                if partial {
+                    assert_eq!(
+                        fs::read(w.dir("partial").join("root.ext4")).unwrap(),
+                        b"partial copy"
+                    );
+                }
+            });
+            for _ in 0..2 {
+                let v = crate::nodes::review_journal_request(&root, &request).unwrap();
+                assert_eq!(v["ok"], false);
+                assert_eq!(v["uncertain"], true);
+            }
+            task.join().unwrap();
+            let db = Connection::open(root.join("node-operations.sqlite3")).unwrap();
+            let response: String = db
+                .query_row(
+                    "SELECT response FROM effects WHERE key='same-key'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&response).unwrap()["ok"],
+                false
+            );
+            drop(db);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    fn aggregate_two_root_start_boundary_has_one_winner() {
+        let root =
+            std::env::temp_dir().join(format!("ow-admission-review-{}", common::nonce().unwrap()));
+        private_dir(&root).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let acquired = Arc::new(std::sync::Barrier::new(2));
+        let tasks: Vec<_> = (0..2)
+            .map(|i| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                let acquired = acquired.clone();
+                std::thread::spawn(move || {
+                    // Separate data roots share exactly the same trusted-user lock.
+                    private_dir(&root.join(format!("data-{i}"))).unwrap();
+                    barrier.wait();
+                    let lock = lock_at(&root.join("user-wide.lock"));
+                    let won = lock.is_ok();
+                    acquired.wait(); // winner retains reservation across fake spawn boundary
+                    won
+                })
+            })
+            .collect();
+        assert_eq!(
+            tasks
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|won| *won)
+                .count(),
+            1
+        );
+        let lock = lock_at(&root.join("user-wide.lock")).unwrap();
+        use std::os::unix::process::CommandExt;
+        let fd = lock.as_raw_fd();
+        let mut cmd = Command::new("/bin/cat");
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(lock); // simulated worker death; fake helper keeps reservation
+        assert!(lock_at(&root.join("user-wide.lock")).is_err());
+        child.stdin.take();
+        assert!(child.wait().unwrap().success());
+        assert!(lock_at(&root.join("user-wide.lock")).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

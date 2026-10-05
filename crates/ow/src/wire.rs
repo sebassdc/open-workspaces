@@ -69,7 +69,17 @@ pub fn request(root: &Path, value: Value) -> Result<Value> {
 pub fn response(result: anyhow::Result<Value>) -> Value {
     match result {
         Ok(result) => json!({"ok":true,"result":result}),
-        Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
+        Err(error) => {
+            let mut response = json!({"ok":false,"error":format!("{error:#}")});
+            #[cfg(target_os = "macos")]
+            if error
+                .downcast_ref::<crate::mac_worker::UncertainCreate>()
+                .is_some()
+            {
+                response["uncertain"] = json!(true);
+            }
+            response
+        }
     }
 }
 

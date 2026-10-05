@@ -29,3 +29,14 @@ claim; networking stays absent until host-owned isolation is implemented.
 Native helper deployment target: macOS 14 minimum for existing save/restore API;
 Apple Silicon required. Record actual linked binary minimum, not only requested
 compiler flags. Public installer rollout is outside this lane.
+
+## Review hardening (PR6)
+Aggregate admission uses the trusted system user home, independent of configured
+node roots. One worker holds the reservation throughout its lifetime; its helper
+inherits the same flock description until exit, closing the crash-to-shutdown
+gap. Unknown demand remains reserved. Completed create replay requires a proved
+state and complete private disk/config; incomplete effects produce an uncertain
+envelope, preserved by the node and controller journals. Sync failure is retained
+as a diagnostic while owned pipe shutdown still runs. Upstream image preparation
+restricts actual successful release signers and derives archive trust from the
+authenticated root, with non-removable checks.

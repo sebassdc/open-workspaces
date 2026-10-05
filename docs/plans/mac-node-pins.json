@@ -4,7 +4,7 @@
     "Cargo.lock": "0c1e72dac30cde94d433be844a4ab76a2c4fd229a9eb59eabc1491ade583cdce",
     "Cargo.toml": "cff740f304c0d1d4819242346e298f6e5e27ce545c34d821478efd9d482918c0",
     "crates/ow/Cargo.toml": "f184b7de4462cf1b65ef20dfad6434ece92adf20dea8f33ff9dc31cb5a54d764",
-    "crates/ow/src/catalog.rs": "b42f80fb45ed7c03b25a9bafb4099a97c34f915e0485c1f7721f0c77340f8cf0",
+    "crates/ow/src/catalog.rs": "c72d1a95855eeaeb4debe7c875a76e0a84e58eab21f2578796d174516624db5a",
     "crates/ow/src/catalog_tests.rs": "a0d0986df7fad3db0522c7681a11300dfd166d5e6086fb8e649af79729f70d7c",
     "crates/ow/src/client.rs": "5b35e2ee0b81f123a063085b5e8a45410db72abc634e01297603004b111d7270",
     "crates/ow/src/common.rs": "f2b6b277a9c8e208da978b4be6e60ae2e811f5eb7b4b653fe9eceb4124cd27c2",
@@ -13,12 +13,12 @@
     "crates/ow/src/local_terminal.rs": "96095dae1e6509d9eb49114d39346d11e576921a63c94762ff15a4addd3dffbd",
     "crates/ow/src/mac_host.rs": "9926794a19ba0c9711e1519873856923d4ce8ecf714acf3dc291cc4ab93c0adc",
     "crates/ow/src/mac_onboarding.rs": "1bf2c3c5728b520862c53ab96e22a056bdad7899ca060ac0ac19c08e951bf1bc",
-    "crates/ow/src/mac_worker.rs": "36b2c051555a3c294346a030f65c98d501e6ed02e94b61dcca70f8b5813ef20b",
+    "crates/ow/src/mac_worker.rs": "cc4e74d006304e73f3c545ea017112344d523cb3be06649db02f296b4d4518be",
     "crates/ow/src/main.rs": "17f0f2b0ab04784cec623f291ac46c5dee304815f875a70b043b1b5bf1765bb1",
     "crates/ow/src/network.rs": "4efd2b0e6905aad9c8fd73372b5e5d9fe0cc6ddf685c0d27cb2c74323c1f2ece",
     "crates/ow/src/node_e2e.rs": "b6cde1c1f0e236a846c0680d36d005f0cf775b189057baee3e491957033da55e",
     "crates/ow/src/node_tests.rs": "6f3a155017965e82f6ae68b52fa4e024f4ab1cc3925f7951a3913d1de5b02175",
-    "crates/ow/src/nodes.rs": "9134d622e70faabbec445163303154fb47afafbd3d608ae66c0e41c7cc9d8b61",
+    "crates/ow/src/nodes.rs": "fb49920d4a68192e44f3eea47dd7b7f186ef2b309ba63ab5c98c4c12e3afc7db",
     "crates/ow/src/onboarding.rs": "3dea64f320a9c54cf07c1c5efd1296bc5c88b009eac899d7a8868a3b90f19d10",
     "crates/ow/src/remote.rs": "2386db22fabe4cf7777b054d9707dda6d96477381203f947c97ed55d40f1757e",
     "crates/ow/src/runtime.rs": "75f55cc57bb1a39484df55667ffed3e9219c08fe4b45fb23b5167da6f3a712c9",
@@ -28,7 +28,7 @@
     "crates/ow/src/ssh_guest.rs": "012f27ed22cec5c1e1fdb40437a77baaa5e636d23ad475706f7e3128e241b5b6",
     "crates/ow/src/terminal.rs": "9cd5d77af68002d1864b0546a6d0a903965088152315eedb83d8e6e2883c7916",
     "crates/ow/src/vm.rs": "c5b05bbf93167914073540408ece9570650bd29e2c992045c9a00fa6dd4a1c29",
-    "crates/ow/src/wire.rs": "31c2cc06c31e5ff06830312a91381705719c58d650d8c4e580acb8981c981ec0",
+    "crates/ow/src/wire.rs": "bfff15af9f0a3b825d1ef7fdcd1c43497b3b8e1b88b51e1faa0082e916b3fad7",
     "crates/ow/ui/app.js": "6d79d991ae928dd308cd814b79fd97057492a3e04da77dc4c9da84892702b4b5",
     "crates/ow-guest/Cargo.toml": "6e80de39f29e6fc5c345a202f9ccb9fe1c5fd229cbc7587870754591c42111bc",
     "crates/ow-guest/src/main.rs": "047af73f78032667c9d80df91960d79a654a0f57cb316bc30dc5b2d875b4f7da",
@@ -37,10 +37,11 @@
     "native/macos/node.swift": "7aee4f24f3877a78f8cea0c1cd66632f25aa5ccea1d054845e1b3de56562c79a",
     "native/macos/virtualization.entitlements": "915e2b39357ecf8d211dc7fac43195c9cdcf55a0a1ecdbf931c116a4eac421f3",
     "scripts/build-mac-host.sh": "0d220dfe33fb0bd9c4219ca84de1f221ae1bc2bc72b47e8f3d8d6063ce7ad92c",
-    "scripts/mac-node-receipt.py": "b31afaed6b4fda2cba655f624dcbc5048969ef4852e7f20356ddacc979d79672",
-    "scripts/prepare-mac-node.py": "731c7c2b82c5062ad277b14c0cc481f4bad0b04f2996b17404080f135cd87a40",
+    "scripts/mac-node-receipt.py": "a23cd081b209dfd38ebd4abac4a75c34ef4a87490fed6a48294683e9ccbeea9f",
+    "scripts/prepare-mac-node.py": "8193d65d77af311f6ed26a457ee6f70baa7bbf3444554d3b08aab9f959205cb0",
     "scripts/test-mac-node-transport.py": "23709ce568451958deb805d12e6d004da61d4bff26f0a7966c4adbb69503343f",
-    "scripts/test-mac-node.py": "7fa2592e7f38ccb10b575d4925816fdd8c60c3f6f0ef191545a74d1e43027aad"
+    "scripts/test-mac-node-trust.py": "0ae6c111fc37450d3a465642a72f3115f88d3d5724fdaffaa7131bca6025c531",
+    "scripts/test-mac-node.py": "cfa1da303326da0c8147514cf369fa9abfee8464797e491426b7dc6b0a6eae4b"
   },
   "native_runs": {
     "local-final": {
@@ -139,11 +140,35 @@
       "source_changes_since_run": {
         "crates/ow/src/catalog.rs": {
           "tested": "d7d734007969eff5a713667e06eb4ea7069388302a6bce7e73e67330163897d5",
-          "final": "b42f80fb45ed7c03b25a9bafb4099a97c34f915e0485c1f7721f0c77340f8cf0"
+          "final": "c72d1a95855eeaeb4debe7c875a76e0a84e58eab21f2578796d174516624db5a"
+        },
+        "crates/ow/src/mac_worker.rs": {
+          "tested": "36b2c051555a3c294346a030f65c98d501e6ed02e94b61dcca70f8b5813ef20b",
+          "final": "cc4e74d006304e73f3c545ea017112344d523cb3be06649db02f296b4d4518be"
+        },
+        "crates/ow/src/nodes.rs": {
+          "tested": "9134d622e70faabbec445163303154fb47afafbd3d608ae66c0e41c7cc9d8b61",
+          "final": "fb49920d4a68192e44f3eea47dd7b7f186ef2b309ba63ab5c98c4c12e3afc7db"
+        },
+        "crates/ow/src/wire.rs": {
+          "tested": "31c2cc06c31e5ff06830312a91381705719c58d650d8c4e580acb8981c981ec0",
+          "final": "bfff15af9f0a3b825d1ef7fdcd1c43497b3b8e1b88b51e1faa0082e916b3fad7"
+        },
+        "scripts/mac-node-receipt.py": {
+          "tested": "b31afaed6b4fda2cba655f624dcbc5048969ef4852e7f20356ddacc979d79672",
+          "final": "a23cd081b209dfd38ebd4abac4a75c34ef4a87490fed6a48294683e9ccbeea9f"
+        },
+        "scripts/prepare-mac-node.py": {
+          "tested": "731c7c2b82c5062ad277b14c0cc481f4bad0b04f2996b17404080f135cd87a40",
+          "final": "8193d65d77af311f6ed26a457ee6f70baa7bbf3444554d3b08aab9f959205cb0"
+        },
+        "scripts/test-mac-node-trust.py": {
+          "tested": null,
+          "final": "0ae6c111fc37450d3a465642a72f3115f88d3d5724fdaffaa7131bca6025c531"
         },
         "scripts/test-mac-node.py": {
           "tested": "7d8517c74667ac59ed272c5122cb360a5b2ef8c8b2b7d3cdf737a2a6e06544c7",
-          "final": "7fa2592e7f38ccb10b575d4925816fdd8c60c3f6f0ef191545a74d1e43027aad"
+          "final": "cfa1da303326da0c8147514cf369fa9abfee8464797e491426b7dc6b0a6eae4b"
         }
       }
     },
@@ -218,13 +243,206 @@
       "source_changes_since_run": {
         "crates/ow/src/catalog.rs": {
           "tested": "d7d734007969eff5a713667e06eb4ea7069388302a6bce7e73e67330163897d5",
-          "final": "b42f80fb45ed7c03b25a9bafb4099a97c34f915e0485c1f7721f0c77340f8cf0"
+          "final": "c72d1a95855eeaeb4debe7c875a76e0a84e58eab21f2578796d174516624db5a"
+        },
+        "crates/ow/src/mac_worker.rs": {
+          "tested": "36b2c051555a3c294346a030f65c98d501e6ed02e94b61dcca70f8b5813ef20b",
+          "final": "cc4e74d006304e73f3c545ea017112344d523cb3be06649db02f296b4d4518be"
+        },
+        "crates/ow/src/nodes.rs": {
+          "tested": "9134d622e70faabbec445163303154fb47afafbd3d608ae66c0e41c7cc9d8b61",
+          "final": "fb49920d4a68192e44f3eea47dd7b7f186ef2b309ba63ab5c98c4c12e3afc7db"
+        },
+        "crates/ow/src/wire.rs": {
+          "tested": "31c2cc06c31e5ff06830312a91381705719c58d650d8c4e580acb8981c981ec0",
+          "final": "bfff15af9f0a3b825d1ef7fdcd1c43497b3b8e1b88b51e1faa0082e916b3fad7"
+        },
+        "scripts/mac-node-receipt.py": {
+          "tested": "b31afaed6b4fda2cba655f624dcbc5048969ef4852e7f20356ddacc979d79672",
+          "final": "a23cd081b209dfd38ebd4abac4a75c34ef4a87490fed6a48294683e9ccbeea9f"
+        },
+        "scripts/prepare-mac-node.py": {
+          "tested": "731c7c2b82c5062ad277b14c0cc481f4bad0b04f2996b17404080f135cd87a40",
+          "final": "8193d65d77af311f6ed26a457ee6f70baa7bbf3444554d3b08aab9f959205cb0"
+        },
+        "scripts/test-mac-node-trust.py": {
+          "tested": null,
+          "final": "0ae6c111fc37450d3a465642a72f3115f88d3d5724fdaffaa7131bca6025c531"
         },
         "scripts/test-mac-node.py": {
           "tested": "7d8517c74667ac59ed272c5122cb360a5b2ef8c8b2b7d3cdf737a2a6e06544c7",
-          "final": "7fa2592e7f38ccb10b575d4925816fdd8c60c3f6f0ef191545a74d1e43027aad"
+          "final": "cfa1da303326da0c8147514cf369fa9abfee8464797e491426b7dc6b0a6eae4b"
         }
       }
+    },
+    "review-hardware": {
+      "receipt_sha256": "b998c459f20fde6e5193ef1ac542616c0bedb7e6abea19d808676f6ab2038740",
+      "source_unchanged_during_run": true,
+      "source_files": {
+        "Cargo.lock": "0c1e72dac30cde94d433be844a4ab76a2c4fd229a9eb59eabc1491ade583cdce",
+        "Cargo.toml": "cff740f304c0d1d4819242346e298f6e5e27ce545c34d821478efd9d482918c0",
+        "crates/ow/Cargo.toml": "f184b7de4462cf1b65ef20dfad6434ece92adf20dea8f33ff9dc31cb5a54d764",
+        "crates/ow/src/catalog.rs": "c72d1a95855eeaeb4debe7c875a76e0a84e58eab21f2578796d174516624db5a",
+        "crates/ow/src/catalog_tests.rs": "a0d0986df7fad3db0522c7681a11300dfd166d5e6086fb8e649af79729f70d7c",
+        "crates/ow/src/client.rs": "5b35e2ee0b81f123a063085b5e8a45410db72abc634e01297603004b111d7270",
+        "crates/ow/src/common.rs": "f2b6b277a9c8e208da978b4be6e60ae2e811f5eb7b4b653fe9eceb4124cd27c2",
+        "crates/ow/src/dashboard.rs": "07437b36dfb874044f0b83c45071da99e2a131a54cd87147ba827f9e2799e6c2",
+        "crates/ow/src/host.rs": "1780229a8597879e01b2c241b05ee717c322f30092c6e47b6ea9e4560e871ac8",
+        "crates/ow/src/local_terminal.rs": "96095dae1e6509d9eb49114d39346d11e576921a63c94762ff15a4addd3dffbd",
+        "crates/ow/src/mac_host.rs": "9926794a19ba0c9711e1519873856923d4ce8ecf714acf3dc291cc4ab93c0adc",
+        "crates/ow/src/mac_onboarding.rs": "1bf2c3c5728b520862c53ab96e22a056bdad7899ca060ac0ac19c08e951bf1bc",
+        "crates/ow/src/mac_worker.rs": "cc4e74d006304e73f3c545ea017112344d523cb3be06649db02f296b4d4518be",
+        "crates/ow/src/main.rs": "17f0f2b0ab04784cec623f291ac46c5dee304815f875a70b043b1b5bf1765bb1",
+        "crates/ow/src/network.rs": "4efd2b0e6905aad9c8fd73372b5e5d9fe0cc6ddf685c0d27cb2c74323c1f2ece",
+        "crates/ow/src/node_e2e.rs": "b6cde1c1f0e236a846c0680d36d005f0cf775b189057baee3e491957033da55e",
+        "crates/ow/src/node_tests.rs": "6f3a155017965e82f6ae68b52fa4e024f4ab1cc3925f7951a3913d1de5b02175",
+        "crates/ow/src/nodes.rs": "fb49920d4a68192e44f3eea47dd7b7f186ef2b309ba63ab5c98c4c12e3afc7db",
+        "crates/ow/src/onboarding.rs": "3dea64f320a9c54cf07c1c5efd1296bc5c88b009eac899d7a8868a3b90f19d10",
+        "crates/ow/src/remote.rs": "2386db22fabe4cf7777b054d9707dda6d96477381203f947c97ed55d40f1757e",
+        "crates/ow/src/runtime.rs": "75f55cc57bb1a39484df55667ffed3e9219c08fe4b45fb23b5167da6f3a712c9",
+        "crates/ow/src/ssh_client.rs": "05a82a3e64e7ba9cdc834ca6a26899900f0d00dbcd4e5e55738b303437d83839",
+        "crates/ow/src/ssh_e2e.rs": "228a700a857def84ee11087f621cc89247632690be822c008ffe26f44d440127",
+        "crates/ow/src/ssh_gateway.rs": "aed40812295ad4747bf553b8eaf96429ca384da0b7144d13119313e5027fdb49",
+        "crates/ow/src/ssh_guest.rs": "012f27ed22cec5c1e1fdb40437a77baaa5e636d23ad475706f7e3128e241b5b6",
+        "crates/ow/src/terminal.rs": "9cd5d77af68002d1864b0546a6d0a903965088152315eedb83d8e6e2883c7916",
+        "crates/ow/src/vm.rs": "c5b05bbf93167914073540408ece9570650bd29e2c992045c9a00fa6dd4a1c29",
+        "crates/ow/src/wire.rs": "bfff15af9f0a3b825d1ef7fdcd1c43497b3b8e1b88b51e1faa0082e916b3fad7",
+        "crates/ow/ui/app.js": "6d79d991ae928dd308cd814b79fd97057492a3e04da77dc4c9da84892702b4b5",
+        "crates/ow-guest/Cargo.toml": "6e80de39f29e6fc5c345a202f9ccb9fe1c5fd229cbc7587870754591c42111bc",
+        "crates/ow-guest/src/main.rs": "047af73f78032667c9d80df91960d79a654a0f57cb316bc30dc5b2d875b4f7da",
+        "crates/ow-guest/src/native.rs": "33ef5a7b21bc28af146857e8657762af03327d49dea508e762e24fc31d1ffeb4",
+        "native/macos/main.swift": "157032854722b3c4080c00ecd292b2be16e3ea9784bfb4d63bcd3a29bb2e8360",
+        "native/macos/node.swift": "7aee4f24f3877a78f8cea0c1cd66632f25aa5ccea1d054845e1b3de56562c79a",
+        "native/macos/virtualization.entitlements": "915e2b39357ecf8d211dc7fac43195c9cdcf55a0a1ecdbf931c116a4eac421f3",
+        "scripts/build-mac-host.sh": "0d220dfe33fb0bd9c4219ca84de1f221ae1bc2bc72b47e8f3d8d6063ce7ad92c",
+        "scripts/mac-node-receipt.py": "a23cd081b209dfd38ebd4abac4a75c34ef4a87490fed6a48294683e9ccbeea9f",
+        "scripts/prepare-mac-node.py": "8193d65d77af311f6ed26a457ee6f70baa7bbf3444554d3b08aab9f959205cb0",
+        "scripts/test-mac-node-transport.py": "23709ce568451958deb805d12e6d004da61d4bff26f0a7966c4adbb69503343f",
+        "scripts/test-mac-node-trust.py": "0ae6c111fc37450d3a465642a72f3115f88d3d5724fdaffaa7131bca6025c531",
+        "scripts/test-mac-node.py": "cfa1da303326da0c8147514cf369fa9abfee8464797e491426b7dc6b0a6eae4b"
+      },
+      "artifacts": {
+        "cli_sha256": "c622f6f13af71c813633b94713e61860fed34f30e9c4cbc6d162cb84d7521bad",
+        "signed_helper_sha256": "f9933fb141151fe42ea955f9ea3f82fbf0768547f98aa7b94ba5725e3673e0c0",
+        "prepared_manifest_sha256": "cd79cdf25df178c668115f397469b87815445b396eaa2c10c6be45318e3ec8b0"
+      },
+      "checks": [
+        "truthful Mac capabilities",
+        "x86 image rejected",
+        "unsupported shape rejected",
+        "Ubuntu ARM64 running",
+        "real exec output/exit",
+        "exec drains complete bounded output",
+        "developer sudo and trusted CA/package tools",
+        "escaped exec response budget is a clear error",
+        "failed exec does not release live demand",
+        "binary file roundtrip",
+        "file traversal rejected",
+        "parent symlink rejected",
+        "final symlink rejected",
+        "FIFO rejected without blocking",
+        "running local capacity rejected",
+        "unsupported snapshot",
+        "unsupported fork",
+        "unsupported hibernate",
+        "unsupported restore",
+        "unsupported ssh",
+        "unsupported ssh-info",
+        "unsupported ssh-keys",
+        "unsupported tunnel",
+        "real PTY and resize",
+        "PTY Ctrl-C",
+        "PTY exit status",
+        "PTY exits by EOF",
+        "unavailable guest sync remains diagnostic",
+        "positive cold stop",
+        "RPC failure still exits helper and retains disk",
+        "cold persistent binary",
+        "machine identity stable",
+        "worker crash demand reconciled positively",
+        "worker recovery preserves files",
+        "live unregistered helper consumes capacity",
+        "owned unregistered helper cleaned",
+        "positive reconciliation after external helper",
+        "unregistered demand reserved",
+        "512 MiB / 2 vCPU Ubuntu starts",
+        "guest observes two actual CPUs",
+        "synthetic reservations removed",
+        "base disk independent of guest writes",
+        "owned worker shutdown"
+      ],
+      "source_changes_since_run": {}
+    },
+    "review-tls": {
+      "receipt_sha256": "52db964092be0bec027285cf628a1ba8bdf38594fafb1944b9321cc7f7e9aed7",
+      "source_unchanged_during_run": true,
+      "source_files": {
+        "Cargo.lock": "0c1e72dac30cde94d433be844a4ab76a2c4fd229a9eb59eabc1491ade583cdce",
+        "Cargo.toml": "cff740f304c0d1d4819242346e298f6e5e27ce545c34d821478efd9d482918c0",
+        "crates/ow/Cargo.toml": "f184b7de4462cf1b65ef20dfad6434ece92adf20dea8f33ff9dc31cb5a54d764",
+        "crates/ow/src/catalog.rs": "c72d1a95855eeaeb4debe7c875a76e0a84e58eab21f2578796d174516624db5a",
+        "crates/ow/src/catalog_tests.rs": "a0d0986df7fad3db0522c7681a11300dfd166d5e6086fb8e649af79729f70d7c",
+        "crates/ow/src/client.rs": "5b35e2ee0b81f123a063085b5e8a45410db72abc634e01297603004b111d7270",
+        "crates/ow/src/common.rs": "f2b6b277a9c8e208da978b4be6e60ae2e811f5eb7b4b653fe9eceb4124cd27c2",
+        "crates/ow/src/dashboard.rs": "07437b36dfb874044f0b83c45071da99e2a131a54cd87147ba827f9e2799e6c2",
+        "crates/ow/src/host.rs": "1780229a8597879e01b2c241b05ee717c322f30092c6e47b6ea9e4560e871ac8",
+        "crates/ow/src/local_terminal.rs": "96095dae1e6509d9eb49114d39346d11e576921a63c94762ff15a4addd3dffbd",
+        "crates/ow/src/mac_host.rs": "9926794a19ba0c9711e1519873856923d4ce8ecf714acf3dc291cc4ab93c0adc",
+        "crates/ow/src/mac_onboarding.rs": "1bf2c3c5728b520862c53ab96e22a056bdad7899ca060ac0ac19c08e951bf1bc",
+        "crates/ow/src/mac_worker.rs": "cc4e74d006304e73f3c545ea017112344d523cb3be06649db02f296b4d4518be",
+        "crates/ow/src/main.rs": "17f0f2b0ab04784cec623f291ac46c5dee304815f875a70b043b1b5bf1765bb1",
+        "crates/ow/src/network.rs": "4efd2b0e6905aad9c8fd73372b5e5d9fe0cc6ddf685c0d27cb2c74323c1f2ece",
+        "crates/ow/src/node_e2e.rs": "b6cde1c1f0e236a846c0680d36d005f0cf775b189057baee3e491957033da55e",
+        "crates/ow/src/node_tests.rs": "6f3a155017965e82f6ae68b52fa4e024f4ab1cc3925f7951a3913d1de5b02175",
+        "crates/ow/src/nodes.rs": "fb49920d4a68192e44f3eea47dd7b7f186ef2b309ba63ab5c98c4c12e3afc7db",
+        "crates/ow/src/onboarding.rs": "3dea64f320a9c54cf07c1c5efd1296bc5c88b009eac899d7a8868a3b90f19d10",
+        "crates/ow/src/remote.rs": "2386db22fabe4cf7777b054d9707dda6d96477381203f947c97ed55d40f1757e",
+        "crates/ow/src/runtime.rs": "75f55cc57bb1a39484df55667ffed3e9219c08fe4b45fb23b5167da6f3a712c9",
+        "crates/ow/src/ssh_client.rs": "05a82a3e64e7ba9cdc834ca6a26899900f0d00dbcd4e5e55738b303437d83839",
+        "crates/ow/src/ssh_e2e.rs": "228a700a857def84ee11087f621cc89247632690be822c008ffe26f44d440127",
+        "crates/ow/src/ssh_gateway.rs": "aed40812295ad4747bf553b8eaf96429ca384da0b7144d13119313e5027fdb49",
+        "crates/ow/src/ssh_guest.rs": "012f27ed22cec5c1e1fdb40437a77baaa5e636d23ad475706f7e3128e241b5b6",
+        "crates/ow/src/terminal.rs": "9cd5d77af68002d1864b0546a6d0a903965088152315eedb83d8e6e2883c7916",
+        "crates/ow/src/vm.rs": "c5b05bbf93167914073540408ece9570650bd29e2c992045c9a00fa6dd4a1c29",
+        "crates/ow/src/wire.rs": "bfff15af9f0a3b825d1ef7fdcd1c43497b3b8e1b88b51e1faa0082e916b3fad7",
+        "crates/ow/ui/app.js": "6d79d991ae928dd308cd814b79fd97057492a3e04da77dc4c9da84892702b4b5",
+        "crates/ow-guest/Cargo.toml": "6e80de39f29e6fc5c345a202f9ccb9fe1c5fd229cbc7587870754591c42111bc",
+        "crates/ow-guest/src/main.rs": "047af73f78032667c9d80df91960d79a654a0f57cb316bc30dc5b2d875b4f7da",
+        "crates/ow-guest/src/native.rs": "33ef5a7b21bc28af146857e8657762af03327d49dea508e762e24fc31d1ffeb4",
+        "native/macos/main.swift": "157032854722b3c4080c00ecd292b2be16e3ea9784bfb4d63bcd3a29bb2e8360",
+        "native/macos/node.swift": "7aee4f24f3877a78f8cea0c1cd66632f25aa5ccea1d054845e1b3de56562c79a",
+        "native/macos/virtualization.entitlements": "915e2b39357ecf8d211dc7fac43195c9cdcf55a0a1ecdbf931c116a4eac421f3",
+        "scripts/build-mac-host.sh": "0d220dfe33fb0bd9c4219ca84de1f221ae1bc2bc72b47e8f3d8d6063ce7ad92c",
+        "scripts/mac-node-receipt.py": "a23cd081b209dfd38ebd4abac4a75c34ef4a87490fed6a48294683e9ccbeea9f",
+        "scripts/prepare-mac-node.py": "8193d65d77af311f6ed26a457ee6f70baa7bbf3444554d3b08aab9f959205cb0",
+        "scripts/test-mac-node-transport.py": "23709ce568451958deb805d12e6d004da61d4bff26f0a7966c4adbb69503343f",
+        "scripts/test-mac-node-trust.py": "0ae6c111fc37450d3a465642a72f3115f88d3d5724fdaffaa7131bca6025c531",
+        "scripts/test-mac-node.py": "cfa1da303326da0c8147514cf369fa9abfee8464797e491426b7dc6b0a6eae4b"
+      },
+      "artifacts": {
+        "cli_sha256": "c622f6f13af71c813633b94713e61860fed34f30e9c4cbc6d162cb84d7521bad",
+        "signed_helper_sha256": "f9933fb141151fe42ea955f9ea3f82fbf0768547f98aa7b94ba5725e3673e0c0",
+        "prepared_manifest_sha256": "cd79cdf25df178c668115f397469b87815445b396eaa2c10c6be45318e3ec8b0"
+      },
+      "checks": [
+        "wrong CA rejected without credentials",
+        "wrong hostname rejected without credentials",
+        "TLS redirect rejected without redeeming",
+        "native TLS one-use enrollment",
+        "consumed invitation rejected",
+        "expired invitation rejected",
+        "Mac dispatchable with exact tuple/owner clamp",
+        "TLS outbound create reaches actual Mac VM",
+        "TLS outbound exec with real exit",
+        "durable operation-key replay returns receipt",
+        "TLS outbound binary files",
+        "guest root remains offline without host Docker",
+        "Linux test binary hash in ARM64 guest",
+        "active PTY replacement closes by EOF",
+        "active PTY revoke closes by EOF",
+        "host stop preserves disk and identity"
+      ],
+      "source_changes_since_run": {}
     }
   },
   "prepared_assets": {
@@ -265,7 +483,7 @@
     }
   },
   "linux_arm64": {
-    "passed": 52,
+    "passed": 53,
     "failed": 2,
     "ignored": 5,
     "failure_names": [
@@ -279,19 +497,54 @@
       101
     ],
     "baseline_receipt_sha256": "4ce0293af0721f1cce08c1598a1545c45f0104b01565add57f4cc621b2255e6d",
-    "final_catalog_test_binary_sha256": "32ae0b37226f87c63ffecd1d65ceebe3ef9c9ac7e069ab103570514e9d3bc320",
-    "final_catalog_test_passed": true,
-    "final_catalog_receipt_sha256": "4c9dcfc67a8864f540be365573a82632645aa006cb26c17632b58d77343a48a9"
+    "initial_final_catalog_test_binary_sha256": "32ae0b37226f87c63ffecd1d65ceebe3ef9c9ac7e069ab103570514e9d3bc320",
+    "initial_final_catalog_test_passed": true,
+    "initial_final_catalog_receipt_sha256": "4c9dcfc67a8864f540be365573a82632645aa006cb26c17632b58d77343a48a9"
   },
-  "native_unit_tests_passed": 6,
+  "native_unit_tests_passed": 8,
   "offline_harness_passed": 13,
   "helper_linked_minimum_macos": "14.0",
   "helper_linked_sdk": "26.4",
   "live_pool_acceptance": false,
   "benchmarks": null,
   "linux_x86_64": {
-    "final_test_binary_sha256": "b2a43509e6d5aba1418cf57ad8459dbda6a13ed91eb4912ebb613f9b7813f3fa",
     "cross_build_passed": true,
-    "executed": false
+    "executed": false,
+    "test_binary_sha256": "7b9cf859861eabff5553cd607db6ce60b30bae4bba75d7bed8003d282b23aa3d"
+  },
+  "review_validation": {
+    "native_hardware_passed": 43,
+    "tls_passed": 16,
+    "native_unit_passed": 8,
+    "trust_under_python_O_passed": 4,
+    "previous_harness_passed": 13,
+    "linux_arm64": {
+      "passed": 53,
+      "failed": 2,
+      "ignored": 5,
+      "new_catalog_journal_test_passed": true,
+      "test_binary_sha256": "07839ef8810bfb5b6a8d6c327b7b32ac2389bf79383a83e4f2a13ad9fc963e30",
+      "summary_sha256": "52c09c56a74a202f14128df437d843fa4ba2879ad46c5a65ced4897823b673c6"
+    },
+    "linux_x86_64": {
+      "cross_build_passed": true,
+      "executed": false,
+      "test_binary_sha256": "7b9cf859861eabff5553cd607db6ce60b30bae4bba75d7bed8003d282b23aa3d"
+    },
+    "official_upstream_reverified": true,
+    "superseded_resume_failure": {
+      "checks_before_failure": 38,
+      "receipt_sha256": "6d9dfe7294129da912c505bc30957b4cb3f2056363d0aba120f62de0d7489649",
+      "reason": "existing stopped small guest required explicit start in resume harness"
+    },
+    "log_sha256": {
+      "review-rust-tests-second.log": "9c1f117cd73013b4b7be7c14d4e542b8bacdcac75a4ce6cf561e71824f184e77",
+      "review-trust-tests-final.log": "59ad7611be1d780db253b68745462c35f626e591e4a9b7b7a9682b65b336e693",
+      "review-hardware-second.log": "c8d725845cb740457f3af3f6b2b8e650f2770e7e8a5834a25451fce0e2246c95",
+      "review-transport.log": "d2f5a457b0e4478d37dd69dc2b78bf296b072345d5a6237dcae9f86b1b2bb92b",
+      "review-offline-harness.log": "87100eaa2807bb8ae978821c355300ce81b2c9df981a1559e198eeb19bf25b4b",
+      "review-linux-cross-build-final.log": "93a9f28182c266dbf54a50377a695686da2b8a544a30d5c99f94ea4bd9bd2385",
+      "review-linux-x86-build.log": "8bca6bc2257786059c502d1d376d0c1ce3724a07c0d10f70adf8cb53ee4c9936"
+    }
   }
 }

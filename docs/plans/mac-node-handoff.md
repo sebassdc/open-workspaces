@@ -6,11 +6,11 @@ Enroll the Mac in the private workspace pool and prove persistent Ubuntu ARM64 f
 
 ## Where it stands
 - Done: main updated to 9acb963; scoped work/mac-node implementation, native worker/guest/helper, managed onboarding, shared contracts/dashboard. See [report](mac-node-report.md) and [pins](mac-node-pins.json).
-- Verified: 41 real hardware checks, 16 isolated TLS checks, 6 native unit tests, 13 prior harness regressions. Linux ARM64: 52 passed, 2 baseline-reproduced cache failures, 5 ignored. x86 tests compile but are not executed.
-- Pending: Linux planner review/x86 checks, coordinated test deployment and real human gateway/browser acceptance. No push, PR, merge or live changes.
+- Verified: 43 real hardware checks, 16 isolated TLS checks, 8 native unit tests, 4 trust regressions, 13 prior harness regressions. Linux ARM64: 53 passed, 2 baseline-reproduced cache failures, 5 ignored. x86 tests compile but are not executed.
+- Pending: Linux planner review/x86 checks, coordinated test deployment and real human gateway/browser acceptance. Published PR: https://github.com/sebassdc/open-workspaces/pull/6. No merge or live changes.
 
 ## Next step
-Planner reads the scoped branch diff, runs x86 Linux/controller checks and reviews the shared capability/catalog/dashboard changes; then supplies a dedicated private invitation and exact coordinated controller/frontend revision. Use docs/MAC_HOST.md to enroll a fresh private Mac root and perform the live acceptance in mac-node-integration.md.
+Planner rereviews the four corrected PR6 findings (trust, incomplete replay, sync-independent stop, aggregate admission), runs x86 Linux/controller checks and reviews the shared capability/catalog/dashboard changes; then supplies a dedicated private invitation and exact coordinated controller/frontend revision. Use docs/MAC_HOST.md to enroll a fresh private Mac root and perform the live acceptance in mac-node-integration.md.
 
 ## Open decision
 NEED: dedicated private test invitation and exact reviewed controller/frontend revision.
@@ -20,7 +20,7 @@ IF YES: enroll only that test node and run bounded live acceptance. IF NO: retai
 
 ## Files
 - Plan: docs/plans/mac-node-integration.md; brief: mac-node-brief.md; ADR: docs/adr/0004-mac-node-private-transport.md.
-- Branch: work/mac-node; source groups: crates/ow*, native/macos, scripts, docs. No PR.
+- Branch: work/mac-node; PR6; source groups: crates/ow*, native/macos, scripts, docs.
 - Private ignored evidence: data/mac-node/local-final, t5, baseline-cache-results.json and build/retirement logs. Never commit them.
 
 ## Gotchas

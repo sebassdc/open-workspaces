@@ -1233,6 +1233,11 @@ fn agent_job(
     }
     Ok(())
 }
+#[cfg(test)]
+pub(crate) fn review_journal_request(root: &Path, request: &Value) -> Result<Value> {
+    journal_request(root, request)
+}
+
 // Persist-before-execute: crash-pending effects are not silently repeated. Stable create/fork IDs
 // may be reconciled by the runtime's existing parameter/lineage checks; arbitrary exec is uncertain.
 fn journal_request(root: &Path, request: &Value) -> Result<Value> {

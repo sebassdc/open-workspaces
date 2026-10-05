@@ -1149,6 +1149,117 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn uncertain_mac_create_replay_retains_catalog_and_node_journals() {
+        use std::{
+            os::unix::net::UnixListener,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
+        let root =
+            PathBuf::from("/tmp").join(format!("ow-create-review-{}", common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let remote = root.join("nodes/mac");
+        let runtime = remote.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        fn server(
+            root: &Path,
+            stop: Arc<AtomicBool>,
+            mut reply: impl FnMut(Value) -> Value + Send + 'static,
+        ) -> std::thread::JoinHandle<()> {
+            let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut s, _)) => {
+                            let r = wire::line(&mut s).unwrap();
+                            wire::send(&mut s, &reply(r)).unwrap();
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2))
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+            })
+        }
+        let local = server(&root, stop.clone(), |r| {
+            if r["op"] == "status" {
+                wire::response(Ok(
+                    json!({"max_memory_mib":2048,"max_running":1,"max_vcpus":2}),
+                ))
+            } else {
+                wire::response(Ok(json!([])))
+            }
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut incomplete = None;
+        let worker = server(&runtime, stop.clone(), move |r| {
+            if r["op"] == "create" {
+                count.fetch_add(1, Ordering::SeqCst);
+                incomplete = Some(
+                    json!({"id":r["id"],"state":"creating","image":"ubuntu-arm64","backend":"apple-virtualization","arch":"aarch64","memory_mib":512,"vcpu_count":1}),
+                );
+                json!({"ok":false,"uncertain":true,"error":"incomplete create: retained reservation"})
+            } else if r["op"] == "list" {
+                wire::response(Ok(json!(incomplete.iter().collect::<Vec<_>>())))
+            } else if r["op"] == "status" {
+                wire::response(Ok(
+                    json!({"max_memory_mib":1024,"max_running":1,"max_vcpus":2,"max_guest_memory_mib":2048,"max_guest_vcpus":2}),
+                ))
+            } else {
+                wire::response(Ok(json!([])))
+            }
+        });
+        let journal_root = runtime.clone();
+        let proxy = server(&remote, stop.clone(), move |r| {
+            nodes::review_journal_request(&journal_root, &r).unwrap()
+        });
+        let mut c = Catalog::open(&root, "test", None).unwrap();
+        let user = c.user(&identity("a", "a@example.test")).unwrap();
+        let cap = json!({"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","operations":common::MAC_OPERATIONS,"images":["ubuntu-arm64"],"memory_mib":1024,"slots":1,"vcpus":2,"max_guest_memory_mib":2048,"max_guest_vcpus":2,"guest_ssh_v1":false});
+        nodes::db(&root).unwrap().execute("INSERT INTO nodes(id,heartbeat,memory_mib,slots,capabilities) VALUES('mac',?1,1024,1,?2)",params![std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,cap.to_string()]).unwrap();
+        for _ in 0..2 {
+            assert!(c.operation(user,json!({"op":"create","id":"partial","node":"mac","image":"ubuntu-arm64","memory_mib":512,"vcpu_count":1,"operation_key":"same-key"})).is_err());
+            let state: String =
+                c.db.query_row(
+                    "SELECT state FROM operations WHERE retry_key='same-key'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "uncertain");
+            let reserved: i64 =
+                c.db.query_row(
+                    "SELECT reserved_mib FROM resources WHERE owner=?1 AND name='partial'",
+                    [user],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(reserved >= 512);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let journal = Connection::open(runtime.join("node-operations.sqlite3")).unwrap();
+        let response: String = journal
+            .query_row("SELECT response FROM effects", [], |r| r.get(0))
+            .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["uncertain"], true);
+        drop(journal);
+        drop(c);
+        stop.store(true, Ordering::SeqCst);
+        for task in [local, worker, proxy] {
+            task.join().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn mac_capability_and_owner_denials_precede_worker_contact() {
         use std::os::unix::net::UnixListener;
         let root =

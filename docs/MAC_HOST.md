@@ -25,8 +25,10 @@ Prepare a NEW private asset directory from signed official Ubuntu Noble ARM64
 inputs. `scripts/prepare-mac-node.py` does not download them. Its input directory
 requires the release root tar, unpacked kernel/initrd and both signed SHA256SUMS
 files; pinned UEC key `cloud-image.gpg`; signed noble-updates `InRelease`,
-`Packages.xz`, `linux-modules.deb` and `archive-keyring.gpg` extracted from the
-signed root. Versions and hashes are in [pins](plans/mac-node-pins.json).
+`Packages.xz` and `linux-modules.deb`. Archive trust is derived directly from
+the authenticated root tar; an optional supplied `archive-keyring.gpg` must
+match those exact bytes. Successful release signers must match the pinned
+primary fingerprint in an isolated restricted keyring; UID text is not trust. Versions and hashes are in [pins](plans/mac-node-pins.json).
 The prepared root preserves package ownership/setuid modes, adds the `dev`
 account with sudo and installs the static ARM64 guest agent. Homebrew e2fsprogs,
 GnuPG, Zig, cargo-zigbuild and the Rust ARM64-musl target are build prerequisites.
@@ -72,7 +74,12 @@ generation acknowledgement; enrollment or a PID alone is insufficient.
 
 Owner caps and local budgets both constrain scheduling. `--storage-gib` is a
 minimum free-space reserve (20–1024 GiB), not the retained disk quota. Unknown,
-unregistered or unresolved runtime demand consumes capacity. Guest root cannot
+unregistered or unresolved runtime demand consumes capacity. A private user-wide
+admission lock, independent of `--data-dir` and environment HOME overrides,
+allows one native worker; its helper inherits the reservation until exit even
+if the worker crashes. Incomplete create replay stays uncertain, and failed
+guest sync cannot bypass the owned host shutdown pipe; stop returns the
+sync diagnostic after positive exit. Guest root cannot
 change host policy because no external networking or host mounts are attached.
 Outbound networking requires a separately reviewed host-enforced policy.
 No live fork or APFS clone is claimed.

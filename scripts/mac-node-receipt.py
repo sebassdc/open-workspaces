@@ -35,6 +35,7 @@ def sources():
             "test-mac-node.py",
             "test-mac-node-transport.py",
             "mac-node-receipt.py",
+            "test-mac-node-trust.py",
         ]
     ]
     files += [
