@@ -1,4 +1,5 @@
 //! One connection, one guest PTY. No host credentials or management capabilities.
+mod native;
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
@@ -316,6 +317,9 @@ fn terminal(mut tcp: TcpStream) -> io::Result<()> {
 }
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--vsock") {
+        return native::run();
+    }
     if args.len() != 4 {
         return Err(invalid());
     }

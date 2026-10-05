@@ -332,21 +332,33 @@ impl Catalog {
             let Ok(machines) = wire::request(&root, json!({"op":"list"})) else {
                 continue;
             };
-            let Ok(snapshots) = wire::request(&root, json!({"op":"snapshots"})) else {
-                continue;
+            let snapshots = if node != "local"
+                && nodes::operation_capable(&self.root, &node, "snapshots").is_err()
+            {
+                json!([])
+            } else {
+                let Ok(value) = wire::request(&root, json!({"op":"snapshots"})) else {
+                    continue;
+                };
+                value
             };
             let (mut extra_mib, mut extra_cpus, mut extra_slots) = (0i64, 0i64, 0i64);
             for m in machines.as_array().context("invalid machines")? {
                 let physical = m["id"].as_str().context("invalid ID")?;
-                if m["state"] == "running"
-                    && !self.placement("machine", physical).is_ok_and(|n| n == node)
+                if matches!(
+                    m["state"].as_str(),
+                    Some("running" | "starting" | "stopping" | "creating" | "unknown")
+                ) && !self.placement("machine", physical).is_ok_and(|n| n == node)
                 {
                     extra_mib += m["memory_mib"].as_i64().unwrap_or(4096);
                     extra_cpus += m["vcpu_count"].as_i64().unwrap_or(16);
                     extra_slots += 1;
                 }
                 self.save_node(&node, "machine", physical, m)?;
-                if m["state"] == "running" {
+                if matches!(
+                    m["state"].as_str(),
+                    Some("running" | "starting" | "stopping" | "creating" | "unknown")
+                ) {
                     self.db.execute("UPDATE resources SET reserved_mib=MAX(reserved_mib,?1),reserved_cpus=MAX(reserved_cpus,?2) WHERE kind='machine' AND physical=?3 AND node=?4",params![m["memory_mib"].as_i64().unwrap_or(0),m["vcpu_count"].as_i64().unwrap_or(1),physical,node])?;
                 }
                 // Release only on positive stopped/hibernated evidence, never because a node is offline.
@@ -595,6 +607,16 @@ impl Catalog {
         metadata: &Value,
         local_status: &Value,
     ) -> Result<()> {
+        if node != "local" {
+            let pool = nodes::inventory(&self.root)?;
+            let n = pool
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["id"] == node)
+                .context("node")?;
+            common::node_operation(&n["capabilities"], op)?;
+        }
         if op == "resize" {
             let (ram, cpus) = common::requested_resources(request)?;
             ensure!(
@@ -684,6 +706,7 @@ impl Catalog {
             let physical = self.physical(user, "machine", &name)?;
             let node = self.placement("machine", &physical)?;
             nodes::online(&self.root, &node)?;
+            nodes::operation_capable(&self.root, &node, &op)?;
             if matches!(op.as_str(), "ssh-keys" | "ssh-info") {
                 nodes::ssh_capable(&self.root, &node)?;
             }
@@ -1015,6 +1038,7 @@ impl Catalog {
     pub fn terminal_target(&self, user: i64, name: &str) -> Result<(PathBuf, String)> {
         let physical = self.physical(user, "machine", name)?;
         let node = self.placement("machine", &physical)?;
+        nodes::operation_capable(&self.root, &node, "terminal")?;
         Ok((nodes::route(&self.root, &node)?, physical))
     }
 
@@ -1122,6 +1146,62 @@ mod tests {
             std::io::ErrorKind::WouldBlock
         );
         drop(c);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn mac_capability_and_owner_denials_precede_worker_contact() {
+        use std::os::unix::net::UnixListener;
+        let root =
+            std::env::temp_dir().join(format!("ow-mac-catalog-{}", common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let mut c = Catalog::open(&root, "test", None).unwrap();
+        let a = c.user(&identity("a", "a@example.test")).unwrap();
+        let b = c.user(&identity("b", "b@example.test")).unwrap();
+        let physical = c.reserve(a, "machine", "private").unwrap();
+        let cap = json!({"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","operations":common::MAC_OPERATIONS,"images":["ubuntu-arm64"],"memory_mib":1024,"slots":1,"vcpus":1,"max_guest_memory_mib":2048,"max_guest_vcpus":2,"guest_ssh_v1":false});
+        nodes::db(&root).unwrap().execute("INSERT INTO nodes(id,heartbeat,memory_mib,slots,capabilities) VALUES('mac',?1,1024,1,?2)",params![std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,cap.to_string()]).unwrap();
+        c.db.execute(
+            "UPDATE resources SET node='mac' WHERE physical=?1",
+            [&physical],
+        )
+        .unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let remote = root.join("nodes/mac");
+        std::fs::create_dir_all(&remote).unwrap();
+        let remote_listener = UnixListener::bind(remote.join("control.sock")).unwrap();
+        remote_listener.set_nonblocking(true).unwrap();
+        for op in [
+            "snapshot",
+            "fork",
+            "restore",
+            "hibernate",
+            "ssh-info",
+            "ssh-keys",
+            "resize",
+        ] {
+            assert!(
+                c.operation(
+                    a,
+                    json!({"op":op,"id":"private","memory_mib":1024,"vcpu_count":1})
+                )
+                .is_err(),
+                "{op}"
+            );
+        }
+        for op in ["start", "stop", "exec", "put", "get"] {
+            assert!(c.operation(b, json!({"op":op,"id":"private"})).is_err());
+        }
+        assert!(c.terminal_target(b, "private").is_err());
+        assert!(c.ssh_target(a, "private").is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            remote_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 let data = {workspaces: [], snapshots: [], stats: {}}, selected = null, busy = false, dialogOperation = null, view = 'machines';
 const histories = new Map();
-const imageNames = {alpine:'Alpine Linux',arch:'Arch Linux',ubuntu:'Ubuntu 24.04'};
+const imageNames = {alpine:'Alpine Linux',arch:'Arch Linux',ubuntu:'Ubuntu 24.04', 'ubuntu-arm64':'Ubuntu 24.04 ARM64'};
 const mib = value => value >= 1024 ? `${(value / 1024).toFixed(1)} GiB` : `${Math.round(value)} MiB`;
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
 function notice(text, error = false) { $('notice').textContent = text; $('notice').className = `notice${error ? ' error' : ''}`; $('notice').hidden = !text; }
@@ -43,7 +43,9 @@ function render() {
   if (current) {
     $('selected-name').textContent = current.id; $('detail-actions').replaceChildren();
     const live = current.state === 'running';
-    if (live) { $('detail-actions').append(action('Open Terminal', () => openTerminal(current.id)), action('Snapshot', () => openDialog('snapshot', current.id)), action('Fork', () => openDialog('fork', current.id)), action('Hibernate', () => operate({op: 'hibernate', id: current.id})), action('Stop', () => openDialog('stop', current.id))); }
+    const operations=(data.nodes||[]).find(n=>n.id===current.node)?.capabilities?.operations;
+    const supports=op=>!operations || operations.includes(op);
+    if (live) { $('detail-actions').append(action('Open Terminal', () => openTerminal(current.id)), action('Snapshot', () => openDialog('snapshot', current.id), !supports('snapshot')), action('Fork', () => openDialog('fork', current.id), !supports('fork')), action('Hibernate', () => operate({op: 'hibernate', id: current.id}), !supports('hibernate')), action('Stop', () => openDialog('stop', current.id))); }
     else { $('detail-actions').append(action(current.state === 'hibernated' ? 'Resume machine' : 'Start machine', () => operate({op: 'start', id: current.id}))); }
     $('run-command').disabled = !live || busy; $('command').disabled = !live || busy;
     $('console-output').textContent = histories.get(current.id) || (live ? 'Ready. Run a command to get started.\n' : 'This machine is asleep or stopped. Start it to run commands.\n');
@@ -66,7 +68,13 @@ function openDialog(op, id, snapshot) {
   if (busy) return; dialogOperation = {op, id, snapshot}; $('dialog-fields').replaceChildren(); $('dialog-error').hidden = true;
   const defaults = {create: ['A fresh place to build.', 'Start a persistent Linux machine. Your disk stays with it when you stop.', 'Create machine'], snapshot: ['Save this moment.', 'Capture this machine’s memory and disk together. You can return to this checkpoint later.', 'Capture snapshot'], fork: ['Try another direction.', 'Create an independent machine from this checkpoint. Changes stay separate from the parent.', 'Create fork'], restore: ['Return to this checkpoint?', 'This replaces the machine’s current memory and disk with the saved snapshot. Changes made since that snapshot will be lost.', 'Restore snapshot'], stop: ['Stop this machine?', 'Disk changes are saved. Running processes and memory state are lost. Choose Hibernate instead to keep them.', 'Stop machine']};
   $('dialog-title').textContent = defaults[op][0]; $('dialog-description').textContent = defaults[op][1]; $('dialog-submit').textContent = defaults[op][2];
-  if (op === 'create') $('dialog-fields').append(field('id', 'Machine name', '', null), field('image', 'Operating system', 'alpine', Object.entries(imageNames).map(([value,label]) => [value,value === 'alpine' ? label : `${label} · developer tools`])), field('memory_mib', 'Memory', '256', [['256','256 MiB'],['512','512 MiB'],['1024','1 GiB'],['2048','2 GiB'],['4096','4 GiB'],['8192','8 GiB'],['16384','16 GiB']]), field('vcpu_count', 'vCPU', '1', Array.from({length:16},(_,i)=>[String(i+1),String(i+1)])), field('node', 'Linux node', '', [['','Automatic placement'], ...(data.nodes || []).filter(n => n.online).map(n => [n.id, n.id])]));
+  if (op === 'create') $('dialog-fields').append(field('id', 'Machine name', '', null), field('image', 'Operating system', 'alpine', Object.entries(imageNames).map(([value,label]) => [value,value === 'alpine' ? label : `${label} · developer tools`])), field('memory_mib', 'Memory', '256', [['256','256 MiB'],['512','512 MiB'],['1024','1 GiB'],['2048','2 GiB'],['4096','4 GiB'],['8192','8 GiB'],['16384','16 GiB']]), field('vcpu_count', 'vCPU', '1', Array.from({length:16},(_,i)=>[String(i+1),String(i+1)])), field('node', 'Pool node', '', [['','Automatic placement'], ...(data.nodes || []).filter(n => n.online).map(n => [n.id, n.id])]));
+  if (op === 'create') {
+    const form=$('operation-form'), image=form.elements.image, memory=form.elements.memory_mib, node=form.elements.node;
+    const fitShape=()=>{if(image.value==='ubuntu-arm64' && Number(memory.value)<512) memory.value='512';};
+    image.addEventListener('change',fitShape);
+    node.addEventListener('change',()=>{const selectedNode=(data.nodes||[]).find(n=>n.id===node.value);const images=selectedNode?.capabilities?.images;if(images?.length===1) image.value=images[0];fitShape();});
+  }
   if (op === 'snapshot') $('dialog-fields').append(field('name', 'Snapshot name', `snapshot-${Date.now().toString(36)}`));
   if (op === 'fork') { $('dialog-fields').append(field('child', 'New machine name', '', null)); if (!snapshot) { const choices = [['','Capture a new snapshot now'], ...data.snapshots.filter(item => item.workspace === id).map(item => [item.name,item.name])]; $('dialog-fields').append(field('snapshot', 'Start from', '', choices)); } }
   if (id) $('dialog-fields').append(element('p', `Machine: ${id}${snapshot ? ` · Snapshot: ${snapshot}` : ''}`, 'muted'));

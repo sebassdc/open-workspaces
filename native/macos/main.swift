@@ -21,6 +21,7 @@ final class Lifecycle: NSObject, VZVirtualMachineDelegate {
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
+if args.first == "node" { runNativeNode(args) }
 if args == ["capabilities"] {
     let caps: [String: Any] = [
         "backend": "apple-virtualization", "architecture": "aarch64",

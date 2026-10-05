@@ -1,4 +1,11 @@
-# Invited Linux hosts
+# Invited hosts
+
+For the native Apple Silicon implementation, use the [Mac operator guide](MAC_HOST.md).
+The Linux participant procedure below and existing Darwin CLI downloads do not
+install the signed native helper or verified ARM64 guest assets. Mac local/TLS
+acceptance is recorded; live private-pool acceptance and distribution remain gated.
+
+## Linux hosts
 
 This implementation admits trusted operator hosts to an owner-managed shared
 pool. Invited friends do not need a human Access login. Admitted humans can use

@@ -6,10 +6,10 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 out="$root/target/mac-host"
 mkdir -p "$out"
-swiftc -O -framework Virtualization "$root/native/macos/main.swift" -o "$out/ow-vz"
+swiftc -O -target arm64-apple-macos14.0 -framework Virtualization "$root/native/macos/main.swift" "$root/native/macos/node.swift" -o "$out/ow-vz"
 codesign --force --sign - --entitlements "$root/native/macos/virtualization.entitlements" "$out/ow-vz"
 "$out/ow-vz" capabilities
 cd "$root"
-CARGO_TARGET_DIR="$root/target/mac-host-rust" cargo build --locked -p ow
-cp "$root/target/mac-host-rust/debug/ow" "$out/ow"
+CARGO_TARGET_DIR="$root/target/mac-host-rust" cargo build --locked --release -p ow
+cp "$root/target/mac-host-rust/release/ow" "$out/ow"
 "$out/ow" mac-host capabilities

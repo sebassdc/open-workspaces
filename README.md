@@ -34,9 +34,11 @@ Headless Arch and Ubuntu Base guest profiles are also available from the New
 machine dialog or `./ow create NAME --image arch` or `--image ubuntu`. See [image sources,
 Omarchy findings and compatibility tests](docs/GUEST_IMAGES.md).
 
-An experimental native Apple Silicon runtime now boots ARM64 Linux and verifies
-local paired RAM/disk recovery. Private-pool integration and macOS guests remain
-pending. See the [Mac runtime guide](docs/MAC_HOST.md).
+A bounded native Apple Silicon node now runs persistent Ubuntu ARM64 with
+exec, files and PTY over the existing authenticated node transport. Local VM
+and TLS acceptance passed; live gateway/dashboard pool acceptance awaits
+planner review and a dedicated invitation. macOS guests remain pending.
+See the [Mac operator guide](docs/MAC_HOST.md) and [integration evidence](docs/plans/mac-node-report.md).
 
 ## Read first
 

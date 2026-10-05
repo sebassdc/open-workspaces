@@ -76,6 +76,12 @@ pub fn guest_limits(v: &serde_json::Value) -> Result<(u64, u64)> {
     ))
 }
 pub fn guest_shape(v: &serde_json::Value, memory: u64, cpus: u64) -> Result<()> {
+    if v["backend"] == "apple-virtualization" {
+        ensure!(
+            [512, 1024, 2048].contains(&memory) && (1..=2).contains(&cpus),
+            "unsupported Mac guest shape"
+        );
+    }
     let (ram, cpu) = guest_limits(v)?;
     ensure!(
         memory <= ram && cpus <= cpu,
@@ -127,6 +133,116 @@ mod capacity_tests {
             (u32::MAX, 1, 1),
         ] {
             assert!(host_limits(ram, slots, cpu).is_err());
+        }
+    }
+}
+
+/// Explicit Mac v1 slice; absence preserves legacy Linux protocol semantics.
+pub const MAC_OPERATIONS: &[&str] = &[
+    "status", "stats", "list", "inspect", "create", "start", "stop", "exec", "put", "get",
+    "terminal",
+];
+pub fn node_operation(v: &serde_json::Value, op: &str) -> Result<()> {
+    if let Some(operations) = v.get("operations") {
+        ensure!(
+            operations
+                .as_array()
+                .is_some_and(|a| a.iter().any(|i| i.as_str() == Some(op))),
+            "node capability does not support {op}"
+        );
+    } else {
+        ensure!(
+            v["backend"] != "apple-virtualization",
+            "Mac operations capability required"
+        );
+    }
+    Ok(())
+}
+pub fn node_capabilities(v: &serde_json::Value) -> Result<()> {
+    guest_limits(v)?;
+    ensure!(
+        v["type"] == "heartbeat" && v["protocol"] == 1,
+        "invalid heartbeat protocol"
+    );
+    ensure!(
+        (256..=HOST_MEMORY_MIB as u64).contains(&v["memory_mib"].as_u64().unwrap_or(0))
+            && (1..=HOST_SLOTS as u64).contains(&v["slots"].as_u64().unwrap_or(0))
+            && (1..=HOST_CPUS as u64).contains(&v["vcpus"].as_u64().unwrap_or(0)),
+        "invalid node budgets"
+    );
+    let mac = v["backend"] == "apple-virtualization"
+        && v["arch"] == "aarch64"
+        && v["runtime"] == "apple-vz-v1";
+    let linux = v["backend"] == "firecracker"
+        && v["arch"] == "x86_64"
+        && v["runtime"] == "firecracker-v1.17.0";
+    ensure!(
+        mac || linux,
+        "unsupported backend/architecture/runtime tuple"
+    );
+    ensure!(
+        v["images"].as_array().is_some_and(|a| a.len() <= 3
+            && a.iter().all(|i| if mac {
+                i == "ubuntu-arm64"
+            } else {
+                matches!(i.as_str(), Some("alpine" | "arch" | "ubuntu"))
+            })),
+        "incompatible prepared image"
+    );
+    if mac {
+        ensure!(
+            v["memory_mib"].as_u64().unwrap() <= 2048
+                && v["slots"] == 1
+                && v["vcpus"].as_u64().unwrap() <= 2
+                && v["guest_ssh_v1"] == false,
+            "Mac slice ceiling/SSH violation"
+        );
+        ensure!(guest_limits(v)? == (2048, 2), "invalid Mac guest ceiling");
+        ensure!(
+            v["operations"]
+                .as_array()
+                .is_some_and(|a| a.len() == MAC_OPERATIONS.len()
+                    && MAC_OPERATIONS
+                        .iter()
+                        .all(|op| a.iter().any(|i| i.as_str() == Some(op)))),
+            "invalid Mac operations"
+        );
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn tuples_and_legacy_operations() {
+        let legacy = json!({"type":"heartbeat","protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":1024,"slots":2,"vcpus":2,"images":["ubuntu"]});
+        assert!(node_capabilities(&legacy).is_ok());
+        assert!(node_operation(&legacy, "fork").is_ok());
+        let mac = json!({"type":"heartbeat","protocol":1,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":2048,"slots":1,"vcpus":2,"images":["ubuntu-arm64"],"max_guest_memory_mib":2048,"max_guest_vcpus":2,"guest_ssh_v1":false,"operations":MAC_OPERATIONS});
+        assert!(node_capabilities(&mac).is_ok());
+        assert!(node_operation(&mac, "terminal").is_ok());
+        for op in [
+            "snapshot",
+            "hibernate",
+            "fork",
+            "restore",
+            "ssh",
+            "ssh-info",
+            "ssh-keys",
+            "resize",
+        ] {
+            assert!(node_operation(&mac, op).is_err());
+        }
+        for (k, val) in [
+            ("arch", json!("x86_64")),
+            ("images", json!(["ubuntu"])),
+            ("guest_ssh_v1", json!(true)),
+            ("slots", json!(2)),
+        ] {
+            let mut bad = mac.clone();
+            bad[k] = val;
+            assert!(node_capabilities(&bad).is_err());
         }
     }
 }
