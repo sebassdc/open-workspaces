@@ -13,7 +13,7 @@ if [ "$profile" = ubuntu ]; then
   printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
   chmod 755 /usr/sbin/policy-rc.d
   apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl wget git neovim build-essential pkg-config cmake ninja-build libssl-dev libffi-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev xz-utils unzip zip jq ripgrep fd-find fzf tmux less man-db bash-completion sudo openssh-client locales gnupg
+  apt-get install -y --no-install-recommends ca-certificates curl wget git neovim build-essential pkg-config cmake ninja-build libssl-dev libffi-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev xz-utils unzip zip jq ripgrep fd-find fzf tmux less man-db bash-completion sudo openssh-client openssh-server procps locales gnupg
   ln -sfn /usr/bin/fdfind /usr/local/bin/fd
   sed -i 's/^# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
   locale-gen
@@ -22,7 +22,7 @@ elif [ "$profile" = arch ]; then
   pacman-key --init
   pacman-key --populate archlinux
   pacman -Sy --noconfirm archlinux-keyring
-  pacman -Syu --noconfirm --needed base-devel ca-certificates curl wget git neovim pkgconf cmake ninja openssl libffi zlib bzip2 readline sqlite xz unzip zip jq ripgrep fd fzf tmux less man-db bash-completion sudo openssh gnupg
+  pacman -Syu --noconfirm --needed base-devel ca-certificates curl wget git neovim pkgconf cmake ninja openssl libffi zlib bzip2 readline sqlite xz unzip zip jq ripgrep fd fzf tmux less man-db bash-completion sudo openssh procps-ng gnupg
   sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
   locale-gen
 else
@@ -30,7 +30,7 @@ else
 fi
 # Dedicated guest account. No copied host account, password, credentials or dotfiles.
 id dev >/dev/null 2>&1 || useradd -m -u 1000 -s /bin/bash dev
-passwd -l dev
+usermod -p '*' dev
 mkdir -p /etc/sudoers.d
 printf 'dev ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/90-ow-dev
 chmod 440 /etc/sudoers.d/90-ow-dev
@@ -64,6 +64,40 @@ mkdir -p /etc/ow-dev
 if [ "$profile" = ubuntu ]; then dpkg-query -W > /etc/ow-dev/packages.txt; apt-get clean; rm -rf /var/lib/apt/lists/*; else pacman -Q > /etc/ow-dev/packages.txt; rm -f /var/cache/pacman/pkg/*.pkg.tar.*; fi
 su - dev -c 'mise ls --json' > /etc/ow-dev/toolchains.json
 printf 'ow developer image v1; guest-only passwordless sudo; mise 2026.10.0\n' > /etc/ow-dev/version
+mkdir -p /etc/ow-ssh /run/sshd
+chmod 700 /etc/ow-ssh
+cat > /etc/ow-ssh/sshd_config <<'CONFIG'
+Port 22
+AddressFamily inet
+HostKey /etc/ssh/ssh_host_ed25519_key
+PidFile /run/ow-sshd.pid
+AuthorizedKeysFile /etc/ow-ssh/authorized_keys
+StrictModes yes
+AllowUsers dev
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+UsePAM no
+AllowAgentForwarding no
+AllowTcpForwarding local
+AllowStreamLocalForwarding no
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+MaxAuthTries 3
+MaxSessions 8
+MaxStartups 4:30:16
+LoginGraceTime 20
+ClientAliveInterval 20
+ClientAliveCountMax 3
+Subsystem sftp internal-sftp
+CONFIG
+chmod 600 /etc/ow-ssh/sshd_config
+printf '1\n' > /etc/ow-ssh-v1
+
 # Remove builder identity and histories. Runtime sets a fresh identity when starting.
 rm -f /root/.bash_history /home/dev/.bash_history /etc/machine-id /etc/ssh/ssh_host_*
 sync

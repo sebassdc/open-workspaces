@@ -172,3 +172,13 @@ the same minimal management init, explaining their similar idle memory; this
 does not establish that full Omaterm tooling or real workloads consume the same
 resources. Each running VM still reserves 256 MiB in the admission controller.
 Allocated blocks are for each base file, not unique CoW clone consumption.
+
+## SSH-capable developer recipe
+
+The next recipe revision, `developer-v2-ssh`, adds distribution OpenSSH/procps,
+`/etc/ow-ssh-v1` and a `dev`-only public-key server configuration. It contains no
+host keys or enrolled user keys. The image builder requires a fresh
+`--output-assets` directory and never replaces existing published images or
+manifests. No new prepared/published bundle was built by the SSH lane. Existing
+v1 Ubuntu/Arch developer guests require an explicit owner opt-in; see [guest
+SSH](SSH.md). Minimal Alpine remains unchanged and unsupported for SSH.

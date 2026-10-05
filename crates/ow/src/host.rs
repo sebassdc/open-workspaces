@@ -139,7 +139,44 @@ fn worker(root: PathBuf) -> Result<()> {
                     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
                     let request = wire::line(&mut stream)?;
                     let operation = request["op"].as_str().unwrap_or("");
-                    if operation == "terminal" {
+                    if operation == "ssh" {
+                        let connection = (|| -> Result<_> {
+                            ensure!(
+                                request
+                                    .as_object()
+                                    .is_some_and(|o| o.len() == 2 && o.contains_key("id")),
+                                "invalid SSH request"
+                            );
+                            terminals
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                    (n < 16).then_some(n + 1)
+                                })
+                                .map_err(|_| anyhow::anyhow!("SSH capacity reached"))?;
+                            struct Slot(Arc<std::sync::atomic::AtomicUsize>);
+                            impl Drop for Slot {
+                                fn drop(&mut self) {
+                                    self.0.fetch_sub(1, Ordering::SeqCst);
+                                }
+                            }
+                            let slot = Slot(terminals.clone());
+                            let id = request["id"].as_str().context("missing ID")?;
+                            let (tcp, generation) = runtime
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
+                                .ssh(id)?;
+                            Ok((tcp, generation, crate::ssh_guest::path(&root, id), slot))
+                        })();
+                        match connection {
+                            Ok((tcp, generation, path, slot)) => {
+                                wire::send(&mut stream, &json!({"ok":true,"result":{}}))?;
+                                std::thread::spawn(move || {
+                                    let _slot = slot;
+                                    let _ = crate::ssh_guest::bridge(stream, tcp, path, generation);
+                                });
+                            }
+                            Err(e) => wire::send(&mut stream, &wire::response(Err(e)))?,
+                        }
+                    } else if operation == "terminal" {
                         struct Slot(Arc<std::sync::atomic::AtomicUsize>);
                         impl Drop for Slot {
                             fn drop(&mut self) {
@@ -677,6 +714,21 @@ pub fn run(cli: Cli) -> Result<i32> {
             return execute(&root, &id, &text, "exec");
         }
         Action::Shell { id } => return terminal::local(&root, &id),
+        Action::SshProxy { id } => return crate::ssh_client::local_proxy(&root, &id),
+        Action::Ssh { id, args } => {
+            let info = wire::request(&root, json!({"op":"ssh-info","id":id}))?;
+            return crate::ssh_client::launch(None, Some(&root), &id, &info, &args);
+        }
+        Action::SshConfig { id } => {
+            let info = wire::request(&root, json!({"op":"ssh-info","id":id}))?;
+            crate::ssh_client::config(None, Some(&root), &id, &info)?;
+            return Ok(0);
+        }
+        Action::SshAuthorize { id, key, upgrade } => {
+            json!({"op":"ssh-keys","id":id,"keys":crate::ssh_client::public_keys(&key)?,"upgrade":upgrade})
+        }
+        Action::SshRevoke { id } => json!({"op":"ssh-keys","id":id,"keys":[],"upgrade":false}),
+        Action::SshInfo { id } => json!({"op":"ssh-info","id":id}),
         Action::Put { id, local, guest } => {
             ensure!(
                 fs::metadata(&local)?.len() <= 256 * 1024,

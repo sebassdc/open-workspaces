@@ -6,8 +6,13 @@ REPO=Path(__file__).resolve().parents[2]
 ASSETS=REPO/'data/runtime-spike'
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('profile',choices=['ubuntu','arch'])
+parser.add_argument('--output-assets',type=Path,required=True,help='Fresh dedicated asset directory; never existing published assets')
 parser.add_argument('--adopt-build',type=Path,help='Resume this project build root after successful provisioning')
 args=parser.parse_args()
+ASSETS=args.output_assets.resolve()
+if ASSETS.exists(): raise SystemExit('Output assets must be fresh; retain previous image pins')
+ASSETS.mkdir(parents=True,mode=0o700)
+(ASSETS/'guest').mkdir()
 profile=args.profile
 root=args.adopt_build.resolve() if args.adopt_build else Path(tempfile.mkdtemp(prefix='build-',dir=REPO/'data/dev-images')).resolve()
 id=profile+'-dev-build'
@@ -47,20 +52,17 @@ try:
     privileged('rm -f /persist/provision.log /persist/provision.exit /etc/machine-id /etc/ssh/ssh_host_* /root/.bash_history /home/dev/.bash_history; sync')
     run('stop',id);fsck(disk,discard=True)
     image=ASSETS/'guest'/f'{profile}.ext4'
-    backup=image.with_name(profile+'.minimal.ext4')
-    if not backup.exists():subprocess.run(['cp','--reflink=always',str(image),str(backup)],check=True)
-    original=json.loads(image.with_suffix('.json').read_text())
-    manifest_backup=image.with_name(profile+'.minimal.json')
-    if not manifest_backup.exists():manifest_backup.write_text(json.dumps(original,indent=2))
+    source_assets=Path(os.environ.get('OW_ASSET_DIR',REPO/'data/runtime-spike'))
+    original=json.loads((source_assets/'guest'/f'{profile}.json').read_text())
     temporary=image.with_suffix('.developer.tmp')
     subprocess.run(['e2image','-ra',str(disk),str(temporary)],check=True,capture_output=True)
     check=subprocess.run(['e2fsck','-fn',str(temporary)],capture_output=True,text=True)
     if check.returncode:raise RuntimeError('Sparse template verification failed: '+check.stdout+check.stderr)
     with temporary.open('rb') as stream:digest=hashlib.file_digest(stream,'sha256').hexdigest()
-    manifest={**original,'revision':'developer-v1','disk_mib':8192,'image_sha256':digest,'mise':'2026.10.0','toolchains':toolchains,'package_inventory_sha256':hashlib.sha256(packages.encode()).hexdigest(),'developer_user':'dev','sudo':'guest-only passwordless','build_date_utc':time.strftime('%Y-%m-%d',time.gmtime()),'physical_allocated_bytes':temporary.stat().st_blocks*512,'validation':checks}
+    manifest={**original,'revision':'developer-v2-ssh','disk_mib':8192,'image_sha256':digest,'mise':'2026.10.0','toolchains':toolchains,'package_inventory_sha256':hashlib.sha256(packages.encode()).hexdigest(),'guest_ssh_v1':True,'developer_user':'dev','sudo':'guest-only passwordless','build_date_utc':time.strftime('%Y-%m-%d',time.gmtime()),'physical_allocated_bytes':temporary.stat().st_blocks*512,'validation':checks}
     manifest_tmp=image.with_suffix('.json.tmp');manifest_tmp.write_text(json.dumps(manifest,indent=2)+'\n')
     os.replace(temporary,image);os.replace(manifest_tmp,image.with_suffix('.json'))
     (root/'result.json').write_text(json.dumps({'passed':True,'profile':profile,'image_sha256':digest,'checks':checks},indent=2))
-    print(json.dumps({'profile':profile,'revision':'developer-v1','disk_mib':8192,'allocated_mib':manifest['physical_allocated_bytes']/1024**2,'checks':checks},indent=2))
+    print(json.dumps({'profile':profile,'revision':'developer-v2-ssh','disk_mib':8192,'allocated_mib':manifest['physical_allocated_bytes']/1024**2,'checks':checks},indent=2))
 finally:
     run('down')

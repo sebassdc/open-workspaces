@@ -320,6 +320,20 @@ pub fn online(root: &Path, node: &str) -> Result<()> {
     );
     Ok(())
 }
+pub fn ssh_capable(root: &Path, node: &str) -> Result<()> {
+    online(root, node)?;
+    if node != "local" {
+        let cap: String =
+            db(root)?.query_row("SELECT capabilities FROM nodes WHERE id=?1", [node], |r| {
+                r.get(0)
+            })?;
+        ensure!(
+            serde_json::from_str::<Value>(&cap)?["guest_ssh_v1"] == true,
+            "node does not support guest SSH v1"
+        );
+    }
+    Ok(())
+}
 pub fn route(root: &Path, node: &str) -> Result<PathBuf> {
     online(root, node)?;
     common::identifier(node)?;
@@ -453,7 +467,7 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
                     if !c.root.join("nodes").join(&node).join("control.sock").exists(){continue;}
                     if let Ok(db)=db(&c.root)
                         && let Ok((ram,slots,cpus)) = db.query_row("SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16) FROM nodes WHERE id=?1",[&node],|r|Ok((r.get::<_,u32>(0)? as u64,r.get::<_,u32>(1)? as u64,r.get::<_,u32>(2)? as u64))) {
-                            let cap=json!({"protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":v["memory_mib"].as_u64().unwrap().min(ram),"slots":v["slots"].as_u64().unwrap().min(slots),"vcpus":v["vcpus"].as_u64().unwrap().min(cpus),"images":v["images"],"max_guest_memory_mib":common::guest_limits(&v).unwrap().0,"max_guest_vcpus":common::guest_limits(&v).unwrap().1});
+                            let cap=json!({"protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":v["memory_mib"].as_u64().unwrap().min(ram),"slots":v["slots"].as_u64().unwrap().min(slots),"vcpus":v["vcpus"].as_u64().unwrap().min(cpus),"images":v["images"],"max_guest_memory_mib":common::guest_limits(&v).unwrap().0,"max_guest_vcpus":common::guest_limits(&v).unwrap().1,"guest_ssh_v1":v["guest_ssh_v1"]==true});
                             if db.execute("UPDATE nodes SET heartbeat=?1,capabilities=?2 WHERE id=?3 AND session=?4 AND revoked=0",params![now(),cap.to_string(),node,generation]).is_ok_and(|n|n==1) {
                                 // Old native agents expect job IDs only; acknowledge only the guided agent's optional extension.
                                 if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break;}}
@@ -1012,7 +1026,7 @@ pub fn agent(
             .collect::<Vec<_>>()
     };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
-    let hello=json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus}).to_string();
+    let hello=json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true}).to_string();
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
@@ -1131,12 +1145,15 @@ fn agent_job(
             "fork",
             "restore",
             "hibernate",
-            "terminal"
+            "terminal",
+            "ssh",
+            "ssh-info",
+            "ssh-keys"
         ]
         .contains(&op),
         "unsupported node operation"
     );
-    if op != "terminal" {
+    if op != "terminal" && op != "ssh" {
         let response = journal_request(root, &request)?;
         let data = serde_json::to_vec(&response)?;
         ensure!(data.len() < 1024 * 1024, "response too large");
@@ -1146,6 +1163,15 @@ fn agent_job(
         socket.send(tungstenite::Message::Binary(vec![b'\n'].into()))?;
         let _ = socket.close(None);
         return Ok(());
+    }
+    if op == "ssh" {
+        ensure!(
+            request
+                .as_object()
+                .is_some_and(|o| o.len() == 2 && o.contains_key("id")),
+            "invalid SSH stream request"
+        );
+        common::identifier(request["id"].as_str().context("SSH ID")?)?;
     }
     let (mut unix, response) = wire::connect(root, &request)?;
     socket.send(tungstenite::Message::Binary(

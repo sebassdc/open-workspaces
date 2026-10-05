@@ -661,6 +661,8 @@ impl Catalog {
                 "start",
                 "stop",
                 "exec",
+                "ssh-keys",
+                "ssh-info",
                 "put",
                 "get",
                 "hibernate",
@@ -682,6 +684,9 @@ impl Catalog {
             let physical = self.physical(user, "machine", &name)?;
             let node = self.placement("machine", &physical)?;
             nodes::online(&self.root, &node)?;
+            if matches!(op.as_str(), "ssh-keys" | "ssh-info") {
+                nodes::ssh_capable(&self.root, &node)?;
+            }
             for key in ["name", "snapshot"] {
                 if matches!(op.as_str(), "restore" | "fork") {
                     if let Some(snapshot) = request[key].as_str() {
@@ -956,7 +961,10 @@ impl Catalog {
             return Err(self.outcome_error(user, operation));
         }
         let mut value = envelope["result"].clone();
-        let correlated = if matches!(op.as_str(), "exec" | "put" | "get") {
+        let correlated = if matches!(
+            op.as_str(),
+            "exec" | "put" | "get" | "ssh-keys" | "ssh-info"
+        ) {
             true
         } else if op == "snapshot" {
             value["name"] == request["name"] && value["workspace"] == request["id"]
@@ -972,7 +980,10 @@ impl Catalog {
             )?;
             return Err(self.outcome_error(user, operation));
         }
-        if matches!(op.as_str(), "exec" | "put" | "get") {
+        if matches!(
+            op.as_str(),
+            "exec" | "put" | "get" | "ssh-keys" | "ssh-info"
+        ) {
         } else if op == "snapshot" {
             let id = request["name"].as_str().unwrap();
             self.save_node(&node, "snapshot", id, &value)?;
@@ -994,6 +1005,12 @@ impl Catalog {
         }
         self.reconcile()?;
         Ok(value)
+    }
+    pub fn ssh_target(&self, user: i64, name: &str) -> Result<(PathBuf, String)> {
+        let physical = self.physical(user, "machine", name)?;
+        let node = self.placement("machine", &physical)?;
+        nodes::ssh_capable(&self.root, &node)?;
+        Ok((nodes::route(&self.root, &node)?, physical))
     }
     pub fn terminal_target(&self, user: i64, name: &str) -> Result<(PathBuf, String)> {
         let physical = self.physical(user, "machine", name)?;
@@ -1080,6 +1097,30 @@ mod tests {
             checkpoint
         );
         assert!(c.terminal_id(b, "legacy").is_err());
+        drop(c);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn ssh_foreign_owner_denied_before_worker_contact() {
+        use std::os::unix::net::UnixListener;
+        let root = std::env::temp_dir().join(format!("ow-ssh-auth-{}", common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let mut c = Catalog::open(&root, "test", None).unwrap();
+        let a = c.user(&identity("a", "a@example.test")).unwrap();
+        let b = c.user(&identity("b", "b@example.test")).unwrap();
+        let physical = c.reserve(a, "machine", "private").unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for name in ["private", physical.as_str(), "unknown"] {
+            assert!(c.ssh_target(b, name).is_err());
+            for op in ["ssh-keys", "ssh-info"] {
+                assert!(c.operation(b,json!({"op":op,"id":name,"keys":[],"operation_key":common::nonce().unwrap()})).is_err());
+            }
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         drop(c);
         std::fs::remove_dir_all(root).unwrap();
     }

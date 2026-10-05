@@ -103,3 +103,9 @@ export CARGO_HOME="$PWD/data/runtime-spike/cargo"
 "$CARGO_HOME/bin/cargo" +1.97.0 test -p ow users_isolated_real_vm -- --ignored --nocapture
 "$CARGO_HOME/bin/cargo" +1.97.0 test -p ow dashboard_browser_real_vm -- --ignored --nocapture
 ```
+
+Guest SSH streams and SSH key/info operations follow the same owner-first
+SQLite lookup and fixed node placement as terminal/exec access. Keys are
+registered explicitly per machine; the host-side policy overrides older
+snapshot authorization and is not inherited by fork children. The trusted local
+operator interface retains maintenance authority. See [SSH](SSH.md).

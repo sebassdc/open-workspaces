@@ -108,3 +108,8 @@ Remote `ow login`, API operations and `ow shell` over verified HTTPS/WSS are now
 
 WSS terminal names are resolved through the authenticated user's SQLite
 ownership mapping before opening the worker connection. See [user isolation](USERS.md).
+
+Actual guest OpenSSH is now a separate source feature with `ow ssh`, standard
+ProxyCommand and SFTP; see [SSH](SSH.md). It uses the guest distribution sshd
+and SSH protocol rather than this terminal agent's PTY frame format. Existing
+terminal behavior remains independently supported.
