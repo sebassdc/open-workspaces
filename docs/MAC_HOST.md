@@ -8,6 +8,7 @@ See [ADR 0003](adr/0003-native-mac-runtime-spike.md) and [report](plans/mac-host
 On Apple Silicon macOS with Swift, Rust and Command Line Tools:
 
 ```sh
+python3 scripts/test-mac-host-harness.py
 ./scripts/build-mac-host.sh
 ./target/mac-host/ow mac-host capabilities
 mkdir -m 700 data/my-mac-fixture
@@ -20,7 +21,10 @@ kernel and creates a fresh dedicated 256 MiB disk. No administrator rights,
 network changes or existing disk are needed. Never select user/production disk
 roots. The test requires a fresh root and retains captures rather than replacing
 them. It starts only one 512 MiB/1-vCPU guest at a time and confirms owned process
-exit. Private receipts/artifacts stay under ignored data storage.
+exit. Private receipts/artifacts stay under ignored data storage. Marker waits cap
+unmatched output at 256 KiB and retain a 64 KiB diagnostic tail; excessive output
+fails and stops the owned helper. Closed or full stdin cannot bypass bounded
+terminate/kill/wait cleanup. The subprocess harness regressions run without a VM.
 
 To open the serial console manually:
 

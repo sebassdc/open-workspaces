@@ -40,3 +40,11 @@ FAT /persist is a fixture; RAM root is ephemeral. Serial tty is not the product
 PTY protocol. Local recovery is not a verified concurrent identity-refreshed
 live fork. Run one guest at a time across roots. Do not deploy/push/merge or
 change existing hosts/services. Existing main remains at baseline.
+
+## PR review follow-up — 2026-10-05
+PR #5: https://github.com/sebassdc/open-workspaces/pull/5 . Updated branch includes
+origin/main `fdbdf59` and both requested harness fixes. Five real-subprocess
+cleanup/output regressions, rebuilt native artifacts, 15 hardware checks and two
+Rust tests pass. Review receipts: `data/mac-host-review/`; regression command:
+`python3 scripts/test-mac-host-harness.py`. Parent re-review remains pending;
+no main merge/deployment, and overall Mac-node task remains in progress.

@@ -13,6 +13,13 @@ import subprocess
 import time
 
 class Guest:
+    MATCH_LIMIT = 256 * 1024
+    LOG_LIMIT = 64 * 1024
+    READY_TIMEOUT = 30
+    STOP_TIMEOUT = 10
+    TERMINATE_TIMEOUT = 5
+    KILL_TIMEOUT = 5
+
     def __init__(self, helper, root, disk="persist.img", mode="boot", via_cli=False):
         self.start = time.monotonic()
         argv = [str(helper), mode, str(root/"Image"), str(root/"initramfs-ow.gz"), str(root/disk)]
@@ -27,25 +34,35 @@ class Guest:
         self.pending = b""
         self.log = bytearray()
         try:
-            self.read_until(rb"OW_RESTORE_READY\r?\n" if mode == "restore" else rb"OW_READY arch=aarch64\r?\n", 30)
+            self.read_until(rb"OW_RESTORE_READY\r?\n" if mode == "restore" else rb"OW_READY arch=aarch64\r?\n", self.READY_TIMEOUT)
         except Exception as error:
             self.stop()
             raise RuntimeError(bytes(self.log[-4096:]).decode(errors="replace")) from error
         self.ready_seconds = time.monotonic() - self.start
     def read_until(self, pattern, timeout=10):
         deadline = time.monotonic() + timeout
-        while True:
-            match = re.search(pattern, self.pending)
-            if match:
-                found = self.pending[:match.end()]
-                self.pending = self.pending[match.end():]
-                return found.decode(errors="replace")
-            if time.monotonic() >= deadline: raise TimeoutError(pattern)
-            for key, _ in self.selector.select(min(0.25, deadline-time.monotonic())):
-                chunk = os.read(key.fd, 65536)
-                if not chunk: raise RuntimeError("guest exited before response")
-                self.log.extend(chunk)
-                self.pending += chunk
+        try:
+            while True:
+                match = re.search(pattern, self.pending)
+                if match:
+                    found = self.pending[:match.end()]
+                    self.pending = self.pending[match.end():]
+                    return found.decode(errors="replace")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0: raise TimeoutError(pattern)
+                for key, _ in self.selector.select(min(0.25, remaining)):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk: raise RuntimeError("guest exited before response")
+                    # Retain only a diagnostic tail; bound unmatched output
+                    # before concatenating it, even when the guest is noisy.
+                    self.log.extend(chunk)
+                    del self.log[:-self.LOG_LIMIT]
+                    if len(self.pending) + len(chunk) > self.MATCH_LIMIT:
+                        raise RuntimeError("guest output limit exceeded while waiting for marker")
+                    self.pending += chunk
+        except BaseException:
+            self.stop()
+            raise
     def command(self, command):
         token = "OW_RESULT_" + os.urandom(8).hex()
         self.proc.stdin.write((command + "; _rc=$?; printf '\\n"+token+":%s\\n' \"$_rc\"\n").encode())
@@ -53,17 +70,34 @@ class Guest:
         code = int(re.search(token+r":([0-9]+)", result)[1])
         return result, code
     def stop(self):
-        if self.proc.poll() is None:
-            self.proc.stdin.write(b"sync; poweroff -f\n")
-            try: self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.terminate()
-                try: self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill(); self.proc.wait(timeout=5)
-        assert self.proc.poll() is not None, "owned helper exit unconfirmed"
-        self.selector.close()
-        self.proc.stdin.close(); self.proc.stdout.close()
+        try:
+            if self.proc.poll() is None:
+                # Graceful shutdown is best-effort, including a full/closed
+                # stdin pipe. Never let that write prevent signal fallback.
+                graceful = False
+                try:
+                    fd = self.proc.stdin.fileno()
+                    os.set_blocking(fd, False)
+                    graceful = os.write(fd, b"sync; poweroff -f\n") == len(b"sync; poweroff -f\n")
+                except (OSError, ValueError):
+                    pass
+                if graceful:
+                    try: self.proc.wait(timeout=self.STOP_TIMEOUT)
+                    except subprocess.TimeoutExpired: pass
+                if self.proc.poll() is None:
+                    try: self.proc.terminate()
+                    except ProcessLookupError: pass
+                    try: self.proc.wait(timeout=self.TERMINATE_TIMEOUT)
+                    except subprocess.TimeoutExpired:
+                        try: self.proc.kill()
+                        except ProcessLookupError: pass
+                        self.proc.wait(timeout=self.KILL_TIMEOUT)
+            assert self.proc.poll() is not None, "owned helper exit unconfirmed"
+        finally:
+            self.selector.close()
+            for stream in (self.proc.stdin, self.proc.stdout):
+                try: stream.close()
+                except (OSError, ValueError): pass
 
 
 def main():

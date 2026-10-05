@@ -83,3 +83,30 @@ exec/files/PTY contract over a private native transport. Then coordinate backend
 architecture and image capability extensions with planner before private-pool
 integration. Obtain a dedicated private invite only when the managed local
 backend is ready. Remote acceptance and Tahoe remain separate gates.
+
+## PR #5 review corrections — 2026-10-05
+Integrated origin/main `fdbdf59` (including additive `guest_ssh_v1` contract)
+into this isolated branch, then rebuilt the native helper and Rust CLI. Missing
+`guest_ssh_v1` remains unsupported; this Mac slice does not announce SSH support.
+No Linux worker or controller behavior was changed by these harness fixes.
+
+P1: graceful shutdown now uses a best-effort nonblocking write. Closed/full stdin
+cannot skip bounded terminate/kill/wait, and stream/selector closure runs in
+finally. Marker-read failures also clean up their owned helper before raising.
+P2: unmatched output is limited to 256 KiB and diagnostics to a 64 KiB tail.
+Excess output fails before growing the matching buffer and triggers cleanup.
+
+`python3 scripts/test-mac-host-harness.py`: five real-subprocess regressions pass
+(closed stdin with forced kill, failed readiness with closed stdin, full stdin,
+excessive output during a marker wait, excessive startup output). Each asserts
+confirmed child exit and closed streams; output tests assert retained bounds.
+The original PR harness fails the requested regression reproductions; evidence
+is retained privately in `data/mac-host-final/review-baseline-regressions.log`.
+
+Rebuilt against current main, then reran the 15-check real Mac hardware acceptance
+using fresh `data/mac-host-review/` and one guest at a time: all pass. Two native
+Rust tests pass; Python compilation, Rust formatting and diff whitespace pass.
+Warm n=1 observed readiness/capture/restore acknowledgement: 0.224/0.266/0.360 s;
+not percentile measurements. Private current artifacts/receipts remain ignored.
+All test helpers/children have confirmed exits. Overall Mac-node work remains in
+progress, with pool enrollment and the other previously listed limitations open.
