@@ -1,5 +1,5 @@
 # Mac node — bounded integration rollout
-Updated: 2026-10-05 | Size: L | State: authorized, in progress
+Updated: 2026-10-05 | Size: L | State: Linux rollout complete; Mac acceptance pending
 Pattern: ADR0002 outbound authenticated nodes + ADR0004 explicit backend capabilities.
 
 ## Goal
@@ -39,3 +39,13 @@ cap, <=20GiB dedicated storage, preserving prior fixtures and headroom.
 ## Done when
 Scoped merge/build/live-service checks and resumable Mac instructions are published.
 The Mac is only marked accepted after actual human gateway/dashboard evidence.
+
+## Observed result
+PR6 merged9e42263; static Linux CLI/guest built in1m51s. Gateway/controller run
+that release; local a/b reconnected, four resource placements and Ubuntu
+PID/start/disk identity preserved. Public installer and compressed manifest200,
+invalid `/_nodes/enroll`401 and anonymous origin401 verified. Positive human
+CLI session was expired and is explicitly pending owner/Mac login. No guest,
+worker or tunnel restart occurred. Private backup/provenance/service records and
+one-hour invitation are in ignored `data/mac-node-rollout/`.
+Next: [Mac live acceptance instructions](mac-node-live-acceptance.md).
