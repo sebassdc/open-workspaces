@@ -99,6 +99,18 @@ changes are intentionally rewound. Backups should be made before rewinding work
 that must be retained. HTTP clients reconnect across these transitions; a sleeping
 workspace returns 502 through its gateway until explicitly started.
 
+```bash
+./ow stop attempt-b
+./ow delete attempt-b
+```
+
+`delete` removes a stopped or hibernated workspace: its record, its disk, its
+local HTTP publications and every snapshot captured from it, including
+hibernation checkpoints. Forks made earlier keep running; their disks are
+independent copies. A running workspace is refused. Delete is local-worker
+only for now: the remote CLI and dashboard reject it, and it does not update a
+gateway catalog sharing the same data directory.
+
 ## Files and limits
 
 ```bash

@@ -1,20 +1,21 @@
 #!/bin/bash
-# Smoke test: deploy one host, run the workspace lifecycle over SSM, record
+# Smoke test: deploy one host, run the workspace lifecycle (create, connect,
+# snapshot, fork, live fork, hibernate/resume, stop, delete) over SSM, record
 # timings, then always `pulumi destroy`. Every input comes from the environment:
 #
 #   AWS credentials and AWS_REGION   standard AWS SDK variables (required)
 #   Pulumi backend                   your own `pulumi login` or PULUMI_BACKEND_URL;
 #                                    PULUMI_CONFIG_PASSPHRASE for self-managed backends
-#   OW_STACK                         stack name (default: smoke)
+#   OW_STACK                         new stack name (default: smoke); an existing stack is refused
 #   OW_REF                           git tag, commit or branch built on the host (default: main)
 #   OW_REPOSITORY                    git URL (default: the upstream repository)
 #   OW_INSTANCE_TYPE                 default m8i-flex.xlarge
 #   OW_SUBNET_ID                     default: default VPC subnet offering the type
 #   OW_DATA_GIB                      Btrfs data volume size (default 100)
 #   OW_TAILSCALE_SECRET_ARN          optional Tailscale auth-key secret; OW_TAILSCALE_SSH=1 for Tailscale SSH
-#   OW_SAMPLES                       lifecycle repetitions, 1-7 (default 5)
+#   OW_SAMPLES                       lifecycle repetitions, 1-30 (default 5)
 #   OW_RESULTS_DIR                   where results go (default: ./results, git-ignored)
-#   OW_KEEP=1                        skip destroy, for debugging only
+#   OW_KEEP=1                        skip destroy, for debugging only (rerun needs a new OW_STACK)
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$here"
@@ -38,7 +39,9 @@ cleanup() {
   fi
   exit "$status"
 }
-pulumi stack select --create "$stack" > /dev/null
+# Only a stack this run creates may be destroyed: `stack init` refuses an existing name.
+pulumi stack init "$stack" > /dev/null \
+  || { echo "stack $stack exists or cannot be created; pick a new OW_STACK. Nothing was changed or destroyed." >&2; exit 1; }
 trap cleanup EXIT
 
 started=$(now)

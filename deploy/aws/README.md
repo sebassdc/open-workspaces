@@ -102,8 +102,9 @@ export PULUMI_CONFIG_PASSPHRASE=...      # self-managed backends only
 ./run.sh
 ```
 
-`run.sh` lists every variable. Per-machine delete is not a CLI command yet, so
-the smoke test stops its machines and the destroy removes the host and volume.
+`run.sh` lists every variable. It only destroys a stack it created itself:
+`pulumi stack init` refuses an existing `OW_STACK`, and the run stops before
+touching anything.
 
 ## Limits
 

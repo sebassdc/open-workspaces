@@ -249,6 +249,10 @@ enum Action {
     Hibernate {
         id: String,
     },
+    /// Delete a stopped workspace with its disk and its own snapshots (local worker only).
+    Delete {
+        id: String,
+    },
     Restore {
         id: String,
         name: String,

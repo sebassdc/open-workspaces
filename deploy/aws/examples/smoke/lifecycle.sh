@@ -1,10 +1,10 @@
 #!/bin/bash
 # Runs on the host (as root, through SSM): create, connect, snapshot, fork,
-# live fork, hibernate/resume and stop, timing each step. Prints one JSON report.
+# live fork, hibernate/resume, stop and delete, timing each step. Prints one JSON report.
 set -euo pipefail
 samples=${OW_SAMPLES:-5}
-# Each sample keeps 3 machine records and ~3 captures; worker caps are 32 and 24.
-(( samples >= 1 && samples <= 7 )) || { echo "OW_SAMPLES must be 1-7"; exit 2; }
+# Samples delete what they create, so the worker's record caps do not bound them.
+(( samples >= 1 && samples <= 30 )) || { echo "OW_SAMPLES must be 1-30"; exit 2; }
 run=$(mktemp -d /tmp/ow-smoke.XXXXXX)
 log="$run/timings"
 ow() { /usr/local/bin/ow "$@"; }
@@ -28,6 +28,11 @@ alive() { # alive MACHINE: ticker process still running and still counting
   [[ "${after##*$'\n'}" -gt "${before##*$'\n'}" ]] || { echo "ticker stopped in $1: $before -> $after"; return 1; }
 }
 
+gone() { # gone MACHINE...: no record and no snapshot of these machines remains
+  ow list | python3 -c 'import json,sys; ids=set(sys.argv[1:]); left=[w["id"] for w in json.load(sys.stdin) if w["id"] in ids]; sys.exit(f"still listed: {left}" if left else 0)' "$@"
+  ow snapshots | python3 -c 'import json,sys; ids=set(sys.argv[1:]); left=[s["name"] for s in json.load(sys.stdin) if s["workspace"] in ids]; sys.exit(f"snapshots left: {left}" if left else 0)' "$@"
+}
+
 ow status > /dev/null
 for i in $(seq "$samples"); do
   box="smoke-$i-$RANDOM"
@@ -43,8 +48,15 @@ for i in $(seq "$samples"); do
   timed resume ow start "$box-l"
   alive "$box-l"
   alive "$box"
-  # No per-machine delete exists yet; stop frees the slots, pulumi destroy removes the rest.
-  for machine in "$box" "$box-f" "$box-l"; do timed stop ow stop "$machine"; done
+  timed stop ow stop "$box"
+  timed stop ow stop "$box-l"
+  # Delete the parent (and its snapshots) while its snapshot fork still runs.
+  timed delete ow delete "$box"
+  alive "$box-f"
+  timed stop ow stop "$box-f"
+  timed delete ow delete "$box-f"
+  timed delete ow delete "$box-l"
+  gone "$box" "$box-f" "$box-l"
   echo "sample $i passed" >&2
 done
 

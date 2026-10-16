@@ -48,8 +48,8 @@ Tahoe installation needs separate allocation/licensing gates. See
   Manager ARN. See [deploy/aws](../deploy/aws/README.md).
 - [x] `deploy/aws/examples/smoke/`: environment-only inputs, caller's state
   backend, tag `project=open-workspaces`; create, connect, fork, live fork,
-  hibernate/resume and stop, then `pulumi destroy`. Per-machine delete awaits a
-  CLI command.
+  hibernate/resume, stop and delete (new local `ow delete`), then
+  `pulumi destroy` of the stack it created.
 - [x] EC2 timings (boot, snapshot, fork, live fork, hibernate) recorded in
   [EC2 timings](experiments/ec2-timings.md).
 

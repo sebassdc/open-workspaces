@@ -37,7 +37,8 @@ export function renderUserData(
     script = fs.readFileSync(path.join(__dirname, "bootstrap.sh"), "utf8"),
 ): string {
     const lines = Object.entries(env).map(([key, value]) => `${key}='${value.replace(/'/g, `'\\''`)}'`);
-    return script.replace("# @OW_ENV@", lines.join("\n"));
+    // A replacer function keeps `$&`, `$$` and similar in values literal.
+    return script.replace("# @OW_ENV@", () => lines.join("\n"));
 }
 
 /**

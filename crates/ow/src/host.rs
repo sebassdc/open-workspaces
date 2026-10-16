@@ -359,6 +359,33 @@ fn unpublish(root: &Path, id: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Shut down local HTTP proxies, all of them or only one workspace's.
+fn unpublish_all(root: &Path, workspace: Option<&str>) -> Result<()> {
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|x| x == "json")
+            && path
+                .file_name()
+                .is_some_and(|x| x.to_string_lossy().starts_with("p-"))
+        {
+            let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+            let id = value["workspace"]
+                .as_str()
+                .context("invalid proxy descriptor")?;
+            if workspace.is_none_or(|w| w == id) {
+                unpublish(
+                    root,
+                    id,
+                    value["guest_port"]
+                        .as_u64()
+                        .context("invalid proxy descriptor")? as u16,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn supervise(root: &Path) -> Result<()> {
     struct Children(Vec<std::process::Child>);
     impl Drop for Children {
@@ -649,25 +676,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Action::Down => {
-            for entry in fs::read_dir(&root)? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|x| x == "json")
-                    && path
-                        .file_name()
-                        .is_some_and(|x| x.to_string_lossy().starts_with("p-"))
-                {
-                    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
-                    unpublish(
-                        &root,
-                        value["workspace"]
-                            .as_str()
-                            .context("invalid proxy descriptor")?,
-                        value["guest_port"]
-                            .as_u64()
-                            .context("invalid proxy descriptor")? as u16,
-                    )?;
-                }
-            }
+            unpublish_all(&root, None)?;
             if root.join("control.sock").exists() {
                 wire::request(&root, json!({"op":"shutdown"}))?;
                 let started = Instant::now();
@@ -757,6 +766,11 @@ pub fn run(cli: Cli) -> Result<i32> {
             snapshot,
         } => json!({"op":"fork","id":id,"child":child,"snapshot":snapshot}),
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),
+        Action::Delete { id } => {
+            runtime::identifier(&id)?;
+            unpublish_all(&root, Some(&id))?;
+            json!({"op":"delete","id":id})
+        }
         Action::Restore { id, name } => json!({"op":"restore","id":id,"name":name}),
         Action::Publish { id, port } => {
             let result = publish(&root, &id, port)?;
