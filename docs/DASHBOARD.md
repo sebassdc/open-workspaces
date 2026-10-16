@@ -71,6 +71,40 @@ cancel an already queued/running VM operation; refresh state before retrying a
 failed request, especially exec. Broader jailer/cgroup and worker recovery gates
 remain open. There is no production hardening or multi-tenant claim.
 
+## Tailnet sign-in
+
+Instead of Cloudflare Access, the dashboard can trust the tailnet login that
+[`tailscale serve`](https://tailscale.com/kb/1312/serve) adds to each proxied
+request. The dashboard stays on loopback; `tailscale serve` (not `funnel`)
+publishes it to the tailnet only, with a tailnet HTTPS certificate.
+
+```json
+{"auth": "tailscale", "hostname": "NAME.TAILNET.ts.net",
+ "allowed_emails": ["you@example.com"], "upstream": "http://127.0.0.1:9/"}
+```
+
+```bash
+ow --data-dir ~/.ow/controller dashboard --config dashboard.json --listen 127.0.0.1:8787
+tailscale serve --bg http://127.0.0.1:8787   # then open https://NAME.TAILNET.ts.net/
+```
+
+- `hostname` is this machine's MagicDNS name; requests for any other Host are
+  refused, and mutations, terminals and SSH need the exact `https://hostname`
+  Origin, as with Access.
+- The identity is the `Tailscale-User-Login` header. `tailscale serve` removes
+  client-sent `Tailscale-User-*` headers and sets them only for a tailnet user,
+  never for tagged devices; the login must be in `allowed_emails`. Catalog
+  identities use the issuer `tailscale://TAILNET.ts.net`.
+- Anyone who can open a TCP connection to the loopback port on this machine can
+  claim an allowed login. Use it only where the machine's local users are
+  operators; guests cannot reach host loopback.
+- Terminal and SSH streams close after eight hours; reconnect to continue.
+  Removing a login from `allowed_emails` takes effect on restart.
+- `team_domain` and `audience` must be omitted; `upstream` is still required by
+  the config format and unused by the dashboard.
+- The AWS component can run this for you: see `dashboardLogins` in
+  [deploy/aws](../deploy/aws/README.md).
+
 ## Run and deployment
 
 Build with `bash scripts/build-local.sh`, then ensure the local worker is running

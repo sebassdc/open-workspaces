@@ -26,7 +26,7 @@ workflow runs the checks and creates that tag. The same tag is the default
 `ref` the host builds, so set `ref` explicitly before the first release exists.
 
 ```bash
-pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.1.1
+pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.2.0
 ```
 
 ```typescript
@@ -52,6 +52,7 @@ export const instanceId = host.instanceId;
 | `tailscaleAuthKeySecretArn` | none | Full secret ARN; the secret string is the raw auth key. |
 | `tailscaleHostname` | component name | |
 | `tailscaleSsh` | `false` | Tailscale SSH, authorized by your tailnet policy. |
+| `dashboardLogins` | none | Tailnet logins allowed into the web dashboard. Needs `tailscaleAuthKeySecretArn`; see below. |
 
 Outputs: `instanceId`, `privateIp`, `availabilityZone`, `dataVolumeId`,
 `roleName`, `securityGroupId`.
@@ -81,6 +82,17 @@ With Tailscale, the host joins your tailnet under `tailscaleHostname`. The
 auth key is read once at boot into a root-only file under `/run`, passed to
 `tailscale up` by file reference and deleted. A failed join does not fail the
 bootstrap; SSM keeps working.
+
+## Dashboard over the tailnet
+
+With `dashboardLogins`, the host also runs `open-workspaces-dashboard.service`:
+`ow dashboard` on `127.0.0.1:8787` with [tailnet sign-in](../../docs/DASHBOARD.md#tailnet-sign-in),
+published by `tailscale serve` to the tailnet only (never Funnel). Open
+`https://HOSTNAME.TAILNET.ts.net/` as one of the listed logins. The tailnet needs
+HTTPS certificates enabled (admin console, DNS). The service waits, retrying
+every 30 s, until the host is on the tailnet, so a later `tailscale up` is
+enough. It uses the controller root, so machines created there are placed on
+the runners.
 
 ## Boot sequence
 
