@@ -28,8 +28,15 @@ if [[ -n "$OW_TAILSCALE_SECRET_ARN" ]]; then
     snap install aws-cli --classic
     local key
     key=$(mktemp -p /run ow-tailscale.XXXXXX)
-    aws secretsmanager get-secret-value --region "$(cut -d: -f4 <<<"$OW_TAILSCALE_SECRET_ARN")" \
-      --secret-id "$OW_TAILSCALE_SECRET_ARN" --query SecretString --output text > "$key"
+    # Piped: the snap-packaged aws CLI writes nothing when its stdout is a regular file.
+    # An empty key would make `tailscale up` fall back to an interactive login.
+    if ! aws secretsmanager get-secret-value --region "$(cut -d: -f4 <<<"$OW_TAILSCALE_SECRET_ARN")" \
+      --secret-id "$OW_TAILSCALE_SECRET_ARN" --query SecretString --output text | cat > "$key" \
+      || [[ ! -s "$key" ]]; then
+      echo "tailscale: no auth key in the secret; not joining"
+      rm -f "$key"
+      return 1
+    fi
     local joined=0
     tailscale up --timeout=60s --auth-key="file:$key" --hostname="$OW_TAILSCALE_HOSTNAME" ${OW_TAILSCALE_SSH:+--ssh} || joined=$?
     rm -f "$key"
