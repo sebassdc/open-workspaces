@@ -17,7 +17,7 @@ outbound `node-agent`. Nothing new is exposed to guests.
 Every runner, including the controller machine, needs Linux x86-64, read/write
 `/dev/kvm` for the SSH user, a Btrfs data directory and the host tools that
 `ow host doctor` checks (`ip`, `nft`, `unshare`, `cp`, `curl`, `sha256sum` and
-unprivileged user namespaces). The controller machine also needs `openssl` and
+unprivileged user namespaces). SSH runners also need `flock`. The controller machine also needs `openssl` and
 the runtime assets (`scripts/setup-local.sh`, or `OW_ASSET_DIR`).
 
 ## Start the controller
@@ -82,9 +82,19 @@ agents apply. It:
    file, deletes it and keeps only the node credential;
 7. waits until the controller sees the runner online, then reports it.
 
-Nothing runs as root except the optional Tailscale step. Re-running `node add`
-for an enrolled runner skips enrollment and restarts it. After a reboot of the
-runner, run `~/.ow-node/start.sh` there (or `ow node add` again).
+Nothing runs as root except the optional Tailscale step.
+
+Re-running `node add` for an enrolled runner never enrolls it twice:
+
+- agent running: nothing is restarted; it reports the runner online;
+- agent stopped (for example after a reboot): `start.sh` starts the worker and
+  agent, and success requires a fresh heartbeat from the new agent;
+- other `--memory`, `--slots` or `--cpus` than the enrolled ones: refused.
+  `node add` does not change an enrolled runner's capacity. Revoke it and add
+  the machine under a new `--name` and `--remote-dir` instead.
+
+`start.sh` itself starts no second agent when one is running. After a reboot of
+the runner, run `~/.ow-node/start.sh` there, or `ow node add` again.
 
 The installed binary is `bin/ow-linux-amd64` from the asset directory when it
 exists (static musl build from `scripts/build-local.sh`), otherwise the running

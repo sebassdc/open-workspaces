@@ -129,15 +129,32 @@ fn node_name(host: &str) -> String {
     }
 }
 
-fn wait_online(controller: &Path, node: &str, limit: Duration) -> bool {
+/// Online with a heartbeat at or after `since` (Unix seconds), so a stale one cannot pass.
+fn wait_online(controller: &Path, node: &str, since: i64, limit: Duration) -> bool {
     let started = Instant::now();
-    while nodes::online(controller, node).is_err() {
+    let fresh = || -> Result<bool> {
+        nodes::online(controller, node)?;
+        let heartbeat: i64 = nodes::db(controller)?.query_row(
+            "SELECT heartbeat FROM nodes WHERE id=?1",
+            [node],
+            |r| r.get(0),
+        )?;
+        Ok(heartbeat >= since)
+    };
+    while !fresh().unwrap_or(false) {
         if started.elapsed() > limit {
             return false;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
     true
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 pub fn up(
@@ -279,7 +296,7 @@ pub fn up(
         });
     }
     println!("Controller listening on {listen}; runners dial {advertised}");
-    if wait_online(&controller, &node, Duration::from_secs(30)) {
+    if wait_online(&controller, &node, unix_now(), Duration::from_secs(30)) {
         println!("Runner {node} online. Add machines with: ow node add ssh://user@host");
     } else {
         println!("Runner {node} not online yet; check ow node list");
@@ -432,7 +449,7 @@ case "$d" in /*) ;; *) echo "remote directory must be absolute: $d" >&2; exit 2;
 [ -d "$d" ] || { mkdir -p "$d"; chmod 700 "$d"; }
 case "$(stat -c %a "$d")" in ?00) ;; *) echo "$d must be private (chmod 700) or a new directory" >&2; exit 2;; esac
 [ "$(stat -f -c %T "$d")" = btrfs ] || { echo "$d is not on Btrfs; pass --remote-dir on a Btrfs filesystem" >&2; exit 2; }
-command -v sha256sum >/dev/null || { echo "sha256sum required on the runner" >&2; exit 2; }
+for t in sha256sum flock; do command -v $t >/dev/null || { echo "$t required on the runner" >&2; exit 2; }; done
 cd "$d"
 pwd -P
 "#;
@@ -464,6 +481,13 @@ chmod "$4" "$t.part"
 mv -f "$t.part" "$t"
 "#;
 
+// Enrolled runner: node ID, whether its agent holds its lock, worker status (may be empty).
+const STATE: &str = r#"d=$1
+grep -o '"node":"[^"]*"' "$d/data/node.json" | cut -d'"' -f4
+if [ -e "$d/data/node-agent.lock" ] && ! flock -n "$d/data/node-agent.lock" true; then echo running; else echo stopped; fi
+"$d/bin/ow" --local --data-dir "$d/data" status 2>/dev/null | tr -d '\n'
+"#;
+
 const WRITE: &str = r#"set -eu
 umask 077
 rm -f "$1/$2.part"
@@ -483,6 +507,10 @@ d={d}
 export PATH="$PATH:/usr/sbin:/sbin"
 export OW_ASSET_DIR="$d/assets" OW_MAX_MEMORY_MIB={memory} OW_MAX_RUNNING={slots} OW_MAX_VCPUS={cpus}
 "$d/bin/ow" --local --data-dir "$d/data" up >/dev/null
+if [ -e "$d/data/node-agent.lock" ] && ! flock -n "$d/data/node-agent.lock" true; then
+  echo "node agent already running" >&2
+  exit 0
+fi
 setsid nohup "$d/bin/ow" --local --data-dir "$d/data" node-agent --controller {url} \
   --credential "$d/data/node.json" --join "$d/join.json" --ca-cert "$d/controller-ca.pem" \
   >>"$d/agent.log" 2>&1 </dev/null &
@@ -619,7 +647,46 @@ fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i
         &[],
     )? == "yes";
     if enrolled {
-        println!("{name} already enrolled; restarting it");
+        let state = ssh.run(STATE, &[&dir], Stdio::null(), &[])?;
+        let mut lines = state.lines();
+        let (remote, agent) = (lines.next().unwrap_or_default(), lines.next());
+        ensure!(
+            remote == name,
+            "{dir} on {destination} is already enrolled as {remote}; pass --name {remote}"
+        );
+        let entry = nodes::inventory(&controller)?
+            .as_array()
+            .and_then(|all| all.iter().find(|n| n["id"] == name).cloned())
+            .with_context(|| format!("{name} is enrolled with another controller"))?;
+        ensure!(
+            entry["revoked"] == false,
+            "{name} is revoked; add the machine under a new --name with a new --remote-dir"
+        );
+        let owner = &entry["owner_limits"];
+        ensure!(
+            *owner == json!({"memory":memory,"slots":slots,"cpus":cpus}),
+            "{name} is enrolled with --memory {} --slots {} --cpus {}; node add does not change an enrolled runner's capacity. Re-run with those values, or revoke it and add the machine under a new --name",
+            owner["memory"],
+            owner["slots"],
+            owner["cpus"]
+        );
+        if let Ok(worker) = serde_json::from_str::<Value>(lines.next().unwrap_or_default()) {
+            ensure!(
+                worker["max_memory_mib"] == memory
+                    && worker["max_running"] == slots
+                    && worker["max_vcpus"] == cpus,
+                "the worker on {destination} runs with other limits; stop it there with {dir}/bin/ow --local --data-dir {dir}/data down, then re-run"
+            );
+        }
+        if agent == Some("running") {
+            ensure!(
+                wait_online(&controller, &name, 0, Duration::from_secs(20)),
+                "{name}'s agent is running on {destination} but not online; inspect {dir}/agent.log there"
+            );
+            println!("Runner {name} is already running and online; nothing was restarted.");
+            return Ok(0);
+        }
+        println!("{name} is enrolled but stopped; starting it");
     } else {
         nodes::invitation(
             &controller,
@@ -641,6 +708,7 @@ fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i
         )
         .with_context(|| format!("enrolling {name}; pass --name NEW_ID"))?;
     }
+    let since = unix_now();
     ssh.run(
         &format!("{WRITE}\nexec sh \"$1/$2\""),
         &[&dir, "start.sh", "700"],
@@ -648,7 +716,7 @@ fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i
         start_script(&dir, &url, memory, slots, cpus).as_bytes(),
     )?;
     ensure!(
-        wait_online(&controller, &name, Duration::from_secs(45)),
+        wait_online(&controller, &name, since, Duration::from_secs(45)),
         "runner {name} did not come online; inspect {dir}/agent.log and {dir}/data/worker.log on {destination}"
     );
     println!("Runner {name} is online. After a reboot of {destination} run {dir}/start.sh there.");

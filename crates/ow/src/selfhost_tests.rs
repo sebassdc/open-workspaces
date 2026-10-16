@@ -237,22 +237,22 @@ fn host_up_then_node_add() {
         std::thread::sleep(Duration::from_millis(250));
     }
     let tools = private_dir("tools");
-    let action = NodeAction::Add {
-        target: "ssh://ow-test-runner".into(),
-        name: Some("sshnode".into()),
-        controller: None,
-        remote_dir: Some(remote.to_str().unwrap().into()),
-        memory: 512,
-        slots: 1,
-        cpus: 1,
-        ubuntu: false,
-        tailscale_auth_key: None,
-        ow_binary: Some(binary.clone()),
+    let add = |memory: u32| {
+        let action = NodeAction::Add {
+            target: "ssh://ow-test-runner".into(),
+            name: Some("sshnode".into()),
+            controller: None,
+            remote_dir: Some(remote.to_str().unwrap().into()),
+            memory,
+            slots: 1,
+            cpus: 1,
+            ubuntu: false,
+            tailscale_auth_key: None,
+            ow_binary: Some(binary.clone()),
+        };
+        node_with(fake_ssh(&tools).as_os_str(), Some(base.clone()), action)
     };
-    assert_eq!(
-        node_with(fake_ssh(&tools).as_os_str(), Some(base.clone()), action).unwrap(),
-        0
-    );
+    assert_eq!(add(512).unwrap(), 0);
     let inventory = nodes::inventory(&controller).unwrap();
     for id in ["single", "sshnode"] {
         assert!(
@@ -269,19 +269,40 @@ fn host_up_then_node_add() {
         "join file must be consumed"
     );
     nodes::private(&remote.join("data/node.json")).unwrap();
-    // Re-running is a restart, not a second enrollment.
-    let again = NodeAction::Add {
-        target: "ssh://ow-test-runner".into(),
-        name: Some("sshnode".into()),
-        controller: None,
-        remote_dir: Some(remote.to_str().unwrap().into()),
-        memory: 512,
-        slots: 1,
-        cpus: 1,
-        ubuntu: false,
-        tailscale_auth_key: None,
-        ow_binary: Some(binary),
-    };
-    node_with(fake_ssh(&tools).as_os_str(), Some(base), again).unwrap();
+    let lock = remote.join("data/node-agent.lock");
+    let agent = fs::read_to_string(&lock).unwrap();
+
+    // Re-running against a live runner changes nothing and starts no second agent.
+    add(512).unwrap();
+    assert_eq!(fs::read_to_string(&lock).unwrap(), agent);
+    let log = || fs::read_to_string(remote.join("agent.log")).unwrap_or_default();
+    assert!(!log().contains("already running"), "{}", log());
+
+    // A capacity change for an enrolled runner is refused, not reported as applied.
+    let error = add(256).unwrap_err().to_string();
+    assert!(error.contains("does not change"), "{error}");
+    assert_eq!(fs::read_to_string(&lock).unwrap(), agent);
+    let entry = nodes::inventory(&controller).unwrap()[1].clone();
+    assert_eq!(entry["id"], "sshnode");
+    assert_eq!(entry["owner_limits"]["memory"], 512);
+
+    // A stopped agent is started again and must send a fresh heartbeat.
+    let pid = serde_json::from_str::<Value>(&agent).unwrap()["pid"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+    let started = Instant::now();
+    while onboarding::held_lock(&lock).unwrap() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "agent did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    add(512).unwrap();
+    let restarted = fs::read_to_string(&lock).unwrap();
+    assert_ne!(restarted, agent);
+    assert!(onboarding::held_lock(&lock).unwrap());
+    assert!(nodes::online(&controller, "sshnode").is_ok());
     fs::remove_dir_all(tools).unwrap();
 }
