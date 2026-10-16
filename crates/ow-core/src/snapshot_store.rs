@@ -110,8 +110,11 @@ impl SnapshotStore for S3Store {
             .stderr(Stdio::inherit())
             .output()
             .context("the AWS CLI (aws) is required for snapshot stores")?;
-        // `aws s3 ls` exits 1 for an empty prefix.
-        if !output.status.success() && !output.stdout.is_empty() {
+        // `aws s3 ls` exits 1 for an empty prefix; other failures (credentials,
+        // network) must not read as an empty store.
+        if !output.status.success()
+            && !(output.status.code() == Some(1) && output.stdout.is_empty())
+        {
             bail!("listing {} failed ({})", self.url, output.status);
         }
         let prefix = self.url.split_once("s3://").unwrap().1;
