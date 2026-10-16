@@ -100,6 +100,26 @@ memory=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) * 3 / 4 / 1024 ))
 (( memory <= 65536 )) || memory=65536
 cpus=$(nproc)
 (( cpus <= 64 )) || cpus=64
+# `ow host up` picks its listen address once, at start: the tailnet address when
+# Tailscale is up, else loopback. At boot tailscaled is often still connecting,
+# so wait (up to 60 s) for it to be Running; a host that is not joined starts at once.
+mkdir -p /usr/local/lib/open-workspaces
+cat > /usr/local/lib/open-workspaces/wait-tailnet <<'WAIT'
+#!/bin/sh
+command -v tailscale > /dev/null || exit 0
+i=0
+while [ "$i" -lt 60 ]; do
+  state=$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null)
+  case $state in
+    Running) tailscale ip -4 > /dev/null 2>&1 && exit 0 ;;
+    NeedsLogin|NeedsMachineAuth|Stopped) exit 0 ;;
+  esac
+  i=$((i + 1))
+  sleep 1
+done
+echo "tailnet not up after 60 s; the controller listens on loopback until the next restart"
+WAIT
+chmod 755 /usr/local/lib/open-workspaces/wait-tailnet
 cat > /etc/systemd/system/open-workspaces.service <<UNIT
 [Unit]
 Description=Open Workspaces controller and local runner (ow host up)
@@ -110,6 +130,7 @@ RequiresMountsFor=/srv/ow
 [Service]
 User=ow
 Environment=HOME=/srv/ow OW_ASSET_DIR=/srv/ow/src/data/runtime-spike
+ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet
 ExecStart=/srv/ow/src/target/release/ow host up --memory $memory --slots 8 --cpus $cpus
 ExecStop=/srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/runner down
 Restart=on-failure
