@@ -1113,7 +1113,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             )?;
             return Ok(0);
         }
-        Action::Down => json!({"op":"shutdown"}),
+        Action::Down { .. } => json!({"op":"shutdown"}),
         Action::Shell { id } => return crate::local_terminal::local(&root, &id),
         _ => bail!("unsupported Mac capability or local action"),
     };

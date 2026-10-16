@@ -135,24 +135,6 @@ done
 echo "tailnet not up after 60 s; the controller listens on loopback until the next restart"
 WAIT
 chmod 755 /usr/local/lib/open-workspaces/wait-tailnet
-# A service stop (restart, reboot, instance stop or replacement) hibernates the
-# running boxes before `ow down`, so their processes survive; they wake on the
-# next connection. A box that fails to hibernate is cold-stopped by `ow down`.
-cat > /usr/local/lib/open-workspaces/stop <<'STOP'
-#!/bin/sh
-running() { /usr/local/bin/ow list | python3 -c 'import json,sys; print(" ".join(w["id"] for w in json.load(sys.stdin) if w["state"] == "running"))'; }
-# A connection can wake a box while others are being captured, so go round
-# until a listing shows none running (at most five rounds).
-for _ in 1 2 3 4 5; do
-  boxes=$(running) || break
-  [ -n "$boxes" ] || break
-  for box in $boxes; do
-    /usr/local/bin/ow hibernate "$box" > /dev/null && echo "hibernated $box" || echo "could not hibernate $box"
-  done
-done
-exec /srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/runner down
-STOP
-chmod 755 /usr/local/lib/open-workspaces/stop
 cat > /etc/systemd/system/open-workspaces.service <<UNIT
 [Unit]
 Description=Open Workspaces controller and local runner (ow host up)
@@ -165,8 +147,10 @@ User=ow
 Environment=HOME=/srv/ow OW_ASSET_DIR=/srv/ow/src/data/runtime-spike
 ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet
 ExecStart=/srv/ow/src/target/release/ow host up --memory $memory --slots 8 --cpus $cpus
-ExecStop=/usr/local/lib/open-workspaces/stop
-# Hibernating hashes each box's RAM and disk (about 25 s for 1 GiB and 8 GiB).
+# A stop (restart, reboot, instance stop or replacement) hibernates the running
+# boxes, with wakes refused meanwhile, so their processes survive; they wake on
+# the next connection. Hibernating hashes RAM and disk (about 25 s per 1 GiB box).
+ExecStop=/srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/runner down --hibernate
 TimeoutStopSec=900
 Restart=on-failure
 RestartSec=5

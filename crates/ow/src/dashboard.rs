@@ -424,7 +424,15 @@ mod tests {
     }
     #[test]
     fn dashboard_cannot_forward_arbitrary_worker_operations() {
-        for op in ["shutdown", "tunnel", "put", "get", "shell-exec", "status"] {
+        for op in [
+            "shutdown",
+            "quiesce",
+            "tunnel",
+            "put",
+            "get",
+            "shell-exec",
+            "status",
+        ] {
             assert!(validated(json!({"op":op,"id":"test"}).to_string().as_bytes()).is_err());
         }
         for body in [

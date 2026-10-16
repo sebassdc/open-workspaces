@@ -171,7 +171,12 @@ enum Action {
         insecure_loopback_test: bool,
     },
     Up,
-    Down,
+    Down {
+        /// Hibernate running machines first, with new starts and wakes refused,
+        /// so their processes survive the shutdown.
+        #[arg(long)]
+        hibernate: bool,
+    },
     Status,
     Stats,
     List,

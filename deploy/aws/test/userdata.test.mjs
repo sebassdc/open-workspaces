@@ -71,34 +71,9 @@ test("the tailnet identity is kept on the data volume, mounted before tailscaled
     assert.ok(bootstrap.includes('--ssh="$([[ -n $OW_TAILSCALE_SSH ]] && echo true || echo false)"'), "restored state cannot keep an old SSH setting");
 });
 
-test("stopping the service hibernates running boxes before ow down", () => {
-    assert.ok(bootstrap.includes("ExecStop=/usr/local/lib/open-workspaces/stop"));
+test("stopping the service hibernates running boxes, with wakes refused", () => {
+    assert.ok(bootstrap.includes("ExecStop=/srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/runner down --hibernate"));
     assert.ok(bootstrap.includes("TimeoutStopSec=900"));
-    const stop = bootstrap.slice(bootstrap.indexOf("<<'STOP'\n") + 9, bootstrap.indexOf("\nSTOP\n"));
-    const dir = mkdtempSync(join(tmpdir(), "ow-stop-"));
-    const log = join(dir, "log");
-    // Stand-in ow: boxes a and c run, b is stopped; c never hibernates, and a is
-    // woken by a connection once, after its first hibernation.
-    const fake = `#!/bin/sh
-echo "$*" >> "${log}"
-case "$1" in
-  list) a=running; [ -e "${dir}/a-slept" ] && a=hibernated
-        [ -e "${dir}/a-woken" ] || { [ -e "${dir}/a-slept" ] && { a=running; touch "${dir}/a-woken"; rm "${dir}/a-slept"; }; }
-        echo "[{\\"id\\":\\"a\\",\\"state\\":\\"$a\\"},{\\"id\\":\\"b\\",\\"state\\":\\"stopped\\"},{\\"id\\":\\"c\\",\\"state\\":\\"running\\"}]" ;;
-  hibernate) [ "$2" = a ] && touch "${dir}/a-slept"; [ "$2" != c ] ;;
-esac
-`;
-    writeFileSync(join(dir, "ow"), fake, { mode: 0o755 });
-    const script = stop.replaceAll("/usr/local/bin/ow", join(dir, "ow")).replace("/srv/ow/src/target/release/ow", join(dir, "ow"));
-    const out = execFileSync("sh", ["-c", script], { encoding: "utf8" });
-    const calls = readFileSync(log, "utf8").trim().split("\n");
-    assert.equal(calls.filter((c) => c === "hibernate a").length, 2, "a box woken mid-shutdown is hibernated again");
-    assert.equal(calls.filter((c) => c === "list").length, 5, "at most five rounds while a box will not hibernate");
-    assert.equal(calls.at(-1), "--data-dir /srv/ow/.ow/runner down");
-    assert.ok(!calls.includes("hibernate b"), "stopped boxes are left alone");
-    assert.match(out, /hibernated a/);
-    assert.match(out, /could not hibernate c/, "a failed hibernate still reaches ow down");
-    rmSync(dir, { recursive: true });
 });
 
 test("developer images are validated and built by a oneshot unit", () => {

@@ -350,6 +350,9 @@ pub struct Runtime {
     kernel_hash: String,
     verified: BTreeMap<String, Vec<Fingerprint>>,
     pub idle: crate::idle::Idle,
+    /// Set by `quiesce` when the worker is going down: no machine may start
+    /// (a wake would consume a hibernation the shutdown just captured).
+    closing: bool,
 }
 
 impl Runtime {
@@ -456,6 +459,7 @@ impl Runtime {
             kernel_hash,
             verified: BTreeMap::new(),
             idle: crate::idle::Idle::from_env()?,
+            closing: false,
         };
         runtime.save()?;
         Ok(runtime)
@@ -569,6 +573,10 @@ impl Runtime {
     }
 
     fn spawn(&mut self, workspace: &Workspace, snapshot: Option<&Path>, fork: bool) -> Result<()> {
+        ensure!(
+            !self.closing,
+            "the worker is shutting down; no machine can start"
+        );
         self.capacity(workspace.memory_mib, workspace.vcpu_count)?;
         let mut machine = Vm::spawn(
             &self.binary(),
@@ -1047,6 +1055,10 @@ impl Runtime {
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
             "list" => Ok(json!(self.state.workspaces.values().collect::<Vec<_>>())),
+            "quiesce" => {
+                self.closing = true;
+                Ok(json!({"closing":true}))
+            }
             "stats" => {
                 let mut running = BTreeMap::new();
                 let mut total_pss = 0u64;

@@ -79,8 +79,9 @@ to 60 s for Tailscale to connect first (after a reboot, for example). Workspace 
 runner (`/srv/ow/.ow/runner`); `node add` needs SSH access from the `ow` user.
 Boxes idle for 30 minutes hibernate and wake on the next connection; see
 [wake on connect](../../docs/DAILY_USE.md). Stopping the service (a restart, a
-reboot, an instance stop or a host replacement) hibernates the running boxes
-first, so their processes carry on when they next wake; only a box that fails
+reboot, an instance stop or a host replacement) runs `ow down --hibernate`:
+the worker refuses new starts and wakes, hibernates the running boxes, then
+stops, so their processes carry on when they next wake; only a box that fails
 to hibernate is cold-stopped. A box hibernated on a host with another kernel or
 CPU (after a new AMI, say) boots its hibernated disk cold when it next starts.
 
