@@ -100,7 +100,10 @@ Runs `aws s3 sync` of the runner's `snapshots/` directory. Only sealed
 snapshots are sent: a snapshot directory appears only once complete, and
 staging directories (`.pending-*`) are skipped. Credentials come from the AWS
 CLI's usual chain. `--endpoint-url` points at any S3-compatible store; it must
-be `https`, except a store on loopback.
+be `https`, except a store on loopback. It is the only endpoint used: `ow` runs
+the CLI with `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true` and without any
+`AWS_ENDPOINT_URL*` variables, so an endpoint from the environment or a
+profile's `endpoint_url` (which would skip that check) is ignored.
 
 Snapshots contain guest memory and disks, including any credentials in them.
 Use a private bucket with encryption at rest (default on AWS S3) and
@@ -126,6 +129,12 @@ Observed on 2026-10-16:
   runner; `ow backup snapshots` against a local S3 server (moto) uploaded the
   four files of a sealed snapshot byte-identical, skipped `.pending-*`, and a
   plain-HTTP non-loopback endpoint was refused.
+- Inherited endpoints, with AWS CLI 2.38.1 in a Linux container: for each of
+  `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3` and a profile `endpoint_url`
+  pointing at a plain-HTTP store on a non-loopback address, the bare
+  `aws s3 sync` uploaded to that store, while `ow backup snapshots` with the
+  same setting sent it no request at all. An explicit loopback `--endpoint-url`
+  still uploaded.
 
 - Real AWS SSM, from macOS (AWS CLI 2.34.9 with the Session Manager plugin):
   the same test against a temporary SSM-only EC2 instance (Ubuntu 24.04,

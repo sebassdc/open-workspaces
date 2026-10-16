@@ -97,7 +97,15 @@ fn snapshots(dir: &Path, to: &str, endpoint: Option<&str>) -> Result<Command> {
         .args(["s3", "sync", "--only-show-errors", "--no-follow-symlinks"])
         .args(["--exclude", ".pending-*"])
         .arg(dir)
-        .arg(to);
+        .arg(to)
+        // Only the endpoint checked below may redirect the upload: the AWS CLI also
+        // reads AWS_ENDPOINT_URL* and profile `endpoint_url`, which are never checked.
+        .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("AWS_ENDPOINT_URL") {
+            command.env_remove(name);
+        }
+    }
     if let Some(endpoint) = endpoint {
         let url = reqwest::Url::parse(endpoint).context("--endpoint-url must be a URL")?;
         // Snapshots hold guest memory: plain HTTP only to a store on this machine.
@@ -188,6 +196,16 @@ mod tests {
             assert!(args(to, endpoint).is_err(), "{to} {endpoint:?} accepted");
         }
         assert!(snapshots(&dir.join("missing"), "s3://b", None).is_err());
+        // Endpoints from the environment or a profile are ignored, never trusted.
+        let envs: Vec<_> = snapshots(&dir, "s3://b", None)
+            .unwrap()
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+            .collect();
+        assert!(envs.contains(&(
+            "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS".into(),
+            Some("true".into())
+        )));
         fs::remove_dir_all(dir).unwrap();
     }
 }

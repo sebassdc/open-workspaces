@@ -34,12 +34,15 @@ See [core traits and backups](CORE.md).
   and the node-add SSH session behind `ConnectAuth`, with no behaviour change.
 - [x] `ConnectAuth` providers: `ssh://`, `ssm://` (OpenSSH through AWS Session
   Manager) and `tailscale://` (OpenSSH through `tailscale nc`), used by
-  `ow node add`. Real AWS SSM and tailnet runs are pending.
+  `ow node add`. A real AWS SSM connection passed; the tailnet transport
+  reached sshd. Pending: `ow node add` end to end over `ssm://` and
+  `tailscale://`, and a login over the tailnet.
 - [x] Capability flags (`snapshot`, `live-fork`, `hibernate`, `exec`, `ssh`),
   checked by the CLI before each local command; remote commands are checked by
   the controller per node.
 - [x] Backups: `ow backup catalog` (SQLite `VACUUM INTO`, integrity-checked)
-  and an interim `ow backup snapshots` sync to S3-compatible storage.
+  and an interim `ow backup snapshots` sync to S3-compatible storage (https,
+  or http on loopback; inherited AWS endpoint settings are ignored).
 
 ## Completed local pilot checks
 
