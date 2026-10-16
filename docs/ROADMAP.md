@@ -62,7 +62,11 @@ See [wake on connect, snapshot store and golden images](DAILY_USE.md).
 - [x] Golden images from code: `ow image build RECIPE` (shell recipe with a
   `# ow-image: base=…` header) and `ow create --image NAME`; runners advertise
   them to the controller. Example: [`images/devtools.sh`](../images/devtools.sh).
-- [ ] Sharing: grants, `owner/name`, `ow share` / `ow unshare`.
+- [x] Sharing: `grants(physical, grantee, role)` with roles `use`/`admin`,
+  machines addressed as `owner@example.com/name`, "Shared with me" in `ow list`
+  and the dashboard, `ow share` / `ow unshare`; unshare closes the grantee's
+  open terminal and SSH streams. A grantee's fork copies the owner's
+  credentials ([USERS.md](USERS.md#sharing-a-machine)).
 
 ## Completed local pilot checks
 

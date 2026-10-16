@@ -314,7 +314,7 @@ async fn handle(app: &App, request: Request) -> Response {
             .strip_prefix("/api/ssh/")
             .unwrap()
             .to_owned();
-        if request.uri().query().is_some() || crate::common::identifier(&name).is_err() {
+        if request.uri().query().is_some() || crate::common::address(&name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid SSH target").into_response();
         }
         let target = crate::dashboard::with_catalog(
@@ -323,14 +323,14 @@ async fn handle(app: &App, request: Request) -> Response {
             move |catalog, user| catalog.ssh_target(user, &name),
         )
         .await;
-        let Ok((root, id)) = target else {
+        let Ok((root, id, revoked)) = target else {
             return (
                 StatusCode::NOT_FOUND,
                 "Machine not found or SSH node unavailable",
             )
                 .into_response();
         };
-        return crate::ssh_gateway::upgrade(&root, request, expires, id).await;
+        return crate::ssh_gateway::upgrade(&root, request, expires, id, revoked).await;
     }
     if let Some(_root) = &app.dashboard
         && request.uri().path().starts_with("/api/terminal/")
@@ -348,7 +348,7 @@ async fn handle(app: &App, request: Request) -> Response {
             .path()
             .trim_start_matches("/api/terminal/")
             .to_owned();
-        if request.uri().query().is_some() || crate::common::identifier(&name).is_err() {
+        if request.uri().query().is_some() || crate::common::address(&name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid terminal target").into_response();
         }
         let id = crate::dashboard::with_catalog(
@@ -357,10 +357,10 @@ async fn handle(app: &App, request: Request) -> Response {
             move |catalog, user| catalog.terminal_target(user, &name),
         )
         .await;
-        let Ok((target_root, id)) = id else {
+        let Ok((target_root, id, revoked)) = id else {
             return (StatusCode::NOT_FOUND, "Machine not found").into_response();
         };
-        return crate::terminal::upgrade(&target_root, request, expires, id).await;
+        return crate::terminal::upgrade(&target_root, request, expires, id, revoked).await;
     }
     if !matches!(
         *request.method(),
@@ -387,8 +387,17 @@ async fn handle(app: &App, request: Request) -> Response {
         return host_admin(app, identity, request).await;
     }
     if app.dashboard.is_some() {
-        let controls = owner_controls(app, &identity).await;
-        return crate::dashboard::handle(app.catalog.clone(), identity, request, controls).await;
+        // Owner controls only shape /api/state. Checking them takes the catalog lock, which a
+        // slow worker call can hold, so other paths (unshare above all) must not wait for it.
+        let controls = request.uri().path() == "/api/state" && owner_controls(app, &identity).await;
+        return crate::dashboard::handle(
+            app.catalog.clone(),
+            app.dashboard.clone(),
+            identity,
+            request,
+            controls,
+        )
+        .await;
     }
     let (parts, body) = request.into_parts();
     let path = parts
@@ -1291,6 +1300,463 @@ mod tests {
         assert!(reopened.terminal_id(user, "demo").is_ok());
         std::fs::write(root.join("users-result.json"),json!({"passed":true,"checks":["explicit legacy owner import","verified distinct subjects","same machine/snapshot/fork names for two users","independent guest files","all lifecycle and exec cross-owner denial","cross-owner snapshot/fork/restore denial","physical ID denial","WSS ownership denial before worker connection","owner-only stats and metadata","database reopen preserves ownership"]}).to_string()).unwrap();
         println!("User isolation artifacts: {}", root.display());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unshare_closes_a_grantees_live_terminal() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("ow-share-{}", crate::common::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        // Fake worker: one running legacy machine; a terminal stream stays open until closed.
+        let listener = std::os::unix::net::UnixListener::bind(root.join("control.sock")).unwrap();
+        let terminals = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        // A "slow" exec holds its reply (and so the gateway's catalog lock) until released.
+        let slow = Arc::new(AtomicUsize::new(0));
+        let (opened, ended, held) = (terminals.clone(), closed.clone(), slow.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let (opened, ended, held) = (opened.clone(), ended.clone(), held.clone());
+                std::thread::spawn(move || {
+                    let Ok(request) = crate::wire::line(&mut stream) else {
+                        return;
+                    };
+                    if request["command"] == "slow" {
+                        held.store(1, Ordering::SeqCst);
+                        while held.load(Ordering::SeqCst) == 1 {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    let result = match request["op"].as_str().unwrap_or("") {
+                        "list" => {
+                            json!([{"id":"legacy","state":"running","memory_mib":256,"vcpu_count":1,"image":"alpine"}])
+                        }
+                        "snapshots" => json!([]),
+                        "stats" => json!({"running":{}}),
+                        "exec" => json!({"output":"shared-ok","exit_code":0}),
+                        _ => json!({}),
+                    };
+                    crate::wire::send(&mut stream, &json!({"ok":true,"result":result})).unwrap();
+                    if request["op"] == "terminal" {
+                        opened.fetch_add(1, Ordering::SeqCst);
+                        let mut sink = [0; 4096];
+                        while std::io::Read::read(&mut stream, &mut sink).is_ok_and(|n| n > 0) {}
+                        ended.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        let mut catalog = crate::catalog::Catalog::open(
+            &root,
+            "https://test-team.cloudflareaccess.com",
+            Some("owner@example.test"),
+        )
+        .unwrap();
+        // The owner is also the configured gateway (host pool) owner.
+        let owner = catalog
+            .user(&crate::catalog::Identity {
+                issuer: "https://test-team.cloudflareaccess.com".into(),
+                subject: "test-subject".into(),
+                email: "owner@example.test".into(),
+            })
+            .unwrap();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let (key, set) = signing_key();
+        let mut cfg = config("http://127.0.0.1:1".into());
+        cfg.hostname = format!("localhost:{port}");
+        cfg.allowed_emails.push("bob@example.test".into());
+        cfg.node_owner_subject = Some("test-subject".into());
+        cfg.node_owner_user_id = Some(owner);
+        let gateway = router(App {
+            dashboard: Some(root.clone()),
+            catalog: Some(Arc::new(std::sync::Mutex::new(catalog))),
+            config: cfg,
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set,
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        });
+        let served = gateway.clone();
+        let server = tokio::spawn(async move { axum::serve(tcp, served).await });
+        let alice = token(&key, &claims());
+        let mut c = claims();
+        c["sub"] = json!("bob-subject");
+        c["email"] = json!("bob@example.test");
+        let bob = token(&key, &c);
+        let host = format!("localhost:{port}");
+        let api = |jwt: String, body: Value| {
+            let gateway = gateway.clone();
+            let host = host.clone();
+            async move {
+                let req = Request::builder()
+                    .uri("/api/operation")
+                    .method(Method::POST)
+                    .header("host", &host)
+                    .header("cf-access-jwt-assertion", jwt)
+                    .header("origin", format!("https://{host}"))
+                    .header("x-ow-request", "dashboard")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                let response = gateway.oneshot(req).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let shared = "owner@example.test/legacy";
+        let terminal = |jwt: String| {
+            let url = format!("ws://localhost:{port}/api/terminal/{shared}");
+            let origin = format!("https://localhost:{port}");
+            tokio::task::spawn_blocking(move || {
+                use tungstenite::client::IntoClientRequest;
+                let mut req = url.into_client_request().unwrap();
+                req.headers_mut()
+                    .insert("cf-access-jwt-assertion", jwt.parse().unwrap());
+                req.headers_mut().insert("origin", origin.parse().unwrap());
+                tungstenite::connect(req).map(|(socket, _)| socket)
+            })
+        };
+        let state = |jwt: String| {
+            let gateway = gateway.clone();
+            let host = host.clone();
+            async move {
+                let req = Request::builder()
+                    .uri("/api/state")
+                    .header("host", &host)
+                    .header("cf-access-jwt-assertion", jwt)
+                    .body(Body::empty())
+                    .unwrap();
+                let response = gateway.oneshot(req).await.unwrap();
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            }
+        };
+        assert_eq!(state(alice.clone()).await["result"]["host_controls"], true);
+        assert_eq!(state(bob.clone()).await["result"]["host_controls"], false);
+        let exec = json!({"op":"exec","id":shared,"command":"id"});
+        assert!(terminal(bob.clone()).await.unwrap().is_err());
+        assert_eq!(api(bob.clone(), exec.clone()).await.0, StatusCode::CONFLICT);
+        let (code, value) = api(
+            alice.clone(),
+            json!({"op":"share","id":"legacy","with":"bob@example.test"}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{value}");
+        let (code, value) = api(bob.clone(), exec.clone()).await;
+        assert_eq!(
+            (code, value["result"]["output"].as_str()),
+            (StatusCode::OK, Some("shared-ok"))
+        );
+        let mut socket = terminal(bob.clone()).await.unwrap().unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = socket.get_mut() {
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+        while terminals.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Bob's slow exec holds the catalog lock while the owner unshares.
+        let pending = tokio::spawn(api(
+            bob.clone(),
+            json!({"op":"exec","id":shared,"command":"slow"}),
+        ));
+        while slow.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let started = Instant::now();
+        let (code, value) = tokio::time::timeout(
+            Duration::from_secs(3),
+            api(
+                alice.clone(),
+                json!({"op":"unshare","id":"legacy","with":"bob@example.test"}),
+            ),
+        )
+        .await
+        .expect("unshare waited behind a slow worker request");
+        assert_eq!(code, StatusCode::OK, "{value}");
+        let ended = tokio::task::spawn_blocking(move || {
+            loop {
+                match socket.read() {
+                    Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        ended.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "unshare did not close the stream"
+        );
+        while closed.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "worker stream left open"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            slow.load(Ordering::SeqCst),
+            1,
+            "slow exec was still in flight"
+        );
+        slow.store(2, Ordering::SeqCst);
+        pending.await.unwrap();
+        assert_eq!(api(bob.clone(), exec).await.0, StatusCode::CONFLICT);
+        assert!(terminal(bob).await.unwrap().is_err());
+        server.abort();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "Needs KVM, prepared real microVM assets and a release worker (target/release/ow)"]
+    async fn sharing_real_vm() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let root = repo
+            .join("data")
+            .join(format!("sharing-{}", &crate::common::nonce().unwrap()[..8]));
+        let binary = repo.join("target/release/ow");
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new(&self.0)
+                    .args(["--local", "--data-dir", self.1.to_str().unwrap(), "down"])
+                    .output();
+            }
+        }
+        let _cleanup = Cleanup(binary.clone(), root.clone());
+        let up = Command::new(&binary)
+            .args(["--local", "--data-dir", root.to_str().unwrap(), "up"])
+            .output()
+            .unwrap();
+        assert!(
+            up.status.success(),
+            "{}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        let catalog =
+            crate::catalog::Catalog::open(&root, "https://test-team.cloudflareaccess.com", None)
+                .unwrap();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let (key, set) = signing_key();
+        let mut cfg = config("http://127.0.0.1:1".into());
+        cfg.hostname = format!("localhost:{port}");
+        cfg.allowed_emails.push("bob@example.test".into());
+        let gateway = router(App {
+            dashboard: Some(root.clone()),
+            catalog: Some(Arc::new(std::sync::Mutex::new(catalog))),
+            config: cfg,
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set,
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        });
+        let served = gateway.clone();
+        let server = tokio::spawn(async move { axum::serve(tcp, served).await });
+        let alice = token(&key, &claims());
+        let mut c = claims();
+        c["sub"] = json!("bob-subject");
+        c["email"] = json!("bob@example.test");
+        let bob = token(&key, &c);
+        let host = format!("localhost:{port}");
+        let api = |jwt: String, body: Option<Value>| {
+            let gateway = gateway.clone();
+            let host = host.clone();
+            async move {
+                let req = Request::builder()
+                    .uri(if body.is_some() {
+                        "/api/operation"
+                    } else {
+                        "/api/state"
+                    })
+                    .method(if body.is_some() {
+                        Method::POST
+                    } else {
+                        Method::GET
+                    })
+                    .header("host", &host)
+                    .header("cf-access-jwt-assertion", jwt)
+                    .header("origin", format!("https://{host}"))
+                    .header("x-ow-request", "dashboard")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+                    .unwrap();
+                let response = gateway.oneshot(req).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 4 << 20).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let shared = "owner@example.test/box";
+        let terminal = |jwt: String| {
+            let url = format!("ws://localhost:{port}/api/terminal/{shared}");
+            let origin = format!("https://localhost:{port}");
+            tokio::task::spawn_blocking(move || {
+                use tungstenite::client::IntoClientRequest;
+                let mut req = url.into_client_request().unwrap();
+                req.headers_mut()
+                    .insert("cf-access-jwt-assertion", jwt.parse().unwrap());
+                req.headers_mut().insert("origin", origin.parse().unwrap());
+                tungstenite::connect(req).map(|(socket, _)| socket)
+            })
+        };
+        let mut checks = Vec::new();
+        let (code, value) = api(
+            alice.clone(),
+            Some(json!({"op":"create","id":"box","memory_mib":256})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{value}");
+        let (code, value) = api(alice.clone(), Some(json!({"op":"exec","id":"box","command":"echo alice-secret > /persist/token; cat /persist/token"}))).await;
+        assert_eq!(code, StatusCode::OK, "{value}");
+        let exec = |command: &str| json!({"op":"exec","id":shared,"command":command});
+        assert_eq!(
+            api(bob.clone(), Some(exec("cat /persist/token"))).await.0,
+            StatusCode::CONFLICT
+        );
+        assert!(terminal(bob.clone()).await.unwrap().is_err());
+        checks.push("no access before share");
+        let (code, value) = api(
+            alice.clone(),
+            Some(json!({"op":"share","id":"box","with":"bob@example.test"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{value}");
+        let (_, state) = api(bob.clone(), None).await;
+        assert_eq!(state["result"]["shared"][0]["id"], shared, "{state}");
+        assert_eq!(state["result"]["workspaces"], json!([]));
+        checks.push("shared with me lists owner/name");
+        let (code, value) = api(bob.clone(), Some(exec("cat /persist/token"))).await;
+        assert_eq!(code, StatusCode::OK, "{value}");
+        assert!(
+            value["result"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("alice-secret")
+        );
+        checks.push("grantee exec in the owner's guest");
+        let (code, _) = api(
+            bob.clone(),
+            Some(json!({"op":"resize","id":shared,"memory_mib":512,"vcpu_count":1})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        checks.push("use role cannot resize");
+        let (code, value) = api(
+            bob.clone(),
+            Some(json!({"op":"fork","id":shared,"child":"copy"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{value}");
+        let (_, value) = api(
+            bob.clone(),
+            Some(json!({"op":"exec","id":"copy","command":"cat /persist/token"})),
+        )
+        .await;
+        assert!(
+            value["result"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("alice-secret")
+        );
+        checks.push("grantee fork copies the owner's files");
+        let mut socket = terminal(bob.clone()).await.unwrap().unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = socket.get_mut() {
+            s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        }
+        let (mut socket, seen) = tokio::task::spawn_blocking(move || {
+            socket
+                .send(tungstenite::Message::Binary(
+                    b"echo SHARED-$((40+2))\r".to_vec().into(),
+                ))
+                .unwrap();
+            let mut seen = String::new();
+            while !seen.contains("SHARED-42") {
+                match socket.read() {
+                    Ok(tungstenite::Message::Binary(bytes)) => {
+                        seen.push_str(&String::from_utf8_lossy(&bytes));
+                        socket
+                            .send(tungstenite::Message::Text(
+                                json!({"type":"ack","bytes":bytes.len()}).to_string().into(),
+                            ))
+                            .unwrap();
+                    }
+                    Ok(_) => {}
+                    Err(e) => panic!("terminal read failed: {e}; saw {seen:?}"),
+                }
+            }
+            (socket, seen)
+        })
+        .await
+        .unwrap();
+        assert!(seen.contains("SHARED-42"));
+        checks.push("grantee terminal in the owner's guest");
+        let (code, value) = api(
+            alice.clone(),
+            Some(json!({"op":"unshare","id":"box","with":"bob@example.test"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{value}");
+        let started = Instant::now();
+        tokio::task::spawn_blocking(move || {
+            loop {
+                match socket.read() {
+                    Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let cut = started.elapsed();
+        assert!(cut < Duration::from_secs(3), "terminal stayed open {cut:?}");
+        checks.push("unshare closes the live terminal");
+        assert_eq!(
+            api(bob.clone(), Some(exec("true"))).await.0,
+            StatusCode::CONFLICT
+        );
+        assert!(terminal(bob.clone()).await.unwrap().is_err());
+        let (_, state) = api(bob.clone(), None).await;
+        assert_eq!(state["result"]["shared"], json!([]));
+        assert_eq!(state["result"]["workspaces"][0]["id"], "copy");
+        checks.push("after unshare: exec and terminal refused, fork stays the grantee's");
+        let (_, value) = api(
+            alice.clone(),
+            Some(json!({"op":"exec","id":"box","command":"cat /persist/token"})),
+        )
+        .await;
+        assert!(
+            value["result"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("alice-secret")
+        );
+        checks.push("owner unaffected");
+        for (jwt, id) in [(&alice, "box"), (&bob, "copy")] {
+            api(jwt.clone(), Some(json!({"op":"stop","id":id}))).await;
+        }
+        server.abort();
+        std::fs::write(
+            root.join("sharing-result.json"),
+            json!({"passed":true,"unshare_cut_ms":cut.as_millis() as u64,"checks":checks})
+                .to_string(),
+        )
+        .unwrap();
+        println!(
+            "Sharing artifacts: {} (stream closed {cut:?} after unshare)",
+            root.display()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

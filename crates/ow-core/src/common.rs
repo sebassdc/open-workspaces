@@ -12,6 +12,54 @@ pub fn identifier(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// A machine address: `name`, or `owner@example.com/name` for a machine shared with you.
+pub fn address(address: &str) -> Result<()> {
+    match address.split_once('/') {
+        None => identifier(address),
+        Some((owner, name)) => {
+            email(owner)?;
+            identifier(name)
+        }
+    }
+}
+
+pub fn email(email: &str) -> Result<()> {
+    ensure!(
+        email.len() <= 254
+            && email
+                .split_once('@')
+                .is_some_and(|(local, domain)| !local.is_empty()
+                    && !domain.is_empty()
+                    && !domain.contains('@'))
+            && email
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"@._+-".contains(&b)),
+        "invalid email address"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn addresses() {
+    for ok in ["box", "a@b.test/box", "a.b+c@x-y.test/my_box"] {
+        assert!(address(ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        "",
+        "a/b",
+        "@b/box",
+        "a@/box",
+        "a@b@c/box",
+        "a@b/../x",
+        "a@b/c/d",
+        "a b@c/x",
+        "a@b/",
+    ] {
+        assert!(address(bad).is_err(), "{bad}");
+    }
+}
+
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }

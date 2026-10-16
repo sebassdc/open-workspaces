@@ -16,7 +16,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
 };
 
 #[derive(Deserialize)]
@@ -137,7 +137,13 @@ pub fn local(root: &Path, id: &str) -> anyhow::Result<i32> {
     }
 }
 
-pub async fn upgrade(root: &Path, request: Request, expires: u64, id: String) -> Response {
+pub async fn upgrade(
+    root: &Path,
+    request: Request,
+    expires: u64,
+    id: String,
+    revoked: Arc<Notify>,
+) -> Response {
     if request.uri().query().is_some()
         || request.uri().scheme().is_some()
         || request.uri().authority().is_some()
@@ -187,7 +193,7 @@ pub async fn upgrade(root: &Path, request: Request, expires: u64, id: String) ->
         .max_frame_size(4096)
         .write_buffer_size(0)
         .max_write_buffer_size(65536)
-        .on_upgrade(move |socket| relay(socket, stream, expires, permit))
+        .on_upgrade(move |socket| relay(socket, stream, expires, permit, revoked))
 }
 
 async fn send_frame(
@@ -204,6 +210,7 @@ async fn relay(
     stream: tokio::net::UnixStream,
     expires: u64,
     _permit: OwnedSemaphorePermit,
+    revoked: Arc<Notify>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -245,6 +252,7 @@ async fn relay(
     loop {
         tokio::select! {
             _=&mut deadline=>break,
+            _=revoked.notified()=>break,
             _=heartbeat.tick()=>{
                 if seen.elapsed()>Duration::from_secs(90) {break;}
                 if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Ping(Vec::new().into()))).await,Ok(Ok(()))) {break;}

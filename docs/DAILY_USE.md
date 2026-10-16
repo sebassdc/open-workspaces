@@ -126,6 +126,15 @@ Recipes run as root in the builder and can do anything a guest can; review them
 like code. A recipe must not copy secrets into the image: every box created from
 it gets them.
 
+## Sharing
+
+`ow share demo --with bob@example.com [--role use|admin]` lets a teammate in;
+they use `alice@example.com/demo` with `ow shell`, `ow exec`, `ow ssh` and the
+dashboard's "Shared with me" section. `ow unshare demo --with bob@example.com`
+takes it back and closes their open shells and SSH sessions. A teammate's fork
+copies everything on the machine, credentials included, and stays theirs. Roles,
+limits and the credential warning: [USERS.md](USERS.md#sharing-a-machine).
+
 ## Evidence
 
 Observed on 2026-10-16 on a dedicated test host from `deploy/aws` (EC2

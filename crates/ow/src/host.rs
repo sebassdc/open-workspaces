@@ -719,7 +719,9 @@ pub fn run(cli: Cli) -> Result<i32> {
         | Action::Host { .. }
         | Action::Node { .. }
         | Action::Backup { .. }
-        | Action::Image { .. } => unreachable!(),
+        | Action::Image { .. }
+        | Action::Share { .. }
+        | Action::Unshare { .. } => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;
             return Ok(0);
