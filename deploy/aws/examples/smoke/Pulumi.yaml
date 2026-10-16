@@ -1,0 +1,7 @@
+name: open-workspaces-smoke
+main: index.ts
+description: Throwaway Open Workspaces host for the lifecycle smoke test
+runtime:
+  name: nodejs
+  options:
+    typescript: true

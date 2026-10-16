@@ -43,6 +43,13 @@ Raw SSH/TCP/UDP needs a separately planned listener or authenticated tunnel; ord
 
 ## AWS
 
+A Pulumi component, [`deploy/aws/`](../deploy/aws/README.md), now creates one
+nested-virtualization EC2 host running controller and runner together: no
+inbound ports, SSM-only role, IMDSv2 with hop limit 1, a Btrfs gp3 data volume
+and optional Tailscale join. Its smoke test and measured timings are in
+[EC2 timings](experiments/ec2-timings.md). The guidance below still applies to
+larger deployments.
+
 Start with a standalone EC2 worker, control-plane service, PostgreSQL and S3. Add managed services/HA only when required. AWS supports nested virtualization on selected EC2 families; enable it explicitly, check regional support and verify runtime operation.
 
 Reference: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html

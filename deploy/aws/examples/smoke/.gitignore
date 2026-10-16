@@ -1,0 +1,4 @@
+results/
+# Per-stack config holds the caller's encryption salt.
+Pulumi.*.yaml
+!Pulumi.yaml

@@ -1,0 +1,36 @@
+# Publishes the deploy/aws Pulumi component: once its package.json version
+# reaches main, tag that commit vX.Y.Z so `pulumi package add` can fetch it.
+name: aws-component-release
+on:
+  push:
+    branches: [main]
+    paths: [deploy/aws/**]
+  pull_request:
+    paths: [deploy/aws/**]
+permissions:
+  contents: write
+jobs:
+  check-and-tag:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: deploy/aws
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - name: Tag the release
+        if: github.event_name == 'push'
+        run: |
+          tag="v$(node -p 'require("./package.json").version')"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists"
+          else
+            git tag "$tag" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag"
+          fi

@@ -601,6 +601,37 @@ impl Runtime {
         Ok(json!({"workspace":self.state.workspaces[id],"sync_error":sync_error}))
     }
 
+    fn delete(&mut self, id: &str) -> Result<Value> {
+        self.workspace(id)?;
+        ensure!(
+            !self.machines.contains_key(id),
+            "workspace is running; stop or hibernate it first"
+        );
+        // Its snapshots go too: a later workspace reusing this ID must not fork them.
+        let mut snapshots = Vec::new();
+        for item in fs::read_dir(self.root.join("snapshots"))? {
+            let directory = item?.path();
+            let manifest = directory.join("manifest.json");
+            if !manifest.exists() {
+                continue;
+            }
+            let snapshot: Snapshot = serde_json::from_slice(&fs::read(manifest)?)?;
+            if snapshot.workspace == id {
+                fs::remove_dir_all(&directory)?;
+                self.verified.remove(&snapshot.name);
+                snapshots.push(snapshot.name);
+            }
+        }
+        // Files first, record last: an interrupted delete can simply be repeated.
+        match fs::remove_dir_all(self.machine_dir(id)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
+        }
+        self.state.workspaces.remove(id);
+        self.save()?;
+        Ok(json!({"deleted":id,"snapshots":snapshots}))
+    }
+
     fn start(&mut self, id: &str) -> Result<Value> {
         let workspace = self.workspace(id)?;
         if self.machines.contains_key(id) {
@@ -797,6 +828,7 @@ impl Runtime {
             }
             "start" => self.start(id),
             "stop" => self.stop(id),
+            "delete" => self.delete(id),
             "ssh-info" => Ok(crate::ssh_guest::info(&crate::ssh_guest::load(
                 &self.root, id,
             )?)),
