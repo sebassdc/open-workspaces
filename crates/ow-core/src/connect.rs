@@ -349,22 +349,23 @@ mod tests {
         assert!(parse("tailscale://-oX=y").is_err());
     }
 
-    /// Real OpenSSH through each transport; `scripts/connect-e2e.sh` sets this up in a container.
+    /// Real OpenSSH through each transport; `scripts/connect-e2e.sh` sets this up in a
+    /// container. `OW_CONNECT_E2E_TARGETS` (comma-separated) and `OW_CONNECT_E2E_SSH`
+    /// (client program) point it at real hosts instead.
     #[test]
     #[ignore = "needs sshd on 127.0.0.1:22 for root and aws/tailscale stand-ins on PATH"]
     fn real_openssh_over_each_transport() {
-        let dir = std::env::temp_dir().join(format!("ow-connect-{}", common::nonce().unwrap()));
+        let targets = std::env::var("OW_CONNECT_E2E_TARGETS").unwrap_or_else(|_| {
+            "ssh://root@127.0.0.1:22,ssm://root@i-0123456789abcdef0,tailscale://root@build-1.tail1234.ts.net".into()
+        });
+        let program = std::env::var_os("OW_CONNECT_E2E_SSH").unwrap_or_else(|| "ssh".into());
+        // Short path: ControlPath sockets must fit the Unix socket limit (104 bytes on macOS).
+        let dir = PathBuf::from(format!("/tmp/ow-connect-{}", common::nonce().unwrap()));
         std::fs::create_dir(&dir).unwrap();
-        for (i, target) in [
-            "ssh://root@127.0.0.1:22",
-            "ssm://root@i-0123456789abcdef0",
-            "tailscale://root@build-1.tail1234.ts.net",
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (i, target) in targets.split(',').enumerate() {
             let auth = parse(target).unwrap();
-            let session = Session::new("ssh".into(), dir.join(format!("c{i}")), auth.as_ref());
+            let control = dir.join(format!("c{i}"));
+            let session = Session::new(program.clone().into(), control.clone(), auth.as_ref());
             let output = session
                 .run(
                     r#"echo "$1"; cat"#,
@@ -375,7 +376,7 @@ mod tests {
                 .unwrap();
             assert_eq!(output, "it's quoted\nstdin bytes", "{target}");
             // A second step reuses the master connection the first one opened.
-            assert!(dir.join(format!("c{i}")).exists(), "{target}: no master");
+            assert!(control.exists(), "{target}: no master connection");
             assert_eq!(
                 session.run("echo again", &[], Stdio::null(), &[]).unwrap(),
                 "again"

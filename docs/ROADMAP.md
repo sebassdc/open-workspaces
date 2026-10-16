@@ -26,6 +26,21 @@ product decisions can materially change them.
 - [x] EC2 timings (boot, snapshot, fork, live fork, hibernate) recorded in
   [EC2 timings](experiments/ec2-timings.md).
 
+## Open-source roadmap: OS phase 1, core traits and pluggable connect
+
+See [core traits and backups](CORE.md).
+
+- [x] `ow-core` crate: the Firecracker runtime moved behind `ComputeProvider`
+  and the node-add SSH session behind `ConnectAuth`, with no behaviour change.
+- [x] `ConnectAuth` providers: `ssh://`, `ssm://` (OpenSSH through AWS Session
+  Manager) and `tailscale://` (OpenSSH through `tailscale nc`), used by
+  `ow node add`. Real AWS SSM and tailnet runs are pending.
+- [x] Capability flags (`snapshot`, `live-fork`, `hibernate`, `exec`, `ssh`),
+  checked by the CLI before each local command; remote commands are checked by
+  the controller per node.
+- [x] Backups: `ow backup catalog` (SQLite `VACUUM INTO`, integrity-checked)
+  and an interim `ow backup snapshots` sync to S3-compatible storage.
+
 ## Completed local pilot checks
 
 - Real guest boot, exec/exit status, binary file transfer and loopback HTTP access.
