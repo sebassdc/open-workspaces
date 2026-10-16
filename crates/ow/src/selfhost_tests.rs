@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 
 fn private_dir(name: &str) -> PathBuf {
@@ -20,55 +21,12 @@ fn fake_ssh(dir: &Path) -> PathBuf {
     path
 }
 
-fn session(dir: &Path) -> Ssh {
-    Ssh {
+fn session(dir: &Path) -> Session {
+    Session {
         program: fake_ssh(dir),
         control: dir.join("control"),
         args: vec!["--".into(), "runner".into()],
     }
-}
-
-#[test]
-fn ssh_targets() {
-    assert_eq!(
-        target("ssh://dev@build-1.example.ts.net:2222").unwrap(),
-        (
-            ["-p", "2222", "-l", "dev", "--", "build-1.example.ts.net"]
-                .map(String::from)
-                .to_vec(),
-            "build-1".to_owned()
-        )
-    );
-    assert_eq!(
-        target("dev@10.0.0.7").unwrap(),
-        (
-            ["-l", "dev", "--", "10.0.0.7"].map(String::from).to_vec(),
-            "10-0-0-7".to_owned()
-        )
-    );
-    assert_eq!(target("ssh://pc").unwrap().1, "pc");
-    assert_eq!(target("ssh://[::1]").unwrap().0, ["--", "::1"]);
-    for bad in [
-        "https://host",
-        "ssh://-oProxyCommand=x",
-        "ssh://-x@host",
-        "ssh://user:secret@host",
-        "ssh://host/path",
-        "ssh://host?x=1",
-        "ssh://host;reboot",
-        "ssh://",
-    ] {
-        assert!(target(bad).is_err(), "{bad} accepted");
-    }
-}
-
-#[test]
-fn default_names_are_valid_ids() {
-    assert_eq!(node_name("local"), "runner");
-    assert_eq!(node_name("..."), "runner");
-    assert_eq!(node_name("My_Box.lan"), "My_Box");
-    assert_eq!(node_name(&"a".repeat(40)).len(), 32);
-    common::identifier(&node_name("fe80::1")).unwrap();
 }
 
 #[test]

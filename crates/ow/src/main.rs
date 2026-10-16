@@ -1,7 +1,8 @@
 #[cfg(target_os = "linux")]
+mod backup;
+#[cfg(target_os = "linux")]
 mod catalog;
 mod client;
-mod common;
 #[cfg(target_os = "linux")]
 mod dashboard;
 #[cfg(target_os = "linux")]
@@ -12,8 +13,6 @@ mod local_terminal;
 mod mac_host;
 #[cfg(target_os = "macos")]
 mod mac_worker;
-#[cfg(target_os = "linux")]
-mod network;
 mod nodes;
 #[cfg(target_os = "macos")]
 #[path = "mac_onboarding.rs"]
@@ -23,19 +22,18 @@ mod onboarding;
 #[cfg(target_os = "linux")]
 mod remote;
 #[cfg(target_os = "linux")]
-mod runtime;
-#[cfg(target_os = "linux")]
 mod selfhost;
 mod ssh_client;
 #[cfg(target_os = "linux")]
 mod ssh_gateway;
 #[cfg(target_os = "linux")]
-mod ssh_guest;
-#[cfg(target_os = "linux")]
 mod terminal;
-#[cfg(target_os = "linux")]
-mod vm;
 mod wire;
+
+// Firecracker runtime and shared limits live in ow-core; keep their `crate::` paths.
+use ow_core::common;
+#[cfg(target_os = "linux")]
+use ow_core::{network, runtime, ssh_guest, vm};
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -95,6 +93,11 @@ enum Action {
     Node {
         #[command(subcommand)]
         command: NodeAction,
+    },
+    /// Back up the controller catalog or a runner's snapshots (Linux, this machine).
+    Backup {
+        #[command(subcommand)]
+        command: BackupAction,
     },
     /// Sign in through Cloudflare Access and save the remote server.
     Login {
@@ -287,10 +290,13 @@ enum Action {
 
 #[derive(Subcommand)]
 enum NodeAction {
-    /// Turn an SSH-reachable Linux machine into a runner: check KVM/Btrfs, install
-    /// ow and Firecracker, write a single-use join file and start the node agent.
+    /// Turn a Linux machine into a runner over SSH, AWS SSM or Tailscale: check
+    /// KVM/Btrfs, install ow and Firecracker, write a single-use join file and start
+    /// the node agent.
     Add {
-        /// ssh://user@host[:port]; user@host and ~/.ssh/config aliases also work.
+        /// ssh://user@host[:port] (user@host and ~/.ssh/config aliases also work),
+        /// ssm://user@i-0123456789abcdef0 (SSH through AWS Session Manager) or
+        /// tailscale://user@host (SSH through `tailscale nc`).
         target: String,
         /// Runner ID; defaults to the host's first DNS label.
         #[arg(long)]
@@ -320,6 +326,30 @@ enum NodeAction {
     },
     /// List runners and whether each is online.
     List,
+}
+
+#[derive(Subcommand)]
+enum BackupAction {
+    /// Consistent SQLite copy of the live catalog into a new private file.
+    Catalog {
+        #[arg(long)]
+        output: PathBuf,
+        /// Controller data directory (default: the one `ow host up` uses).
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// Interim: upload sealed snapshots with `aws s3 sync` (never deletes remote copies).
+    Snapshots {
+        /// s3://bucket[/prefix]
+        #[arg(long)]
+        to: String,
+        /// Runner data directory (default: the `ow host up` runner).
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// S3-compatible store such as MinIO or R2 (https; http only on loopback).
+        #[arg(long)]
+        endpoint_url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -454,6 +484,19 @@ fn main_result() -> anyhow::Result<i32> {
             anyhow::bail!("ow node runs on the Linux controller machine (ow host up)");
         }
     }
+    if let Action::Backup { command } = cli.command {
+        anyhow::ensure!(
+            cli.server.is_none(),
+            "backups run on this machine; omit --server"
+        );
+        #[cfg(target_os = "linux")]
+        return backup::run(cli.data_dir, command);
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop(command);
+            anyhow::bail!("ow backup runs on the Linux controller or runner machine");
+        }
+    }
     if let Action::Host { command } = cli.command {
         if let HostAction::Up {
             listen,
@@ -534,6 +577,14 @@ fn main_result() -> anyhow::Result<i32> {
     if let Some(server) = server {
         return client::run(&server, cli.command, cli.operation_key);
     }
+    // Remote commands are checked by the controller against the machine's node.
+    #[cfg(target_os = "linux")]
+    let (backend, capabilities) = (runtime::BACKEND, runtime::CAPABILITIES);
+    #[cfg(target_os = "macos")]
+    let (backend, capabilities) = (mac_worker::BACKEND, mac_worker::CAPABILITIES);
+    if let Some(request) = operation(&cli.command) {
+        capabilities.check(backend, &request)?;
+    }
     #[cfg(target_os = "linux")]
     {
         host::run(cli)
@@ -544,6 +595,28 @@ fn main_result() -> anyhow::Result<i32> {
     }
 }
 
+/// The worker operation behind a workspace command, for the capability check.
+fn operation(action: &Action) -> Option<serde_json::Value> {
+    let op = match action {
+        Action::Fork { snapshot, .. } => {
+            return Some(serde_json::json!({"op":"fork","snapshot":snapshot}));
+        }
+        Action::Snapshot { .. } => "snapshot",
+        Action::Snapshots => "snapshots",
+        Action::Restore { .. } => "restore",
+        Action::Hibernate { .. } => "hibernate",
+        Action::Exec { .. } => "exec",
+        Action::Shell { .. } => "terminal",
+        Action::Put { .. } => "put",
+        Action::Get { .. } => "get",
+        Action::Ssh { .. } | Action::SshProxy { .. } => "ssh",
+        Action::SshConfig { .. } | Action::SshInfo { .. } => "ssh-info",
+        Action::SshAuthorize { .. } | Action::SshRevoke { .. } => "ssh-keys",
+        _ => return None,
+    };
+    Some(serde_json::json!({"op":op}))
+}
+
 fn main() {
     match main_result() {
         Ok(code) => std::process::exit(code),
@@ -551,5 +624,42 @@ fn main() {
             eprintln!("ow: {error:#}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use ow_core::{Capabilities, Capability};
+
+    fn needed(args: &[&str]) -> Option<Capability> {
+        let cli = Cli::try_parse_from([&["ow"], args].concat()).unwrap();
+        operation(&cli.command).and_then(|r| Capability::required(&r))
+    }
+
+    #[test]
+    fn commands_need_their_flags() {
+        assert_eq!(needed(&["fork", "a", "b"]), Some(Capability::LiveFork));
+        assert_eq!(
+            needed(&["fork", "a", "b", "--snapshot", "s"]),
+            Some(Capability::Snapshot)
+        );
+        assert_eq!(needed(&["snapshots"]), Some(Capability::Snapshot));
+        assert_eq!(needed(&["restore", "a", "s"]), Some(Capability::Snapshot));
+        assert_eq!(needed(&["hibernate", "a"]), Some(Capability::Hibernate));
+        assert_eq!(needed(&["exec", "a", "true"]), Some(Capability::Exec));
+        assert_eq!(needed(&["shell", "a"]), Some(Capability::Exec));
+        assert_eq!(needed(&["ssh-proxy", "a"]), Some(Capability::Ssh));
+        assert_eq!(needed(&["ssh-config", "a"]), Some(Capability::Ssh));
+        assert_eq!(needed(&["ssh-revoke", "a"]), Some(Capability::Ssh));
+        assert_eq!(needed(&["create", "a"]), None);
+        assert_eq!(needed(&["list"]), None);
+        let exec_only = Capabilities::of(&[Capability::Exec]);
+        let request = operation(
+            &Cli::try_parse_from(["ow", "hibernate", "a"])
+                .unwrap()
+                .command,
+        );
+        assert!(exec_only.check("mac", &request.unwrap()).is_err());
     }
 }

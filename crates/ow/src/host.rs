@@ -2,6 +2,7 @@ use crate::runtime::Runtime;
 use crate::{Action, Cli, assets, network, remote, runtime, terminal, vm, wire};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use ow_core::ComputeProvider;
 use serde_json::{Value, json};
 use std::{
     fs::{self, OpenOptions},
@@ -249,7 +250,7 @@ fn worker(root: PathBuf) -> Result<()> {
                         let response = runtime
                             .lock()
                             .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
-                            .request(&request);
+                            .operation(&request);
                         wire::send(&mut stream, &wire::response(response))?;
                     }
                     Ok(())
@@ -658,7 +659,10 @@ pub fn run(cli: Cli) -> Result<i32> {
             remote::run(&config, listen, None)?;
             return Ok(0);
         }
-        Action::Login { .. } | Action::Host { .. } | Action::Node { .. } => unreachable!(),
+        Action::Login { .. }
+        | Action::Host { .. }
+        | Action::Node { .. }
+        | Action::Backup { .. } => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;
             return Ok(0);

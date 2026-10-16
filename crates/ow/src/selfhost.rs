@@ -1,13 +1,14 @@
-//! Single-host mode (`ow host up`) and SSH runner onboarding (`ow node add`).
+//! Single-host mode (`ow host up`) and runner onboarding over SSH, AWS SSM or
+//! Tailscale (`ow node add`).
 //! Both compose the existing controller, worker, single-use join file and node agent.
 use crate::{NodeAction, common, host, nodes, onboarding};
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use ow_core::connect::{self, Session};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::OsStr,
     fs,
-    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -17,7 +18,7 @@ use std::{
 
 const PORT: u16 = 8790;
 
-fn base(explicit: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn base(explicit: Option<PathBuf>) -> Result<PathBuf> {
     let path = match explicit {
         Some(path) => path,
         None => PathBuf::from(std::env::var_os("HOME").context("HOME required")?).join(".ow"),
@@ -105,30 +106,6 @@ rm -f server.csr server.ext
     Ok(())
 }
 
-fn node_name(host: &str) -> String {
-    let label = if host.parse::<IpAddr>().is_ok() {
-        host
-    } else {
-        host.split('.').next().unwrap_or_default()
-    };
-    let name: String = label
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .take(32)
-        .collect();
-    if name.trim_matches('-').is_empty() || name == "local" {
-        "runner".to_owned()
-    } else {
-        name
-    }
-}
-
 /// Online with a heartbeat at or after `since` (Unix seconds), so a stale one cannot pass.
 fn wait_online(controller: &Path, node: &str, since: i64, limit: Duration) -> bool {
     let started = Instant::now();
@@ -183,7 +160,7 @@ pub fn up(
     let hostname = fs::read_to_string("/proc/sys/kernel/hostname")?
         .trim()
         .to_owned();
-    let node = node.unwrap_or_else(|| node_name(&hostname));
+    let node = node.unwrap_or_else(|| connect::node_name(&hostname));
     common::identifier(&node)?;
     let tailnet = tailscale();
     // Never a public listener by default: the tailnet address, else loopback only.
@@ -307,113 +284,6 @@ pub fn up(
     let (what, result) = finished.recv()?;
     result.with_context(|| format!("{what} stopped"))?;
     bail!("{what} stopped")
-}
-
-/// Remote shell over the system OpenSSH client; config aliases and agents apply.
-struct Ssh {
-    program: PathBuf,
-    control: PathBuf,
-    args: Vec<String>,
-}
-impl Ssh {
-    fn command(&self) -> Command {
-        let mut c = Command::new(&self.program);
-        c.arg("-o")
-            .arg("ControlMaster=auto")
-            .arg("-o")
-            .arg(format!("ControlPath={}", self.control.display()))
-            .arg("-o")
-            .arg("ControlPersist=60")
-            .args(&self.args);
-        c
-    }
-    /// Runs `script` under remote `sh` with quoted positional arguments.
-    fn run(&self, script: &str, args: &[&str], stdin: Stdio, bytes: &[u8]) -> Result<String> {
-        let mut remote = format!("sh -c {} sh", common::shell_quote(script));
-        for arg in args {
-            remote.push(' ');
-            remote.push_str(&common::shell_quote(arg));
-        }
-        let mut child = self
-            .command()
-            .arg(remote)
-            .stdin(if bytes.is_empty() {
-                stdin
-            } else {
-                Stdio::piped()
-            })
-            .stdout(Stdio::piped())
-            .spawn()
-            .context("ssh client required")?;
-        if !bytes.is_empty() {
-            child.stdin.take().context("ssh stdin")?.write_all(bytes)?;
-        }
-        let output = child.wait_with_output()?;
-        ensure!(
-            output.status.success(),
-            "remote step failed ({})",
-            output.status
-        );
-        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-    }
-}
-impl Drop for Ssh {
-    fn drop(&mut self) {
-        let _ = self
-            .command()
-            .args(["-O", "exit"])
-            .stderr(Stdio::null())
-            .stdout(Stdio::null())
-            .status();
-    }
-}
-
-/// `ssh://user@host[:port]` (scheme optional) to client arguments plus a default node ID.
-fn target(value: &str) -> Result<(Vec<String>, String)> {
-    let url = reqwest::Url::parse(&if value.contains("://") {
-        value.to_owned()
-    } else {
-        format!("ssh://{value}")
-    })
-    .context("use ssh://user@host[:port]")?;
-    ensure!(
-        url.scheme() == "ssh"
-            && matches!(url.path(), "" | "/")
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && url.password().is_none(),
-        "use ssh://user@host[:port]"
-    );
-    let host = url
-        .host_str()
-        .context("SSH host required")?
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    ensure!(
-        !host.is_empty()
-            && !host.starts_with('-')
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b".-_:".contains(&b)),
-        "invalid SSH host"
-    );
-    let mut args = Vec::new();
-    if let Some(port) = url.port() {
-        args.extend(["-p".to_owned(), port.to_string()]);
-    }
-    let user = url.username();
-    if !user.is_empty() {
-        ensure!(
-            !user.starts_with('-')
-                && user
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
-            "invalid SSH user"
-        );
-        args.extend(["-l".to_owned(), user.to_owned()]);
-    }
-    args.extend(["--".to_owned(), host.to_owned()]);
-    Ok((args, node_name(host)))
 }
 
 /// The key never appears in arguments, logs or saved files.
@@ -559,8 +429,8 @@ fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i
         false,
     )?;
     let key = tailscale_auth_key.as_deref().map(auth_key).transpose()?;
-    let (args, default_name) = target(&destination)?;
-    let name = name.unwrap_or(default_name);
+    let auth = connect::parse(&destination)?;
+    let name = name.unwrap_or_else(|| auth.default_name());
     common::identifier(&name)?;
     ensure!(name != "local", "local is reserved");
     let binary = match ow_binary {
@@ -596,11 +466,11 @@ fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let ssh = Ssh {
-        program: ssh.into(),
-        control: base.join(format!("ssh-{}", common::nonce()?)),
-        args,
-    };
+    let ssh = Session::new(
+        ssh.into(),
+        base.join(format!("ssh-{}", common::nonce()?)),
+        auth.as_ref(),
+    );
     println!("Checking {destination}: Linux x86-64, KVM, Btrfs");
     let dir = ssh.run(
         PRECHECK,

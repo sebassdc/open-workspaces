@@ -1,4 +1,5 @@
 use crate::vm::{self, Vm, shell_quote};
+use crate::{Capabilities, ComputeProvider};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -264,6 +265,22 @@ fn install_file(machine: &mut Vm, binary: &Path, guest: &str, digest: &str) -> R
     installation?;
     transmitted?;
     Ok(())
+}
+
+pub const BACKEND: &str = "firecracker";
+/// Firecracker supports every flag: paired snapshots, live forks, hibernation, exec and SSH.
+pub const CAPABILITIES: Capabilities = Capabilities::ALL;
+
+impl ComputeProvider for Runtime {
+    fn backend(&self) -> &'static str {
+        BACKEND
+    }
+    fn capabilities(&self) -> Capabilities {
+        CAPABILITIES
+    }
+    fn call(&mut self, request: &Value) -> Result<Value> {
+        self.request(request)
+    }
 }
 
 pub struct Runtime {

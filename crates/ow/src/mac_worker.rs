@@ -1,6 +1,7 @@
 //! Bounded Apple worker. A process-owned pipe prevents orphaned native guests.
 use crate::{Action, Cli, common, nodes, wire};
 use anyhow::{Context, Result, bail, ensure};
+use ow_core::{Capabilities, Capability, ComputeProvider};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -252,6 +253,23 @@ pub fn verified_assets(root: &Path) -> Result<PathBuf> {
     }
     Ok(assets)
 }
+
+pub const BACKEND: &str = "apple-virtualization";
+/// The Mac slice runs commands, terminals and file transfer only (see MAC_OPERATIONS).
+pub const CAPABILITIES: Capabilities = Capabilities::of(&[Capability::Exec]);
+
+impl ComputeProvider for Worker {
+    fn backend(&self) -> &'static str {
+        BACKEND
+    }
+    fn capabilities(&self) -> Capabilities {
+        CAPABILITIES
+    }
+    fn call(&mut self, request: &Value) -> Result<Value> {
+        self.request(request)
+    }
+}
+
 struct Worker {
     root: PathBuf,
     assets: PathBuf,
@@ -958,7 +976,7 @@ fn worker(root: PathBuf) -> Result<()> {
                                 } else {
                                     rt.lock()
                                         .map_err(|_| anyhow::anyhow!("worker poisoned"))?
-                                        .request(&r)
+                                        .operation(&r)
                                 };
                             let shutdown = r["op"] == "shutdown" && result.is_ok();
                             wire::send(&mut s, &wire::response(result))?;
