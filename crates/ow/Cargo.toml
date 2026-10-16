@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1"
+ow-core = { path = "../ow-core" }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"

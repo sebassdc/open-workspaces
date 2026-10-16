@@ -46,7 +46,10 @@ and the [EC2 timings](docs/experiments/ec2-timings.md).
 
 Single-host mode: `ow host up` runs the controller and a runner on one Linux
 machine, and `ow node add ssh://user@host` adds any SSH-reachable KVM machine
-as another runner. See [single-host mode and SSH runners](docs/SINGLE_HOST.md).
+as another runner (`ssm://` and `tailscale://` targets go through AWS Systems
+Manager or a tailnet). See [single-host mode and SSH runners](docs/SINGLE_HOST.md).
+The `ow-core` crate holds the compute, connect and capability traits, and
+`ow backup` copies the catalog and snapshots; see [core traits and backups](docs/CORE.md).
 
 ## Read first
 

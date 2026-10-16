@@ -6,7 +6,8 @@ certificates:
 - `ow host up` runs the controller and a local runner on one Linux machine.
   This is the default single-host mode.
 - `ow node add ssh://user@host` turns any SSH-reachable Linux machine into
-  another runner of that controller.
+  another runner of that controller. `ssm://` and `tailscale://` targets reach
+  it through AWS Systems Manager or a tailnet instead.
 
 They compose the existing pieces from [the multi-node prototype](MULTINODE.md):
 `node-controller`, the private rootless worker, single-use join files and the
@@ -100,6 +101,30 @@ The installed binary is `bin/ow-linux-amd64` from the asset directory when it
 exists (static musl build from `scripts/build-local.sh`), otherwise the running
 `ow`. Use `--ow-binary` when the runner's C library differs.
 
+### Connect over AWS SSM or Tailscale
+
+The target's scheme picks the [connect provider](CORE.md#connect-providers).
+All three drive the system OpenSSH client; SSM and Tailscale only carry the
+connection, so every step above is the same:
+
+```sh
+ow node add ssm://ubuntu@i-0123456789abcdef0      # no inbound port on the instance
+ow node add tailscale://dev@build-box.tail1234.ts.net
+```
+
+- `ssm://` tunnels through AWS Systems Manager (`AWS-StartSSHSession`). It needs
+  the AWS CLI with the Session Manager plugin on this machine, IAM permission
+  for `ssm:StartSession` on the instance, and the instance's SSM agent online.
+  Region and profile come from `AWS_REGION`/`AWS_PROFILE`. SSH login still needs
+  a key the instance accepts; for an EC2 instance without one, push yours for 60
+  seconds first:
+  `aws ec2-instance-connect send-ssh-public-key --instance-id i-… --instance-os-user ubuntu --ssh-public-key file://$HOME/.ssh/id_ed25519.pub`.
+  The default runner name is the instance ID.
+- `tailscale://` tunnels through `tailscale nc` over the tailnet, so this machine
+  must be on the same tailnet. With Tailscale SSH enabled on the runner
+  (`tailscale up --ssh`) the tailnet identity is the login; otherwise its sshd
+  checks your key as usual.
+
 ### Join a tailnet
 
 ```sh
@@ -123,6 +148,12 @@ the tailnet admin console.
 `ow node list` prints every runner with `online` true when its agent sent a
 heartbeat in the last 15 seconds. Revoke a runner with
 `ow --data-dir ~/.ow/controller node-revoke ID`; revoked IDs cannot be reused.
+
+## Backups
+
+`ow backup catalog --output FILE` copies the live controller catalog;
+`ow backup snapshots --to s3://bucket/prefix` uploads the runner's sealed
+snapshots. See [backups](CORE.md#backups).
 
 ## Limits
 
