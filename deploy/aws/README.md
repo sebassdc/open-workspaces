@@ -117,7 +117,8 @@ export PULUMI_CONFIG_PASSPHRASE=...      # self-managed backends only
 
 `run.sh` lists every variable. It only destroys a stack it created itself:
 `pulumi stack init` refuses an existing `OW_STACK`, and the run stops before
-touching anything.
+touching anything. Every SSM command has a local deadline, so AWS errors end
+the run and the stack is still destroyed.
 
 ## Limits
 

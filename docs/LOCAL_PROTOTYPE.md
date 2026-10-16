@@ -107,7 +107,7 @@ workspace returns 502 through its gateway until explicitly started.
 `delete` removes a stopped or hibernated workspace: its record, its disk, its
 local HTTP publications and every snapshot captured from it, including
 hibernation checkpoints. Forks made earlier keep running; their disks are
-independent copies. A running workspace is refused. Delete is local-worker
+independent copies. A running workspace is refused and keeps its publications. Delete is local-worker
 only for now: the remote CLI and dashboard reject it, and it does not update a
 gateway catalog sharing the same data directory.
 
