@@ -14,10 +14,16 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
 };
 
-pub async fn upgrade(root: &Path, request: Request, expires: u64, id: String) -> Response {
+pub async fn upgrade(
+    root: &Path,
+    request: Request,
+    expires: u64,
+    id: String,
+    revoked: Arc<Notify>,
+) -> Response {
     if request.uri().query().is_some()
         || request.uri().authority().is_some()
         || request.uri().scheme().is_some()
@@ -63,13 +69,14 @@ pub async fn upgrade(root: &Path, request: Request, expires: u64, id: String) ->
         .max_frame_size(16384)
         .write_buffer_size(0)
         .max_write_buffer_size(65536)
-        .on_upgrade(move |socket| relay(socket, stream, expires, permit))
+        .on_upgrade(move |socket| relay(socket, stream, expires, permit, revoked))
 }
 async fn relay(
     mut socket: WebSocket,
     mut stream: tokio::net::UnixStream,
     expires: u64,
     _permit: OwnedSemaphorePermit,
+    revoked: Arc<Notify>,
 ) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -83,6 +90,7 @@ async fn relay(
     loop {
         tokio::select! {
             _=&mut deadline=>break,
+            _=revoked.notified()=>break,
             _=tick.tick()=>{if active.elapsed()>Duration::from_secs(90){break;}if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Ping(Vec::new().into()))).await,Ok(Ok(()))){break;}}
             message=socket.recv()=>{
                 match message {

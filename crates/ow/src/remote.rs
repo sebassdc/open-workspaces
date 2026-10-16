@@ -314,7 +314,7 @@ async fn handle(app: &App, request: Request) -> Response {
             .strip_prefix("/api/ssh/")
             .unwrap()
             .to_owned();
-        if request.uri().query().is_some() || crate::common::identifier(&name).is_err() {
+        if request.uri().query().is_some() || crate::common::address(&name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid SSH target").into_response();
         }
         let target = crate::dashboard::with_catalog(
@@ -323,14 +323,14 @@ async fn handle(app: &App, request: Request) -> Response {
             move |catalog, user| catalog.ssh_target(user, &name),
         )
         .await;
-        let Ok((root, id)) = target else {
+        let Ok((root, id, revoked)) = target else {
             return (
                 StatusCode::NOT_FOUND,
                 "Machine not found or SSH node unavailable",
             )
                 .into_response();
         };
-        return crate::ssh_gateway::upgrade(&root, request, expires, id).await;
+        return crate::ssh_gateway::upgrade(&root, request, expires, id, revoked).await;
     }
     if let Some(_root) = &app.dashboard
         && request.uri().path().starts_with("/api/terminal/")
@@ -348,7 +348,7 @@ async fn handle(app: &App, request: Request) -> Response {
             .path()
             .trim_start_matches("/api/terminal/")
             .to_owned();
-        if request.uri().query().is_some() || crate::common::identifier(&name).is_err() {
+        if request.uri().query().is_some() || crate::common::address(&name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid terminal target").into_response();
         }
         let id = crate::dashboard::with_catalog(
@@ -357,10 +357,10 @@ async fn handle(app: &App, request: Request) -> Response {
             move |catalog, user| catalog.terminal_target(user, &name),
         )
         .await;
-        let Ok((target_root, id)) = id else {
+        let Ok((target_root, id, revoked)) = id else {
             return (StatusCode::NOT_FOUND, "Machine not found").into_response();
         };
-        return crate::terminal::upgrade(&target_root, request, expires, id).await;
+        return crate::terminal::upgrade(&target_root, request, expires, id, revoked).await;
     }
     if !matches!(
         *request.method(),
@@ -1291,6 +1291,163 @@ mod tests {
         assert!(reopened.terminal_id(user, "demo").is_ok());
         std::fs::write(root.join("users-result.json"),json!({"passed":true,"checks":["explicit legacy owner import","verified distinct subjects","same machine/snapshot/fork names for two users","independent guest files","all lifecycle and exec cross-owner denial","cross-owner snapshot/fork/restore denial","physical ID denial","WSS ownership denial before worker connection","owner-only stats and metadata","database reopen preserves ownership"]}).to_string()).unwrap();
         println!("User isolation artifacts: {}", root.display());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unshare_closes_a_grantees_live_terminal() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("ow-share-{}", crate::common::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        // Fake worker: one running legacy machine; a terminal stream stays open until closed.
+        let listener = std::os::unix::net::UnixListener::bind(root.join("control.sock")).unwrap();
+        let terminals = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let (opened, ended) = (terminals.clone(), closed.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let (opened, ended) = (opened.clone(), ended.clone());
+                std::thread::spawn(move || {
+                    let Ok(request) = crate::wire::line(&mut stream) else {
+                        return;
+                    };
+                    let result = match request["op"].as_str().unwrap_or("") {
+                        "list" => {
+                            json!([{"id":"legacy","state":"running","memory_mib":256,"vcpu_count":1,"image":"alpine"}])
+                        }
+                        "snapshots" => json!([]),
+                        "stats" => json!({"running":{}}),
+                        "exec" => json!({"output":"shared-ok","exit_code":0}),
+                        _ => json!({}),
+                    };
+                    crate::wire::send(&mut stream, &json!({"ok":true,"result":result})).unwrap();
+                    if request["op"] == "terminal" {
+                        opened.fetch_add(1, Ordering::SeqCst);
+                        let mut sink = [0; 4096];
+                        while std::io::Read::read(&mut stream, &mut sink).is_ok_and(|n| n > 0) {}
+                        ended.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        let catalog = crate::catalog::Catalog::open(
+            &root,
+            "https://test-team.cloudflareaccess.com",
+            Some("owner@example.test"),
+        )
+        .unwrap();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let (key, set) = signing_key();
+        let mut cfg = config("http://127.0.0.1:1".into());
+        cfg.hostname = format!("localhost:{port}");
+        cfg.allowed_emails.push("bob@example.test".into());
+        let gateway = router(App {
+            dashboard: Some(root.clone()),
+            catalog: Some(Arc::new(std::sync::Mutex::new(catalog))),
+            config: cfg,
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set,
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        });
+        let served = gateway.clone();
+        let server = tokio::spawn(async move { axum::serve(tcp, served).await });
+        let alice = token(&key, &claims());
+        let mut c = claims();
+        c["sub"] = json!("bob-subject");
+        c["email"] = json!("bob@example.test");
+        let bob = token(&key, &c);
+        let host = format!("localhost:{port}");
+        let api = |jwt: String, body: Value| {
+            let gateway = gateway.clone();
+            let host = host.clone();
+            async move {
+                let req = Request::builder()
+                    .uri("/api/operation")
+                    .method(Method::POST)
+                    .header("host", &host)
+                    .header("cf-access-jwt-assertion", jwt)
+                    .header("origin", format!("https://{host}"))
+                    .header("x-ow-request", "dashboard")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                let response = gateway.oneshot(req).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let shared = "owner@example.test/legacy";
+        let terminal = |jwt: String| {
+            let url = format!("ws://localhost:{port}/api/terminal/{shared}");
+            let origin = format!("https://localhost:{port}");
+            tokio::task::spawn_blocking(move || {
+                use tungstenite::client::IntoClientRequest;
+                let mut req = url.into_client_request().unwrap();
+                req.headers_mut()
+                    .insert("cf-access-jwt-assertion", jwt.parse().unwrap());
+                req.headers_mut().insert("origin", origin.parse().unwrap());
+                tungstenite::connect(req).map(|(socket, _)| socket)
+            })
+        };
+        let exec = json!({"op":"exec","id":shared,"command":"id"});
+        assert!(terminal(bob.clone()).await.unwrap().is_err());
+        assert_eq!(api(bob.clone(), exec.clone()).await.0, StatusCode::CONFLICT);
+        let (code, value) = api(
+            alice.clone(),
+            json!({"op":"share","id":"legacy","with":"bob@example.test"}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{value}");
+        let (code, value) = api(bob.clone(), exec.clone()).await;
+        assert_eq!(
+            (code, value["result"]["output"].as_str()),
+            (StatusCode::OK, Some("shared-ok"))
+        );
+        let mut socket = terminal(bob.clone()).await.unwrap().unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = socket.get_mut() {
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+        while terminals.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (code, value) = api(
+            alice.clone(),
+            json!({"op":"unshare","id":"legacy","with":"bob@example.test"}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{value}");
+        let started = Instant::now();
+        let ended = tokio::task::spawn_blocking(move || {
+            loop {
+                match socket.read() {
+                    Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        ended.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "unshare did not close the stream"
+        );
+        while closed.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "worker stream left open"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(api(bob.clone(), exec).await.0, StatusCode::CONFLICT);
+        assert!(terminal(bob).await.unwrap().is_err());
+        server.abort();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

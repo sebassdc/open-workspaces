@@ -8,6 +8,7 @@ use std::{
     fs::OpenOptions,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -35,6 +36,47 @@ impl std::fmt::Display for OperationFailure {
     }
 }
 impl std::error::Error for OperationFailure {}
+
+/// Open gateway streams (terminal, SSH) by user and machine, so unsharing closes them at once.
+type Sessions = Vec<(i64, String, std::sync::Weak<tokio::sync::Notify>)>;
+static SESSIONS: std::sync::Mutex<Sessions> = std::sync::Mutex::new(Vec::new());
+fn session(user: i64, physical: &str) -> Arc<tokio::sync::Notify> {
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    sessions.retain(|(_, _, s)| s.strong_count() > 0);
+    sessions.push((user, physical.into(), Arc::downgrade(&notify)));
+    notify
+}
+fn cut(user: i64, physical: &str) {
+    let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    for (u, p, s) in sessions.iter() {
+        if *u == user && p == physical {
+            // notify_one keeps a permit, so a stream that is not polling yet still closes.
+            s.upgrade().inspect(|s| s.notify_one());
+        }
+    }
+}
+
+/// What a grantee may do on a machine shared with them. Resize and sharing stay with the owner.
+fn permitted(role: &str, op: &str) -> bool {
+    match role {
+        "owner" => true,
+        "admin" => op != "resize",
+        "use" => matches!(
+            op,
+            "exec"
+                | "put"
+                | "get"
+                | "terminal"
+                | "ssh"
+                | "ssh-info"
+                | "start"
+                | "hibernate"
+                | "fork"
+        ),
+        _ => false,
+    }
+}
 
 impl Catalog {
     pub fn open(root: &Path, issuer: &str, bootstrap: Option<&str>) -> Result<Self> {
@@ -75,6 +117,8 @@ impl Catalog {
           CREATE TABLE IF NOT EXISTS resources(owner INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL CHECK(kind IN ('machine','snapshot')), name TEXT NOT NULL, physical TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(owner,kind,name), UNIQUE(kind,physical));
           CREATE TABLE IF NOT EXISTS operations(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL REFERENCES users(id), op TEXT NOT NULL, resource TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, finished_at TEXT);
           CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+          -- Additive, like node_usage: an older binary ignores grants, so grantees lose access.
+          CREATE TABLE IF NOT EXISTS grants(physical TEXT NOT NULL, grantee INTEGER NOT NULL REFERENCES users(id), role TEXT NOT NULL CHECK(role IN ('use','admin')), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(physical,grantee));
           ")?;
         if version == 1 {
             // Machine and snapshot IDs occupy separate worker directories and may match.
@@ -243,11 +287,88 @@ impl Catalog {
         Ok(self
             .db
             .query_row(
-                "SELECT name FROM resources WHERE owner=?1 AND kind=?2 AND physical=?3",
+                "SELECT CASE WHEN r.owner=?1 THEN r.name ELSE u.email||'/'||r.name END FROM resources r JOIN users u ON u.id=r.owner WHERE r.kind=?2 AND r.physical=?3 AND (r.owner=?1 OR (r.kind='machine' AND EXISTS(SELECT 1 FROM grants g WHERE g.physical=r.physical AND g.grantee=?1)))",
                 params![user, kind, physical],
                 |r| r.get(0),
             )
             .optional()?)
+    }
+    /// Physical ID of a machine the user owns (`name`) or that was shared with them
+    /// (`owner@example.com/name`), when their role allows `op`.
+    fn machine(&self, user: i64, address: &str, op: &str) -> Result<String> {
+        let Some((owner, name)) = address.split_once('/') else {
+            return self.physical(user, "machine", address);
+        };
+        common::address(address)?;
+        let (physical, role): (String, String) = self
+            .db
+            .query_row(
+                "SELECT r.physical, CASE WHEN r.owner=?1 THEN 'owner' ELSE g.role END FROM resources r JOIN users u ON u.id=r.owner LEFT JOIN grants g ON g.physical=r.physical AND g.grantee=?1 WHERE r.kind='machine' AND u.issuer=(SELECT issuer FROM users WHERE id=?1) AND u.email=?2 AND r.name=?3 AND (r.owner=?1 OR g.role IS NOT NULL)",
+                params![user, owner.to_ascii_lowercase(), name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .context("resource not found")?;
+        ensure!(
+            permitted(&role, op),
+            "{op} is not allowed on a machine shared with you as {role}"
+        );
+        Ok(physical)
+    }
+    fn shared_with(&self, physical: &str) -> Result<Value> {
+        let mut stmt = self.db.prepare("SELECT u.email,g.role FROM grants g JOIN users u ON u.id=g.grantee WHERE g.physical=?1 ORDER BY u.email")?;
+        let rows = stmt.query_map([physical], |r| {
+            Ok(json!({"email":r.get::<_, String>(0)?,"role":r.get::<_, String>(1)?}))
+        })?;
+        Ok(json!(rows.collect::<rusqlite::Result<Vec<_>>>()?))
+    }
+    /// `share` grants a teammate (by login email) a role on an owned machine; `unshare` removes
+    /// it and closes their open terminal and SSH streams. Machines they forked stay theirs.
+    fn share(&mut self, user: i64, op: &str, request: &Value) -> Result<Value> {
+        let name = request["id"].as_str().context("id")?;
+        let physical = self.physical(user, "machine", name)?;
+        let email = request["with"]
+            .as_str()
+            .context("teammate email required")?
+            .to_ascii_lowercase();
+        common::email(&email)?;
+        let tx = self.db.transaction()?;
+        let issuer: String =
+            tx.query_row("SELECT issuer FROM users WHERE id=?1", [user], |r| r.get(0))?;
+        if op == "share" {
+            // An email nobody has logged in with yet is reserved; its first verified login binds it.
+            tx.execute(
+                "INSERT INTO users(issuer,email) VALUES(?1,?2) ON CONFLICT(issuer,email) DO NOTHING",
+                params![issuer, email],
+            )?;
+        }
+        let grantee: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM users WHERE issuer=?1 AND email=?2",
+                params![issuer, email],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(grantee != Some(user), "you already own this machine");
+        if let Some(grantee) = grantee {
+            if op == "share" {
+                let role = request["role"].as_str().unwrap_or("use");
+                ensure!(matches!(role, "use" | "admin"), "role must be use or admin");
+                tx.execute("INSERT INTO grants(physical,grantee,role) VALUES(?1,?2,?3) ON CONFLICT(physical,grantee) DO UPDATE SET role=excluded.role",params![physical,grantee,role])?;
+            } else {
+                tx.execute(
+                    "DELETE FROM grants WHERE physical=?1 AND grantee=?2",
+                    params![physical, grantee],
+                )?;
+            }
+        }
+        tx.commit()?;
+        if op == "unshare"
+            && let Some(grantee) = grantee
+        {
+            cut(grantee, &physical);
+        }
+        Ok(json!({"id":name,"shared_with":self.shared_with(&physical)?}))
     }
     fn reserve(&mut self, user: i64, kind: &str, name: &str) -> Result<String> {
         common::identifier(name)?;
@@ -418,26 +539,32 @@ impl Catalog {
         let mut reserved = 0;
         for row in rows {
             let (kind, physical, metadata, node, memory) = row?;
-            let mut value: Value = serde_json::from_str(&metadata)?;
-            value[if kind == "machine" { "id" } else { "name" }] = json!(physical);
-            value["node"] = json!(node);
-            let online = if node == "local" {
-                self.root.join("control.sock").exists()
-            } else {
-                nodes::online(&self.root, &node).is_ok()
-            };
-            value["node_online"] = json!(online);
-            if !online {
-                value["observed_state"] = value["state"].clone();
-                value["state"] = json!("offline");
-            }
-            let value = self.public(user, &kind, &value)?;
+            let mut value = self.view(user, &kind, &physical, &metadata, &node)?;
             if kind == "machine" {
                 reserved += memory;
+                value["shared_with"] = self.shared_with(&physical)?;
                 machines.push(value);
             } else {
                 snapshots.push(value);
             }
+        }
+        let mut shared = Vec::new();
+        let mut stmt = self.db.prepare("SELECT r.physical,r.metadata,r.node,u.email,g.role FROM grants g JOIN resources r ON r.kind='machine' AND r.physical=g.physical JOIN users u ON u.id=r.owner WHERE g.grantee=?1 ORDER BY u.email,r.name")?;
+        let rows = stmt.query_map([user], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (physical, metadata, node, owner, role) = row?;
+            let mut value = self.view(user, "machine", &physical, &metadata, &node)?;
+            value["owner"] = json!(owner);
+            value["role"] = json!(role);
+            shared.push(value);
         }
         let mut running = BTreeMap::new();
         let mut pss = 0;
@@ -464,7 +591,11 @@ impl Catalog {
             if let Some(entries) = stats["running"].as_object() {
                 for (physical, stats) in entries {
                     if self.placement("machine", physical).is_ok_and(|n| n == node) {
-                        if let Some(name) = self.logical(user, "machine", physical)? {
+                        // Usage covers owned machines only, not ones shared with this user.
+                        if let Some(name) = self
+                            .logical(user, "machine", physical)?
+                            .filter(|name| !name.contains('/'))
+                        {
                             pss += stats["pss_kib"].as_u64().unwrap_or(0);
                             running.insert(name, stats.clone());
                         }
@@ -480,8 +611,31 @@ impl Catalog {
             operations.push(self.operation_info(user, id?)?);
         }
         Ok(
-            json!({"operations":operations,"workspaces":machines,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
+            json!({"operations":operations,"workspaces":machines,"shared":shared,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
         )
+    }
+    fn view(
+        &self,
+        user: i64,
+        kind: &str,
+        physical: &str,
+        metadata: &str,
+        node: &str,
+    ) -> Result<Value> {
+        let mut value: Value = serde_json::from_str(metadata)?;
+        value[if kind == "machine" { "id" } else { "name" }] = json!(physical);
+        value["node"] = json!(node);
+        let online = if node == "local" {
+            self.root.join("control.sock").exists()
+        } else {
+            nodes::online(&self.root, node).is_ok()
+        };
+        value["node_online"] = json!(online);
+        if !online {
+            value["observed_state"] = value["state"].clone();
+            value["state"] = json!("offline");
+        }
+        self.public(user, kind, &value)
     }
     fn snapshot_source(&self, user: i64, snapshot: &str, physical: &str) -> Result<()> {
         let metadata: String = self.db.query_row(
@@ -690,20 +844,25 @@ impl Catalog {
                 "hibernate",
                 "snapshot",
                 "fork",
-                "restore"
+                "restore",
+                "share",
+                "unshare"
             ]
             .contains(&op.as_str()),
             "unsupported user operation"
         );
+        if matches!(op.as_str(), "share" | "unshare") {
+            return self.share(user, &op, &request);
+        }
         if matches!(op.as_str(), "create" | "resize") {
             common::requested_resources(&request)?;
         }
         let name = request["id"].as_str().context("id")?.to_owned();
-        common::identifier(&name)?;
+        common::address(&name)?;
         let input = request.clone();
         // Resolve authority before any worker contact, including inventory refresh.
         if op != "create" {
-            let physical = self.physical(user, "machine", &name)?;
+            let physical = self.machine(user, &name, &op)?;
             let node = self.placement("machine", &physical)?;
             nodes::online(&self.root, &node)?;
             nodes::operation_capable(&self.root, &node, &op)?;
@@ -744,7 +903,7 @@ impl Catalog {
             let physical = if op == "create" {
                 self.reserve(user, "machine", &name)?
             } else {
-                self.physical(user, "machine", &name)?
+                self.machine(user, &name, &op)?
             };
             let metadata: String = self.db.query_row(
                 "SELECT metadata FROM resources WHERE kind='machine' AND physical=?1",
@@ -1029,17 +1188,28 @@ impl Catalog {
         self.reconcile()?;
         Ok(value)
     }
-    pub fn ssh_target(&self, user: i64, name: &str) -> Result<(PathBuf, String)> {
-        let physical = self.physical(user, "machine", name)?;
+    /// Route for a gateway SSH stream; the returned notify fires when the user loses access.
+    pub fn ssh_target(
+        &self,
+        user: i64,
+        name: &str,
+    ) -> Result<(PathBuf, String, Arc<tokio::sync::Notify>)> {
+        let physical = self.machine(user, name, "ssh")?;
         let node = self.placement("machine", &physical)?;
         nodes::ssh_capable(&self.root, &node)?;
-        Ok((nodes::route(&self.root, &node)?, physical))
+        let route = nodes::route(&self.root, &node)?;
+        Ok((route, physical.clone(), session(user, &physical)))
     }
-    pub fn terminal_target(&self, user: i64, name: &str) -> Result<(PathBuf, String)> {
-        let physical = self.physical(user, "machine", name)?;
+    pub fn terminal_target(
+        &self,
+        user: i64,
+        name: &str,
+    ) -> Result<(PathBuf, String, Arc<tokio::sync::Notify>)> {
+        let physical = self.machine(user, name, "terminal")?;
         let node = self.placement("machine", &physical)?;
         nodes::operation_capable(&self.root, &node, "terminal")?;
-        Ok((nodes::route(&self.root, &node)?, physical))
+        let route = nodes::route(&self.root, &node)?;
+        Ok((route, physical.clone(), session(user, &physical)))
     }
 
     #[cfg(test)]

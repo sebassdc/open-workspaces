@@ -304,6 +304,8 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Snapshot { .. }
                 | Action::Restore { .. }
                 | Action::Fork { .. }
+                | Action::Share { .. }
+                | Action::Unshare { .. }
         ),
         "this command is local-only; use --local for the local worker"
     );
@@ -343,16 +345,17 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         | Action::Snapshots
         | Action::Inspect { .. } => {
             let state = request(&url, &token, None)?;
+            let mut machines = state["workspaces"].as_array().cloned().unwrap_or_default();
+            // Shared with me: addressed as owner@example.com/name, with owner and role.
+            machines.extend(state["shared"].as_array().cloned().unwrap_or_default());
             let result = match action {
-                Action::List => state["workspaces"].clone(),
+                Action::List => json!(machines),
                 Action::Snapshots => state["snapshots"].clone(),
                 Action::Stats => state["stats"].clone(),
                 Action::Status => {
                     json!({"server":url,"connected":true,"machines":state["workspaces"].as_array().map(Vec::len)})
                 }
-                Action::Inspect { id } => state["workspaces"]
-                    .as_array()
-                    .context("missing machines")?
+                Action::Inspect { id } => machines
                     .iter()
                     .find(|w| w["id"] == id)
                     .context("workspace not found")?
@@ -400,6 +403,8 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             file.write_all(&data)?;
             return Ok(0);
         }
+        Action::Share { id, with, role } => json!({"op":"share","id":id,"with":with,"role":role}),
+        Action::Unshare { id, with } => json!({"op":"unshare","id":id,"with":with}),
         Action::Start { id } => json!({"op":"start","id":id}),
         Action::Stop { id } => json!({"op":"stop","id":id}),
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),

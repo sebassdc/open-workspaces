@@ -267,6 +267,24 @@ enum Action {
     Hibernate {
         id: String,
     },
+    /// Let a teammate use one of your machines; they address it as `you@example.com/NAME`
+    /// (remote server only). A teammate's fork copies everything in the machine.
+    Share {
+        id: String,
+        /// The teammate's login email.
+        #[arg(long)]
+        with: String,
+        /// use: exec, shell, SSH, files, start, hibernate, fork. admin: also stop, snapshot,
+        /// restore and SSH keys. Resize and sharing stay yours.
+        #[arg(long, default_value = "use", value_parser = ["use", "admin"])]
+        role: String,
+    },
+    /// Take a machine back from a teammate; closes their open shells and SSH sessions.
+    Unshare {
+        id: String,
+        #[arg(long)]
+        with: String,
+    },
     /// Delete a stopped workspace with its disk and its own snapshots (local worker only).
     Delete {
         id: String,
@@ -666,6 +684,10 @@ fn main_result() -> anyhow::Result<i32> {
     if let Some(server) = server {
         return client::run(&server, cli.command, cli.operation_key);
     }
+    anyhow::ensure!(
+        !matches!(cli.command, Action::Share { .. } | Action::Unshare { .. }),
+        "sharing is per user: run ow login <server> first"
+    );
     // Remote commands are checked by the controller against the machine's node.
     #[cfg(target_os = "linux")]
     let (backend, capabilities) = (runtime::BACKEND, runtime::CAPABILITIES);

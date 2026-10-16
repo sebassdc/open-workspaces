@@ -287,7 +287,7 @@ fn two_worker_tls_real_guests() {
             .contains("persistent-node-data")
     );
     // Actual guest PTY through the node channel, using existing terminal framing.
-    let (target, id) = c.terminal_target(a, "alpha-box").unwrap();
+    let (target, id, _) = c.terminal_target(a, "alpha-box").unwrap();
     let (mut pty, _) = wire::connect(&target, &json!({"op":"terminal","id":id})).unwrap();
     pty.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
     let input = b"tty; echo NODE_PTY_OK; exit\n";

@@ -47,6 +47,10 @@ struct Operation {
     keys: Option<Vec<String>>,
     #[serde(default)]
     upgrade: Option<bool>,
+    #[serde(default)]
+    with: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 fn validated(bytes: &[u8]) -> Result<Value> {
@@ -59,7 +63,7 @@ fn validated(bytes: &[u8]) -> Result<Value> {
         matches!(operation.op.as_str(), "put" | "get") || bytes.len() <= 16384,
         "operation too large"
     );
-    runtime::identifier(&operation.id)?;
+    crate::common::address(&operation.id)?;
     let mut request = json!({"op":operation.op,"id":operation.id});
     if let Some(key) = operation.operation_key {
         runtime::identifier(&key)?;
@@ -90,6 +94,18 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             request["vcpu_count"] = json!(cpus);
         }
         "start" | "stop" | "hibernate" | "ssh-info" => {}
+        "share" | "unshare" => {
+            let with = operation.with.context("teammate email required")?;
+            crate::common::email(&with)?;
+            request["with"] = json!(with);
+            if let Some(role) = operation.role.filter(|_| operation.op == "share") {
+                ensure!(
+                    matches!(role.as_str(), "use" | "admin"),
+                    "role must be use or admin"
+                );
+                request["role"] = json!(role);
+            }
+        }
         "ssh-keys" => {
             let keys =
                 crate::ssh_guest::validate_keys(&json!(operation.keys.context("keys required")?))?;

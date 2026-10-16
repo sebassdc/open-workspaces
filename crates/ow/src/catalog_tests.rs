@@ -76,6 +76,23 @@ impl Fake {
                         s
                     }
                     "exec" => json!({"output":"ok","exit_code":0}),
+                    "fork" => {
+                        let child = request["child"].as_str().unwrap();
+                        let mut m = machines.get(id).unwrap().clone();
+                        m["id"] = json!(child);
+                        m["source"] = json!(id);
+                        machines.insert(child.into(), m.clone());
+                        m
+                    }
+                    "hibernate" | "start" => {
+                        let m = machines.get_mut(id).unwrap();
+                        m["state"] = json!(if op == "start" {
+                            "running"
+                        } else {
+                            "hibernated"
+                        });
+                        m.clone()
+                    }
                     "stop" => {
                         let m = machines.get_mut(id).unwrap();
                         m["state"] = json!("stopped");
@@ -388,4 +405,140 @@ fn mixed_version_shapes_reject_before_durable_intent() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn sharing_roles_owner_addresses_and_revocation() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    c.operation(a, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    let physical = c.physical(a, "machine", "demo").unwrap();
+    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.guest_ssh_v1',json('true')) WHERE id='alpha'",[]).unwrap();
+    let shared = "alice@example.test/demo";
+    let exec = |id: &str| json!({"op":"exec","id":id,"command":"id"});
+    // Shared before Bob ever logged in: his first verified login binds the reserved email.
+    let granted = c
+        .operation(
+            a,
+            json!({"op":"share","id":"demo","with":"Bob@Example.test"}),
+        )
+        .unwrap();
+    assert_eq!(
+        granted["shared_with"],
+        json!([{"email":"bob@example.test","role":"use"}])
+    );
+    let b = c.user(&identity("bob")).unwrap();
+    let e = c.user(&identity("eve")).unwrap();
+    let before = fake.calls.load(Ordering::SeqCst);
+    assert!(c.operation(e, exec(shared)).is_err());
+    assert!(c.terminal_target(e, shared).is_err());
+    assert!(c.ssh_target(e, shared).is_err());
+    assert!(c.operation(b, exec("demo")).is_err());
+    assert_eq!(fake.calls.load(Ordering::SeqCst), before);
+    // The owner may use the full address too.
+    assert_eq!(c.operation(a, exec(shared)).unwrap()["output"], "ok");
+    assert_eq!(c.operation(b, exec(shared)).unwrap()["output"], "ok");
+    assert_eq!(c.terminal_target(b, shared).unwrap().1, physical);
+    assert_eq!(c.ssh_target(b, shared).unwrap().1, physical);
+    let before = fake.calls.load(Ordering::SeqCst);
+    for denied in [
+        json!({"op":"stop","id":shared}),
+        json!({"op":"resize","id":shared,"memory_mib":512,"vcpu_count":1}),
+        json!({"op":"snapshot","id":shared,"name":"mine"}),
+        json!({"op":"ssh-keys","id":shared,"keys":[],"upgrade":false}),
+        json!({"op":"share","id":shared,"with":"eve@example.test"}),
+        json!({"op":"share","id":"demo","with":"eve@example.test"}),
+        json!({"op":"unshare","id":"demo","with":"bob@example.test"}),
+    ] {
+        assert!(c.operation(b, denied.clone()).is_err(), "{denied}");
+    }
+    assert_eq!(fake.calls.load(Ordering::SeqCst), before);
+    assert!(
+        c.operation(
+            a,
+            json!({"op":"share","id":"demo","with":"alice@example.test"})
+        )
+        .is_err()
+    );
+    let state = c.state(b).unwrap();
+    assert_eq!(state["workspaces"], json!([]));
+    assert_eq!(state["shared"][0]["id"], shared);
+    assert_eq!(state["shared"][0]["owner"], "alice@example.test");
+    assert_eq!(state["shared"][0]["role"], "use");
+    assert_eq!(
+        c.state(a).unwrap()["workspaces"][0]["shared_with"][0]["email"],
+        "bob@example.test"
+    );
+    // A grantee's fork is theirs and outlives the grant.
+    let fork = c
+        .operation(b, json!({"op":"fork","id":shared,"child":"copy"}))
+        .unwrap();
+    assert_eq!(fork["id"], "copy");
+    assert_eq!(fork["source"], shared);
+    assert_eq!(
+        c.operation(b, json!({"op":"hibernate","id":shared}))
+            .unwrap()["id"],
+        shared
+    );
+    // Admin adds snapshots (in the grantee's namespace) and stop.
+    c.operation(
+        a,
+        json!({"op":"share","id":"demo","with":"bob@example.test","role":"admin"}),
+    )
+    .unwrap();
+    let snapshot = c
+        .operation(b, json!({"op":"snapshot","id":shared,"name":"saved"}))
+        .unwrap();
+    assert_eq!(
+        (snapshot["name"].as_str(), snapshot["workspace"].as_str()),
+        (Some("saved"), Some(shared))
+    );
+    assert!(
+        c.operation(
+            b,
+            json!({"op":"resize","id":shared,"memory_mib":512,"vcpu_count":1})
+        )
+        .is_err()
+    );
+    // Unshare closes the grantee's open streams at once, not the owner's.
+    let (_, _, grantee_stream) = c.terminal_target(b, shared).unwrap();
+    let (_, _, grantee_ssh) = c.ssh_target(b, shared).unwrap();
+    let (_, _, owner_stream) = c.terminal_target(a, "demo").unwrap();
+    let removed = c
+        .operation(
+            a,
+            json!({"op":"unshare","id":"demo","with":"bob@example.test"}),
+        )
+        .unwrap();
+    assert_eq!(removed["shared_with"], json!([]));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let wait = |n: Arc<tokio::sync::Notify>, ms| {
+        rt.block_on(async { tokio::time::timeout(Duration::from_millis(ms), n.notified()).await })
+            .is_ok()
+    };
+    assert!(wait(grantee_stream, 1000));
+    assert!(wait(grantee_ssh, 1000));
+    assert!(!wait(owner_stream, 50));
+    let before = fake.calls.load(Ordering::SeqCst);
+    assert!(c.operation(b, exec(shared)).is_err());
+    assert!(c.terminal_target(b, shared).is_err());
+    assert_eq!(fake.calls.load(Ordering::SeqCst), before);
+    let state = c.state(b).unwrap();
+    assert_eq!(state["shared"], json!([]));
+    assert_eq!(state["workspaces"][0]["id"], "copy");
+    assert_eq!(state["workspaces"][0]["source"], json!(null));
+    // The grants table survives a restart.
+    c.operation(
+        a,
+        json!({"op":"share","id":"demo","with":"bob@example.test"}),
+    )
+    .unwrap();
+    drop(c);
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(c.state(b).unwrap()["shared"][0]["id"], shared);
 }

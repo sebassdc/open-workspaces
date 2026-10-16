@@ -30,7 +30,7 @@ pub fn public_keys(paths: &[PathBuf]) -> Result<Vec<String>> {
         .collect()
 }
 fn proxy_command(server: Option<&str>, root: Option<&Path>, id: &str) -> Result<String> {
-    crate::common::identifier(id)?;
+    crate::common::address(id)?;
     let executable = std::env::current_exe()?;
     let quote = |s: &str| crate::common::shell_quote(&s.replace('%', "%%"));
     let mut cmd = quote(
@@ -87,7 +87,7 @@ pub fn launch(
             "-l",
             "dev",
         ])
-        .arg(id)
+        .arg(&alias)
         .args(args)
         .status()
         .context("OpenSSH ssh client is required")?;
@@ -96,8 +96,10 @@ pub fn launch(
 pub fn config(server: Option<&str>, root: Option<&Path>, id: &str, info: &Value) -> Result<()> {
     let proxy = proxy_command(server, root, id)?;
     let alias = alias(info)?;
+    // A shared machine's address has '@' and '/', which OpenSSH host names cannot carry.
+    let host = id.replace(['@', '/'], "-");
     println!(
-        "# Verify guest host public key: {}\nHost ow-{id}\n    HostName {id}\n    User dev\n    HostKeyAlias {alias}\n    StrictHostKeyChecking ask\n    ProxyCommand {proxy}",
+        "# Verify guest host public key: {}\nHost ow-{host}\n    HostName {host}\n    User dev\n    HostKeyAlias {alias}\n    StrictHostKeyChecking ask\n    ProxyCommand {proxy}",
         info["host_key"].as_str().context("host key missing")?
     );
     Ok(())
@@ -208,7 +210,7 @@ pub fn local_proxy(root: &Path, id: &str) -> Result<i32> {
     }
 }
 pub fn remote_proxy(url: &str, id: &str) -> Result<i32> {
-    crate::common::identifier(id)?;
+    crate::common::address(id)?;
     let token = crate::client::token(url)?;
     let mut request =
         format!("{}/api/ssh/{id}", url.replacen("https://", "wss://", 1)).into_client_request()?;

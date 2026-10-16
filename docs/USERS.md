@@ -78,8 +78,53 @@ part of implementing this feature.
 `ow login <HTTPS origin>` selects the remote authenticated account; `ow list`,
 `ow exec`, `ow shell` and lifecycle operations use that account's logical names.
 The local operator CLI/socket remains trusted maintenance access to all physical
-worker IDs. Local host access is not a restricted tenant login. Per-user sharing,
-teams, administration roles and workload tokens are not implemented.
+worker IDs. Local host access is not a restricted tenant login. Machine sharing
+is below; teams, administration roles and workload tokens are not implemented.
+
+## Sharing a machine
+
+An owner lets a teammate use one machine:
+
+```sh
+ow share demo --with bob@example.com [--role use|admin]
+ow unshare demo --with bob@example.com
+```
+
+Bob addresses it as `alice@example.com/demo` (the owner's login email, a slash,
+the machine name): `ow shell alice@example.com/demo`, `ow exec …`, `ow ssh …`.
+`ow list` and the dashboard's "Shared with me" section list machines shared with
+you, with their `owner` and `role`; the owner's own list shows `shared_with` for
+each machine, and the dashboard has Share and Unshare buttons.
+
+| Role | Allows |
+| --- | --- |
+| `use` (default) | exec, shell, SSH stream, `put`/`get`, `ssh-info`, start, hibernate, fork into their own namespace |
+| `admin` | `use`, plus stop, snapshot, restore and `ssh-keys` |
+
+Resize and sharing stay with the owner; there is no delete through the gateway.
+The catalog keeps grants in `grants(physical, grantee, role)` (an additive table:
+an older binary ignores it, so grantees lose access rather than gain it) and resolves every request to a physical ID through the owner or a grant before
+any worker contact, as for owned machines. Sharing with an email nobody has used
+yet reserves it: the first verified login with that email (which must still be
+admitted by the Access policy and allowlist) binds it. Sharing grants no login.
+
+`ow unshare` deletes the grant and closes the teammate's open terminal and SSH
+streams to that machine at once; their next request is refused. It does not
+remove SSH keys an owner or admin registered for them (they can no longer reach
+the guest's SSH through the gateway, but remove them with `ow ssh-authorize` if
+the guest is reachable another way), and it does not undo what they already did
+inside the guest.
+
+**A fork copies the owner's credentials.** A fork is a full copy of the
+machine's disk and memory: tokens, SSH keys, cloud credentials, browser
+sessions and anything else on it. A grantee's fork (and an admin's snapshot)
+lives in the grantee's namespace and stays theirs after `ow unshare`. Only share
+machines whose contents you would hand to that person, and rotate credentials
+on the machine after unsharing if that matters.
+
+For SSH, the owner registers the teammate's public key next to their own:
+`ow ssh-authorize demo --key ~/.ssh/id_ed25519.pub --key bob.pub`
+(`ssh-authorize` replaces the whole key list). `use` grantees cannot change keys.
 
 ## Acceptance evidence
 
