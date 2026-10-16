@@ -104,11 +104,23 @@ fn push_new(store: &dyn SnapshotStore, dir: &Path) -> Result<Vec<String>> {
     Ok(pushed)
 }
 
-/// Downloads `name` into `dir` (a runner's snapshots) unless it is already there,
-/// through a staging directory so a partial download is never a snapshot.
+/// Downloads `name` into `dir` (a runner's snapshots) through a staging directory,
+/// so a partial download is never a snapshot. A snapshot of that name already on
+/// the runner is used only when it is the one in the store (same manifest, which
+/// holds the workspace and every file's hash); any other is refused.
 fn fetch(store: &dyn SnapshotStore, name: &str, dir: &Path) -> Result<()> {
     let target = dir.join(name);
     if target.join("manifest.json").exists() {
+        let stored: serde_json::Value = serde_json::from_slice(&store.manifest(name)?)
+            .with_context(|| format!("invalid stored manifest for {name}"))?;
+        let local = ow_core::snapshot_store::read_manifest(&target.join("manifest.json"), name)?;
+        ensure!(
+            stored == local,
+            "this runner already has a different snapshot named {name} (workspace {}, \
+             the store's is for {}); restore onto another runner or delete the local one",
+            local["workspace"],
+            stored["workspace"]
+        );
         return Ok(());
     }
     ensure!(
@@ -224,6 +236,9 @@ mod tests {
             }
             Ok(())
         }
+        fn manifest(&self, name: &str) -> Result<Vec<u8>> {
+            Ok(fs::read(self.0.join(name).join("manifest.json"))?)
+        }
         fn pull(&self, name: &str, directory: &Path) -> Result<()> {
             ensure!(self.0.join(name).join("manifest.json").exists(), "missing");
             fs::create_dir(directory)?;
@@ -237,11 +252,21 @@ mod tests {
     #[test]
     fn push_skips_staging_and_stored_and_fetch_never_leaves_partials() {
         let (runner, remote, other) = (temp("runner"), temp("remote"), temp("other"));
+        let manifest = |name: &str, workspace: &str| {
+            let h = "a".repeat(64);
+            json!({"name":name,"workspace":workspace,"files":{"state":h,"memory":h,"disk.ext4":h}})
+                .to_string()
+        };
         for name in ["a", "b", ".pending-x"] {
             fs::create_dir(runner.join(name)).unwrap();
-            for f in ["state", "memory", "disk.ext4", "manifest.json"] {
+            for f in ["state", "memory", "disk.ext4"] {
                 fs::write(runner.join(name).join(f), name).unwrap();
             }
+            fs::write(
+                runner.join(name).join("manifest.json"),
+                manifest(name, "box-b"),
+            )
+            .unwrap();
         }
         fs::create_dir(runner.join("unsealed")).unwrap();
         let store = Dir(remote.clone());
@@ -266,6 +291,14 @@ mod tests {
             fetch(&store, "b", &other).is_err(),
             "adopted an incomplete snapshot"
         );
+        fs::remove_dir(other.join("b")).unwrap();
+        // A same-named local snapshot of another workspace is never used instead.
+        fs::create_dir(other.join("b")).unwrap();
+        fs::write(other.join("b/manifest.json"), manifest("b", "box-a")).unwrap();
+        let error = fetch(&store, "b", &other).unwrap_err().to_string();
+        assert!(error.contains("different snapshot named b"), "{error}");
+        fs::write(other.join("b/manifest.json"), manifest("b", "box-b")).unwrap();
+        fetch(&store, "b", &other).unwrap();
         for d in [runner, remote, other] {
             fs::remove_dir_all(d).unwrap();
         }

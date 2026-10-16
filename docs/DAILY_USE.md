@@ -81,7 +81,9 @@ loopback); endpoint settings from the environment or a profile are ignored.
 `ow host up` runner, whose worker must be running) and brings its box up under
 the same ID: RAM state resumed, or with `--cold` its disk booted fresh, which a
 host with a different CPU or kernel needs. The box's ID must not exist on that
-runner. Restore is runner-local: the box is not added to a controller's
+runner. A snapshot of that name already on the runner is used only if its
+manifest equals the store's; a different one (another box, other data) is
+refused rather than restored. Restore is runner-local: the box is not added to a controller's
 catalog, so reach it with `ow --local --data-dir RUNNER_DIR`. SSH keys are kept
 outside snapshots: run `ow ssh-authorize` on the restored box again.
 

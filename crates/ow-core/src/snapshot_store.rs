@@ -25,6 +25,8 @@ pub trait SnapshotStore {
     fn list(&self) -> Result<Vec<String>>;
     /// Uploads one sealed snapshot directory under `name`, manifest last.
     fn push(&self, name: &str, directory: &Path) -> Result<()>;
+    /// The stored manifest of `name`, unchecked bytes.
+    fn manifest(&self, name: &str) -> Result<Vec<u8>>;
     /// Downloads `name` into `directory`, which must not exist yet. Every file is
     /// checked against the stored manifest; on any failure `directory` is removed.
     fn pull(&self, name: &str, directory: &Path) -> Result<()>;
@@ -174,23 +176,29 @@ impl SnapshotStore for S3Store {
         Ok(())
     }
 
+    fn manifest(&self, name: &str) -> Result<Vec<u8>> {
+        crate::common::identifier(name)?;
+        let mut child = self.get(&self.key(name, "manifest.json"))?;
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .take(1 << 20)
+            .read_to_end(&mut bytes)?;
+        finished(
+            child,
+            &format!("snapshot {name} not in the store: download"),
+        )?;
+        Ok(bytes)
+    }
+
     fn pull(&self, name: &str, directory: &Path) -> Result<()> {
         crate::common::identifier(name)?;
         fs::create_dir(directory)?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         let result = (|| -> Result<()> {
-            let mut child = self.get(&self.key(name, "manifest.json"))?;
-            let mut bytes = Vec::new();
-            child
-                .stdout
-                .take()
-                .unwrap()
-                .take(1 << 20)
-                .read_to_end(&mut bytes)?;
-            finished(
-                child,
-                &format!("snapshot {name} not in the store: download"),
-            )?;
+            let bytes = self.manifest(name)?;
             let manifest_path = directory.join("manifest.json");
             private_file(&manifest_path)?.write_all(&bytes)?;
             let manifest = read_manifest(&manifest_path, name)?;
