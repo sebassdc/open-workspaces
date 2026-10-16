@@ -68,6 +68,7 @@ test("the tailnet identity is kept on the data volume, mounted before tailscaled
     assert.ok(mount > 0 && mount < bootstrap.indexOf("apt-get install -y -q tailscale"), "state mounted before tailscale is installed");
     assert.ok(bootstrap.includes("RequiresMountsFor=/var/lib/tailscale"), "tailscaled waits for the state mount at boot");
     assert.ok(bootstrap.includes("chmod 700 /srv/ow/.tailscale-state"));
+    assert.ok(bootstrap.includes('--ssh="$([[ -n $OW_TAILSCALE_SSH ]] && echo true || echo false)"'), "restored state cannot keep an old SSH setting");
 });
 
 test("stopping the service hibernates running boxes before ow down", () => {
@@ -96,8 +97,8 @@ esac
 test("developer images are validated and built by a oneshot unit", () => {
     assert.equal(developerImageList(["ubuntu", "ubuntu"]), "ubuntu");
     assert.equal(developerImageList([]), "");
-    for (const bad of ["alpine", "ubuntu; id", ""]) {
-        assert.throws(() => developerImageList([bad]), /developerImages takes ubuntu or arch/);
+    for (const bad of ["alpine", "arch", "ubuntu; id", ""]) {
+        assert.throws(() => developerImageList([bad]), /developerImages takes ubuntu/);
     }
     const script = renderUserData({ OW_DEVELOPER_IMAGES: "ubuntu", OW_TAILSCALE_SSH: "" }, bootstrap);
     execFileSync("bash", ["-n"], { input: script });

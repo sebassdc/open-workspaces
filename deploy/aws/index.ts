@@ -33,7 +33,7 @@ export interface HostArgs {
      */
     dashboardLogins?: pulumi.Input<pulumi.Input<string>[]>;
     /**
-     * Developer images (`ubuntu`, `arch`) to build on the host after boot: the `dev`
+     * Developer images (`ubuntu` only for now) to build on the host after boot: the `dev`
      * user, SSH server and toolchains that SSH access and golden-image recipes need.
      * Built once per data volume, in the background. Default: none (Alpine only).
      */
@@ -66,8 +66,9 @@ export function dashboardLoginList(logins: string[]): string {
 /** Checks developer image names and joins them for the user data. */
 export function developerImageList(images: string[]): string {
     for (const image of images) {
-        if (image !== "ubuntu" && image !== "arch") {
-            throw new Error(`developerImages takes ubuntu or arch, not ${JSON.stringify(image)}`);
+        // Arch's bootstrap archive is .tar.zst, which the host's Python 3.12 tarfile cannot read.
+        if (image !== "ubuntu") {
+            throw new Error(`developerImages takes ubuntu, not ${JSON.stringify(image)}`);
         }
     }
     return [...new Set(images)].join(" ");

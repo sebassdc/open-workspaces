@@ -64,7 +64,9 @@ if [[ -n "$OW_TAILSCALE_SECRET_ARN" ]]; then
       return 1
     fi
     local joined=0
-    tailscale up --timeout=60s --auth-key="file:$key" --hostname="$OW_TAILSCALE_HOSTNAME" ${OW_TAILSCALE_SSH:+--ssh} || joined=$?
+    # Explicit --ssh=true|false: state kept from an earlier host must not keep an old setting.
+    tailscale up --timeout=60s --auth-key="file:$key" --hostname="$OW_TAILSCALE_HOSTNAME" \
+      --ssh="$([[ -n $OW_TAILSCALE_SSH ]] && echo true || echo false)" || joined=$?
     rm -f "$key"
     return "$joined"
   }
@@ -225,7 +227,7 @@ UNIT
   systemctl start --no-block open-workspaces-dashboard.service
 fi
 
-# Optional developer images (input developerImages): the `dev` user, SSH server
+# Optional developer image (input developerImages): the `dev` user, SSH server
 # and toolchains that SSH access and golden-image recipes build on. Built once
 # per data volume in a disposable microVM, in the background (10-20 minutes),
 # then published under the built-in profile name; retried at boot until done.

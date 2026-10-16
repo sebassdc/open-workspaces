@@ -53,7 +53,7 @@ export const instanceId = host.instanceId;
 | `tailscaleHostname` | component name | |
 | `tailscaleSsh` | `false` | Tailscale SSH, authorized by your tailnet policy. |
 | `dashboardLogins` | none | Tailnet logins allowed into the web dashboard. Needs `tailscaleAuthKeySecretArn`; see below. |
-| `developerImages` | none | `ubuntu` and/or `arch`: build the [developer image](../../docs/GUEST_IMAGES.md) (user `dev`, SSH server, toolchains) after boot. SSH into boxes and golden-image recipes need it. |
+| `developerImages` | none | `["ubuntu"]`: build the [developer image](../../docs/GUEST_IMAGES.md) (user `dev`, SSH server, toolchains) after boot. SSH into boxes and golden-image recipes need it. |
 
 Outputs: `instanceId`, `privateIp`, `availabilityZone`, `dataVolumeId`,
 `roleName`, `securityGroupId`.
@@ -81,7 +81,8 @@ Boxes idle for 30 minutes hibernate and wake on the next connection; see
 [wake on connect](../../docs/DAILY_USE.md). Stopping the service (a restart, a
 reboot, an instance stop or a host replacement) hibernates the running boxes
 first, so their processes carry on when they next wake; only a box that fails
-to hibernate is cold-stopped.
+to hibernate is cold-stopped. A box hibernated on a host with another kernel or
+CPU (after a new AMI, say) boots its hibernated disk cold when it next starts.
 
 With Tailscale, the host joins your tailnet under `tailscaleHostname`. The
 auth key is read once at boot into a root-only file under `/run`, passed to
@@ -153,8 +154,8 @@ the run and the stack is still destroyed.
 - The host builds from source on first boot; there are no prebuilt release
   binaries yet.
 - RAM checkpoints only restore on the same host kernel and CPU. Replacing the
-  instance with a new AMI keeps disks, but hibernated machines then need a cold
-  start.
+  instance with a new AMI keeps disks; hibernated machines then boot their disk
+  cold (their processes do not survive).
 - Pulumi `destroy` deletes the data volume and every workspace on it. Protect
   the volume (`protect` resource option on the component) for long-lived hosts.
 
