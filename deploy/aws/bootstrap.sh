@@ -140,8 +140,15 @@ chmod 755 /usr/local/lib/open-workspaces/wait-tailnet
 # next connection. A box that fails to hibernate is cold-stopped by `ow down`.
 cat > /usr/local/lib/open-workspaces/stop <<'STOP'
 #!/bin/sh
-for box in $(/usr/local/bin/ow list | python3 -c 'import json,sys; print(" ".join(w["id"] for w in json.load(sys.stdin) if w["state"] == "running"))'); do
-  /usr/local/bin/ow hibernate "$box" > /dev/null && echo "hibernated $box" || echo "could not hibernate $box"
+running() { /usr/local/bin/ow list | python3 -c 'import json,sys; print(" ".join(w["id"] for w in json.load(sys.stdin) if w["state"] == "running"))'; }
+# A connection can wake a box while others are being captured, so go round
+# until a listing shows none running (at most five rounds).
+for _ in 1 2 3 4 5; do
+  boxes=$(running) || break
+  [ -n "$boxes" ] || break
+  for box in $boxes; do
+    /usr/local/bin/ow hibernate "$box" > /dev/null && echo "hibernated $box" || echo "could not hibernate $box"
+  done
 done
 exec /srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/runner down
 STOP
@@ -242,7 +249,12 @@ for profile in "$@"; do
     echo "$profile: developer image present"
     continue
   fi
-  [[ -f $guest/$profile.ext4 ]] || python3 experiments/runtime-spike/prepare-profiles.py "$profile"
+  if [[ ! -f $guest/$profile.ext4 ]]; then
+    rm -rf "$guest/$profile.tmp" "$guest"/build-"$profile"-*
+    # Its mkfs runs in a user namespace, which Ubuntu's AppArmor policy allows only
+    # under the open-workspaces profile.
+    aa-exec -p open-workspaces -- python3 experiments/runtime-spike/prepare-profiles.py "$profile"
+  fi
   mkdir -p data/dev-images
   out=data/dev-images/out-$profile-$(date +%s)
   python3 experiments/guest-dev/build.py "$profile" --output-assets "$out"
