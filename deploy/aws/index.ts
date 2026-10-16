@@ -32,6 +32,12 @@ export interface HostArgs {
      * `tailscale serve`. Needs `tailscaleAuthKeySecretArn`. Omit for no dashboard.
      */
     dashboardLogins?: pulumi.Input<pulumi.Input<string>[]>;
+    /**
+     * Developer images (`ubuntu` only for now) to build on the host after boot: the `dev`
+     * user, SSH server and toolchains that SSH access and golden-image recipes need.
+     * Built once per data volume, in the background. Default: none (Alpine only).
+     */
+    developerImages?: pulumi.Input<pulumi.Input<string>[]>;
 }
 
 const DEFAULT_REPOSITORY = "https://github.com/sebassdc/open-workspaces.git";
@@ -55,6 +61,17 @@ export function dashboardLoginList(logins: string[]): string {
         }
     }
     return logins.join(",");
+}
+
+/** Checks developer image names and joins them for the user data. */
+export function developerImageList(images: string[]): string {
+    for (const image of images) {
+        // Arch's bootstrap archive is .tar.zst, which the host's Python 3.12 tarfile cannot read.
+        if (image !== "ubuntu") {
+            throw new Error(`developerImages takes ubuntu, not ${JSON.stringify(image)}`);
+        }
+    }
+    return [...new Set(images)].join(" ");
 }
 
 /**
@@ -152,8 +169,9 @@ export class Host extends pulumi.ComponentResource {
                 args.tailscaleHostname ?? name,
                 args.tailscaleSsh ?? false,
                 args.dashboardLogins ?? [],
+                args.developerImages ?? [],
             ])
-            .apply(([volumeId, repository, ref, secretArn, hostname, tailscaleSsh, logins]) => {
+            .apply(([volumeId, repository, ref, secretArn, hostname, tailscaleSsh, logins, images]) => {
                 if (logins.length > 0 && !secretArn) {
                     throw new Error("dashboardLogins needs tailscaleAuthKeySecretArn: the dashboard is served over the tailnet only");
                 }
@@ -165,6 +183,7 @@ export class Host extends pulumi.ComponentResource {
                     OW_TAILSCALE_HOSTNAME: hostname,
                     OW_TAILSCALE_SSH: tailscaleSsh ? "1" : "",
                     OW_DASHBOARD_LOGINS: dashboardLoginList(logins),
+                    OW_DEVELOPER_IMAGES: developerImageList(images),
                 });
             });
 

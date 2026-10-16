@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { dashboardLoginList, renderUserData } from "../index.ts";
+import { dashboardLoginList, developerImageList, renderUserData } from "../index.ts";
 
 const bootstrap = readFileSync(new URL("../bootstrap.sh", import.meta.url), "utf8");
 
@@ -60,4 +60,31 @@ test("dashboard logins are validated and the dashboard block is valid bash", () 
     assert.ok(script.includes("--listen 127.0.0.1:8787"), "dashboard stays on loopback");
     assert.ok(script.includes("tailscale serve --bg http://127.0.0.1:8787"), "served to the tailnet only");
     assert.ok(!script.includes("tailscale funnel"), "never public");
+});
+
+test("the tailnet identity is kept on the data volume, mounted before tailscaled starts", () => {
+    const mount = bootstrap.indexOf("mountpoint -q /var/lib/tailscale || mount /var/lib/tailscale");
+    assert.ok(bootstrap.indexOf("mountpoint -q /srv/ow || mount /srv/ow") < mount, "data volume first");
+    assert.ok(mount > 0 && mount < bootstrap.indexOf("apt-get install -y -q tailscale"), "state mounted before tailscale is installed");
+    assert.ok(bootstrap.includes("RequiresMountsFor=/var/lib/tailscale"), "tailscaled waits for the state mount at boot");
+    assert.ok(bootstrap.includes("chmod 700 /srv/ow/.tailscale-state"));
+    assert.ok(bootstrap.includes('--ssh="$([[ -n $OW_TAILSCALE_SSH ]] && echo true || echo false)"'), "restored state cannot keep an old SSH setting");
+});
+
+test("stopping the service hibernates running boxes, with wakes refused", () => {
+    assert.ok(bootstrap.includes("ExecStop=/srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/runner down --hibernate"));
+    assert.ok(bootstrap.includes("TimeoutStopSec=900"));
+});
+
+test("developer images are validated and built by a oneshot unit", () => {
+    assert.equal(developerImageList(["ubuntu", "ubuntu"]), "ubuntu");
+    assert.equal(developerImageList([]), "");
+    for (const bad of ["alpine", "arch", "ubuntu; id", ""]) {
+        assert.throws(() => developerImageList([bad]), /developerImages takes ubuntu/);
+    }
+    const script = renderUserData({ OW_DEVELOPER_IMAGES: "ubuntu", OW_TAILSCALE_SSH: "" }, bootstrap);
+    execFileSync("bash", ["-n"], { input: script });
+    const images = bootstrap.slice(bootstrap.indexOf("<<'IMAGES'\n") + 11, bootstrap.indexOf("\nIMAGES\n"));
+    execFileSync("bash", ["-n"], { input: images });
+    assert.ok(bootstrap.includes("ExecStart=/usr/local/lib/open-workspaces/developer-images $OW_DEVELOPER_IMAGES"));
 });

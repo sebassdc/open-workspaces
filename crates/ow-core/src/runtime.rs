@@ -116,6 +116,23 @@ mod image_tests {
         let snapshot: Snapshot = serde_json::from_value(json!({"name":"saved","workspace":"existing","memory_mib":256,"runtime":"firecracker-v1.17.0","cpu":"cpu","kernel_sha256":"hash","files":{}})).unwrap();
         assert_eq!(snapshot.image, "alpine");
     }
+    #[test]
+    fn a_capture_from_another_host_kernel_or_cpu_is_not_resumable() {
+        let snapshot: Snapshot = serde_json::from_value(json!({"name":"sleep-1","workspace":"box","memory_mib":256,"runtime":"firecracker-v1.17.0","cpu":"model\nflags\nhost-kernel:6.8.0-1","kernel_sha256":"guest","files":{}})).unwrap();
+        assert!(snapshot.resumable("model\nflags\nhost-kernel:6.8.0-1", "guest"));
+        assert!(
+            !snapshot.resumable("model\nflags\nhost-kernel:6.8.0-2", "guest"),
+            "replaced host with a new kernel"
+        );
+        assert!(
+            !snapshot.resumable("other\nflags\nhost-kernel:6.8.0-1", "guest"),
+            "other CPU"
+        );
+        assert!(
+            !snapshot.resumable("model\nflags\nhost-kernel:6.8.0-1", "other"),
+            "other guest kernel"
+        );
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -154,6 +171,14 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    /// Whether this host can resume the captured RAM state: same runtime, CPU
+    /// (including the host kernel) and guest kernel.
+    fn resumable(&self, cpu: &str, kernel_sha256: &str) -> bool {
+        self.runtime == "firecracker-v1.17.0"
+            && self.cpu == cpu
+            && self.kernel_sha256 == kernel_sha256
+    }
+
     fn summary(&self) -> Value {
         json!({"name":self.name,"workspace":self.workspace,"memory_mib":self.memory_mib,"vcpu_count":self.vcpu_count,"image":self.image,"state":"ready"})
     }
@@ -325,6 +350,9 @@ pub struct Runtime {
     kernel_hash: String,
     verified: BTreeMap<String, Vec<Fingerprint>>,
     pub idle: crate::idle::Idle,
+    /// Set by `quiesce` when the worker is going down: no machine may start
+    /// (a wake would consume a hibernation the shutdown just captured).
+    closing: bool,
 }
 
 impl Runtime {
@@ -431,6 +459,7 @@ impl Runtime {
             kernel_hash,
             verified: BTreeMap::new(),
             idle: crate::idle::Idle::from_env()?,
+            closing: false,
         };
         runtime.save()?;
         Ok(runtime)
@@ -544,6 +573,10 @@ impl Runtime {
     }
 
     fn spawn(&mut self, workspace: &Workspace, snapshot: Option<&Path>, fork: bool) -> Result<()> {
+        ensure!(
+            !self.closing,
+            "the worker is shutting down; no machine can start"
+        );
         self.capacity(workspace.memory_mib, workspace.vcpu_count)?;
         let mut machine = Vm::spawn(
             &self.binary(),
@@ -740,11 +773,24 @@ impl Runtime {
         if self.machines.contains_key(id) {
             return Ok(json!(workspace));
         }
-        let snapshot = workspace
-            .hibernation
-            .as_deref()
-            .map(|name| self.validate_snapshot(name))
-            .transpose()?;
+        // A box hibernated on another host kernel or CPU (a replaced host) cannot
+        // resume its RAM; it boots its hibernated disk cold instead.
+        let mut resume = true;
+        let snapshot = match workspace.hibernation.as_deref() {
+            Some(name) => {
+                let manifest: Snapshot = serde_json::from_slice(&fs::read(
+                    self.snapshot_dir(name).join("manifest.json"),
+                )?)?;
+                resume = manifest.resumable(&self.cpu, &self.kernel_hash);
+                if !resume {
+                    eprintln!(
+                        "{id} was hibernated on another host kernel or CPU; booting its disk cold"
+                    );
+                }
+                Some(self.verify_snapshot(name, resume)?)
+            }
+            None => None,
+        };
         if let Some(ref directory) = snapshot {
             let replacement = self
                 .machine_dir(id)
@@ -752,7 +798,7 @@ impl Runtime {
             vm::reflink(&directory.join("disk.ext4"), &replacement)?;
             fs::rename(replacement, self.machine_dir(id).join("disk.ext4"))?;
         }
-        self.spawn(&workspace, snapshot.as_deref(), false)?;
+        self.spawn(&workspace, snapshot.as_deref().filter(|_| resume), false)?;
         let workspace = self.state.workspaces.get_mut(id).unwrap();
         workspace.state = "running".into();
         let slept = workspace.hibernation.take();
@@ -843,10 +889,7 @@ impl Runtime {
         let snapshot: Snapshot =
             serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
         ensure!(
-            !resume
-                || (snapshot.runtime == "firecracker-v1.17.0"
-                    && snapshot.cpu == self.cpu
-                    && snapshot.kernel_sha256 == self.kernel_hash),
+            !resume || snapshot.resumable(&self.cpu, &self.kernel_hash),
             "snapshot runtime, CPU or guest kernel is incompatible; restore it with --cold to boot its disk"
         );
         ensure!(snapshot.files.len() == 3, "snapshot manifest is incomplete");
@@ -1012,6 +1055,10 @@ impl Runtime {
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
             "list" => Ok(json!(self.state.workspaces.values().collect::<Vec<_>>())),
+            "quiesce" => {
+                self.closing = true;
+                Ok(json!({"closing":true}))
+            }
             "stats" => {
                 let mut running = BTreeMap::new();
                 let mut total_pss = 0u64;

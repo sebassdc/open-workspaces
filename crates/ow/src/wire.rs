@@ -49,8 +49,17 @@ pub fn send(stream: &mut UnixStream, value: &Value) -> Result<()> {
 }
 
 pub fn connect(root: &Path, request: &Value) -> Result<(UnixStream, Value)> {
+    connect_waiting(root, request, Duration::from_secs(120))
+}
+
+/// `connect` with a longer wait for the reply, for operations such as a large hibernation.
+pub fn connect_waiting(
+    root: &Path,
+    request: &Value,
+    wait: Duration,
+) -> Result<(UnixStream, Value)> {
     let mut stream = UnixStream::connect(root.join("control.sock"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_read_timeout(Some(wait))?;
     stream.set_write_timeout(Some(Duration::from_secs(120)))?;
     send(&mut stream, request)?;
     let response = line(&mut stream)?;

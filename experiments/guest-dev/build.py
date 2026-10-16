@@ -22,6 +22,9 @@ def run(*cmd):
     if r.returncode:raise RuntimeError((cmd,r.stdout,r.stderr))
     return r.stdout
 def guest(command):return run('exec',id,'--',command)
+def provision_exit():
+    # The serial console can leak a stray prompt into exec output; only a number is the exit status.
+    return next((t for t in guest('cat /persist/provision.exit 2>/dev/null || true').split() if t.isdigit()),None)
 def fsck(disk,discard=False):
     r=subprocess.run(['e2fsck','-fy']+(['-E','discard'] if discard else [])+[str(disk)],capture_output=True,text=True)
     if r.returncode not in [0,1]:raise RuntimeError(r.stdout+r.stderr)
@@ -32,16 +35,16 @@ try:
         with disk.open('r+b') as stream:stream.truncate(8*1024**3)
         fsck(disk);subprocess.run(['resize2fs',str(disk)],check=True,capture_output=True);run('start',id)
         run('put',id,str(REPO/'experiments/guest-dev/provision.sh'),'/run/provision-dev.sh')
-        guest(f"/bin/bash -c 'if [ $(id -u) = 0 ]; then bash /run/provision-dev.sh {profile}; else sudo -n bash /run/provision-dev.sh {profile}; fi >/persist/provision.log 2>&1; echo $? > /persist/provision.exit' </dev/null >/dev/null 2>&1 &")
+        guest(f"/bin/bash -c 'umask 022; if [ $(id -u) = 0 ]; then bash /run/provision-dev.sh {profile}; else sudo -n bash /run/provision-dev.sh {profile}; fi >/persist/provision.log 2>&1; echo $? > /persist/provision.exit' </dev/null >/dev/null 2>&1 &")
         deadline=time.monotonic()+1800
-        while guest('test ! -f /persist/provision.exit || cat /persist/provision.exit').strip()=='':
+        while provision_exit() is None:
             if time.monotonic()>deadline:raise RuntimeError('guest provision timed out; build data retained')
             time.sleep(5)
     else:
         # Adoption must be explicit and belongs to an existing project-marked worker root.
         assert root.is_relative_to(REPO/'data/dev-images') and (root/'.ow-data').exists()
         disk=root/'machines'/id/'disk.ext4'
-    assert guest('cat /persist/provision.exit').strip()=='0','provisioning failed; inspect retained guest log'
+    assert provision_exit()=='0','provisioning failed; inspect retained guest log'
     # All privileged cleanup is confined to the guest. Works with old root exec and new dev exec.
     def privileged(command):
         return guest('if [ $(id -u) = 0 ]; then /bin/bash -c '+__import__('shlex').quote(command)+'; else sudo -n /bin/bash -c '+__import__('shlex').quote(command)+'; fi')

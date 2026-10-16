@@ -29,6 +29,14 @@ product decisions can materially change them.
   "tailscale"` stays on loopback behind `tailscale serve` and admits listed
   tailnet logins; the AWS component runs it with `dashboardLogins`. See
   [tailnet sign-in](DASHBOARD.md#tailnet-sign-in).
+- [x] `deploy/aws` 0.3.0, for long-lived hosts: the Tailscale state lives on the
+  data volume, so a replaced host keeps its tailnet device and name; stopping
+  the service runs `ow down --hibernate` (wakes refused, running boxes
+  hibernated); a box hibernated under another host kernel boots its disk cold;
+  `developerImages: ["ubuntu"]` builds the developer image after boot. Checked
+  on EC2: a host replacement kept the tailnet name and address and a hibernated
+  box resumed on the new host; a scheduled instance stop hibernated a box whose
+  process carried on after the start. See [deploy/aws](../deploy/aws/README.md).
 
 ## Open-source roadmap: OS phase 1, core traits and pluggable connect
 

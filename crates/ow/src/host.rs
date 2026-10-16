@@ -416,6 +416,29 @@ fn unpublish(root: &Path, id: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Refuses new starts and wakes, then hibernates every running machine. A machine
+/// that fails to hibernate is left to the shutdown, which stops it.
+fn hibernate_all(root: &Path) -> Result<()> {
+    // The AWS unit allows 900 s to stop; the worker captures one machine at a time.
+    let deadline = Instant::now() + Duration::from_secs(840);
+    wire::request(root, json!({"op":"quiesce"}))?;
+    let list = wire::request(root, json!({"op":"list"}))?;
+    for workspace in list.as_array().context("workspace list")? {
+        let (Some(id), Some("running")) = (workspace["id"].as_str(), workspace["state"].as_str())
+        else {
+            continue;
+        };
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(1));
+        match wire::connect_waiting(root, &json!({"op":"hibernate","id":id}), wait) {
+            Ok(_) => println!("hibernated {id}"),
+            Err(e) => eprintln!("could not hibernate {id}: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
 /// Shut down local HTTP proxies, all of them or only one workspace's.
 fn unpublish_all(root: &Path, workspace: Option<&str>) -> Result<()> {
     for entry in fs::read_dir(root)? {
@@ -738,9 +761,12 @@ pub fn run(cli: Cli) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&up(&root)?)?);
             return Ok(0);
         }
-        Action::Down => {
+        Action::Down { hibernate } => {
             unpublish_all(&root, None)?;
             if root.join("control.sock").exists() {
+                if hibernate {
+                    hibernate_all(&root)?;
+                }
                 wire::request(&root, json!({"op":"shutdown"}))?;
                 let started = Instant::now();
                 while root.join("control.sock").exists() {
