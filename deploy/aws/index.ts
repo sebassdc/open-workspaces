@@ -26,6 +26,12 @@ export interface HostArgs {
     tailscaleHostname?: pulumi.Input<string>;
     /** Enable Tailscale SSH, authorized by the tailnet policy. */
     tailscaleSsh?: pulumi.Input<boolean>;
+    /**
+     * Tailnet logins (for example `you@example.com`) allowed into the web dashboard.
+     * The dashboard listens on loopback and is served to the tailnet only, through
+     * `tailscale serve`. Needs `tailscaleAuthKeySecretArn`. Omit for no dashboard.
+     */
+    dashboardLogins?: pulumi.Input<pulumi.Input<string>[]>;
 }
 
 const DEFAULT_REPOSITORY = "https://github.com/sebassdc/open-workspaces.git";
@@ -39,6 +45,16 @@ export function renderUserData(
     const lines = Object.entries(env).map(([key, value]) => `${key}='${value.replace(/'/g, `'\\''`)}'`);
     // A replacer function keeps `$&`, `$$` and similar in values literal.
     return script.replace("# @OW_ENV@", () => lines.join("\n"));
+}
+
+/** Checks dashboard logins and joins them for the user data. */
+export function dashboardLoginList(logins: string[]): string {
+    for (const login of logins) {
+        if (!/^[A-Za-z0-9._%+@-]+@[A-Za-z0-9.-]+$/.test(login) || login.length > 254) {
+            throw new Error(`invalid dashboard login: ${JSON.stringify(login)}`);
+        }
+    }
+    return logins.join(",");
 }
 
 /**
@@ -135,17 +151,22 @@ export class Host extends pulumi.ComponentResource {
                 args.tailscaleAuthKeySecretArn ?? "",
                 args.tailscaleHostname ?? name,
                 args.tailscaleSsh ?? false,
+                args.dashboardLogins ?? [],
             ])
-            .apply(([volumeId, repository, ref, secretArn, hostname, tailscaleSsh]) =>
-                renderUserData({
+            .apply(([volumeId, repository, ref, secretArn, hostname, tailscaleSsh, logins]) => {
+                if (logins.length > 0 && !secretArn) {
+                    throw new Error("dashboardLogins needs tailscaleAuthKeySecretArn: the dashboard is served over the tailnet only");
+                }
+                return renderUserData({
                     OW_DATA_VOLUME_ID: volumeId,
                     OW_REPOSITORY: repository,
                     OW_REF: ref,
                     OW_TAILSCALE_SECRET_ARN: secretArn,
                     OW_TAILSCALE_HOSTNAME: hostname,
                     OW_TAILSCALE_SSH: tailscaleSsh ? "1" : "",
-                }),
-            );
+                    OW_DASHBOARD_LOGINS: dashboardLoginList(logins),
+                });
+            });
 
         const instance = new aws.ec2.Instance(`${name}-host`, {
             ami: amiId,

@@ -160,9 +160,9 @@ snapshots and `ow backup restore` brings one up on another runner. See
 
 ## Limits
 
-- The controller is a single process with a SQLite catalog. The human dashboard
-  still needs its Cloudflare Access config (`ow dashboard`); `host up` does not
-  start it.
+- The controller is a single process with a SQLite catalog. `host up` does not
+  start the human dashboard; run `ow --data-dir ~/.ow/controller dashboard`
+  with Cloudflare Access or [tailnet sign-in](DASHBOARD.md#tailnet-sign-in).
 - One credential per runner; a stolen credential can act as that runner until
   revoked. Enrollment trust is the controller's private CA.
 - The remote must accept a POSIX `sh -c` command string over SSH.

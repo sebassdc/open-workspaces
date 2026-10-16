@@ -121,5 +121,55 @@ runner_online() {
 for _ in $(seq 60); do runner_online 2>/dev/null && break; sleep 2; done
 runner_online || { echo "controller never reported its runner online"; journalctl -u open-workspaces -n 30 --no-pager; false; }
 
+# Optional web dashboard: loopback only, served to the tailnet by `tailscale serve`.
+# It starts once the host is on the tailnet and retries until then.
+if [[ -n "${OW_DASHBOARD_LOGINS:-}" ]]; then
+  mkdir -p /etc/open-workspaces /usr/local/lib/open-workspaces
+  printf 'OW_DASHBOARD_LOGINS=%s\n' "$OW_DASHBOARD_LOGINS" > /etc/open-workspaces/dashboard.env
+  cat > /usr/local/lib/open-workspaces/dashboard-prepare <<'PREPARE'
+#!/bin/bash
+# Root: write the dashboard config for this host's tailnet name, then turn on `tailscale serve`.
+set -euo pipefail
+name=$(tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+sys.exit(1) if s.get("BackendState") != "Running" else print(s["Self"]["DNSName"].rstrip("."))') \
+  || { echo "tailscale is not up; the dashboard starts once this host is on the tailnet"; exit 1; }
+runuser -u ow -- env NAME="$name" LOGINS="$OW_DASHBOARD_LOGINS" python3 -c '
+import json, os
+path = "/srv/ow/.ow/dashboard.json"
+fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump({"auth": "tailscale", "hostname": os.environ["NAME"], "upstream": "http://127.0.0.1:9/",
+               "allowed_emails": os.environ["LOGINS"].split(",")}, f)
+os.replace(path + ".tmp", path)'
+tailscale serve --bg http://127.0.0.1:8787 > /dev/null
+echo "dashboard: https://$name/"
+PREPARE
+  chmod 755 /usr/local/lib/open-workspaces/dashboard-prepare
+  cat > /etc/systemd/system/open-workspaces-dashboard.service <<UNIT
+[Unit]
+Description=Open Workspaces dashboard on loopback, served to the tailnet by tailscale serve
+After=open-workspaces.service tailscaled.service
+Wants=open-workspaces.service
+StartLimitIntervalSec=0
+
+[Service]
+User=ow
+EnvironmentFile=/etc/open-workspaces/dashboard.env
+Environment=HOME=/srv/ow OW_ASSET_DIR=/srv/ow/src/data/runtime-spike
+ExecStartPre=+/usr/local/lib/open-workspaces/dashboard-prepare
+ExecStart=/srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/controller dashboard --config /srv/ow/.ow/dashboard.json --listen 127.0.0.1:8787
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable open-workspaces-dashboard.service
+  systemctl start --no-block open-workspaces-dashboard.service
+fi
+
 echo "bootstrap done $(date -Is) tailscale=$tailscale_state"
 echo "ok tailscale=$tailscale_state" > "$status"

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { renderUserData } from "../index.ts";
+import { dashboardLoginList, renderUserData } from "../index.ts";
 
 const bootstrap = readFileSync(new URL("../bootstrap.sh", import.meta.url), "utf8");
 
@@ -15,4 +15,17 @@ test("user data keeps values literal and starts with the bootstrap shebang", () 
         const printed = execFileSync("bash", ["-c", `${header.join("\n")}\nprintf %s "$OW_REF"`], { encoding: "utf8" });
         assert.equal(printed, value);
     }
+});
+
+test("dashboard logins are validated and the dashboard block is valid bash", () => {
+    assert.equal(dashboardLoginList(["a@example.com", "b.c+d@example.org"]), "a@example.com,b.c+d@example.org");
+    assert.equal(dashboardLoginList([]), "");
+    for (const bad of ["no-at-sign", "a@b,c@d", "x@y'", "a b@c", "$(id)@x"]) {
+        assert.throws(() => dashboardLoginList([bad]), /invalid dashboard login/);
+    }
+    const script = renderUserData({ OW_DASHBOARD_LOGINS: "a@example.com", OW_TAILSCALE_SSH: "" }, bootstrap);
+    execFileSync("bash", ["-n"], { input: script });
+    assert.ok(script.includes("--listen 127.0.0.1:8787"), "dashboard stays on loopback");
+    assert.ok(script.includes("tailscale serve --bg http://127.0.0.1:8787"), "served to the tailnet only");
+    assert.ok(!script.includes("tailscale funnel"), "never public");
 });

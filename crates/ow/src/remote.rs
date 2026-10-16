@@ -15,19 +15,34 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{RwLock, Semaphore};
 
 const REQUEST_LIMIT: usize = 1024 * 1024;
 const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 const KEY_LIFETIME: Duration = Duration::from_secs(3600);
+/// Terminal and SSH streams opened with a tailnet login close after this long.
+const TAILNET_SESSION: Duration = Duration::from_secs(8 * 3600);
+
+/// Who vouches for the caller: Cloudflare Access JWTs, or `tailscale serve` on this host.
+#[derive(Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Auth {
+    #[default]
+    Access,
+    Tailscale,
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     hostname: String,
+    #[serde(default)]
+    auth: Auth,
+    #[serde(default)]
     team_domain: String,
+    #[serde(default)]
     audience: String,
     allowed_emails: Vec<String>,
     upstream: String,
@@ -37,22 +52,104 @@ struct Config {
     node_owner_subject: Option<String>,
     #[serde(default)]
     node_owner_user_id: Option<i64>,
+    /// Runtime only: tailnet user lookups (`tailscale whois`), not a config key.
+    #[serde(skip)]
+    whois: Whois,
+}
+
+/// Resolves a tailnet peer address to its stable user ID and login with
+/// `tailscale whois`, caching each answer briefly.
+#[derive(Clone)]
+struct Whois {
+    cli: PathBuf,
+    cache:
+        Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (Instant, u64, String)>>>,
+}
+
+impl Default for Whois {
+    fn default() -> Self {
+        Self {
+            cli: PathBuf::from("tailscale"),
+            cache: Arc::default(),
+        }
+    }
+}
+
+impl Whois {
+    async fn user(&self, peer: std::net::IpAddr) -> Option<(u64, String)> {
+        const FRESH: Duration = Duration::from_secs(60);
+        if let Some((at, id, login)) = self.cache.lock().ok()?.get(&peer)
+            && at.elapsed() < FRESH
+        {
+            return Some((*id, login.clone()));
+        }
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new(&self.cli)
+                .args(["whois", "--json", &peer.to_string()])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        #[derive(Deserialize)]
+        struct Answer {
+            #[serde(rename = "UserProfile")]
+            user: Profile,
+        }
+        #[derive(Deserialize)]
+        struct Profile {
+            #[serde(rename = "ID")]
+            id: u64,
+            #[serde(rename = "LoginName")]
+            login: String,
+        }
+        let answer: Answer = serde_json::from_slice(&output.stdout).ok()?;
+        (answer.user.id != 0).then_some(())?;
+        let mut cache = self.cache.lock().ok()?;
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(
+            peer,
+            (Instant::now(), answer.user.id, answer.user.login.clone()),
+        );
+        Some((answer.user.id, answer.user.login))
+    }
 }
 
 impl Config {
     fn validate(&self) -> Result<()> {
         ensure!(valid_hostname(&self.hostname), "invalid public hostname");
-        let suffix = ".cloudflareaccess.com";
-        ensure!(
-            self.team_domain.ends_with(suffix)
-                && !self.team_domain.trim_end_matches(suffix).contains('.')
-                && valid_hostname(&self.team_domain),
-            "team_domain must be your single-level Cloudflare Access team domain"
-        );
-        ensure!(
-            !self.audience.is_empty() && self.audience.len() <= 256,
-            "missing Access audience"
-        );
+        match self.auth {
+            Auth::Access => {
+                let suffix = ".cloudflareaccess.com";
+                ensure!(
+                    self.team_domain.ends_with(suffix)
+                        && !self.team_domain.trim_end_matches(suffix).contains('.')
+                        && valid_hostname(&self.team_domain),
+                    "team_domain must be your single-level Cloudflare Access team domain"
+                );
+                ensure!(
+                    !self.audience.is_empty() && self.audience.len() <= 256,
+                    "missing Access audience"
+                );
+            }
+            Auth::Tailscale => {
+                ensure!(
+                    self.hostname.ends_with(".ts.net") && self.hostname.split('.').count() >= 4,
+                    "tailscale auth needs this machine's MagicDNS name (NAME.TAILNET.ts.net)"
+                );
+                ensure!(
+                    self.team_domain.is_empty() && self.audience.is_empty(),
+                    "team_domain and audience are Access settings; omit them with tailscale auth"
+                );
+            }
+        }
         ensure!(
             !self.allowed_emails.is_empty()
                 && self
@@ -97,7 +194,16 @@ impl Config {
     }
 
     fn issuer(&self) -> String {
-        format!("https://{}", self.team_domain)
+        match self.auth {
+            Auth::Access => format!("https://{}", self.team_domain),
+            // One identity namespace per tailnet: NAME.TAILNET.ts.net -> tailscale://TAILNET.ts.net
+            Auth::Tailscale => format!(
+                "tailscale://{}",
+                self.hostname
+                    .split_once('.')
+                    .map_or("", |(_, tailnet)| tailnet)
+            ),
+        }
     }
 }
 
@@ -154,10 +260,52 @@ async fn fetch_keys(client: &reqwest::Client, config: &Config) -> Result<JwkSet>
     Ok(set)
 }
 
+/// `tailscale serve` replaces client-sent Tailscale-User-* and X-Forwarded-For
+/// headers: it sets the login only for tailnet users (never tagged devices) and
+/// X-Forwarded-For to the real peer address. The login is a reusable name, so
+/// the catalog subject is the stable user ID that `tailscale whois` reports for
+/// that peer, and both must agree. The listener is loopback-only, so these
+/// headers are trusted as far as this host's local users are.
+async fn tailnet_identity(
+    config: &Config,
+    headers: &HeaderMap,
+) -> Option<(u64, crate::catalog::Identity)> {
+    let single = |name: &str| {
+        let mut values = headers.get_all(name).iter();
+        let value = values.next()?.to_str().ok()?;
+        (values.next().is_none() && !value.is_empty() && value.len() <= 254).then_some(value)
+    };
+    let login = single("tailscale-user-login")?;
+    let peer: std::net::IpAddr = single("x-forwarded-for")?.parse().ok()?;
+    if !config
+        .allowed_emails
+        .iter()
+        .any(|email| email.eq_ignore_ascii_case(login))
+    {
+        return None;
+    }
+    let (id, whois_login) = config.whois.user(peer).await?;
+    if !whois_login.eq_ignore_ascii_case(login) {
+        return None;
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some((
+        now + TAILNET_SESSION.as_secs(),
+        crate::catalog::Identity {
+            issuer: config.issuer(),
+            subject: id.to_string(),
+            email: login.to_owned(),
+        },
+    ))
+}
+
 async fn authorized_until(
     app: &App,
     headers: &HeaderMap,
 ) -> Option<(u64, crate::catalog::Identity)> {
+    if app.config.auth == Auth::Tailscale {
+        return tailnet_identity(&app.config, headers).await;
+    }
     let mut assertions = headers.get_all("cf-access-jwt-assertion").iter();
     let token = assertions.next().and_then(|v| v.to_str().ok())?;
     if assertions.next().is_some() || token.len() > 16384 {
@@ -232,6 +380,7 @@ fn clean_headers(source: &HeaderMap, request: bool) -> HeaderMap {
                     | "authorization"
             )
             || key.starts_with("cf-")
+            || key.starts_with("tailscale-")
             || key.starts_with("x-forwarded-")
         {
             continue;
@@ -289,7 +438,11 @@ async fn handle(app: &App, request: Request) -> Response {
     if host != app.config.hostname && host != format!("{}:443", app.config.hostname) {
         return (StatusCode::MISDIRECTED_REQUEST, "Unknown hostname").into_response();
     }
-    if app.dashboard.is_some() && crate::dashboard::public_path(request.uri().path()) {
+    // The CLI signs in through Cloudflare Access only, so tailnet mode offers no installer.
+    if app.dashboard.is_some()
+        && app.config.auth == Auth::Access
+        && crate::dashboard::public_path(request.uri().path())
+    {
         return crate::dashboard::public_download(
             &format!("https://{}", app.config.hostname),
             request,
@@ -297,7 +450,13 @@ async fn handle(app: &App, request: Request) -> Response {
         .await;
     }
     let Some((expires, identity)) = authorized_until(app, request.headers()).await else {
-        return (StatusCode::UNAUTHORIZED, "Cloudflare Access login required").into_response();
+        let login = match app.config.auth {
+            Auth::Access => "Cloudflare Access login required",
+            Auth::Tailscale => {
+                "Tailnet login required: open this through tailscale serve as an allowed user"
+            }
+        };
+        return (StatusCode::UNAUTHORIZED, login).into_response();
     };
     if app.dashboard.is_some() && request.uri().path().starts_with("/api/ssh/") {
         if request
@@ -623,9 +782,14 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(30))
                 .build()?;
-            let keys = fetch_keys(&client, &config)
-                .await
-                .context("loading Cloudflare Access signing keys")?;
+            let access = config.auth == Auth::Access;
+            let keys = if access {
+                fetch_keys(&client, &config)
+                    .await
+                    .context("loading Cloudflare Access signing keys")?
+            } else {
+                JwkSet { keys: Vec::new() }
+            };
             let app = App {
                 dashboard: dashboard.clone(),
                 catalog,
@@ -638,7 +802,11 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
                 requests: Arc::new(Semaphore::new(64)),
             };
             let refresh = app.clone();
+            // Tailnet sign-in uses no signing keys, so there is nothing to refresh.
             tokio::spawn(async move {
+                if !access {
+                    return;
+                }
                 loop {
                     tokio::time::sleep(Duration::from_secs(600)).await;
                     if let Ok(set) = fetch_keys(&refresh.client, &refresh.config).await {
@@ -723,6 +891,7 @@ mod tests {
     fn config(upstream: String) -> Config {
         Config {
             hostname: "app.example.test".into(),
+            auth: Auth::Access,
             team_domain: "test-team.cloudflareaccess.com".into(),
             audience: "test-audience".into(),
             allowed_emails: vec!["owner@example.test".into()],
@@ -730,6 +899,7 @@ mod tests {
             bootstrap_owner_email: None,
             node_owner_subject: None,
             node_owner_user_id: None,
+            whois: Whois::default(),
         }
     }
 
@@ -779,6 +949,175 @@ mod tests {
         cfg = config("http://127.0.0.1:1234".into());
         cfg.team_domain = "attacker.test-team.cloudflareaccess.com".into();
         assert!(cfg.validate().is_err());
+    }
+
+    fn tailnet_config() -> Config {
+        // Stand-in `tailscale whois --json ADDR`: two tailnet users, nothing else.
+        let dir = std::env::temp_dir().join(format!("ow-whois-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cli = dir.join("tailscale");
+        fs::write(
+            &cli,
+            "#!/bin/sh\ncase \"$3\" in\n\
+             100.64.0.1) echo '{\"UserProfile\":{\"ID\":42,\"LoginName\":\"Owner@example.test\"}}' ;;\n\
+             100.64.0.2) echo '{\"UserProfile\":{\"ID\":43,\"LoginName\":\"stranger@example.test\"}}' ;;\n\
+             *) exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        Config {
+            hostname: "box-host.example-net.ts.net".into(),
+            auth: Auth::Tailscale,
+            team_domain: String::new(),
+            audience: String::new(),
+            whois: Whois {
+                cli,
+                cache: Arc::default(),
+            },
+            ..config("http://127.0.0.1:1234".into())
+        }
+    }
+
+    #[test]
+    fn tailnet_configuration_is_strict() {
+        let cfg = tailnet_config();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.issuer(), "tailscale://example-net.ts.net");
+        let mut bad = tailnet_config();
+        bad.hostname = "app.example.test".into();
+        assert!(bad.validate().is_err());
+        bad = tailnet_config();
+        bad.hostname = "example-net.ts.net".into();
+        assert!(bad.validate().is_err());
+        bad = tailnet_config();
+        bad.audience = "test-audience".into();
+        assert!(bad.validate().is_err());
+        bad = tailnet_config();
+        bad.allowed_emails.clear();
+        assert!(bad.validate().is_err());
+        // Access mode still needs its own settings.
+        let mut access = config("http://127.0.0.1:1234".into());
+        access.audience.clear();
+        assert!(access.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn tailnet_login_gates_the_dashboard() {
+        let (key, _) = signing_key();
+        let gateway = router(App {
+            dashboard: Some(PathBuf::from("/tmp/ow-no-worker-test")),
+            catalog: None,
+            config: tailnet_config(),
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set: JwkSet { keys: Vec::new() },
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        });
+        let get_from = |logins: &[&str], peers: &[&str], host: &str| {
+            let mut req = Request::builder().uri("/").header("host", host);
+            for login in logins {
+                req = req.header("tailscale-user-login", *login);
+            }
+            for peer in peers {
+                req = req.header("x-forwarded-for", *peer);
+            }
+            req.body(Body::empty()).unwrap()
+        };
+        let get = |logins: &[&str], host: &str| get_from(logins, &["100.64.0.1"], host);
+        let host = "box-host.example-net.ts.net";
+        for (logins, status) in [
+            (&[][..], StatusCode::UNAUTHORIZED),
+            (&["stranger@example.test"][..], StatusCode::UNAUTHORIZED),
+            (
+                &["owner@example.test", "owner@example.test"][..],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (&[""][..], StatusCode::UNAUTHORIZED),
+            (&["Owner@Example.test"][..], StatusCode::OK),
+        ] {
+            let response = gateway.clone().oneshot(get(logins, host)).await.unwrap();
+            assert_eq!(response.status(), status, "{logins:?}");
+        }
+        // The login must belong to the peer: whois decides, and serve sets one address.
+        for peers in [
+            &[][..],
+            &["100.64.0.2"][..],
+            &["100.64.0.9"][..],
+            &["100.64.0.1, 100.64.0.2"][..],
+            &["100.64.0.1", "100.64.0.1"][..],
+            &["not-an-address"][..],
+        ] {
+            let req = get_from(&["owner@example.test"], peers, host);
+            assert_eq!(
+                gateway.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{peers:?}"
+            );
+        }
+        // Ownership is bound to the stable user ID, not to the reusable login.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "tailscale-user-login",
+            "owner@example.test".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-for", "100.64.0.1".parse().unwrap());
+        let (_, identity) = tailnet_identity(&tailnet_config(), &headers).await.unwrap();
+        assert_eq!(identity.subject, "42");
+        assert_eq!(identity.issuer, "tailscale://example-net.ts.net");
+        // No CLI installer: the CLI signs in through Access only.
+        let mut req = get(&[], host);
+        *req.uri_mut() = "/cli/install.sh".parse().unwrap();
+        assert_eq!(
+            gateway.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // A valid Access JWT means nothing in tailnet mode.
+        let mut req = get(&[], host);
+        req.headers_mut().insert(
+            "cf-access-jwt-assertion",
+            token(&key, &claims()).parse().unwrap(),
+        );
+        assert_eq!(
+            gateway.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Other hostnames are refused before any identity check.
+        let response = gateway
+            .clone()
+            .oneshot(get(&["owner@example.test"], "app.example.test"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+        // Mutations still need the exact tailnet HTTPS origin.
+        for origin in [None, Some("https://app.example.test")] {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/operation")
+                .header("host", host)
+                .header("x-forwarded-for", "100.64.0.1")
+                .header("tailscale-user-login", "owner@example.test");
+            if let Some(origin) = origin {
+                req = req.header("origin", origin);
+            }
+            let req = req
+                .body(Body::from(r#"{"op":"create","id":"test"}"#))
+                .unwrap();
+            assert_eq!(
+                gateway.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        // Tailnet identity headers never reach a guest upstream.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "tailscale-user-login",
+            "owner@example.test".parse().unwrap(),
+        );
+        headers.insert("tailscale-user-name", "Owner".parse().unwrap());
+        assert!(clean_headers(&headers, true).is_empty());
     }
 
     #[tokio::test]

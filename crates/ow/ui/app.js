@@ -147,6 +147,8 @@ window.addEventListener('pagehide', closeTerminal);
 const installCommand = `curl -fsSL ${location.origin}/cli/install.sh | sh`;
 $('cli-command').textContent = installCommand;
 $('cli-login').textContent = `ow login ${location.origin}`;
+// Tailnet sign-in serves no CLI installer: the CLI signs in through Access only.
+fetch('/cli/install.sh', {cache: 'no-store'}).then(r => { if (!r.ok) $('cli-install').hidden = true; }).catch(() => { $('cli-install').hidden = true; });
 $('copy-install').addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(installCommand); $('copy-install').textContent = 'Copied'; setTimeout(() => { $('copy-install').textContent = 'Copy command'; }, 2000); }
   catch { notice('Select the install command and copy it to your terminal.'); }

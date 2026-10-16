@@ -25,6 +25,10 @@ product decisions can materially change them.
   `pulumi destroy` of the stack it created.
 - [x] EC2 timings (boot, snapshot, fork, live fork, hibernate) recorded in
   [EC2 timings](experiments/ec2-timings.md).
+- [x] Dashboard sign-in over the tailnet: `ow dashboard` with `"auth":
+  "tailscale"` stays on loopback behind `tailscale serve` and admits listed
+  tailnet logins; the AWS component runs it with `dashboardLogins`. See
+  [tailnet sign-in](DASHBOARD.md#tailnet-sign-in).
 
 ## Open-source roadmap: OS phase 1, core traits and pluggable connect
 
