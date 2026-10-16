@@ -23,7 +23,7 @@ sha2 = "0.10"
 hyper-util = { version = "0.1", features = ["tokio"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zstd = { version = "=0.13.3", default-features = false }

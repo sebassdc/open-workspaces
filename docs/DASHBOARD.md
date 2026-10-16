@@ -91,10 +91,18 @@ tailscale serve --bg http://127.0.0.1:8787   # then open https://NAME.TAILNET.ts
 - `hostname` is this machine's MagicDNS name; requests for any other Host are
   refused, and mutations, terminals and SSH need the exact `https://hostname`
   Origin, as with Access.
-- The identity is the `Tailscale-User-Login` header. `tailscale serve` removes
-  client-sent `Tailscale-User-*` headers and sets them only for a tailnet user,
-  never for tagged devices; the login must be in `allowed_emails`. Catalog
+- `tailscale serve` replaces client-sent `Tailscale-User-*` and
+  `X-Forwarded-For` headers: it sets the login only for a tailnet user (never for
+  tagged devices) and `X-Forwarded-For` to the real peer address. The login must
+  be in `allowed_emails`, and `tailscale whois` for that peer must report the
+  same login. The catalog subject is the stable Tailscale user ID from whois, so
+  a login name reassigned to someone else does not inherit machines. Catalog
   identities use the issuer `tailscale://TAILNET.ts.net`.
+- The dashboard runs `tailscale whois --json PEER` (cached for a minute), so the
+  `tailscale` CLI must be on its `PATH`; tailscaled answers this read-only query
+  for any local user.
+- The CLI installer and `ow login` are not offered: the remote CLI signs in
+  through Cloudflare Access only.
 - Anyone who can open a TCP connection to the loopback port on this machine can
   claim an allowed login. Use it only where the machine's local users are
   operators; guests cannot reach host loopback.

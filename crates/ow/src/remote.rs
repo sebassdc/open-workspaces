@@ -52,6 +52,74 @@ struct Config {
     node_owner_subject: Option<String>,
     #[serde(default)]
     node_owner_user_id: Option<i64>,
+    /// Runtime only: tailnet user lookups (`tailscale whois`), not a config key.
+    #[serde(skip)]
+    whois: Whois,
+}
+
+/// Resolves a tailnet peer address to its stable user ID and login with
+/// `tailscale whois`, caching each answer briefly.
+#[derive(Clone)]
+struct Whois {
+    cli: PathBuf,
+    cache:
+        Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (Instant, u64, String)>>>,
+}
+
+impl Default for Whois {
+    fn default() -> Self {
+        Self {
+            cli: PathBuf::from("tailscale"),
+            cache: Arc::default(),
+        }
+    }
+}
+
+impl Whois {
+    async fn user(&self, peer: std::net::IpAddr) -> Option<(u64, String)> {
+        const FRESH: Duration = Duration::from_secs(60);
+        if let Some((at, id, login)) = self.cache.lock().ok()?.get(&peer)
+            && at.elapsed() < FRESH
+        {
+            return Some((*id, login.clone()));
+        }
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new(&self.cli)
+                .args(["whois", "--json", &peer.to_string()])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        #[derive(Deserialize)]
+        struct Answer {
+            #[serde(rename = "UserProfile")]
+            user: Profile,
+        }
+        #[derive(Deserialize)]
+        struct Profile {
+            #[serde(rename = "ID")]
+            id: u64,
+            #[serde(rename = "LoginName")]
+            login: String,
+        }
+        let answer: Answer = serde_json::from_slice(&output.stdout).ok()?;
+        (answer.user.id != 0).then_some(())?;
+        let mut cache = self.cache.lock().ok()?;
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(
+            peer,
+            (Instant::now(), answer.user.id, answer.user.login.clone()),
+        );
+        Some((answer.user.id, answer.user.login))
+    }
 }
 
 impl Config {
@@ -192,33 +260,43 @@ async fn fetch_keys(client: &reqwest::Client, config: &Config) -> Result<JwkSet>
     Ok(set)
 }
 
-/// `tailscale serve` drops client-sent Tailscale-User-* headers and sets them only
-/// for requests from a tailnet user (never for tagged devices). The listener is
-/// loopback-only, so the header is trusted as far as this host's local users are.
-fn tailnet_identity(
+/// `tailscale serve` replaces client-sent Tailscale-User-* and X-Forwarded-For
+/// headers: it sets the login only for tailnet users (never tagged devices) and
+/// X-Forwarded-For to the real peer address. The login is a reusable name, so
+/// the catalog subject is the stable user ID that `tailscale whois` reports for
+/// that peer, and both must agree. The listener is loopback-only, so these
+/// headers are trusted as far as this host's local users are.
+async fn tailnet_identity(
     config: &Config,
     headers: &HeaderMap,
 ) -> Option<(u64, crate::catalog::Identity)> {
-    let mut logins = headers.get_all("tailscale-user-login").iter();
-    let login = logins.next()?.to_str().ok()?;
-    if logins.next().is_some() || login.is_empty() || login.len() > 254 {
-        return None;
-    }
-    let allowed = config
+    let single = |name: &str| {
+        let mut values = headers.get_all(name).iter();
+        let value = values.next()?.to_str().ok()?;
+        (values.next().is_none() && !value.is_empty() && value.len() <= 254).then_some(value)
+    };
+    let login = single("tailscale-user-login")?;
+    let peer: std::net::IpAddr = single("x-forwarded-for")?.parse().ok()?;
+    if !config
         .allowed_emails
         .iter()
-        .any(|email| email.eq_ignore_ascii_case(login));
+        .any(|email| email.eq_ignore_ascii_case(login))
+    {
+        return None;
+    }
+    let (id, whois_login) = config.whois.user(peer).await?;
+    if !whois_login.eq_ignore_ascii_case(login) {
+        return None;
+    }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    allowed.then(|| {
-        (
-            now + TAILNET_SESSION.as_secs(),
-            crate::catalog::Identity {
-                issuer: config.issuer(),
-                subject: login.to_ascii_lowercase(),
-                email: login.to_owned(),
-            },
-        )
-    })
+    Some((
+        now + TAILNET_SESSION.as_secs(),
+        crate::catalog::Identity {
+            issuer: config.issuer(),
+            subject: id.to_string(),
+            email: login.to_owned(),
+        },
+    ))
 }
 
 async fn authorized_until(
@@ -226,7 +304,7 @@ async fn authorized_until(
     headers: &HeaderMap,
 ) -> Option<(u64, crate::catalog::Identity)> {
     if app.config.auth == Auth::Tailscale {
-        return tailnet_identity(&app.config, headers);
+        return tailnet_identity(&app.config, headers).await;
     }
     let mut assertions = headers.get_all("cf-access-jwt-assertion").iter();
     let token = assertions.next().and_then(|v| v.to_str().ok())?;
@@ -360,7 +438,11 @@ async fn handle(app: &App, request: Request) -> Response {
     if host != app.config.hostname && host != format!("{}:443", app.config.hostname) {
         return (StatusCode::MISDIRECTED_REQUEST, "Unknown hostname").into_response();
     }
-    if app.dashboard.is_some() && crate::dashboard::public_path(request.uri().path()) {
+    // The CLI signs in through Cloudflare Access only, so tailnet mode offers no installer.
+    if app.dashboard.is_some()
+        && app.config.auth == Auth::Access
+        && crate::dashboard::public_path(request.uri().path())
+    {
         return crate::dashboard::public_download(
             &format!("https://{}", app.config.hostname),
             request,
@@ -817,6 +899,7 @@ mod tests {
             bootstrap_owner_email: None,
             node_owner_subject: None,
             node_owner_user_id: None,
+            whois: Whois::default(),
         }
     }
 
@@ -869,11 +952,29 @@ mod tests {
     }
 
     fn tailnet_config() -> Config {
+        // Stand-in `tailscale whois --json ADDR`: two tailnet users, nothing else.
+        let dir = std::env::temp_dir().join(format!("ow-whois-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cli = dir.join("tailscale");
+        fs::write(
+            &cli,
+            "#!/bin/sh\ncase \"$3\" in\n\
+             100.64.0.1) echo '{\"UserProfile\":{\"ID\":42,\"LoginName\":\"Owner@example.test\"}}' ;;\n\
+             100.64.0.2) echo '{\"UserProfile\":{\"ID\":43,\"LoginName\":\"stranger@example.test\"}}' ;;\n\
+             *) exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
         Config {
             hostname: "box-host.example-net.ts.net".into(),
             auth: Auth::Tailscale,
             team_domain: String::new(),
             audience: String::new(),
+            whois: Whois {
+                cli,
+                cache: Arc::default(),
+            },
             ..config("http://127.0.0.1:1234".into())
         }
     }
@@ -915,13 +1016,17 @@ mod tests {
             })),
             requests: Arc::new(Semaphore::new(64)),
         });
-        let get = |logins: &[&str], host: &str| {
+        let get_from = |logins: &[&str], peers: &[&str], host: &str| {
             let mut req = Request::builder().uri("/").header("host", host);
             for login in logins {
                 req = req.header("tailscale-user-login", *login);
             }
+            for peer in peers {
+                req = req.header("x-forwarded-for", *peer);
+            }
             req.body(Body::empty()).unwrap()
         };
+        let get = |logins: &[&str], host: &str| get_from(logins, &["100.64.0.1"], host);
         let host = "box-host.example-net.ts.net";
         for (logins, status) in [
             (&[][..], StatusCode::UNAUTHORIZED),
@@ -936,6 +1041,39 @@ mod tests {
             let response = gateway.clone().oneshot(get(logins, host)).await.unwrap();
             assert_eq!(response.status(), status, "{logins:?}");
         }
+        // The login must belong to the peer: whois decides, and serve sets one address.
+        for peers in [
+            &[][..],
+            &["100.64.0.2"][..],
+            &["100.64.0.9"][..],
+            &["100.64.0.1, 100.64.0.2"][..],
+            &["100.64.0.1", "100.64.0.1"][..],
+            &["not-an-address"][..],
+        ] {
+            let req = get_from(&["owner@example.test"], peers, host);
+            assert_eq!(
+                gateway.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{peers:?}"
+            );
+        }
+        // Ownership is bound to the stable user ID, not to the reusable login.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "tailscale-user-login",
+            "owner@example.test".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-for", "100.64.0.1".parse().unwrap());
+        let (_, identity) = tailnet_identity(&tailnet_config(), &headers).await.unwrap();
+        assert_eq!(identity.subject, "42");
+        assert_eq!(identity.issuer, "tailscale://example-net.ts.net");
+        // No CLI installer: the CLI signs in through Access only.
+        let mut req = get(&[], host);
+        *req.uri_mut() = "/cli/install.sh".parse().unwrap();
+        assert_eq!(
+            gateway.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
         // A valid Access JWT means nothing in tailnet mode.
         let mut req = get(&[], host);
         req.headers_mut().insert(
@@ -959,6 +1097,7 @@ mod tests {
                 .method(Method::POST)
                 .uri("/api/operation")
                 .header("host", host)
+                .header("x-forwarded-for", "100.64.0.1")
                 .header("tailscale-user-login", "owner@example.test");
             if let Some(origin) = origin {
                 req = req.header("origin", origin);
