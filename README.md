@@ -40,6 +40,10 @@ and TLS acceptance passed; live gateway/dashboard pool acceptance awaits
 planner review and a dedicated invitation. macOS guests remain pending.
 See the [Mac operator guide](docs/MAC_HOST.md) and [integration evidence](docs/plans/mac-node-report.md).
 
+An AWS Pulumi component runs one nested-virtualization EC2 host with controller
+and runner, reachable only through SSM or Tailscale. See [deploy/aws](deploy/aws/README.md)
+and the [EC2 timings](docs/experiments/ec2-timings.md).
+
 ## Read first
 
 1. [Agent handoff](docs/HANDOFF.md): context, first task, and acceptance criteria.
