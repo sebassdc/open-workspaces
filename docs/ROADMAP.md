@@ -39,6 +39,20 @@ guest-agent integration, host admission and private-pool acceptance remain pendi
 Tahoe installation needs separate allocation/licensing gates. See
 [Mac implementation report](plans/mac-host-report.md).
 
+## Open-source phase 0: usable on any machine
+
+- [x] `deploy/aws/` Pulumi component (TypeScript, consumed with
+  `pulumi package add` from a git tag): one nested-virtualization EC2 host with
+  controller and runner, no inbound ports, SSM-only role, IMDSv2 hop limit 1,
+  Btrfs gp3 data volume, `tags` input, optional Tailscale join from a Secrets
+  Manager ARN. See [deploy/aws](../deploy/aws/README.md).
+- [x] `deploy/aws/examples/smoke/`: environment-only inputs, caller's state
+  backend, tag `project=open-workspaces`; create, connect, fork, live fork,
+  hibernate/resume and stop, then `pulumi destroy`. Per-machine delete awaits a
+  CLI command.
+- [x] EC2 timings (boot, snapshot, fork, live fork, hibernate) recorded in
+  [EC2 timings](experiments/ec2-timings.md).
+
 ## Phase 0 — Feasibility (1–2 weeks)
 
 - Inspect actual development machine and record capabilities.
