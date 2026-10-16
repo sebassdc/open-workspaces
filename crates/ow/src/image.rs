@@ -125,7 +125,8 @@ fn shell(runner: &Path, id: &str, command: &str) -> Result<(String, i64)> {
 }
 
 /// Uploads the recipe and returns the command that starts it in the background:
-/// a management command is bounded to 30 seconds, a recipe is not.
+/// a management command is bounded to 30 seconds, a recipe is not. The usual
+/// umask, not the management shell's 077, so files it installs are readable.
 fn recipe_run(runner: &Path, id: &str, text: &str) -> Result<String> {
     wire::request(
         runner,
@@ -133,7 +134,7 @@ fn recipe_run(runner: &Path, id: &str, text: &str) -> Result<String> {
     )?;
     Ok(format!(
         // In a subshell: the serial transport appends `; …` to the command.
-        "(cd /root && HOME=/root DEBIAN_FRONTEND=noninteractive nohup sh -c 'sh {SCRIPT} >/root/ow-recipe.log 2>&1; echo $? >/root/ow-recipe.exit' </dev/null >/dev/null 2>&1 &)"
+        "(umask 022; cd /root && HOME=/root DEBIAN_FRONTEND=noninteractive nohup sh -c 'sh {SCRIPT} >/root/ow-recipe.log 2>&1; echo $? >/root/ow-recipe.exit' </dev/null >/dev/null 2>&1 &)"
     ))
 }
 
