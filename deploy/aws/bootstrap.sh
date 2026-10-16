@@ -16,6 +16,32 @@ apt-get update -q
 apt-get install -y -q --no-install-recommends git curl ca-certificates python3 python-is-python3 \
   build-essential btrfs-progs nftables iproute2 util-linux openssl
 
+# The data volume is attached after launch; wait for it, format only if blank.
+device="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${OW_DATA_VOLUME_ID//-/}"
+for _ in $(seq 900); do [[ -e "$device" ]] && break; sleep 1; done
+[[ -e "$device" ]] || { echo "data volume $OW_DATA_VOLUME_ID was never attached"; false; }
+if ! blkid "$device" >/dev/null; then
+  mkfs.btrfs -q -L ow-data "$device"
+fi
+[[ "$(blkid -s TYPE -o value "$device")" == btrfs ]] || { echo "data volume is not Btrfs; refusing"; false; }
+uuid=$(blkid -s UUID -o value "$device")
+mkdir -p /srv/ow
+grep -q "UUID=$uuid " /etc/fstab || echo "UUID=$uuid /srv/ow btrfs defaults,nofail 0 0" >> /etc/fstab
+mountpoint -q /srv/ow || mount /srv/ow
+
+# The tailnet identity lives on the data volume, so a replaced host (new AMI or
+# ref) comes back as the same device and name instead of a new `-1` device.
+# Root-only, bind-mounted before tailscaled is installed or started.
+mkdir -p /srv/ow/.tailscale-state /var/lib/tailscale
+chown root:root /srv/ow/.tailscale-state
+chmod 700 /srv/ow/.tailscale-state
+grep -q " /var/lib/tailscale none bind" /etc/fstab \
+  || echo "/srv/ow/.tailscale-state /var/lib/tailscale none bind,nofail,x-systemd.requires-mounts-for=/srv/ow 0 0" >> /etc/fstab
+mountpoint -q /var/lib/tailscale || mount /var/lib/tailscale
+mkdir -p /etc/systemd/system/tailscaled.service.d
+printf '[Unit]\nRequiresMountsFor=/var/lib/tailscale\n' > /etc/systemd/system/tailscaled.service.d/open-workspaces-state.conf
+systemctl daemon-reload
+
 tailscale_state=skipped
 if [[ -n "$OW_TAILSCALE_SECRET_ARN" ]]; then
   join_tailscale() {
@@ -46,19 +72,6 @@ if [[ -n "$OW_TAILSCALE_SECRET_ARN" ]]; then
   if join_tailscale; then tailscale_state=joined; else tailscale_state=failed; fi
   echo "tailscale: $tailscale_state"
 fi
-
-# The data volume is attached after launch; wait for it, format only if blank.
-device="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${OW_DATA_VOLUME_ID//-/}"
-for _ in $(seq 900); do [[ -e "$device" ]] && break; sleep 1; done
-[[ -e "$device" ]] || { echo "data volume $OW_DATA_VOLUME_ID was never attached"; false; }
-if ! blkid "$device" >/dev/null; then
-  mkfs.btrfs -q -L ow-data "$device"
-fi
-[[ "$(blkid -s TYPE -o value "$device")" == btrfs ]] || { echo "data volume is not Btrfs; refusing"; false; }
-uuid=$(blkid -s UUID -o value "$device")
-mkdir -p /srv/ow
-grep -q "UUID=$uuid " /etc/fstab || echo "UUID=$uuid /srv/ow btrfs defaults,nofail 0 0" >> /etc/fstab
-mountpoint -q /srv/ow || mount /srv/ow
 
 id ow >/dev/null 2>&1 || useradd --system --home-dir /srv/ow --shell /bin/bash --groups kvm ow
 chown ow:ow /srv/ow
@@ -120,6 +133,17 @@ done
 echo "tailnet not up after 60 s; the controller listens on loopback until the next restart"
 WAIT
 chmod 755 /usr/local/lib/open-workspaces/wait-tailnet
+# A service stop (restart, reboot, instance stop or replacement) hibernates the
+# running boxes before `ow down`, so their processes survive; they wake on the
+# next connection. A box that fails to hibernate is cold-stopped by `ow down`.
+cat > /usr/local/lib/open-workspaces/stop <<'STOP'
+#!/bin/sh
+for box in $(/usr/local/bin/ow list | python3 -c 'import json,sys; print(" ".join(w["id"] for w in json.load(sys.stdin) if w["state"] == "running"))'); do
+  /usr/local/bin/ow hibernate "$box" > /dev/null && echo "hibernated $box" || echo "could not hibernate $box"
+done
+exec /srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/runner down
+STOP
+chmod 755 /usr/local/lib/open-workspaces/stop
 cat > /etc/systemd/system/open-workspaces.service <<UNIT
 [Unit]
 Description=Open Workspaces controller and local runner (ow host up)
@@ -132,7 +156,9 @@ User=ow
 Environment=HOME=/srv/ow OW_ASSET_DIR=/srv/ow/src/data/runtime-spike
 ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet
 ExecStart=/srv/ow/src/target/release/ow host up --memory $memory --slots 8 --cpus $cpus
-ExecStop=/srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/runner down
+ExecStop=/usr/local/lib/open-workspaces/stop
+# Hibernating hashes each box's RAM and disk (about 25 s for 1 GiB and 8 GiB).
+TimeoutStopSec=900
 Restart=on-failure
 RestartSec=5
 
@@ -197,6 +223,54 @@ UNIT
   systemctl daemon-reload
   systemctl enable open-workspaces-dashboard.service
   systemctl start --no-block open-workspaces-dashboard.service
+fi
+
+# Optional developer images (input developerImages): the `dev` user, SSH server
+# and toolchains that SSH access and golden-image recipes build on. Built once
+# per data volume in a disposable microVM, in the background (10-20 minutes),
+# then published under the built-in profile name; retried at boot until done.
+if [[ -n "${OW_DEVELOPER_IMAGES:-}" ]]; then
+  cat > /usr/local/lib/open-workspaces/developer-images <<'IMAGES'
+#!/bin/bash
+set -euo pipefail
+cd /srv/ow/src
+guest=data/runtime-spike/guest
+for profile in "$@"; do
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("developer_user") else 1)' "$guest/$profile.json" 2>/dev/null; then
+    echo "$profile: developer image present"
+    continue
+  fi
+  [[ -f $guest/$profile.ext4 ]] || python3 experiments/runtime-spike/prepare-profiles.py "$profile"
+  mkdir -p data/dev-images
+  out=data/dev-images/out-$profile-$(date +%s)
+  python3 experiments/guest-dev/build.py "$profile" --output-assets "$out"
+  # Boxes clone the image when created, so replacing it leaves existing boxes alone.
+  mv "$out/guest/$profile.ext4" "$guest/$profile.ext4"
+  mv "$out/guest/$profile.json" "$guest/$profile.json"
+  rm -rf "$out"
+  for build in data/dev-images/build-*; do [[ -f $build/result.json ]] && rm -rf "$build"; done
+  echo "$profile: developer image built"
+done
+IMAGES
+  chmod 755 /usr/local/lib/open-workspaces/developer-images
+  cat > /etc/systemd/system/open-workspaces-images.service <<UNIT
+[Unit]
+Description=Open Workspaces developer images ($OW_DEVELOPER_IMAGES), built once
+After=open-workspaces.service
+
+[Service]
+Type=oneshot
+User=ow
+Environment=HOME=/srv/ow OW_ASSET_DIR=/srv/ow/src/data/runtime-spike
+ExecStart=/usr/local/lib/open-workspaces/developer-images $OW_DEVELOPER_IMAGES
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable open-workspaces-images.service
+  systemctl start --no-block open-workspaces-images.service
 fi
 
 echo "bootstrap done $(date -Is) tailscale=$tailscale_state"

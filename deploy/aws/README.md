@@ -26,7 +26,7 @@ workflow runs the checks and creates that tag. The same tag is the default
 `ref` the host builds, so set `ref` explicitly before the first release exists.
 
 ```bash
-pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.2.2
+pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.3.0
 ```
 
 ```typescript
@@ -53,6 +53,7 @@ export const instanceId = host.instanceId;
 | `tailscaleHostname` | component name | |
 | `tailscaleSsh` | `false` | Tailscale SSH, authorized by your tailnet policy. |
 | `dashboardLogins` | none | Tailnet logins allowed into the web dashboard. Needs `tailscaleAuthKeySecretArn`; see below. |
+| `developerImages` | none | `ubuntu` and/or `arch`: build the [developer image](../../docs/GUEST_IMAGES.md) (user `dev`, SSH server, toolchains) after boot. SSH into boxes and golden-image recipes need it. |
 
 Outputs: `instanceId`, `privateIp`, `availabilityZone`, `dataVolumeId`,
 `roleName`, `securityGroupId`.
@@ -77,12 +78,17 @@ loopback only otherwise. It picks the address at start, so the service waits up
 to 60 s for Tailscale to connect first (after a reboot, for example). Workspace commands through the wrapper go to the local
 runner (`/srv/ow/.ow/runner`); `node add` needs SSH access from the `ow` user.
 Boxes idle for 30 minutes hibernate and wake on the next connection; see
-[wake on connect](../../docs/DAILY_USE.md).
+[wake on connect](../../docs/DAILY_USE.md). Stopping the service (a restart, a
+reboot, an instance stop or a host replacement) hibernates the running boxes
+first, so their processes carry on when they next wake; only a box that fails
+to hibernate is cold-stopped.
 
 With Tailscale, the host joins your tailnet under `tailscaleHostname`. The
 auth key is read once at boot into a root-only file under `/run`, passed to
 `tailscale up` by file reference and deleted. A failed join does not fail the
-bootstrap; SSM keeps working.
+bootstrap; SSM keeps working. The Tailscale state (`/var/lib/tailscale`) is kept
+on the data volume, so a replaced host (new AMI or `ref`) comes back as the same
+tailnet device, with the same name and address.
 
 ## Dashboard over the tailnet
 
@@ -99,14 +105,19 @@ the runners.
 
 User data (`bootstrap.sh`) runs once per instance:
 
-1. installs build and host packages, and optionally joins Tailscale;
-2. waits for the data volume, formats it Btrfs only if it is blank, mounts it;
+1. installs build and host packages;
+2. waits for the data volume, formats it Btrfs only if it is blank, mounts it,
+   and optionally joins Tailscale with its state on that volume;
 3. creates the `ow` system user (member of `kvm`) and an AppArmor profile that
    lets only the `ow` binary create user namespaces (Ubuntu restricts them);
 4. clones `repository`, checks out `ref` and runs `scripts/setup-local.sh`
    (pinned Rust, Firecracker and guest assets, then a release build);
 5. installs `/usr/local/bin/ow`, starts `open-workspaces.service`
-   (`ow host up`) and waits until the controller reports its runner online.
+   (`ow host up`) and waits until the controller reports its runner online;
+6. with `developerImages`, starts `open-workspaces-images.service`, which builds
+   each missing developer image in a disposable microVM (10-20 minutes) and then
+   publishes it under the built-in name (`ow create --image ubuntu`). It runs
+   once per data volume and retries at the next boot if it failed.
 
 Progress: `/var/log/open-workspaces-bootstrap.log`; state:
 `/var/lib/open-workspaces/bootstrap-status` (`running`, `failed` or

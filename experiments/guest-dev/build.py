@@ -32,7 +32,7 @@ try:
         with disk.open('r+b') as stream:stream.truncate(8*1024**3)
         fsck(disk);subprocess.run(['resize2fs',str(disk)],check=True,capture_output=True);run('start',id)
         run('put',id,str(REPO/'experiments/guest-dev/provision.sh'),'/run/provision-dev.sh')
-        guest(f"/bin/bash -c 'if [ $(id -u) = 0 ]; then bash /run/provision-dev.sh {profile}; else sudo -n bash /run/provision-dev.sh {profile}; fi >/persist/provision.log 2>&1; echo $? > /persist/provision.exit' </dev/null >/dev/null 2>&1 &")
+        guest(f"/bin/bash -c 'umask 022; if [ $(id -u) = 0 ]; then bash /run/provision-dev.sh {profile}; else sudo -n bash /run/provision-dev.sh {profile}; fi >/persist/provision.log 2>&1; echo $? > /persist/provision.exit' </dev/null >/dev/null 2>&1 &")
         deadline=time.monotonic()+1800
         while guest('test ! -f /persist/provision.exit || cat /persist/provision.exit').strip()=='':
             if time.monotonic()>deadline:raise RuntimeError('guest provision timed out; build data retained')
