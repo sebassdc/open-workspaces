@@ -1044,9 +1044,9 @@ pub fn agent(
     };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
     #[cfg(target_os = "linux")]
-    let hello=json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true}).to_string();
+    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true});
     #[cfg(target_os = "macos")]
-    let hello=json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS}).to_string();
+    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
@@ -1061,8 +1061,17 @@ pub fn agent(
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
             loop {
                 if heartbeat.elapsed() > Duration::from_secs(3) {
-                    wire::request(root, json!({"op":"status"})).context("local worker stopped")?;
-                    ws.send(tungstenite::Message::Text(hello.clone().into()))?;
+                    let status = wire::request(root, json!({"op":"status"}))
+                        .context("local worker stopped")?;
+                    // Golden images built since the agent started are advertised too.
+                    let mut beat = hello.clone();
+                    if let Some(golden) = status["images"].as_array() {
+                        beat["images"]
+                            .as_array_mut()
+                            .unwrap()
+                            .extend(golden.iter().cloned());
+                    }
+                    ws.send(tungstenite::Message::Text(beat.to_string().into()))?;
                     heartbeat = std::time::Instant::now();
                 }
                 match ws.read() {

@@ -98,6 +98,22 @@ fn bridge(mut unix: UnixStream, mut tcp: TcpStream) -> Result<()> {
     Ok(())
 }
 
+/// Keeps a machine awake (no automatic hibernation) while one of its streams is open.
+struct Awake(Arc<Mutex<Runtime>>, String);
+impl Awake {
+    fn open(runtime: &Arc<Mutex<Runtime>>, locked: &mut Runtime, id: &str) -> Self {
+        locked.idle.open(id, Instant::now());
+        Self(runtime.clone(), id.to_owned())
+    }
+}
+impl Drop for Awake {
+    fn drop(&mut self) {
+        if let Ok(mut runtime) = self.0.lock() {
+            runtime.idle.close(&self.1, Instant::now());
+        }
+    }
+}
+
 fn worker(root: PathBuf) -> Result<()> {
     unsafe {
         libc::umask(0o077);
@@ -130,7 +146,22 @@ fn worker(root: PathBuf) -> Result<()> {
     listener.set_nonblocking(true)?;
     let stopping = Arc::new(AtomicBool::new(false));
     let terminals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut idle_check = Instant::now();
     while !stopping.load(Ordering::SeqCst) {
+        // On this thread: hibernation must not race the VMMs this thread spawns.
+        if idle_check.elapsed() >= Duration::from_secs(5) {
+            idle_check = Instant::now();
+            let results = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
+                .hibernate_idle();
+            for (id, result) in results {
+                match result {
+                    Ok(_) => eprintln!("idle: hibernated {id}"),
+                    Err(e) => eprintln!("idle: hibernating {id} failed: {e:#}"),
+                }
+            }
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let runtime = runtime.clone();
@@ -161,11 +192,17 @@ fn worker(root: PathBuf) -> Result<()> {
                             }
                             let slot = Slot(terminals.clone());
                             let id = request["id"].as_str().context("missing ID")?;
-                            let (tcp, generation) = runtime
+                            let mut locked = runtime
                                 .lock()
-                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
-                                .ssh(id)?;
-                            Ok((tcp, generation, crate::ssh_guest::path(&root, id), slot))
+                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
+                            let (tcp, generation) = locked.ssh(id)?;
+                            let awake = Awake::open(&runtime, &mut locked, id);
+                            Ok((
+                                tcp,
+                                generation,
+                                crate::ssh_guest::path(&root, id),
+                                (slot, awake),
+                            ))
                         })();
                         match connection {
                             Ok((tcp, generation, path, slot)) => {
@@ -184,7 +221,7 @@ fn worker(root: PathBuf) -> Result<()> {
                                 self.0.fetch_sub(1, Ordering::SeqCst);
                             }
                         }
-                        let connection = (|| -> Result<(TcpStream, Slot)> {
+                        let connection = (|| -> Result<(TcpStream, (Slot, Awake))> {
                             terminals
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                                     (n < 16).then_some(n + 1)
@@ -192,11 +229,12 @@ fn worker(root: PathBuf) -> Result<()> {
                                 .map_err(|_| anyhow::anyhow!("terminal capacity reached"))?;
                             let slot = Slot(terminals.clone());
                             let id = request["id"].as_str().context("missing ID")?;
-                            let tcp = runtime
+                            let mut locked = runtime
                                 .lock()
-                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
-                                .terminal(id)?;
-                            Ok((tcp, slot))
+                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
+                            let tcp = locked.terminal(id)?;
+                            let awake = Awake::open(&runtime, &mut locked, id);
+                            Ok((tcp, (slot, awake)))
                         })();
                         match connection {
                             Ok((tcp, slot)) => {
@@ -209,23 +247,28 @@ fn worker(root: PathBuf) -> Result<()> {
                             Err(error) => wire::send(&mut stream, &wire::response(Err(error)))?,
                         }
                     } else if operation == "tunnel" {
-                        let connection = (|| -> Result<TcpStream> {
+                        let connection = (|| -> Result<(TcpStream, Awake)> {
                             let id = request["id"].as_str().context("missing ID")?;
                             let port = request["port"].as_u64().context("missing port")?;
                             ensure!((1..=65535).contains(&port), "invalid port");
-                            let address = runtime
+                            let mut locked = runtime
                                 .lock()
-                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
-                                .address(id)?;
-                            Ok(TcpStream::connect_timeout(
-                                &format!("{address}:{port}").parse()?,
-                                Duration::from_secs(5),
-                            )?)
+                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
+                            let address = locked.address(id)?;
+                            let awake = Awake::open(&runtime, &mut locked, id);
+                            Ok((
+                                TcpStream::connect_timeout(
+                                    &format!("{address}:{port}").parse()?,
+                                    Duration::from_secs(5),
+                                )?,
+                                awake,
+                            ))
                         })();
                         match connection {
-                            Ok(tcp) => {
+                            Ok((tcp, awake)) => {
                                 wire::send(&mut stream, &json!({"ok":true,"result":{}}))?;
                                 std::thread::spawn(move || {
+                                    let _awake = awake;
                                     let _ = bridge(stream, tcp);
                                 });
                             }
@@ -662,7 +705,8 @@ pub fn run(cli: Cli) -> Result<i32> {
         Action::Login { .. }
         | Action::Host { .. }
         | Action::Node { .. }
-        | Action::Backup { .. } => unreachable!(),
+        | Action::Backup { .. }
+        | Action::Image { .. } => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;
             return Ok(0);

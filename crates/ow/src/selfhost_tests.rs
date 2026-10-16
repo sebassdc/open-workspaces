@@ -116,10 +116,19 @@ fn remote_scripts_quote_and_verify() {
 
 #[test]
 fn start_script_quotes_paths() {
-    let script = start_script("/home/o'k/.ow-node", "https://ctl.example:8790", 512, 1, 2);
+    let script = start_script(
+        "/home/o'k/.ow-node",
+        "https://ctl.example:8790",
+        512,
+        1,
+        2,
+        30,
+    );
     assert!(script.contains(r#"d='/home/o'\''k/.ow-node'"#));
     assert!(script.contains("--controller 'https://ctl.example:8790'"));
-    assert!(script.contains("OW_MAX_MEMORY_MIB=512 OW_MAX_RUNNING=1 OW_MAX_VCPUS=2"));
+    assert!(script.contains(
+        "OW_MAX_MEMORY_MIB=512 OW_MAX_RUNNING=1 OW_MAX_VCPUS=2 OW_IDLE_HIBERNATE_SECS=1800"
+    ));
 }
 
 #[test]
@@ -135,6 +144,7 @@ fn node_add_requires_running_controller() {
         cpus: 1,
         ubuntu: false,
         tailscale_auth_key: None,
+        idle_minutes: 30,
         ow_binary: None,
     };
     let error = node_with(OsStr::new("false"), Some(base.clone()), add()).unwrap_err();
@@ -206,6 +216,7 @@ fn host_up_then_node_add() {
             cpus: 1,
             ubuntu: false,
             tailscale_auth_key: None,
+            idle_minutes: 30,
             ow_binary: Some(binary.clone()),
         };
         node_with(fake_ssh(&tools).as_os_str(), Some(base.clone()), action)

@@ -7,6 +7,8 @@ mod client;
 mod dashboard;
 #[cfg(target_os = "linux")]
 mod host;
+#[cfg(target_os = "linux")]
+mod image;
 #[cfg(target_os = "macos")]
 mod local_terminal;
 #[cfg(target_os = "macos")]
@@ -94,6 +96,11 @@ enum Action {
         #[command(subcommand)]
         command: NodeAction,
     },
+    /// Golden images built from recipes on this machine's runner (Linux).
+    Image {
+        #[command(subcommand)]
+        command: ImageAction,
+    },
     /// Back up the controller catalog or a runner's snapshots (Linux, this machine).
     Backup {
         #[command(subcommand)]
@@ -173,7 +180,8 @@ enum Action {
     },
     Create {
         id: String,
-        #[arg(long, default_value = "alpine", value_parser = ["alpine", "arch", "ubuntu", "ubuntu-arm64"])]
+        /// alpine, ubuntu, arch, ubuntu-arm64 (Mac), or a golden image from `ow image build`.
+        #[arg(long, default_value = "alpine")]
         image: String,
         #[arg(long, default_value_t = 256)]
         memory: u32,
@@ -319,6 +327,10 @@ enum NodeAction {
         /// Join a tailnet first with the auth key held in a 0600 file or env variable.
         #[arg(long, value_name = "file:PATH|env:NAME")]
         tailscale_auth_key: Option<String>,
+        /// Hibernate a box after this many idle minutes (no connection, little CPU
+        /// or network); a connection wakes it. 0 turns it off.
+        #[arg(long, default_value_t = 30)]
+        idle_minutes: u64,
         /// Linux x86-64 ow binary to install (default: bin/ow-linux-amd64 in the
         /// asset directory, else this binary).
         #[arg(long)]
@@ -326,6 +338,32 @@ enum NodeAction {
     },
     /// List runners and whether each is online.
     List,
+}
+
+#[derive(Subcommand)]
+enum ImageAction {
+    /// Build a golden image from a recipe: a shell script, run as root in a fresh
+    /// machine with network access, whose header names its base, e.g.
+    /// `# ow-image: base=ubuntu`. The image is named after the file
+    /// (`node-dev.sh` builds `node-dev`); use it with `ow create --image node-dev`.
+    Build {
+        recipe: PathBuf,
+        /// Runner data directory (default: the `ow host up` runner).
+        #[arg(long)]
+        runner: Option<PathBuf>,
+        #[arg(long, default_value_t = 2048)]
+        memory: u32,
+        #[arg(long, default_value_t = 2)]
+        cpus: u32,
+        /// Give up on a recipe that runs longer than this.
+        #[arg(long, default_value_t = 60)]
+        timeout_minutes: u64,
+    },
+    /// Golden images built on this runner.
+    List {
+        #[arg(long)]
+        runner: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -338,7 +376,8 @@ enum BackupAction {
         #[arg(long)]
         from: Option<PathBuf>,
     },
-    /// Interim: upload sealed snapshots with `aws s3 sync` (never deletes remote copies).
+    /// Upload this runner's sealed snapshots that the store does not have yet
+    /// (compressed; never deletes remote copies).
     Snapshots {
         /// s3://bucket[/prefix]
         #[arg(long)]
@@ -347,6 +386,30 @@ enum BackupAction {
         #[arg(long)]
         from: Option<PathBuf>,
         /// S3-compatible store such as MinIO or R2 (https; http only on loopback).
+        #[arg(long)]
+        endpoint_url: Option<String>,
+    },
+    /// Download a snapshot from a store onto this runner and bring its machine up
+    /// under the same ID (the runner's worker must be running).
+    Restore {
+        snapshot: String,
+        /// s3://bucket[/prefix] the snapshot was uploaded to.
+        #[arg(long)]
+        from: String,
+        /// Runner data directory (default: the `ow host up` runner).
+        #[arg(long)]
+        to: Option<PathBuf>,
+        #[arg(long)]
+        endpoint_url: Option<String>,
+        /// Boot the snapshot's disk instead of resuming its RAM state (needed when
+        /// this host's CPU or kernel differs from the one that captured it).
+        #[arg(long)]
+        cold: bool,
+    },
+    /// List the snapshots in a store.
+    List {
+        /// s3://bucket[/prefix]
+        store: String,
         #[arg(long)]
         endpoint_url: Option<String>,
     },
@@ -362,6 +425,10 @@ enum HostAction {
         /// Local runner ID (default: hostname).
         #[arg(long)]
         node: Option<String>,
+        /// Hibernate a box after this many idle minutes (no connection, little CPU
+        /// or network); a connection wakes it. 0 turns it off.
+        #[arg(long, default_value_t = 30)]
+        idle_minutes: u64,
         #[arg(long, default_value_t = 2048)]
         memory: u32,
         #[arg(long, default_value_t = 2)]
@@ -484,6 +551,19 @@ fn main_result() -> anyhow::Result<i32> {
             anyhow::bail!("ow node runs on the Linux controller machine (ow host up)");
         }
     }
+    if let Action::Image { command } = cli.command {
+        anyhow::ensure!(
+            cli.server.is_none(),
+            "images are built on this machine's runner; omit --server"
+        );
+        #[cfg(target_os = "linux")]
+        return image::run(cli.data_dir, command);
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop(command);
+            anyhow::bail!("ow image runs on the Linux runner machine");
+        }
+    }
     if let Action::Backup { command } = cli.command {
         anyhow::ensure!(
             cli.server.is_none(),
@@ -504,14 +584,23 @@ fn main_result() -> anyhow::Result<i32> {
             memory,
             slots,
             cpus,
+            idle_minutes,
         } = command
         {
             anyhow::ensure!(cli.server.is_none(), "host up is local; omit --server");
             #[cfg(target_os = "linux")]
-            return selfhost::up(cli.data_dir, listen, node, memory, slots, cpus);
+            return selfhost::up(
+                cli.data_dir,
+                listen,
+                node,
+                memory,
+                slots,
+                cpus,
+                idle_minutes,
+            );
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = (listen, node, memory, slots, cpus);
+                let _ = (listen, node, memory, slots, cpus, idle_minutes);
                 anyhow::bail!("host up requires Linux x86-64 with KVM");
             }
         }
