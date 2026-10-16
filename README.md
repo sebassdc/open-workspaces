@@ -40,6 +40,10 @@ and TLS acceptance passed; live gateway/dashboard pool acceptance awaits
 planner review and a dedicated invitation. macOS guests remain pending.
 See the [Mac operator guide](docs/MAC_HOST.md) and [integration evidence](docs/plans/mac-node-report.md).
 
+Single-host mode: `ow host up` runs the controller and a runner on one Linux
+machine, and `ow node add ssh://user@host` adds any SSH-reachable KVM machine
+as another runner. See [single-host mode and SSH runners](docs/SINGLE_HOST.md).
+
 ## Read first
 
 1. [Agent handoff](docs/HANDOFF.md): context, first task, and acceptance criteria.

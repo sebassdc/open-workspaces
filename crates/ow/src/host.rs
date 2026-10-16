@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn data_root(value: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn data_root(value: Option<PathBuf>) -> Result<PathBuf> {
     let path = value
         .or_else(|| std::env::var_os("OW_DATA_DIR").map(PathBuf::from))
         .unwrap_or(std::env::current_dir()?.join("data/prototype"));
@@ -631,7 +631,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             remote::run(&config, listen, None)?;
             return Ok(0);
         }
-        Action::Login { .. } | Action::Host { .. } => unreachable!(),
+        Action::Login { .. } | Action::Host { .. } | Action::Node { .. } => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;
             return Ok(0);
