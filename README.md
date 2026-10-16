@@ -50,6 +50,9 @@ as another runner (`ssm://` and `tailscale://` targets go through AWS Systems
 Manager or a tailnet). See [single-host mode and SSH runners](docs/SINGLE_HOST.md).
 The `ow-core` crate holds the compute, connect and capability traits, and
 `ow backup` copies the catalog and snapshots; see [core traits and backups](docs/CORE.md).
+Idle boxes hibernate and wake on the next connection, snapshots restore from S3
+onto another runner, and `ow image build` makes golden images from recipes; see
+[wake on connect, snapshot store and golden images](docs/DAILY_USE.md).
 
 ## Read first
 

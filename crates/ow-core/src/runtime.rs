@@ -80,12 +80,15 @@ fn resources(memory: u32, cpus: u32) -> Result<()> {
 fn default_image() -> String {
     "alpine".into()
 }
+/// Built-in image profiles, prepared from runtime assets.
+pub const PROFILES: [&str; 3] = ["alpine", "arch", "ubuntu"];
+/// Golden images (`ow image build`) are built on these developer profiles.
+pub const GOLDEN_BASES: [&str; 2] = ["ubuntu", "arch"];
+
+/// A built-in profile or the name of a golden image; whether a golden image is
+/// built on this runner is checked when a machine is created from it.
 pub fn image_profile(image: &str) -> Result<()> {
-    ensure!(
-        ["alpine", "arch", "ubuntu"].contains(&image),
-        "unsupported image profile"
-    );
-    Ok(())
+    identifier(image).context("unsupported image profile")
 }
 
 #[cfg(test)]
@@ -97,6 +100,14 @@ mod image_tests {
             assert!(parse_limit(value, 4096).is_err());
         }
         assert_eq!(parse_limit("512", 4096).unwrap(), 512);
+    }
+    #[test]
+    fn idle_counters_parse_proc_files() {
+        assert!(cpu_ticks(std::process::id()).is_some());
+        let dev = "Inter-|   Receive\n face |bytes packets\n   ow1: 1000 5 0 0 0 0 0 0 2000 4 0 0 0 0 0 0\n  ow12: 7 1 0 0 0 0 0 0 9 1 0 0 0 0 0 0\n";
+        assert_eq!(tap_bytes(dev, "ow1"), Some(3000));
+        assert_eq!(tap_bytes(dev, "ow12"), Some(16));
+        assert_eq!(tap_bytes(dev, "ow2"), None);
     }
     #[test]
     fn existing_workspaces_keep_the_alpine_profile() {
@@ -267,6 +278,28 @@ fn install_file(machine: &mut Vm, binary: &Path, guest: &str, digest: &str) -> R
     Ok(())
 }
 
+const SLEEP: &str = "sleep-";
+
+/// utime + stime of a process, in clock ticks.
+fn cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the parenthesised command name; utime and stime are fields 14 and 15.
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
+}
+
+/// Received plus sent bytes of one interface, from `/proc/net/dev` text.
+fn tap_bytes(dev: &str, tap: &str) -> Option<u64> {
+    let line = dev
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix(tap)?.strip_prefix(':'))?;
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .map(|f| f.parse().ok())
+        .collect::<Option<_>>()?;
+    Some(fields.first()? + fields.get(8)?)
+}
+
 pub const BACKEND: &str = "firecracker";
 /// Firecracker supports every flag: paired snapshots, live forks, hibernation, exec and SSH.
 pub const CAPABILITIES: Capabilities = Capabilities::ALL;
@@ -291,11 +324,14 @@ pub struct Runtime {
     cpu: String,
     kernel_hash: String,
     verified: BTreeMap<String, Vec<Fingerprint>>,
+    pub idle: crate::idle::Idle,
 }
 
 impl Runtime {
     pub fn ssh(&mut self, id: &str) -> Result<(std::net::TcpStream, String)> {
         identifier(id)?;
+        // Waking first: resuming replaces the stream generation in the policy.
+        self.wake(id)?;
         let policy = crate::ssh_guest::load(&self.root, id)?;
         ensure!(
             policy.ready && !policy.keys.is_empty(),
@@ -394,6 +430,7 @@ impl Runtime {
             cpu,
             kernel_hash,
             verified: BTreeMap::new(),
+            idle: crate::idle::Idle::from_env()?,
         };
         runtime.save()?;
         Ok(runtime)
@@ -462,7 +499,48 @@ impl Runtime {
     }
 
     pub fn address(&mut self, id: &str) -> Result<String> {
+        self.wake(id)?;
         Ok(self.running(id)?.address.clone())
+    }
+
+    /// Wake on connect: a connection or command resumes a hibernated machine.
+    /// A stopped machine stays stopped.
+    fn wake(&mut self, id: &str) -> Result<()> {
+        if !self.machines.contains_key(id) && self.workspace(id)?.state == "hibernated" {
+            self.start(id).context("waking hibernated workspace")?;
+        }
+        Ok(())
+    }
+
+    /// Hibernates running machines that have been idle for the configured
+    /// timeout (`OW_IDLE_HIBERNATE_SECS`). Returns each attempt's result.
+    pub fn hibernate_idle(&mut self) -> Vec<(String, Result<Value>)> {
+        if !self.idle.enabled() {
+            return Vec::new();
+        }
+        let net = fs::read_to_string("/proc/self/net/dev").unwrap_or_default();
+        let now = std::time::Instant::now();
+        let mut due = Vec::new();
+        for (id, machine) in &self.machines {
+            let (Some(cpu), Some(bytes)) =
+                (cpu_ticks(machine.child.id()), tap_bytes(&net, &machine.tap))
+            else {
+                continue;
+            };
+            if self.idle.due(id, cpu, bytes, now) {
+                due.push(id.clone());
+            }
+        }
+        due.into_iter()
+            .map(|id| {
+                let result = self.request(&json!({"op":"hibernate","id":id}));
+                if result.is_err() {
+                    // Retry after another full timeout, not every check.
+                    self.idle.touch(&id, now);
+                }
+                (id, result)
+            })
+            .collect()
     }
 
     fn spawn(&mut self, workspace: &Workspace, snapshot: Option<&Path>, fork: bool) -> Result<()> {
@@ -510,6 +588,7 @@ impl Runtime {
             )?;
         }
         self.machines.insert(workspace.id.clone(), machine);
+        self.idle.touch(&workspace.id, std::time::Instant::now());
         Ok(())
     }
 
@@ -568,6 +647,13 @@ impl Runtime {
         );
         let source_disk = if let Some(name) = snapshot {
             self.snapshot_dir(name).join("disk.ext4")
+        } else if !PROFILES.contains(&image) {
+            let disk = self.root.join("images").join(image).join("disk.ext4");
+            ensure!(
+                disk.is_file(),
+                "image {image} is not built on this runner; run ow image build"
+            );
+            disk
         } else {
             self.assets.join(if image == "alpine" {
                 "guest/base.ext4".to_string()
@@ -669,12 +755,24 @@ impl Runtime {
         self.spawn(&workspace, snapshot.as_deref(), false)?;
         let workspace = self.state.workspaces.get_mut(id).unwrap();
         workspace.state = "running".into();
-        workspace.hibernation = None;
+        let slept = workspace.hibernation.take();
         self.save()?;
+        // A resumed hibernation capture is spent; keeping it would leak one per sleep.
+        // The running VMM keeps its mapped memory file until it exits.
+        if let Some(name) = slept.filter(|n| n.starts_with(SLEEP))
+            && let Some(directory) = snapshot
+        {
+            self.verified.remove(&name);
+            if let Err(e) = fs::remove_dir_all(&directory) {
+                eprintln!("removing spent hibernation {name}: {e}");
+            }
+        }
         Ok(json!(self.state.workspaces[id]))
     }
 
-    fn capture(&mut self, id: &str, name: &str) -> Result<Value> {
+    /// Seals a RAM+disk snapshot. With `hibernate` the paused VM is dropped right after
+    /// the capture, so nothing the guest does while the files are hashed is lost.
+    fn capture(&mut self, id: &str, name: &str, hibernate: bool) -> Result<Value> {
         identifier(name)?;
         let workspace = self.workspace(id)?;
         self.storage_headroom(workspace.memory_mib as u64 * 1024 * 1024)?;
@@ -700,7 +798,13 @@ impl Runtime {
         let staging = self.snapshot_dir(&format!(".pending-{}", vm::nonce()?));
         fs::create_dir(&staging)?;
         let disk = self.machine_dir(id).join("disk.ext4");
-        self.running(id)?.capture(&staging, &disk)?;
+        self.running(id)?.capture(&staging, &disk, !hibernate)?;
+        if hibernate {
+            self.machines.remove(id);
+            // Until the capture is sealed, the live disk is the machine's state.
+            self.state.workspaces.get_mut(id).unwrap().state = "stopped".into();
+            self.save()?;
+        }
         let mut files = BTreeMap::new();
         for file in ["state", "memory", "disk.ext4"] {
             files.insert(file.into(), hash(&staging.join(file))?);
@@ -728,15 +832,22 @@ impl Runtime {
     }
 
     fn validate_snapshot(&mut self, name: &str) -> Result<PathBuf> {
+        self.verify_snapshot(name, true)
+    }
+
+    /// Checks a snapshot's files against its manifest and, when its RAM state will be
+    /// resumed, that this host's runtime, CPU and guest kernel match its capture.
+    fn verify_snapshot(&mut self, name: &str, resume: bool) -> Result<PathBuf> {
         identifier(name)?;
         let directory = self.snapshot_dir(name);
         let snapshot: Snapshot =
             serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
         ensure!(
-            snapshot.runtime == "firecracker-v1.17.0"
-                && snapshot.cpu == self.cpu
-                && snapshot.kernel_sha256 == self.kernel_hash,
-            "snapshot runtime, CPU or guest kernel is incompatible"
+            !resume
+                || (snapshot.runtime == "firecracker-v1.17.0"
+                    && snapshot.cpu == self.cpu
+                    && snapshot.kernel_sha256 == self.kernel_hash),
+            "snapshot runtime, CPU or guest kernel is incompatible; restore it with --cold to boot its disk"
         );
         ensure!(snapshot.files.len() == 3, "snapshot manifest is incomplete");
         let before = fingerprints(&directory)?;
@@ -757,6 +868,121 @@ impl Runtime {
         Ok(directory)
     }
 
+    /// Brings up a machine from a snapshot copied onto this runner (for example by
+    /// `ow backup restore`), as the same machine ID it was captured from: its RAM
+    /// state resumed, or with `cold` its disk booted fresh (for a host whose CPU or
+    /// kernel differs).
+    fn import(&mut self, name: &str, cold: bool) -> Result<Value> {
+        let directory = self.verify_snapshot(name, !cold)?;
+        let snapshot: Snapshot =
+            serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+        let id = snapshot.workspace.clone();
+        identifier(&id)?;
+        ensure!(
+            !self.state.workspaces.contains_key(&id),
+            "workspace {id} already exists on this runner; start or delete it"
+        );
+        ensure!(
+            self.state.workspaces.len() < MAX_WORKSPACES,
+            "workspace limit ({MAX_WORKSPACES}) reached"
+        );
+        ensure!(
+            self.state.next_index < 8192,
+            "prototype network address allocation exhausted"
+        );
+        self.storage_headroom(0)?;
+        let machine = self.machine_dir(&id);
+        ensure!(
+            !machine.exists(),
+            "unregistered workspace directory exists; preserve and inspect it"
+        );
+        fs::create_dir(&machine)?;
+        if cold {
+            vm::reflink(&directory.join("disk.ext4"), &machine.join("disk.ext4"))?;
+        }
+        let workspace = Workspace {
+            id: id.clone(),
+            index: self.state.next_index,
+            state: if cold { "stopped" } else { "hibernated" }.into(),
+            memory_mib: snapshot.memory_mib,
+            vcpu_count: snapshot.vcpu_count,
+            image: snapshot.image,
+            source: None,
+            hibernation: (!cold).then(|| name.to_owned()),
+        };
+        self.state.next_index += 1;
+        self.state.workspaces.insert(id.clone(), workspace);
+        self.save()?;
+        self.start(&id)
+    }
+
+    /// Golden images built on this runner: `images/NAME/{disk.ext4,manifest.json}`.
+    fn images(&self) -> Result<Vec<Value>> {
+        let mut images = Vec::new();
+        let Ok(entries) = fs::read_dir(self.root.join("images")) else {
+            return Ok(images);
+        };
+        for entry in entries {
+            let path = entry?.path().join("manifest.json");
+            if path.is_file() {
+                images.push(serde_json::from_slice(&fs::read(path)?)?);
+            }
+        }
+        images.sort_by(|a: &Value, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(images)
+    }
+
+    /// Promotes a stopped builder machine's disk to golden image `name`, replacing
+    /// an older build of it. Machines already created from the old build keep their
+    /// own disks.
+    fn save_image(&mut self, id: &str, name: &str, recipe_sha256: &str) -> Result<Value> {
+        identifier(name)?;
+        ensure!(
+            !PROFILES.contains(&name) && name != "ubuntu-arm64",
+            "{name} is a built-in image"
+        );
+        ensure!(
+            recipe_sha256.len() == 64 && recipe_sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid recipe hash"
+        );
+        let builder = self.workspace(id)?;
+        ensure!(
+            !self.machines.contains_key(id) && builder.state == "stopped",
+            "stop the builder machine before saving its disk"
+        );
+        ensure!(
+            GOLDEN_BASES.contains(&builder.image.as_str()),
+            "golden images are built on {GOLDEN_BASES:?}"
+        );
+        // Runners advertise every golden image to the controller, which takes 32.
+        ensure!(
+            self.images()?.iter().filter(|i| i["name"] != name).count() < 32,
+            "golden image limit (32) reached"
+        );
+        let images = self.root.join("images");
+        fs::create_dir_all(&images)?;
+        let staging = images.join(format!(".pending-{}", vm::nonce()?));
+        fs::create_dir(&staging)?;
+        let disk = staging.join("disk.ext4");
+        vm::reflink(&self.machine_dir(id).join("disk.ext4"), &disk)?;
+        let manifest = json!({"name":name,"base":builder.image,"recipe_sha256":recipe_sha256,
+            "disk_sha256":hash(&disk)?,"built_unix":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()});
+        atomic_json(&staging.join("manifest.json"), &manifest)?;
+        fs::set_permissions(&disk, fs::Permissions::from_mode(0o400))?;
+        let target = images.join(name);
+        // shortcut: a create during the two renames sees no image and fails; retry it.
+        let old = images.join(format!(".old-{}", vm::nonce()?));
+        if target.exists() {
+            fs::rename(&target, &old)?;
+        }
+        fs::rename(&staging, &target)?;
+        File::open(&images)?.sync_all()?;
+        if old.exists() {
+            fs::remove_dir_all(&old)?;
+        }
+        Ok(manifest)
+    }
+
     pub fn request(&mut self, request: &Value) -> Result<Value> {
         let exited: Vec<_> = self
             .machines
@@ -772,12 +998,18 @@ impl Runtime {
         }
         let op = request["op"].as_str().context("missing operation")?;
         let id = request["id"].as_str().unwrap_or("");
+        if !id.is_empty() && op != "hibernate" {
+            self.idle.touch(id, std::time::Instant::now());
+        }
+        if matches!(op, "exec" | "shell-exec" | "put" | "get" | "ssh-keys") {
+            self.wake(id)?;
+        }
         match op {
             "status" => Ok(
                 json!({"runtime":"Firecracker v1.17.0","running":self.machines.len(),
                 "worker_pid":std::process::id(),"guest_ssh_v1":true,
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
-                "max_snapshots":MAX_SNAPSHOTS,"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
+                "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
             "list" => Ok(json!(self.state.workspaces.values().collect::<Vec<_>>())),
             "stats" => {
@@ -844,6 +1076,20 @@ impl Runtime {
                 Ok(json!(self.state.workspaces[id]))
             }
             "start" => self.start(id),
+            "images" => Ok(json!(self.images()?)),
+            "image-save" => self.save_image(
+                id,
+                request["name"].as_str().context("missing image name")?,
+                request["recipe_sha256"]
+                    .as_str()
+                    .context("missing recipe hash")?,
+            ),
+            "import" => self.import(
+                request["snapshot"]
+                    .as_str()
+                    .context("missing snapshot name")?,
+                request["cold"].as_bool().unwrap_or(false),
+            ),
             "stop" => self.stop(id),
             "delete" => self.delete(id),
             "ssh-info" => Ok(crate::ssh_guest::info(&crate::ssh_guest::load(
@@ -922,12 +1168,15 @@ impl Runtime {
             "snapshot" => self.capture(
                 id,
                 request["name"].as_str().context("missing snapshot name")?,
+                false,
             ),
             "snapshots" => {
                 let mut snapshots = Vec::<Snapshot>::new();
                 for item in fs::read_dir(self.root.join("snapshots"))? {
-                    let path = item?.path().join("manifest.json");
-                    if path.exists() {
+                    let item = item?;
+                    let path = item.path().join("manifest.json");
+                    // Hibernation captures are internal to their machine.
+                    if path.exists() && !item.file_name().to_string_lossy().starts_with(SLEEP) {
                         snapshots.push(serde_json::from_slice(&fs::read(path)?)?);
                     }
                 }
@@ -951,7 +1200,7 @@ impl Runtime {
                 let generated = format!("fork-{}", vm::nonce()?);
                 let name = supplied.unwrap_or(&generated);
                 if supplied.is_none() {
-                    self.capture(id, name)?;
+                    self.capture(id, name, false)?;
                 }
                 let directory = self.validate_snapshot(name)?;
                 let snapshot: Snapshot =
@@ -974,9 +1223,8 @@ impl Runtime {
                 if workspace.state == "hibernated" {
                     return Ok(json!(workspace));
                 }
-                let name = format!("sleep-{}", vm::nonce()?);
-                self.capture(id, &name)?;
-                self.machines.remove(id);
+                let name = format!("{SLEEP}{}", vm::nonce()?);
+                self.capture(id, &name, true)?;
                 let workspace = self.state.workspaces.get_mut(id).unwrap();
                 workspace.state = "hibernated".into();
                 workspace.hibernation = Some(name);

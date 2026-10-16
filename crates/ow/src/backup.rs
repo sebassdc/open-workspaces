@@ -1,14 +1,15 @@
 //! Backups: a consistent SQLite copy of the controller catalog, and an interim
-//! push of a runner's sealed snapshots to S3-compatible storage.
-use crate::{BackupAction, selfhost};
+//! runner's sealed snapshots to an S3-compatible [`SnapshotStore`], restorable
+//! onto another runner.
+use crate::{BackupAction, common, selfhost, wire};
 use anyhow::{Context, Result, ensure};
+use ow_core::snapshot_store::{S3Store, SnapshotStore};
 use rusqlite::Connection;
 use serde_json::json;
 use std::{
     fs,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -35,14 +36,118 @@ pub fn run(base: Option<PathBuf>, action: BackupAction) -> Result<i32> {
                 Some(dir) => dir,
                 None => selfhost::base(base)?.join("runner"),
             };
-            let status = snapshots(&from.join("snapshots"), &to, endpoint_url.as_deref())?
-                .status()
-                .context("the AWS CLI (aws) is required for snapshot sync")?;
-            ensure!(status.success(), "snapshot sync failed ({status})");
-            println!("Snapshots in {} synced to {to}", from.display());
+            let store = S3Store::new(&to, endpoint_url.as_deref())?;
+            let pushed = push_new(&store, &from.join("snapshots"))?;
+            println!("{}", json!({"store":to,"uploaded":pushed}));
+            Ok(0)
+        }
+        BackupAction::Restore {
+            snapshot,
+            from,
+            to,
+            endpoint_url,
+            cold,
+        } => {
+            common::identifier(&snapshot)?;
+            let runner = match to {
+                Some(dir) => dir,
+                None => selfhost::base(base)?.join("runner"),
+            };
+            let store = S3Store::new(&from, endpoint_url.as_deref())?;
+            fetch(&store, &snapshot, &runner.join("snapshots"))?;
+            let result = wire::request(
+                &runner,
+                json!({"op":"import","snapshot":snapshot,"cold":cold}),
+            )
+            .with_context(|| {
+                format!("starting the machine of {snapshot} on {}", runner.display())
+            })?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(0)
+        }
+        BackupAction::List {
+            store,
+            endpoint_url,
+        } => {
+            let names = S3Store::new(&store, endpoint_url.as_deref())?.list()?;
+            println!("{}", json!(names));
             Ok(0)
         }
     }
+}
+
+/// Uploads every sealed snapshot in `dir` that the store lacks; staging
+/// (`.pending-*`) never counts. Returns the uploaded names.
+fn push_new(store: &dyn SnapshotStore, dir: &Path) -> Result<Vec<String>> {
+    ensure!(
+        dir.is_dir(),
+        "no snapshots at {}; pass --from with the runner's data directory",
+        dir.display()
+    );
+    let stored = store.list()?;
+    let mut pushed = Vec::new();
+    let mut entries = fs::read_dir(dir)?
+        .map(|e| Ok(e?.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort();
+    for name in entries {
+        let path = dir.join(&name);
+        if name.starts_with('.') || !path.join("manifest.json").is_file() {
+            continue;
+        }
+        if stored.contains(&name) {
+            // Already stored only if it is this snapshot; never skip a different one.
+            let remote: serde_json::Value = serde_json::from_slice(&store.manifest(&name)?)
+                .with_context(|| format!("invalid stored manifest for {name}"))?;
+            let local = ow_core::snapshot_store::read_manifest(&path.join("manifest.json"), &name)?;
+            ensure!(
+                remote == local,
+                "the store already has a different snapshot named {name}; use a prefix per runner"
+            );
+            continue;
+        }
+        store
+            .push(&name, &path)
+            .with_context(|| format!("uploading snapshot {name}"))?;
+        pushed.push(name);
+    }
+    Ok(pushed)
+}
+
+/// Downloads `name` into `dir` (a runner's snapshots) through a staging directory,
+/// so a partial download is never a snapshot. A snapshot of that name already on
+/// the runner is used only when it is the one in the store (same manifest, which
+/// holds the workspace and every file's hash); any other is refused.
+fn fetch(store: &dyn SnapshotStore, name: &str, dir: &Path) -> Result<()> {
+    let target = dir.join(name);
+    if target.join("manifest.json").exists() {
+        let stored: serde_json::Value = serde_json::from_slice(&store.manifest(name)?)
+            .with_context(|| format!("invalid stored manifest for {name}"))?;
+        let local = ow_core::snapshot_store::read_manifest(&target.join("manifest.json"), name)?;
+        ensure!(
+            stored == local,
+            "this runner already has a different snapshot named {name} (workspace {}, \
+             the store's is for {}); restore onto another runner or delete the local one",
+            local["workspace"],
+            stored["workspace"]
+        );
+        return Ok(());
+    }
+    ensure!(
+        dir.is_dir(),
+        "no runner at {}; start its worker first or pass --to",
+        dir.display()
+    );
+    ensure!(
+        !target.exists(),
+        "incomplete snapshot {} exists; preserve and inspect it",
+        target.display()
+    );
+    let staging = dir.join(format!(".pending-{}", common::nonce()?));
+    store.pull(name, &staging)?;
+    fs::rename(&staging, &target)?;
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Copies a live catalog with `VACUUM INTO` (one read transaction, so writers keep
@@ -76,51 +181,6 @@ fn catalog(source: &Path, output: &Path) -> Result<u64> {
         let _ = fs::remove_file(output);
     }
     copied
-}
-
-/// `aws s3 sync` of sealed snapshot directories; staging (`.pending-*`) is skipped.
-/// shortcut: shells out to the AWS CLI and never deletes remote copies; the phase 2
-/// `SnapshotStore` replaces it with retention and a tested restore.
-fn snapshots(dir: &Path, to: &str, endpoint: Option<&str>) -> Result<Command> {
-    ensure!(
-        to.strip_prefix("s3://")
-            .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/')),
-        "--to takes s3://bucket[/prefix]"
-    );
-    ensure!(
-        dir.is_dir(),
-        "no snapshots at {}; pass --from with the runner's data directory",
-        dir.display()
-    );
-    let mut command = Command::new("aws");
-    command
-        .args(["s3", "sync", "--only-show-errors", "--no-follow-symlinks"])
-        .args(["--exclude", ".pending-*"])
-        .arg(dir)
-        .arg(to)
-        // Only the endpoint checked below may redirect the upload: the AWS CLI also
-        // reads AWS_ENDPOINT_URL* and profile `endpoint_url`, which are never checked.
-        .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true");
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("AWS_ENDPOINT_URL") {
-            command.env_remove(name);
-        }
-    }
-    if let Some(endpoint) = endpoint {
-        let url = reqwest::Url::parse(endpoint).context("--endpoint-url must be a URL")?;
-        // Snapshots hold guest memory: plain HTTP only to a store on this machine.
-        let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
-        let loopback = host == "localhost"
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        ensure!(
-            url.scheme() == "https" || (url.scheme() == "http" && loopback),
-            "--endpoint-url must use https (http only for loopback)"
-        );
-        command.args(["--endpoint-url", endpoint]);
-    }
-    Ok(command)
 }
 
 #[cfg(test)]
@@ -166,46 +226,98 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn snapshot_sync_skips_staging_and_requires_safe_endpoints() {
-        let dir = temp("snapshots");
-        let args = |to: &str, endpoint: Option<&str>| {
-            snapshots(&dir, to, endpoint).map(|c| {
-                c.get_args()
-                    .map(|a| a.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-            })
-        };
-        let plain = args("s3://bucket/ow", None).unwrap();
-        assert_eq!(&plain[..2], ["s3", "sync"]);
-        assert!(plain.windows(2).any(|w| w == ["--exclude", ".pending-*"]));
-        assert_eq!(plain.last().unwrap(), "s3://bucket/ow");
-        let minio = args("s3://b", Some("http://127.0.0.1:9000")).unwrap();
-        assert_eq!(
-            &minio[minio.len() - 2..],
-            ["--endpoint-url", "http://127.0.0.1:9000"]
-        );
-        assert!(args("s3://b", Some("https://r2.example.com")).is_ok());
-        for (to, endpoint) in [
-            ("/tmp/x", None),
-            ("s3://", None),
-            ("s3:///x", None),
-            ("s3://b", Some("http://store.example.com")),
-            ("s3://b", Some("ftp://127.0.0.1")),
-        ] {
-            assert!(args(to, endpoint).is_err(), "{to} {endpoint:?} accepted");
+    /// A store in a local directory, standing in for S3.
+    struct Dir(PathBuf);
+    impl SnapshotStore for Dir {
+        fn list(&self) -> Result<Vec<String>> {
+            let mut names = Vec::new();
+            for e in fs::read_dir(&self.0)? {
+                let e = e?;
+                if e.path().join("manifest.json").exists() {
+                    names.push(e.file_name().to_string_lossy().into_owned());
+                }
+            }
+            Ok(names)
         }
-        assert!(snapshots(&dir.join("missing"), "s3://b", None).is_err());
-        // Endpoints from the environment or a profile are ignored, never trusted.
-        let envs: Vec<_> = snapshots(&dir, "s3://b", None)
+        fn push(&self, name: &str, directory: &Path) -> Result<()> {
+            fs::create_dir(self.0.join(name))?;
+            for f in ["state", "memory", "disk.ext4", "manifest.json"] {
+                fs::copy(directory.join(f), self.0.join(name).join(f))?;
+            }
+            Ok(())
+        }
+        fn manifest(&self, name: &str) -> Result<Vec<u8>> {
+            Ok(fs::read(self.0.join(name).join("manifest.json"))?)
+        }
+        fn pull(&self, name: &str, directory: &Path) -> Result<()> {
+            ensure!(self.0.join(name).join("manifest.json").exists(), "missing");
+            fs::create_dir(directory)?;
+            for f in ["state", "memory", "disk.ext4", "manifest.json"] {
+                fs::copy(self.0.join(name).join(f), directory.join(f))?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn push_skips_staging_and_stored_and_fetch_never_leaves_partials() {
+        let (runner, remote, other) = (temp("runner"), temp("remote"), temp("other"));
+        let manifest = |name: &str, workspace: &str| {
+            let h = "a".repeat(64);
+            json!({"name":name,"workspace":workspace,"files":{"state":h,"memory":h,"disk.ext4":h}})
+                .to_string()
+        };
+        for name in ["a", "b", ".pending-x"] {
+            fs::create_dir(runner.join(name)).unwrap();
+            for f in ["state", "memory", "disk.ext4"] {
+                fs::write(runner.join(name).join(f), name).unwrap();
+            }
+            fs::write(
+                runner.join(name).join("manifest.json"),
+                manifest(name, "box-b"),
+            )
+            .unwrap();
+        }
+        fs::create_dir(runner.join("unsealed")).unwrap();
+        let store = Dir(remote.clone());
+        assert_eq!(push_new(&store, &runner).unwrap(), ["a", "b"]);
+        assert!(
+            push_new(&store, &runner).unwrap().is_empty(),
+            "uploaded twice"
+        );
+        // Another runner's same-named snapshot in the store is not taken for ours.
+        fs::write(remote.join("a/manifest.json"), manifest("a", "box-x")).unwrap();
+        assert!(
+            push_new(&store, &runner).is_err(),
+            "skipped a different stored snapshot"
+        );
+        fs::write(remote.join("a/manifest.json"), manifest("a", "box-b")).unwrap();
+        assert!(push_new(&store, &runner.join("missing")).is_err());
+
+        fetch(&store, "a", &other).unwrap();
+        assert_eq!(fs::read(other.join("a/memory")).unwrap(), b"a");
+        fetch(&store, "a", &other).unwrap(); // already there
+        assert!(fetch(&store, "nope", &other).is_err());
+        let left: Vec<_> = fs::read_dir(&other)
             .unwrap()
-            .get_envs()
-            .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+            .map(|e| e.unwrap().file_name())
             .collect();
-        assert!(envs.contains(&(
-            "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS".into(),
-            Some("true".into())
-        )));
-        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(left, ["a"], "a failed download left files behind");
+        fs::create_dir(other.join("b")).unwrap();
+        assert!(
+            fetch(&store, "b", &other).is_err(),
+            "adopted an incomplete snapshot"
+        );
+        fs::remove_dir(other.join("b")).unwrap();
+        // A same-named local snapshot of another workspace is never used instead.
+        fs::create_dir(other.join("b")).unwrap();
+        fs::write(other.join("b/manifest.json"), manifest("b", "box-a")).unwrap();
+        let error = fetch(&store, "b", &other).unwrap_err().to_string();
+        assert!(error.contains("different snapshot named b"), "{error}");
+        fs::write(other.join("b/manifest.json"), manifest("b", "box-b")).unwrap();
+        fetch(&store, "b", &other).unwrap();
+        for d in [runner, remote, other] {
+            fs::remove_dir_all(d).unwrap();
+        }
     }
 }

@@ -321,13 +321,18 @@ impl Vm {
         Ok(())
     }
 
-    pub fn capture(&mut self, directory: &Path, disk: &Path) -> Result<()> {
+    /// Pauses the guest and captures RAM state and disk. The guest resumes afterwards,
+    /// unless `resume` is false and the capture succeeded (hibernation drops the VM).
+    pub fn capture(&mut self, directory: &Path, disk: &Path, resume: bool) -> Result<()> {
         self.checked("sync")?;
         self.api("PATCH", "/vm", json!({"state":"Paused"}))?;
         let captured = (|| {
             self.api("PUT", "/snapshot/create", json!({"snapshot_type":"Full","snapshot_path":directory.join("state"),"mem_file_path":directory.join("memory")}))?;
             reflink(disk, &directory.join("disk.ext4"))
         })();
+        if captured.is_ok() && !resume {
+            return Ok(());
+        }
         let resumed = self.api("PATCH", "/vm", json!({"state":"Resumed"}));
         captured?;
         resumed

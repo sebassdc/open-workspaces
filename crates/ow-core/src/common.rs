@@ -181,12 +181,16 @@ pub fn node_capabilities(v: &serde_json::Value) -> Result<()> {
         "unsupported backend/architecture/runtime tuple"
     );
     ensure!(
-        v["images"].as_array().is_some_and(|a| a.len() <= 3
-            && a.iter().all(|i| if mac {
-                i == "ubuntu-arm64"
-            } else {
-                matches!(i.as_str(), Some("alpine" | "arch" | "ubuntu"))
-            })),
+        // Linux runners add golden images (`ow image build`) to the built-in profiles.
+        v["images"]
+            .as_array()
+            .is_some_and(|a| a.len() <= if mac { 3 } else { 3 + 32 }
+                && a.iter().all(|i| if mac {
+                    i == "ubuntu-arm64"
+                } else {
+                    i.as_str()
+                        .is_some_and(|i| i != "ubuntu-arm64" && identifier(i).is_ok())
+                })),
         "incompatible prepared image"
     );
     if mac {
@@ -218,6 +222,13 @@ mod backend_tests {
     fn tuples_and_legacy_operations() {
         let legacy = json!({"type":"heartbeat","protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":1024,"slots":2,"vcpus":2,"images":["ubuntu"]});
         assert!(node_capabilities(&legacy).is_ok());
+        let mut golden = legacy.clone();
+        golden["images"] = json!(["alpine", "ubuntu", "devtools"]);
+        assert!(node_capabilities(&golden).is_ok());
+        for images in [json!(["ubuntu-arm64"]), json!(["../x"]), json!([1])] {
+            golden["images"] = images;
+            assert!(node_capabilities(&golden).is_err());
+        }
         assert!(node_operation(&legacy, "fork").is_ok());
         let mac = json!({"type":"heartbeat","protocol":1,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":2048,"slots":1,"vcpus":2,"images":["ubuntu-arm64"],"max_guest_memory_mib":2048,"max_guest_vcpus":2,"guest_ssh_v1":false,"operations":MAC_OPERATIONS});
         assert!(node_capabilities(&mac).is_ok());

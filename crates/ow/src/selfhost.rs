@@ -141,6 +141,7 @@ pub fn up(
     memory: u32,
     slots: u32,
     cpus: u32,
+    idle_minutes: u64,
 ) -> Result<i32> {
     common::host_limits(memory, slots, cpus)?;
     let base = self::base(base)?;
@@ -213,6 +214,7 @@ pub fn up(
         .env("OW_MAX_MEMORY_MIB", memory.to_string())
         .env("OW_MAX_RUNNING", slots.to_string())
         .env("OW_MAX_VCPUS", cpus.to_string())
+        .env(ow_core::idle::ENV, (idle_minutes * 60).to_string())
         .stdout(Stdio::null())
         .status()?;
     ensure!(
@@ -366,7 +368,15 @@ chmod "$3" "$1/$2.part"
 mv -f "$1/$2.part" "$1/$2"
 "#;
 
-fn start_script(dir: &str, url: &str, memory: u32, slots: u32, cpus: u32) -> String {
+fn start_script(
+    dir: &str,
+    url: &str,
+    memory: u32,
+    slots: u32,
+    cpus: u32,
+    idle_minutes: u64,
+) -> String {
+    let idle = idle_minutes * 60;
     let (d, url) = (common::shell_quote(dir), common::shell_quote(url));
     format!(
         r#"#!/bin/sh
@@ -375,7 +385,7 @@ set -eu
 d={d}
 # Non-interactive SSH sessions often omit sbin, where nft and ip live.
 export PATH="$PATH:/usr/sbin:/sbin"
-export OW_ASSET_DIR="$d/assets" OW_MAX_MEMORY_MIB={memory} OW_MAX_RUNNING={slots} OW_MAX_VCPUS={cpus}
+export OW_ASSET_DIR="$d/assets" OW_MAX_MEMORY_MIB={memory} OW_MAX_RUNNING={slots} OW_MAX_VCPUS={cpus} OW_IDLE_HIBERNATE_SECS={idle}
 "$d/bin/ow" --local --data-dir "$d/data" up >/dev/null
 if [ -e "$d/data/node-agent.lock" ] && ! flock -n "$d/data/node-agent.lock" true; then
   echo "node agent already running" >&2
@@ -406,6 +416,7 @@ fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i
         ubuntu,
         tailscale_auth_key,
         ow_binary,
+        idle_minutes,
     } = action
     else {
         println!(
@@ -583,7 +594,7 @@ fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i
         &format!("{WRITE}\nexec sh \"$1/$2\""),
         &[&dir, "start.sh", "700"],
         Stdio::null(),
-        start_script(&dir, &url, memory, slots, cpus).as_bytes(),
+        start_script(&dir, &url, memory, slots, cpus, idle_minutes).as_bytes(),
     )?;
     ensure!(
         wait_online(&controller, &name, since, Duration::from_secs(45)),

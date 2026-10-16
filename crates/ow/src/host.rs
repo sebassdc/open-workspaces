@@ -98,6 +98,35 @@ fn bridge(mut unix: UnixStream, mut tcp: TcpStream) -> Result<()> {
     Ok(())
 }
 
+/// Anything that keeps idle bookkeeping: the runtime, or a stand-in in tests.
+trait Streams {
+    fn idle(&mut self) -> &mut ow_core::idle::Idle;
+}
+impl Streams for Runtime {
+    fn idle(&mut self) -> &mut ow_core::idle::Idle {
+        &mut self.idle
+    }
+}
+
+/// Keeps a machine awake (no automatic hibernation) while one of its streams is open.
+struct Awake<T: Streams>(Arc<Mutex<T>>, String);
+impl<T: Streams> Awake<T> {
+    /// Takes the lock guard and releases it: dropping an `Awake` locks the runtime,
+    /// so it must never outlive a guard held on the same thread.
+    fn open(runtime: &Arc<Mutex<T>>, mut locked: std::sync::MutexGuard<'_, T>, id: &str) -> Self {
+        locked.idle().open(id, Instant::now());
+        drop(locked);
+        Self(runtime.clone(), id.to_owned())
+    }
+}
+impl<T: Streams> Drop for Awake<T> {
+    fn drop(&mut self) {
+        if let Ok(mut runtime) = self.0.lock() {
+            runtime.idle().close(&self.1, Instant::now());
+        }
+    }
+}
+
 fn worker(root: PathBuf) -> Result<()> {
     unsafe {
         libc::umask(0o077);
@@ -130,7 +159,22 @@ fn worker(root: PathBuf) -> Result<()> {
     listener.set_nonblocking(true)?;
     let stopping = Arc::new(AtomicBool::new(false));
     let terminals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut idle_check = Instant::now();
     while !stopping.load(Ordering::SeqCst) {
+        // On this thread: hibernation must not race the VMMs this thread spawns.
+        if idle_check.elapsed() >= Duration::from_secs(5) {
+            idle_check = Instant::now();
+            let results = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
+                .hibernate_idle();
+            for (id, result) in results {
+                match result {
+                    Ok(_) => eprintln!("idle: hibernated {id}"),
+                    Err(e) => eprintln!("idle: hibernating {id} failed: {e:#}"),
+                }
+            }
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let runtime = runtime.clone();
@@ -161,11 +205,17 @@ fn worker(root: PathBuf) -> Result<()> {
                             }
                             let slot = Slot(terminals.clone());
                             let id = request["id"].as_str().context("missing ID")?;
-                            let (tcp, generation) = runtime
+                            let mut locked = runtime
                                 .lock()
-                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
-                                .ssh(id)?;
-                            Ok((tcp, generation, crate::ssh_guest::path(&root, id), slot))
+                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
+                            let (tcp, generation) = locked.ssh(id)?;
+                            let awake = Awake::open(&runtime, locked, id);
+                            Ok((
+                                tcp,
+                                generation,
+                                crate::ssh_guest::path(&root, id),
+                                (slot, awake),
+                            ))
                         })();
                         match connection {
                             Ok((tcp, generation, path, slot)) => {
@@ -184,7 +234,7 @@ fn worker(root: PathBuf) -> Result<()> {
                                 self.0.fetch_sub(1, Ordering::SeqCst);
                             }
                         }
-                        let connection = (|| -> Result<(TcpStream, Slot)> {
+                        let connection = (|| -> Result<(TcpStream, (Slot, Awake<Runtime>))> {
                             terminals
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                                     (n < 16).then_some(n + 1)
@@ -192,11 +242,12 @@ fn worker(root: PathBuf) -> Result<()> {
                                 .map_err(|_| anyhow::anyhow!("terminal capacity reached"))?;
                             let slot = Slot(terminals.clone());
                             let id = request["id"].as_str().context("missing ID")?;
-                            let tcp = runtime
+                            let mut locked = runtime
                                 .lock()
-                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
-                                .terminal(id)?;
-                            Ok((tcp, slot))
+                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
+                            let tcp = locked.terminal(id)?;
+                            let awake = Awake::open(&runtime, locked, id);
+                            Ok((tcp, (slot, awake)))
                         })();
                         match connection {
                             Ok((tcp, slot)) => {
@@ -209,23 +260,28 @@ fn worker(root: PathBuf) -> Result<()> {
                             Err(error) => wire::send(&mut stream, &wire::response(Err(error)))?,
                         }
                     } else if operation == "tunnel" {
-                        let connection = (|| -> Result<TcpStream> {
+                        let connection = (|| -> Result<(TcpStream, Awake<Runtime>)> {
                             let id = request["id"].as_str().context("missing ID")?;
                             let port = request["port"].as_u64().context("missing port")?;
                             ensure!((1..=65535).contains(&port), "invalid port");
-                            let address = runtime
+                            let mut locked = runtime
                                 .lock()
-                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
-                                .address(id)?;
-                            Ok(TcpStream::connect_timeout(
-                                &format!("{address}:{port}").parse()?,
-                                Duration::from_secs(5),
-                            )?)
+                                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
+                            let address = locked.address(id)?;
+                            let awake = Awake::open(&runtime, locked, id);
+                            Ok((
+                                TcpStream::connect_timeout(
+                                    &format!("{address}:{port}").parse()?,
+                                    Duration::from_secs(5),
+                                )?,
+                                awake,
+                            ))
                         })();
                         match connection {
-                            Ok(tcp) => {
+                            Ok((tcp, awake)) => {
                                 wire::send(&mut stream, &json!({"ok":true,"result":{}}))?;
                                 std::thread::spawn(move || {
+                                    let _awake = awake;
                                     let _ = bridge(stream, tcp);
                                 });
                             }
@@ -662,7 +718,8 @@ pub fn run(cli: Cli) -> Result<i32> {
         Action::Login { .. }
         | Action::Host { .. }
         | Action::Node { .. }
-        | Action::Backup { .. } => unreachable!(),
+        | Action::Backup { .. }
+        | Action::Image { .. } => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;
             return Ok(0);
@@ -793,4 +850,43 @@ pub fn run(cli: Cli) -> Result<i32> {
         serde_json::to_string_pretty(&wire::request(&root, request)?)?
     );
     Ok(0)
+}
+
+#[cfg(test)]
+mod awake_tests {
+    use super::*;
+
+    struct Fake(ow_core::idle::Idle);
+    impl Streams for Fake {
+        fn idle(&mut self) -> &mut ow_core::idle::Idle {
+            &mut self.0
+        }
+    }
+
+    #[test]
+    fn a_failed_connection_after_opening_releases_the_runtime() {
+        let runtime = Arc::new(Mutex::new(Fake(ow_core::idle::Idle::new(Some(
+            Duration::from_secs(60),
+        )))));
+        let (done, finished) = std::sync::mpsc::channel();
+        let shared = runtime.clone();
+        std::thread::spawn(move || {
+            // The tunnel path: open, then a refused connection drops the guard.
+            let result = (|| -> Result<Awake<Fake>> {
+                let locked = shared.lock().unwrap();
+                let awake = Awake::open(&shared, locked, "box");
+                TcpStream::connect_timeout(&"127.0.0.1:1".parse()?, Duration::from_secs(1))?;
+                Ok(awake)
+            })();
+            let _ = done.send(result.is_err());
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "worker deadlocked"
+        );
+        let later = Instant::now() + Duration::from_secs(120);
+        // The stream was closed again, so the box can go idle.
+        assert!(runtime.lock().unwrap().0.due("box", 0, 0, later));
+    }
 }

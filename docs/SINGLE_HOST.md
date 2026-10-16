@@ -32,7 +32,9 @@ ow --data-dir /data/ow host up  # base directory on Btrfs, shorter than 52 bytes
 creates a private CA in `~/.ow/tls` on first use. It then starts the controller
 and enrolls the local runner, named after the hostname (`--node` to change it).
 Budgets default to 2048 MiB, 2 running guests and 2 vCPUs per runner
-(`--memory`, `--slots`, `--cpus`).
+(`--memory`, `--slots`, `--cpus`). Boxes idle for 30 minutes hibernate and wake
+on the next connection (`--idle-minutes`, 0 to turn off; `ow node add` takes the
+same flag). See [wake on connect](DAILY_USE.md).
 
 The controller listens on this machine's Tailscale IPv4 address at port 8790.
 Without a running Tailscale it listens on loopback only, so it is never on a
@@ -153,7 +155,8 @@ heartbeat in the last 15 seconds. Revoke a runner with
 
 `ow backup catalog --output FILE` copies the live controller catalog;
 `ow backup snapshots --to s3://bucket/prefix` uploads the runner's sealed
-snapshots. See [backups](CORE.md#backups).
+snapshots and `ow backup restore` brings one up on another runner. See
+[backups](CORE.md#backups) and [snapshot store](DAILY_USE.md#snapshot-store).
 
 ## Limits
 
