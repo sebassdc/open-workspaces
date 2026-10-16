@@ -132,7 +132,8 @@ fn recipe_run(runner: &Path, id: &str, text: &str) -> Result<String> {
         json!({"op":"put","id":id,"path":SCRIPT,"data":STANDARD.encode(text)}),
     )?;
     Ok(format!(
-        "cd /root && HOME=/root DEBIAN_FRONTEND=noninteractive nohup sh -c 'sh {SCRIPT} >/root/ow-recipe.log 2>&1; echo $? >/root/ow-recipe.exit' </dev/null >/dev/null 2>&1 &"
+        // In a subshell: the serial transport appends `; …` to the command.
+        "(cd /root && HOME=/root DEBIAN_FRONTEND=noninteractive nohup sh -c 'sh {SCRIPT} >/root/ow-recipe.log 2>&1; echo $? >/root/ow-recipe.exit' </dev/null >/dev/null 2>&1 &)"
     ))
 }
 
