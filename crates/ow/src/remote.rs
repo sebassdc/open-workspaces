@@ -388,7 +388,14 @@ async fn handle(app: &App, request: Request) -> Response {
     }
     if app.dashboard.is_some() {
         let controls = owner_controls(app, &identity).await;
-        return crate::dashboard::handle(app.catalog.clone(), identity, request, controls).await;
+        return crate::dashboard::handle(
+            app.catalog.clone(),
+            app.dashboard.clone(),
+            identity,
+            request,
+            controls,
+        )
+        .await;
     }
     let (parts, body) = request.into_parts();
     let path = parts
@@ -1304,15 +1311,23 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(root.join("control.sock")).unwrap();
         let terminals = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicUsize::new(0));
-        let (opened, ended) = (terminals.clone(), closed.clone());
+        // A "slow" exec holds its reply (and so the gateway's catalog lock) until released.
+        let slow = Arc::new(AtomicUsize::new(0));
+        let (opened, ended, held) = (terminals.clone(), closed.clone(), slow.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                let (opened, ended) = (opened.clone(), ended.clone());
+                let (opened, ended, held) = (opened.clone(), ended.clone(), held.clone());
                 std::thread::spawn(move || {
                     let Ok(request) = crate::wire::line(&mut stream) else {
                         return;
                     };
+                    if request["command"] == "slow" {
+                        held.store(1, Ordering::SeqCst);
+                        while held.load(Ordering::SeqCst) == 1 {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
                     let result = match request["op"].as_str().unwrap_or("") {
                         "list" => {
                             json!([{"id":"legacy","state":"running","memory_mib":256,"vcpu_count":1,"image":"alpine"}])
@@ -1417,13 +1432,25 @@ mod tests {
         while terminals.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let (code, value) = api(
-            alice.clone(),
-            json!({"op":"unshare","id":"legacy","with":"bob@example.test"}),
-        )
-        .await;
-        assert_eq!(code, StatusCode::OK, "{value}");
+        // Bob's slow exec holds the catalog lock while the owner unshares.
+        let pending = tokio::spawn(api(
+            bob.clone(),
+            json!({"op":"exec","id":shared,"command":"slow"}),
+        ));
+        while slow.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let started = Instant::now();
+        let (code, value) = tokio::time::timeout(
+            Duration::from_secs(3),
+            api(
+                alice.clone(),
+                json!({"op":"unshare","id":"legacy","with":"bob@example.test"}),
+            ),
+        )
+        .await
+        .expect("unshare waited behind a slow worker request");
+        assert_eq!(code, StatusCode::OK, "{value}");
         let ended = tokio::task::spawn_blocking(move || {
             loop {
                 match socket.read() {
@@ -1444,6 +1471,13 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert_eq!(
+            slow.load(Ordering::SeqCst),
+            1,
+            "slow exec was still in flight"
+        );
+        slow.store(2, Ordering::SeqCst);
+        pending.await.unwrap();
         assert_eq!(api(bob.clone(), exec).await.0, StatusCode::CONFLICT);
         assert!(terminal(bob).await.unwrap().is_err());
         server.abort();

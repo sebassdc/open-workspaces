@@ -276,6 +276,7 @@ pub async fn with_catalog<T: Send + 'static>(
 
 pub async fn handle(
     catalog: Option<Arc<Mutex<Catalog>>>,
+    root: Option<std::path::PathBuf>,
     identity: Identity,
     request: Request,
     host_controls: bool,
@@ -362,10 +363,23 @@ pub async fn handle(
             );
         }
     };
-    let result = with_catalog(catalog, identity, move |catalog, user| {
-        catalog.operation(user, operation)
-    })
-    .await;
+    let result = if matches!(operation["op"].as_str(), Some("share" | "unshare")) {
+        // Not through with_catalog: a slow worker call there must not delay a revocation.
+        match root {
+            Some(root) => tokio::task::spawn_blocking(move || {
+                crate::catalog::share_unlocked(&root, &identity, &operation)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r),
+            None => Err(anyhow::anyhow!("ownership catalog unavailable")),
+        }
+    } else {
+        with_catalog(catalog, identity, move |catalog, user| {
+            catalog.operation(user, operation)
+        })
+        .await
+    };
     secure(match result {
         Ok(value) => Json(json!({"ok":true,"result":value})).into_response(),
         // Worker diagnostics may contain host paths; keep detailed error text in operator logs.

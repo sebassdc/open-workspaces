@@ -450,7 +450,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
 }
 
 fn shell(url: &str, token: &str, id: &str) -> Result<i32> {
-    common::identifier(id)?;
+    common::address(id)?;
     ensure!(
         unsafe { libc::isatty(0) } == 1,
         "ow shell requires an interactive terminal; use ow exec for scripts"

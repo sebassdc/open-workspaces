@@ -57,6 +57,128 @@ fn cut(user: i64, physical: &str) {
     }
 }
 
+/// Bind a verified identity to its user row (by subject, or a reserved email) and return its ID.
+fn user_on(db: &mut Connection, identity: &Identity) -> Result<i64> {
+    ensure!(
+        !identity.subject.is_empty()
+            && identity.subject.len() <= 512
+            && identity.email.len() <= 254,
+        "invalid identity"
+    );
+    let email = identity.email.to_ascii_lowercase();
+    let tx = db.transaction()?;
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM users WHERE issuer=?1 AND subject=?2",
+            params![identity.issuer, identity.subject],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let id = if let Some(id) = existing {
+        id
+    } else {
+        let reserved: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT id,subject FROM users WHERE issuer=?1 AND email=?2",
+                params![identity.issuer, email],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, subject)) = reserved {
+            ensure!(subject.is_none(), "email already bound to another subject");
+            tx.execute(
+                "UPDATE users SET subject=?1 WHERE id=?2 AND subject IS NULL",
+                params![identity.subject, id],
+            )?;
+            id
+        } else {
+            tx.execute(
+                "INSERT INTO users(issuer,subject,email) VALUES(?1,?2,?3)",
+                params![identity.issuer, identity.subject, email],
+            )?;
+            tx.last_insert_rowid()
+        }
+    };
+    tx.commit()?;
+    Ok(id)
+}
+fn shared_with(db: &Connection, physical: &str) -> Result<Value> {
+    let mut stmt = db.prepare("SELECT u.email,g.role FROM grants g JOIN users u ON u.id=g.grantee WHERE g.physical=?1 ORDER BY u.email")?;
+    let rows = stmt.query_map([physical], |r| {
+        Ok(json!({"email":r.get::<_, String>(0)?,"role":r.get::<_, String>(1)?}))
+    })?;
+    Ok(json!(rows.collect::<rusqlite::Result<Vec<_>>>()?))
+}
+/// `share` grants a teammate (by login email) a role on an owned machine; `unshare` removes
+/// it and closes their open terminal and SSH streams. Machines they forked stay theirs.
+fn share_on(db: &mut Connection, user: i64, op: &str, request: &Value) -> Result<Value> {
+    let name = request["id"].as_str().context("id")?;
+    common::identifier(name)?;
+    let physical: String = db
+        .query_row(
+            "SELECT physical FROM resources WHERE owner=?1 AND kind='machine' AND name=?2",
+            params![user, name],
+            |r| r.get(0),
+        )
+        .optional()?
+        .context("resource not found")?;
+    let email = request["with"]
+        .as_str()
+        .context("teammate email required")?
+        .to_ascii_lowercase();
+    common::email(&email)?;
+    let tx = db.transaction()?;
+    let issuer: String =
+        tx.query_row("SELECT issuer FROM users WHERE id=?1", [user], |r| r.get(0))?;
+    if op == "share" {
+        // An email nobody has logged in with yet is reserved; its first verified login binds it.
+        tx.execute(
+            "INSERT INTO users(issuer,email) VALUES(?1,?2) ON CONFLICT(issuer,email) DO NOTHING",
+            params![issuer, email],
+        )?;
+    }
+    let grantee: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM users WHERE issuer=?1 AND email=?2",
+            params![issuer, email],
+            |r| r.get(0),
+        )
+        .optional()?;
+    ensure!(grantee != Some(user), "you already own this machine");
+    if let Some(grantee) = grantee {
+        if op == "share" {
+            let role = request["role"].as_str().unwrap_or("use");
+            ensure!(matches!(role, "use" | "admin"), "role must be use or admin");
+            tx.execute("INSERT INTO grants(physical,grantee,role) VALUES(?1,?2,?3) ON CONFLICT(physical,grantee) DO UPDATE SET role=excluded.role",params![physical,grantee,role])?;
+        } else {
+            tx.execute(
+                "DELETE FROM grants WHERE physical=?1 AND grantee=?2",
+                params![physical, grantee],
+            )?;
+        }
+    }
+    tx.commit()?;
+    if op == "unshare"
+        && let Some(grantee) = grantee
+    {
+        cut(grantee, &physical);
+    }
+    Ok(json!({"id":name,"shared_with":shared_with(db, &physical)?}))
+}
+/// Share or unshare on a connection of its own. The gateway's catalog lock is held across
+/// worker calls, and revoking access must not wait behind a slow request it revokes.
+pub fn share_unlocked(root: &Path, identity: &Identity, request: &Value) -> Result<Value> {
+    let op = request["op"].as_str().context("op")?;
+    ensure!(matches!(op, "share" | "unshare"), "not a sharing operation");
+    let path = root.join("catalog.sqlite3");
+    nodes::private(&path)?;
+    let mut db = Connection::open(path)?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+    let user = user_on(&mut db, identity)?;
+    share_on(&mut db, user, op, request)
+}
+
 /// What a grantee may do on a machine shared with them. Resize and sharing stay with the owner.
 fn permitted(role: &str, op: &str) -> bool {
     match role {
@@ -228,48 +350,7 @@ impl Catalog {
         )?)
     }
     pub fn user(&mut self, identity: &Identity) -> Result<i64> {
-        ensure!(
-            !identity.subject.is_empty()
-                && identity.subject.len() <= 512
-                && identity.email.len() <= 254,
-            "invalid identity"
-        );
-        let email = identity.email.to_ascii_lowercase();
-        let tx = self.db.transaction()?;
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM users WHERE issuer=?1 AND subject=?2",
-                params![identity.issuer, identity.subject],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let id = if let Some(id) = existing {
-            id
-        } else {
-            let reserved: Option<(i64, Option<String>)> = tx
-                .query_row(
-                    "SELECT id,subject FROM users WHERE issuer=?1 AND email=?2",
-                    params![identity.issuer, email],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            if let Some((id, subject)) = reserved {
-                ensure!(subject.is_none(), "email already bound to another subject");
-                tx.execute(
-                    "UPDATE users SET subject=?1 WHERE id=?2 AND subject IS NULL",
-                    params![identity.subject, id],
-                )?;
-                id
-            } else {
-                tx.execute(
-                    "INSERT INTO users(issuer,subject,email) VALUES(?1,?2,?3)",
-                    params![identity.issuer, identity.subject, email],
-                )?;
-                tx.last_insert_rowid()
-            }
-        };
-        tx.commit()?;
-        Ok(id)
+        user_on(&mut self.db, identity)
     }
 
     fn physical(&self, user: i64, kind: &str, name: &str) -> Result<String> {
@@ -315,60 +396,8 @@ impl Catalog {
         );
         Ok(physical)
     }
-    fn shared_with(&self, physical: &str) -> Result<Value> {
-        let mut stmt = self.db.prepare("SELECT u.email,g.role FROM grants g JOIN users u ON u.id=g.grantee WHERE g.physical=?1 ORDER BY u.email")?;
-        let rows = stmt.query_map([physical], |r| {
-            Ok(json!({"email":r.get::<_, String>(0)?,"role":r.get::<_, String>(1)?}))
-        })?;
-        Ok(json!(rows.collect::<rusqlite::Result<Vec<_>>>()?))
-    }
-    /// `share` grants a teammate (by login email) a role on an owned machine; `unshare` removes
-    /// it and closes their open terminal and SSH streams. Machines they forked stay theirs.
     fn share(&mut self, user: i64, op: &str, request: &Value) -> Result<Value> {
-        let name = request["id"].as_str().context("id")?;
-        let physical = self.physical(user, "machine", name)?;
-        let email = request["with"]
-            .as_str()
-            .context("teammate email required")?
-            .to_ascii_lowercase();
-        common::email(&email)?;
-        let tx = self.db.transaction()?;
-        let issuer: String =
-            tx.query_row("SELECT issuer FROM users WHERE id=?1", [user], |r| r.get(0))?;
-        if op == "share" {
-            // An email nobody has logged in with yet is reserved; its first verified login binds it.
-            tx.execute(
-                "INSERT INTO users(issuer,email) VALUES(?1,?2) ON CONFLICT(issuer,email) DO NOTHING",
-                params![issuer, email],
-            )?;
-        }
-        let grantee: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM users WHERE issuer=?1 AND email=?2",
-                params![issuer, email],
-                |r| r.get(0),
-            )
-            .optional()?;
-        ensure!(grantee != Some(user), "you already own this machine");
-        if let Some(grantee) = grantee {
-            if op == "share" {
-                let role = request["role"].as_str().unwrap_or("use");
-                ensure!(matches!(role, "use" | "admin"), "role must be use or admin");
-                tx.execute("INSERT INTO grants(physical,grantee,role) VALUES(?1,?2,?3) ON CONFLICT(physical,grantee) DO UPDATE SET role=excluded.role",params![physical,grantee,role])?;
-            } else {
-                tx.execute(
-                    "DELETE FROM grants WHERE physical=?1 AND grantee=?2",
-                    params![physical, grantee],
-                )?;
-            }
-        }
-        tx.commit()?;
-        if op == "unshare"
-            && let Some(grantee) = grantee
-        {
-            cut(grantee, &physical);
-        }
-        Ok(json!({"id":name,"shared_with":self.shared_with(&physical)?}))
+        share_on(&mut self.db, user, op, request)
     }
     fn reserve(&mut self, user: i64, kind: &str, name: &str) -> Result<String> {
         common::identifier(name)?;
@@ -542,7 +571,7 @@ impl Catalog {
             let mut value = self.view(user, &kind, &physical, &metadata, &node)?;
             if kind == "machine" {
                 reserved += memory;
-                value["shared_with"] = self.shared_with(&physical)?;
+                value["shared_with"] = shared_with(&self.db, &physical)?;
                 machines.push(value);
             } else {
                 snapshots.push(value);
@@ -1188,6 +1217,22 @@ impl Catalog {
         self.reconcile()?;
         Ok(value)
     }
+    /// Register a stream, then check access again: unshare runs outside the catalog lock, so a
+    /// grant deleted before this check denies the stream and one deleted after it cuts it.
+    fn watched(
+        &self,
+        user: i64,
+        name: &str,
+        op: &str,
+        physical: &str,
+    ) -> Result<Arc<tokio::sync::Notify>> {
+        let notify = session(user, physical);
+        ensure!(
+            self.machine(user, name, op)? == physical,
+            "resource not found"
+        );
+        Ok(notify)
+    }
     /// Route for a gateway SSH stream; the returned notify fires when the user loses access.
     pub fn ssh_target(
         &self,
@@ -1198,7 +1243,11 @@ impl Catalog {
         let node = self.placement("machine", &physical)?;
         nodes::ssh_capable(&self.root, &node)?;
         let route = nodes::route(&self.root, &node)?;
-        Ok((route, physical.clone(), session(user, &physical)))
+        Ok((
+            route,
+            physical.clone(),
+            self.watched(user, name, "ssh", &physical)?,
+        ))
     }
     pub fn terminal_target(
         &self,
@@ -1209,7 +1258,11 @@ impl Catalog {
         let node = self.placement("machine", &physical)?;
         nodes::operation_capable(&self.root, &node, "terminal")?;
         let route = nodes::route(&self.root, &node)?;
-        Ok((route, physical.clone(), session(user, &physical)))
+        Ok((
+            route,
+            physical.clone(),
+            self.watched(user, name, "terminal", &physical)?,
+        ))
     }
 
     #[cfg(test)]
