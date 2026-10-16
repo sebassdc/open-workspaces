@@ -26,7 +26,7 @@ workflow runs the checks and creates that tag. The same tag is the default
 `ref` the host builds, so set `ref` explicitly before the first release exists.
 
 ```bash
-pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.1.0
+pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.1.1
 ```
 
 ```typescript
