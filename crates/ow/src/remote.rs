@@ -387,7 +387,9 @@ async fn handle(app: &App, request: Request) -> Response {
         return host_admin(app, identity, request).await;
     }
     if app.dashboard.is_some() {
-        let controls = owner_controls(app, &identity).await;
+        // Owner controls only shape /api/state. Checking them takes the catalog lock, which a
+        // slow worker call can hold, so other paths (unshare above all) must not wait for it.
+        let controls = request.uri().path() == "/api/state" && owner_controls(app, &identity).await;
         return crate::dashboard::handle(
             app.catalog.clone(),
             app.dashboard.clone(),
@@ -1347,18 +1349,28 @@ mod tests {
                 });
             }
         });
-        let catalog = crate::catalog::Catalog::open(
+        let mut catalog = crate::catalog::Catalog::open(
             &root,
             "https://test-team.cloudflareaccess.com",
             Some("owner@example.test"),
         )
         .unwrap();
+        // The owner is also the configured gateway (host pool) owner.
+        let owner = catalog
+            .user(&crate::catalog::Identity {
+                issuer: "https://test-team.cloudflareaccess.com".into(),
+                subject: "test-subject".into(),
+                email: "owner@example.test".into(),
+            })
+            .unwrap();
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = tcp.local_addr().unwrap().port();
         let (key, set) = signing_key();
         let mut cfg = config("http://127.0.0.1:1".into());
         cfg.hostname = format!("localhost:{port}");
         cfg.allowed_emails.push("bob@example.test".into());
+        cfg.node_owner_subject = Some("test-subject".into());
+        cfg.node_owner_user_id = Some(owner);
         let gateway = router(App {
             dashboard: Some(root.clone()),
             catalog: Some(Arc::new(std::sync::Mutex::new(catalog))),
@@ -1411,6 +1423,23 @@ mod tests {
                 tungstenite::connect(req).map(|(socket, _)| socket)
             })
         };
+        let state = |jwt: String| {
+            let gateway = gateway.clone();
+            let host = host.clone();
+            async move {
+                let req = Request::builder()
+                    .uri("/api/state")
+                    .header("host", &host)
+                    .header("cf-access-jwt-assertion", jwt)
+                    .body(Body::empty())
+                    .unwrap();
+                let response = gateway.oneshot(req).await.unwrap();
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            }
+        };
+        assert_eq!(state(alice.clone()).await["result"]["host_controls"], true);
+        assert_eq!(state(bob.clone()).await["result"]["host_controls"], false);
         let exec = json!({"op":"exec","id":shared,"command":"id"});
         assert!(terminal(bob.clone()).await.unwrap().is_err());
         assert_eq!(api(bob.clone(), exec.clone()).await.0, StatusCode::CONFLICT);
