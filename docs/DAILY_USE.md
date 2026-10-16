@@ -74,7 +74,8 @@ ow backup restore SNAPSHOT --from s3://my-bucket/ow/runner-1 [--to RUNNER_DIR] [
 
 `backup snapshots` uploads every sealed snapshot the store does not have yet,
 including hibernated boxes' captures, and never deletes remote copies. Use one
-prefix per runner. `--endpoint-url` takes an https store (http only on
+prefix per runner: a same-named snapshot in the store that is not this one
+stops the upload instead of being skipped. `--endpoint-url` takes an https store (http only on
 loopback); endpoint settings from the environment or a profile are ignored.
 
 `backup restore` downloads the snapshot onto the runner (default: the

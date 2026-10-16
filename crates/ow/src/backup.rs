@@ -92,8 +92,18 @@ fn push_new(store: &dyn SnapshotStore, dir: &Path) -> Result<Vec<String>> {
     entries.sort();
     for name in entries {
         let path = dir.join(&name);
-        if name.starts_with('.') || !path.join("manifest.json").is_file() || stored.contains(&name)
-        {
+        if name.starts_with('.') || !path.join("manifest.json").is_file() {
+            continue;
+        }
+        if stored.contains(&name) {
+            // Already stored only if it is this snapshot; never skip a different one.
+            let remote: serde_json::Value = serde_json::from_slice(&store.manifest(&name)?)
+                .with_context(|| format!("invalid stored manifest for {name}"))?;
+            let local = ow_core::snapshot_store::read_manifest(&path.join("manifest.json"), &name)?;
+            ensure!(
+                remote == local,
+                "the store already has a different snapshot named {name}; use a prefix per runner"
+            );
             continue;
         }
         store
@@ -275,6 +285,13 @@ mod tests {
             push_new(&store, &runner).unwrap().is_empty(),
             "uploaded twice"
         );
+        // Another runner's same-named snapshot in the store is not taken for ours.
+        fs::write(remote.join("a/manifest.json"), manifest("a", "box-x")).unwrap();
+        assert!(
+            push_new(&store, &runner).is_err(),
+            "skipped a different stored snapshot"
+        );
+        fs::write(remote.join("a/manifest.json"), manifest("a", "box-b")).unwrap();
         assert!(push_new(&store, &runner.join("missing")).is_err());
 
         fetch(&store, "a", &other).unwrap();
