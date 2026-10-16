@@ -954,6 +954,11 @@ impl Runtime {
             GOLDEN_BASES.contains(&builder.image.as_str()),
             "golden images are built on {GOLDEN_BASES:?}"
         );
+        // Runners advertise every golden image to the controller, which takes 32.
+        ensure!(
+            self.images()?.iter().filter(|i| i["name"] != name).count() < 32,
+            "golden image limit (32) reached"
+        );
         let images = self.root.join("images");
         fs::create_dir_all(&images)?;
         let staging = images.join(format!(".pending-{}", vm::nonce()?));
