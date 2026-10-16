@@ -74,6 +74,8 @@ and 8 running machines. Controller state lives in `/srv/ow/.ow`. The controller
 listens on the host's Tailscale address (port 8790) when Tailscale is up, and on
 loopback only otherwise. Workspace commands through the wrapper go to the local
 runner (`/srv/ow/.ow/runner`); `node add` needs SSH access from the `ow` user.
+Boxes idle for 30 minutes hibernate and wake on the next connection; see
+[wake on connect](../../docs/DAILY_USE.md).
 
 With Tailscale, the host joins your tailnet under `tailscaleHostname`. The
 auth key is read once at boot into a root-only file under `/run`, passed to

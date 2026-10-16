@@ -89,28 +89,16 @@ catalog, so runners enrolled before the backup should reconnect when the
 controller URL and CA (`~/.ow/tls`) are unchanged; that reconnect is not tested
 yet (only the restored catalog's contents are).
 
-### Snapshots (interim)
+### Snapshots
 
 ```sh
 ow backup snapshots --to s3://my-bucket/ow/runner-1
-ow backup snapshots --to s3://ow --endpoint-url https://minio.internal:9000
+ow backup restore SNAPSHOT --from s3://my-bucket/ow/runner-1
 ```
 
-Runs `aws s3 sync` of the runner's `snapshots/` directory. Only sealed
-snapshots are sent: a snapshot directory appears only once complete, and
-staging directories (`.pending-*`) are skipped. Credentials come from the AWS
-CLI's usual chain. `--endpoint-url` points at any S3-compatible store; it must
-be `https`, except a store on loopback. It is the only endpoint used: `ow` runs
-the CLI with `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true` and without any
-`AWS_ENDPOINT_URL*` variables, so an endpoint from the environment or a
-profile's `endpoint_url` (which would skip that check) is ignored.
-
-Snapshots contain guest memory and disks, including any credentials in them.
-Use a private bucket with encryption at rest (default on AWS S3) and
-least-privilege write credentials. This is a stopgap: it never deletes remote
-copies, uploads sparse disks in full, and has no restore command. The
-`SnapshotStore` trait with an S3 implementation and a tested restore onto a new
-runner is OS phase 2.
+Through the `SnapshotStore` trait (OS phase 2): compressed uploads of the
+snapshots the store lacks, and a hash-checked restore onto another runner. See
+[snapshot store](DAILY_USE.md#snapshot-store).
 
 ## Evidence
 
@@ -118,17 +106,18 @@ Observed on 2026-10-16:
 
 - Unit tests: capability mapping and checks, provider dispatch, target parsing
   for all three schemes, CLI command-to-flag mapping, catalog backup (private,
-  consistent under an open write transaction, never overwrites) and snapshot
-  sync arguments. Run with `cargo test -p ow-core -p ow`.
+  consistent under an open write transaction, never overwrites) and, since
+  phase 2, snapshot store upload and restore staging. Run with `cargo test -p ow-core -p ow`.
 - `scripts/connect-e2e.sh`: real OpenSSH in a Linux container through each
   provider, against sshd on loopback, with stand-in `aws` and `tailscale`
   commands that check their exact arguments and then tunnel. Quoting, stdin
   and master-connection reuse pass for `ssh://`, `ssm://` and `tailscale://`.
 - In a Linux container: `ow backup catalog` from a controller with an enrolled
   runner, restored onto a fresh controller directory, which then listed the
-  runner; `ow backup snapshots` against a local S3 server (moto) uploaded the
-  four files of a sealed snapshot byte-identical, skipped `.pending-*`, and a
-  plain-HTTP non-loopback endpoint was refused.
+  runner; the phase 1 `ow backup snapshots` (`aws s3 sync`, since replaced by
+  the snapshot store) against a local S3 server (moto) uploaded the four files
+  of a sealed snapshot byte-identical, skipped `.pending-*`, and a plain-HTTP
+  non-loopback endpoint was refused.
 - Inherited endpoints, with AWS CLI 2.38.1 in a Linux container: for each of
   `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3` and a profile `endpoint_url`
   pointing at a plain-HTTP store on a non-loopback address, the bare

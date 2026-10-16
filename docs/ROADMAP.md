@@ -44,6 +44,26 @@ See [core traits and backups](CORE.md).
   and an interim `ow backup snapshots` sync to S3-compatible storage (https,
   or http on loopback; inherited AWS endpoint settings are ignored).
 
+## Open-source roadmap: OS phase 2, daily-use features
+
+See [wake on connect, snapshot store and golden images](DAILY_USE.md).
+
+- [x] Wake on connect: SSH, terminal, published-port, exec and file connections
+  resume a hibernated box in the worker, so direct SSH, SSM and the controller
+  path all wake it. Idle boxes hibernate automatically (`--idle-minutes`,
+  default 30 for `ow host up` and `ow node add`): no stream, no operation, under
+  2% CPU and 1 KiB/s network. Checked on EC2 over SSH and SSM; a real tailnet
+  connection is pending.
+- [x] `SnapshotStore` trait with an S3 implementation (zstd, manifest last,
+  hash-checked sparse downloads); `ow backup snapshots`, `ow backup restore`
+  onto a new runner (RAM resumed or `--cold`), `ow backup list`. Restore onto a
+  fresh runner through real S3 passed. Pending: adopting a restored box into a
+  controller catalog.
+- [x] Golden images from code: `ow image build RECIPE` (shell recipe with a
+  `# ow-image: base=…` header) and `ow create --image NAME`; runners advertise
+  them to the controller. Example: [`images/devtools.sh`](../images/devtools.sh).
+- [ ] Sharing: grants, `owner/name`, `ow share` / `ow unshare`.
+
 ## Completed local pilot checks
 
 - Real guest boot, exec/exit status, binary file transfer and loopback HTTP access.
