@@ -132,7 +132,7 @@ Evidence (2026-10-16): `catalog::multinode_tests::sharing_roles_owner_addresses_
 `remote::tests::unshare_closes_a_grantees_live_terminal` (gateway, signed
 tokens, real WSS terminal, fake worker, unshare while the grantee's slow exec
 holds the catalog lock) run with `cargo test`. The ignored
-`remote::tests::sharing_real_vm` passed on two throwaway `deploy/aws` host
+`remote::tests::sharing_real_vm` passed on two throwaway `deploy/aws` hosts
 (m8i-flex.xlarge, Ubuntu 24.04, Firecracker 1.17.0, Rust 1.97.0): the grantee
 got nothing before the share; after it, saw `owner@example.test/box` under
 `shared`, ran exec and an interactive terminal in the owner's guest, was refused
