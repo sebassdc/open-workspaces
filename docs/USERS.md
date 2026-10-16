@@ -126,6 +126,19 @@ For SSH, the owner registers the teammate's public key next to their own:
 `ow ssh-authorize demo --key ~/.ssh/id_ed25519.pub --key bob.pub`
 (`ssh-authorize` replaces the whole key list). `use` grantees cannot change keys.
 
+Evidence (2026-10-16): `catalog::multinode_tests::sharing_roles_owner_addresses_and_revocation`
+(roles, addressing, reserved email binding, restart) and
+`remote::tests::unshare_closes_a_grantees_live_terminal` (gateway, signed
+tokens, real WSS terminal, fake worker) run with `cargo test`. The ignored
+`remote::tests::sharing_real_vm` passed once on a throwaway `deploy/aws` host
+(m8i-flex.xlarge, Ubuntu 24.04, Firecracker 1.17.0, Rust 1.97.0): the grantee
+got nothing before the share; after it, saw `owner@example.test/box` under
+`shared`, ran exec and an interactive terminal in the owner's guest, was refused
+resize, and forked a copy holding the owner's file; `unshare` closed the open
+terminal in under 1 ms, then exec and terminal were refused, the fork stayed
+the grantee's and the owner was unaffected. One sample; signed test tokens
+stand in for two real Cloudflare or tailnet logins.
+
 ## Acceptance evidence
 
 Automated tests verify explicit legacy migration, identity binding, rejection of

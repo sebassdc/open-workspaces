@@ -268,7 +268,7 @@ enum Action {
         id: String,
     },
     /// Let a teammate use one of your machines; they address it as `you@example.com/NAME`
-    /// (remote server only). A teammate's fork copies everything in the machine.
+    /// (remote server only). A teammate's fork copies everything on it, credentials included.
     Share {
         id: String,
         /// The teammate's login email.
