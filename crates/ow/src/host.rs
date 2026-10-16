@@ -419,6 +419,8 @@ fn unpublish(root: &Path, id: &str, port: u16) -> Result<()> {
 /// Refuses new starts and wakes, then hibernates every running machine. A machine
 /// that fails to hibernate is left to the shutdown, which stops it.
 fn hibernate_all(root: &Path) -> Result<()> {
+    // The AWS unit allows 900 s to stop; the worker captures one machine at a time.
+    let deadline = Instant::now() + Duration::from_secs(840);
     wire::request(root, json!({"op":"quiesce"}))?;
     let list = wire::request(root, json!({"op":"list"}))?;
     for workspace in list.as_array().context("workspace list")? {
@@ -426,7 +428,10 @@ fn hibernate_all(root: &Path) -> Result<()> {
         else {
             continue;
         };
-        match wire::request(root, json!({"op":"hibernate","id":id})) {
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(1));
+        match wire::connect_waiting(root, &json!({"op":"hibernate","id":id}), wait) {
             Ok(_) => println!("hibernated {id}"),
             Err(e) => eprintln!("could not hibernate {id}: {e:#}"),
         }
