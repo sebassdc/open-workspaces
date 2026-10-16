@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { dashboardLoginList, renderUserData } from "../index.ts";
 
@@ -21,6 +23,30 @@ test("the Tailscale key is piped and an empty key never reaches tailscale up", (
     const join = bootstrap.slice(bootstrap.indexOf("join_tailscale() {"), bootstrap.indexOf("tailscale up --timeout"));
     assert.ok(join.includes('--output text | cat > "$key"'), "snap aws writes nothing to a redirected file");
     assert.ok(join.includes('[[ ! -s "$key" ]]') && join.includes("return 1"), "empty key stops before tailscale up");
+});
+
+test("the controller waits for the tailnet before choosing its listen address", () => {
+    assert.ok(bootstrap.includes("ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet"));
+    const wait = bootstrap.slice(bootstrap.indexOf("<<'WAIT'\n") + 8, bootstrap.indexOf("\nWAIT\n"));
+    const dir = mkdtempSync(join(tmpdir(), "ow-wait-"));
+    // Stand-in tailscale: reports Running only after its second status call.
+    writeFileSync(join(dir, "tailscale"), `#!/bin/sh
+case "$1" in
+  status) n=$(cat "${dir}/n" 2>/dev/null || echo 0); echo $((n + 1)) > "${dir}/n"
+          if [ "$STATE" = Starting ] && [ "$n" -ge 1 ]; then s=Running; else s=$STATE; fi
+          echo "{\\"BackendState\\": \\"$s\\"}" ;;
+  ip) [ "$STATE" = Starting ] ;;
+esac
+`, { mode: 0o755 });
+    const run = (state) => {
+        rmSync(join(dir, "n"), { force: true });
+        const started = Date.now();
+        execFileSync("sh", ["-c", wait], { env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, STATE: state } });
+        return { calls: Number(readFileSync(join(dir, "n"), "utf8")), ms: Date.now() - started };
+    };
+    assert.equal(run("Starting").calls, 2, "waits until the tailnet is Running");
+    assert.ok(run("NeedsLogin").ms < 1000, "a host that is not joined does not wait");
+    rmSync(dir, { recursive: true });
 });
 
 test("dashboard logins are validated and the dashboard block is valid bash", () => {

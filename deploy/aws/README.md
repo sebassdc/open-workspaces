@@ -26,7 +26,7 @@ workflow runs the checks and creates that tag. The same tag is the default
 `ref` the host builds, so set `ref` explicitly before the first release exists.
 
 ```bash
-pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.2.1
+pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.2.2
 ```
 
 ```typescript
@@ -73,7 +73,8 @@ The service runs [`ow host up`](../../docs/SINGLE_HOST.md): the controller plus
 a local runner whose budget is three quarters of the instance RAM, all vCPUs
 and 8 running machines. Controller state lives in `/srv/ow/.ow`. The controller
 listens on the host's Tailscale address (port 8790) when Tailscale is up, and on
-loopback only otherwise. Workspace commands through the wrapper go to the local
+loopback only otherwise. It picks the address at start, so the service waits up
+to 60 s for Tailscale to connect first (after a reboot, for example). Workspace commands through the wrapper go to the local
 runner (`/srv/ow/.ow/runner`); `node add` needs SSH access from the `ow` user.
 Boxes idle for 30 minutes hibernate and wake on the next connection; see
 [wake on connect](../../docs/DAILY_USE.md).
