@@ -33,6 +33,9 @@ gone() { # gone MACHINE...: no record and no snapshot of these machines remains
   ow snapshots | python3 -c 'import json,sys; ids=set(sys.argv[1:]); left=[s["name"] for s in json.load(sys.stdin) if s["workspace"] in ids]; sys.exit(f"snapshots left: {left}" if left else 0)' "$@"
 }
 
+# Controller first: it must be running and see its local runner online.
+controller=$(ow node list)
+python3 -c 'import json,sys; nodes=json.loads(sys.argv[1]); sys.exit(0 if any(n["online"] for n in nodes) else "controller reports no runner online")' "$controller"
 ow status > /dev/null
 for i in $(seq "$samples"); do
   box="smoke-$i-$RANDOM"
@@ -78,6 +81,8 @@ print(json.dumps({
     "memory_kib": sh("awk '/MemTotal/{print $2}' /proc/meminfo"),
     "commit": sh("runuser -u ow -- git -C /srv/ow/src rev-parse HEAD"),
     "firecracker": sh("/srv/ow/src/data/runtime-spike/official/release-v1.17.0-x86_64/firecracker-v1.17.0-x86_64 --version | head -1"),
+    "controller": {"service": sh("systemctl is-active open-workspaces"),
+                   "runners": [{"id": n["id"], "online": n["online"]} for n in json.loads(sh("/usr/local/bin/ow node list"))]},
     "metrics": metrics,
 }))
 REPORT

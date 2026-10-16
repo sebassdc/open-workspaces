@@ -62,9 +62,18 @@ There are no inbound ports. Use SSM:
 
 ```bash
 aws ssm start-session --target "$(pulumi stack output instanceId)"
+sudo ow node list      # controller view: the local runner and whether it is online
 sudo ow list           # the wrapper runs every command as the `ow` user
 sudo ow create my-box && sudo ow shell my-box
+sudo ow node add ssh://dev@build-box   # another KVM machine as a runner
 ```
+
+The service runs [`ow host up`](../../docs/SINGLE_HOST.md): the controller plus
+a local runner whose budget is three quarters of the instance RAM, all vCPUs
+and 8 running machines. Controller state lives in `/srv/ow/.ow`. The controller
+listens on the host's Tailscale address (port 8790) when Tailscale is up, and on
+loopback only otherwise. Workspace commands through the wrapper go to the local
+runner (`/srv/ow/.ow/runner`); `node add` needs SSH access from the `ow` user.
 
 With Tailscale, the host joins your tailnet under `tailscaleHostname`. The
 auth key is read once at boot into a root-only file under `/run`, passed to
@@ -81,7 +90,8 @@ User data (`bootstrap.sh`) runs once per instance:
    lets only the `ow` binary create user namespaces (Ubuntu restricts them);
 4. clones `repository`, checks out `ref` and runs `scripts/setup-local.sh`
    (pinned Rust, Firecracker and guest assets, then a release build);
-5. installs `/usr/local/bin/ow` and starts `open-workspaces.service` (`ow up`).
+5. installs `/usr/local/bin/ow`, starts `open-workspaces.service`
+   (`ow host up`) and waits until the controller reports its runner online.
 
 Progress: `/var/log/open-workspaces-bootstrap.log`; state:
 `/var/lib/open-workspaces/bootstrap-status` (`running`, `failed` or

@@ -2,9 +2,12 @@
 
 Observed on 2026-10-16 with the [AWS component](../../deploy/aws/README.md)
 smoke test (`deploy/aws/examples/smoke/run.sh`) in a dedicated sandbox account.
-Two five-sample runs on fresh hosts: run A at commit `fba80ca` (no delete
-command yet) and run B at `7fd0de3`, which adds `ow delete`. Both stacks were
-destroyed afterwards; no resources remain.
+Three five-sample runs on fresh hosts: run A at commit `fba80ca` (local worker
+via `ow up`, no delete command yet), run B at `7fd0de3` (adds `ow delete`), and
+run C at `d5e8af6`, where the host service is `ow host up`: controller plus
+local runner. Run C was one unattended `run.sh` call; before the lifecycle it
+checked the service active and the controller reporting its runner online.
+All stacks were destroyed afterwards; no resources remain.
 
 ## Setup
 
@@ -23,17 +26,17 @@ were warm after the first sample.
 
 ## Workspace operations (n=5 per run)
 
-| Operation | Run A p50 / p95 | Run B p50 / p95 | What it covers |
-| --- | --- | --- | --- |
-| Create to first exec | 1,366.7 / 1,370.5 ms | 1,367.8 / 1,373.2 ms | `ow create` plus a successful `ow exec true` |
-| Connect (exec round trip) | 17.6 / 17.7 ms | 17.5 / 17.9 ms | `ow exec -- uname -r` on a running machine |
-| Snapshot | 1,558.6 / 1,562.4 ms | 1,539.4 / 1,661.9 ms | paired RAM+disk capture with SHA-256 hashes and publication |
-| Fork from snapshot | 134.3 / 136.6 ms | 133.7 / 139.8 ms | child from that snapshot, cached verification, ready to exec |
-| Live fork | 2,158.3 / 2,183.8 ms | 2,161.5 / 2,172.6 ms | `ow fork` without `--snapshot`: capture of the running parent, then fork |
-| Hibernate | 1,583.0 / 1,647.4 ms | 1,588.8 / 1,601.9 ms | checkpoint and VMM exit |
-| Resume | 128.7 / 130.5 ms | 127.7 / 131.7 ms | `ow start` of the hibernated machine |
-| Stop (n=15) | 46.9 / 54.9 ms | 53.8 / 74.6 ms | cold stop of each machine |
-| Delete (n=15) | not available | 36.4 / 46.8 ms | `ow delete` of a stopped machine, its disk and its snapshots |
+| Operation | Run A p50 / p95 | Run B p50 / p95 | Run C p50 / p95 | What it covers |
+| --- | --- | --- | --- | --- |
+| Create to first exec | 1,366.7 / 1,370.5 ms | 1,367.8 / 1,373.2 ms | 1,371.5 / 1,386.0 ms | `ow create` plus a successful `ow exec true` |
+| Connect (exec round trip) | 17.6 / 17.7 ms | 17.5 / 17.9 ms | 16.8 / 17.7 ms | `ow exec -- uname -r` on a running machine |
+| Snapshot | 1,558.6 / 1,562.4 ms | 1,539.4 / 1,661.9 ms | 1,544.8 / 1,627.0 ms | paired RAM+disk capture with SHA-256 hashes and publication |
+| Fork from snapshot | 134.3 / 136.6 ms | 133.7 / 139.8 ms | 137.4 / 146.3 ms | child from that snapshot, cached verification, ready to exec |
+| Live fork | 2,158.3 / 2,183.8 ms | 2,161.5 / 2,172.6 ms | 2,164.1 / 2,207.2 ms | `ow fork` without `--snapshot`: capture of the running parent, then fork |
+| Hibernate | 1,583.0 / 1,647.4 ms | 1,588.8 / 1,601.9 ms | 1,588.6 / 1,982.6 ms | checkpoint and VMM exit |
+| Resume | 128.7 / 130.5 ms | 127.7 / 131.7 ms | 128.3 / 130.6 ms | `ow start` of the hibernated machine |
+| Stop (n=15) | 46.9 / 54.9 ms | 53.8 / 74.6 ms | 52.6 / 74.8 ms | cold stop of each machine |
+| Delete (n=15) | not available | 36.4 / 46.8 ms | 35.8 / 48.2 ms | `ow delete` of a stopped machine, its disk and its snapshots |
 
 Every sample checked state, not only exit codes: a guest process started before
 the snapshot kept running and kept counting in the snapshot fork, the live fork,
@@ -49,12 +52,12 @@ with the deleted ID starts clean and cannot fork the deleted snapshot.
 
 ## Host lifecycle
 
-| Phase | Run A | Run B |
-| --- | --- | --- |
-| `pulumi up` (8 resources) to instance ID | 52 s | 54 s |
-| Instance to SSM agent online | 1 s | 3 s |
-| Instance to bootstrap done (packages, Btrfs, Rust/Firecracker/guest assets, release build, `ow up`) | 348 s | 277 s |
-| `pulumi destroy` | 65 s | 51 s |
+| Phase | Run A | Run B | Run C |
+| --- | --- | --- | --- |
+| `pulumi up` (8 resources) to instance ID | 52 s | 54 s | 52 s |
+| Instance to SSM agent online | 1 s | 3 s | 1 s |
+| Instance to bootstrap done (packages, Btrfs, Rust/Firecracker/guest assets, release build, service start; run C also waits for the runner online in the controller) | 348 s | 277 s | 268 s |
+| `pulumi destroy` | 65 s | 51 s | 65 s |
 
 ## Compared with the local development machine
 

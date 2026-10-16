@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -q
 apt-get install -y -q --no-install-recommends git curl ca-certificates python3 python-is-python3 \
-  build-essential btrfs-progs nftables iproute2 util-linux
+  build-essential btrfs-progs nftables iproute2 util-linux openssl
 
 tailscale_state=skipped
 if [[ -n "$OW_TAILSCALE_SECRET_ARN" ]]; then
@@ -78,36 +78,48 @@ runuser -u ow -- env OW_REPOSITORY="$OW_REPOSITORY" OW_REF="$OW_REF" bash -euo p
   bash scripts/setup-local.sh
 '
 
+# `ow host up` keeps controller state under $HOME/.ow; workspace commands use its runner.
 cat > /usr/local/bin/ow <<'WRAPPER'
 #!/bin/sh
 # The worker checks the caller's UID, so every command runs as the ow user.
 [ "$(id -un)" = ow ] || exec runuser -u ow -- "$0" "$@"
-export OW_DATA_DIR=/srv/ow/workspaces OW_ASSET_DIR=/srv/ow/src/data/runtime-spike
+export HOME=/srv/ow OW_DATA_DIR=/srv/ow/.ow/runner OW_ASSET_DIR=/srv/ow/src/data/runtime-spike
 exec /srv/ow/src/target/release/ow "$@"
 WRAPPER
 chmod 755 /usr/local/bin/ow
 
-cat > /etc/systemd/system/open-workspaces.service <<'UNIT'
+# Local runner budget: three quarters of RAM (worker cap 64 GiB), every vCPU, 8 slots.
+memory=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) * 3 / 4 / 1024 ))
+(( memory <= 65536 )) || memory=65536
+cpus=$(nproc)
+(( cpus <= 64 )) || cpus=64
+cat > /etc/systemd/system/open-workspaces.service <<UNIT
 [Unit]
-Description=Open Workspaces controller and runner
-After=network-online.target
+Description=Open Workspaces controller and local runner (ow host up)
+After=network-online.target tailscaled.service
 Wants=network-online.target
 RequiresMountsFor=/srv/ow
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
 User=ow
-Environment=OW_DATA_DIR=/srv/ow/workspaces OW_ASSET_DIR=/srv/ow/src/data/runtime-spike
-ExecStart=/srv/ow/src/target/release/ow up
-ExecStop=/srv/ow/src/target/release/ow down
-TimeoutStartSec=120
+Environment=HOME=/srv/ow OW_ASSET_DIR=/srv/ow/src/data/runtime-spike
+ExecStart=/srv/ow/src/target/release/ow host up --memory $memory --slots 8 --cpus $cpus
+ExecStop=/srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/runner down
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
 systemctl enable --now open-workspaces.service
+
+# Done only when the controller reports its local runner online.
+runner_online() {
+  /usr/local/bin/ow node list | python3 -c 'import json,sys; sys.exit(0 if any(n["online"] for n in json.load(sys.stdin)) else 1)'
+}
+for _ in $(seq 60); do runner_online 2>/dev/null && break; sleep 2; done
+runner_online || { echo "controller never reported its runner online"; journalctl -u open-workspaces -n 30 --no-pager; false; }
 
 echo "bootstrap done $(date -Is) tailscale=$tailscale_state"
 echo "ok tailscale=$tailscale_state" > "$status"
