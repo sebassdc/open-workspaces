@@ -429,8 +429,8 @@ d="${1:-$HOME/.ow-node}"
 case "$d" in /*) ;; *) echo "remote directory must be absolute: $d" >&2; exit 2;; esac
 [ "$(uname -s)/$(uname -m)" = Linux/x86_64 ] || { echo "runner must be Linux x86-64, found $(uname -sm)" >&2; exit 2; }
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || { echo "KVM unavailable: /dev/kvm must be readable and writable by $(id -un)" >&2; exit 2; }
-mkdir -p "$d"
-chmod 700 "$d"
+[ -d "$d" ] || { mkdir -p "$d"; chmod 700 "$d"; }
+case "$(stat -c %a "$d")" in ?00) ;; *) echo "$d must be private (chmod 700) or a new directory" >&2; exit 2;; esac
 [ "$(stat -f -c %T "$d")" = btrfs ] || { echo "$d is not on Btrfs; pass --remote-dir on a Btrfs filesystem" >&2; exit 2; }
 command -v sha256sum >/dev/null || { echo "sha256sum required on the runner" >&2; exit 2; }
 cd "$d"
