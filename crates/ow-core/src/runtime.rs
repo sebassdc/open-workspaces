@@ -770,7 +770,9 @@ impl Runtime {
         Ok(json!(self.state.workspaces[id]))
     }
 
-    fn capture(&mut self, id: &str, name: &str) -> Result<Value> {
+    /// Seals a RAM+disk snapshot. With `hibernate` the paused VM is dropped right after
+    /// the capture, so nothing the guest does while the files are hashed is lost.
+    fn capture(&mut self, id: &str, name: &str, hibernate: bool) -> Result<Value> {
         identifier(name)?;
         let workspace = self.workspace(id)?;
         self.storage_headroom(workspace.memory_mib as u64 * 1024 * 1024)?;
@@ -796,7 +798,13 @@ impl Runtime {
         let staging = self.snapshot_dir(&format!(".pending-{}", vm::nonce()?));
         fs::create_dir(&staging)?;
         let disk = self.machine_dir(id).join("disk.ext4");
-        self.running(id)?.capture(&staging, &disk)?;
+        self.running(id)?.capture(&staging, &disk, !hibernate)?;
+        if hibernate {
+            self.machines.remove(id);
+            // Until the capture is sealed, the live disk is the machine's state.
+            self.state.workspaces.get_mut(id).unwrap().state = "stopped".into();
+            self.save()?;
+        }
         let mut files = BTreeMap::new();
         for file in ["state", "memory", "disk.ext4"] {
             files.insert(file.into(), hash(&staging.join(file))?);
@@ -1155,6 +1163,7 @@ impl Runtime {
             "snapshot" => self.capture(
                 id,
                 request["name"].as_str().context("missing snapshot name")?,
+                false,
             ),
             "snapshots" => {
                 let mut snapshots = Vec::<Snapshot>::new();
@@ -1186,7 +1195,7 @@ impl Runtime {
                 let generated = format!("fork-{}", vm::nonce()?);
                 let name = supplied.unwrap_or(&generated);
                 if supplied.is_none() {
-                    self.capture(id, name)?;
+                    self.capture(id, name, false)?;
                 }
                 let directory = self.validate_snapshot(name)?;
                 let snapshot: Snapshot =
@@ -1210,8 +1219,7 @@ impl Runtime {
                     return Ok(json!(workspace));
                 }
                 let name = format!("{SLEEP}{}", vm::nonce()?);
-                self.capture(id, &name)?;
-                self.machines.remove(id);
+                self.capture(id, &name, true)?;
                 let workspace = self.state.workspaces.get_mut(id).unwrap();
                 workspace.state = "hibernated".into();
                 workspace.hibernation = Some(name);
