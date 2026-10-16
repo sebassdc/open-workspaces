@@ -17,6 +17,12 @@ test("user data keeps values literal and starts with the bootstrap shebang", () 
     }
 });
 
+test("the Tailscale key is piped and an empty key never reaches tailscale up", () => {
+    const join = bootstrap.slice(bootstrap.indexOf("join_tailscale() {"), bootstrap.indexOf("tailscale up --timeout"));
+    assert.ok(join.includes('--output text | cat > "$key"'), "snap aws writes nothing to a redirected file");
+    assert.ok(join.includes('[[ ! -s "$key" ]]') && join.includes("return 1"), "empty key stops before tailscale up");
+});
+
 test("dashboard logins are validated and the dashboard block is valid bash", () => {
     assert.equal(dashboardLoginList(["a@example.com", "b.c+d@example.org"]), "a@example.com,b.c+d@example.org");
     assert.equal(dashboardLoginList([]), "");
