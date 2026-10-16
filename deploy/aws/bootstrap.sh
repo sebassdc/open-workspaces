@@ -264,6 +264,7 @@ for profile in "$@"; do
   rm -rf "$out"
   for build in data/dev-images/build-*; do [[ -f $build/result.json ]] && rm -rf "$build"; done
   echo "$profile: developer image built"
+  touch /srv/ow/.ow/developer-images-new
 done
 IMAGES
   chmod 755 /usr/local/lib/open-workspaces/developer-images
@@ -277,6 +278,9 @@ Type=oneshot
 User=ow
 Environment=HOME=/srv/ow OW_ASSET_DIR=/srv/ow/src/data/runtime-spike
 ExecStart=/usr/local/lib/open-workspaces/developer-images $OW_DEVELOPER_IMAGES
+# The runner advertises its images when it connects: restart it after a new build
+# (running boxes hibernate first, through the service's stop hook).
+ExecStartPost=+/bin/sh -c 'if [ -e /srv/ow/.ow/developer-images-new ]; then rm /srv/ow/.ow/developer-images-new; systemctl restart open-workspaces; fi'
 TimeoutStartSec=3600
 
 [Install]
