@@ -28,6 +28,8 @@ alive() { # alive MACHINE: ticker process still running and still counting
   [[ "${after##*$'\n'}" -gt "${before##*$'\n'}" ]] || { echo "ticker stopped in $1: $before -> $after"; return 1; }
 }
 
+http_code() { curl -s -o /dev/null -m 5 -w '%{http_code}' "$1" || true; }
+
 gone() { # gone MACHINE...: no record and no snapshot of these machines remains
   ow list | python3 -c 'import json,sys; ids=set(sys.argv[1:]); left=[w["id"] for w in json.load(sys.stdin) if w["id"] in ids]; sys.exit(f"still listed: {left}" if left else 0)' "$@"
   ow snapshots | python3 -c 'import json,sys; ids=set(sys.argv[1:]); left=[s["name"] for s in json.load(sys.stdin) if s["workspace"] in ids]; sys.exit(f"snapshots left: {left}" if left else 0)' "$@"
@@ -41,6 +43,11 @@ for i in $(seq "$samples"); do
   box="smoke-$i-$RANDOM"
   timed create_to_exec sh -c "/usr/local/bin/ow create $box && /usr/local/bin/ow exec $box -- true"
   timed connect_exec ow exec "$box" -- 'uname -r'
+  # A refused delete must leave the machine and its HTTP publication alone.
+  url=$(ow publish "$box")
+  ! ow delete "$box" > /dev/null 2>&1 || { echo "delete of running $box was accepted"; exit 1; }
+  sleep 1
+  [[ "$(http_code "$url")" != 000 ]] || { echo "refused delete closed the publication of $box"; exit 1; }
   ow exec "$box" -- "$ticker" > /dev/null
   timed snapshot ow snapshot "$box" "$box-snap"
   timed fork_from_snapshot ow fork "$box" "$box-f" --snapshot "$box-snap"
@@ -55,6 +62,8 @@ for i in $(seq "$samples"); do
   timed stop ow stop "$box-l"
   # Delete the parent (and its snapshots) while its snapshot fork still runs.
   timed delete ow delete "$box"
+  for _ in $(seq 10); do [[ "$(http_code "$url")" == 000 ]] && break; sleep 0.5; done
+  [[ "$(http_code "$url")" == 000 ]] || { echo "publication of deleted $box still answers"; exit 1; }
   alive "$box-f"
   timed stop ow stop "$box-f"
   timed delete ow delete "$box-f"

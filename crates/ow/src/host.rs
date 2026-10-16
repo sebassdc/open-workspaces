@@ -767,9 +767,11 @@ pub fn run(cli: Cli) -> Result<i32> {
         } => json!({"op":"fork","id":id,"child":child,"snapshot":snapshot}),
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),
         Action::Delete { id } => {
-            runtime::identifier(&id)?;
+            // Publications close only once the worker has accepted the delete.
+            let result = wire::request(&root, json!({"op":"delete","id":id}))?;
             unpublish_all(&root, Some(&id))?;
-            json!({"op":"delete","id":id})
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(0);
         }
         Action::Restore { id, name } => json!({"op":"restore","id":id,"name":name}),
         Action::Publish { id, port } => {

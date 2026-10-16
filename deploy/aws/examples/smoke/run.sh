@@ -51,7 +51,9 @@ provisioned=$(now)
 echo "instance $instance up in $((provisioned - started)) s"
 
 ssm() { # ssm TIMEOUT_SECONDS SCRIPT: run as root on the host, print stdout
-  local id state
+  local id state deadline
+  # Delivery may take up to 600 s, then the script up to TIMEOUT; never poll past both.
+  deadline=$(( $(now) + 600 + $1 + 60 ))
   id=$(aws ssm send-command --instance-ids "$instance" --document-name AWS-RunShellScript \
     --timeout-seconds 600 --parameters "$(python3 -c 'import json,sys; print(json.dumps({"commands":[sys.argv[1]],"executionTimeout":[sys.argv[2]]}))' "$2" "$1")" \
     --query Command.CommandId --output text)
@@ -60,6 +62,7 @@ ssm() { # ssm TIMEOUT_SECONDS SCRIPT: run as root on the host, print stdout
     state=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$instance" \
       --query Status --output text 2>/dev/null || echo Pending)
     case $state in Pending|InProgress|Delayed) ;; *) break ;; esac
+    (( $(now) < deadline )) || { echo "SSM command $id gave no result in time (last: $state)" >&2; return 1; }
   done
   aws ssm get-command-invocation --command-id "$id" --instance-id "$instance" \
     --query '[StandardOutputContent,StandardErrorContent]' --output text
