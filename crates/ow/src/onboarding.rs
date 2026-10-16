@@ -346,7 +346,7 @@ fn existing_demand() -> Result<Value> {
         json!({"existing_vmm_count":count,"existing_vmm_rss_mib":rss,"host_available_mib":mem_available()?,"reservation_inventory":"RSS is not configured RAM. Unresolved/offline reservations require operator inventory; budgets must be disjoint."}),
     )
 }
-fn doctor(root: &Path) -> Result<Value> {
+pub(crate) fn doctor(root: &Path) -> Result<Value> {
     let mut errors = Vec::new();
     if std::env::consts::ARCH != "x86_64" {
         errors.push("Linux x86-64 required".to_owned());
@@ -1011,7 +1011,7 @@ fn worker_matches(root: &Path, status: &Value, c: &Config) -> bool {
         && bounded_file(&root.join("assets/manifest.json"), 16384)
             .is_ok_and(|b| status["host_asset_hash"] == format!("{:x}", Sha256::digest(b)))
 }
-fn held_lock(path: &Path) -> Result<bool> {
+pub(crate) fn held_lock(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),

@@ -6,6 +6,16 @@ The broader acceptance gates remain open. Estimates are planning ranges for
 2–3 experienced engineers, not commitments; runtime, security, staffing, and
 product decisions can materially change them.
 
+## Open-source roadmap: OS phase 0, usable on any machine
+
+- [x] `ow node add ssh://user@host` turns an SSH-reachable Linux machine into a
+  runner: checks KVM and Btrfs, installs Firecracker and `ow`, writes a
+  single-use join file, starts `ow node-agent`, optionally joins a tailnet
+  from an auth key in a file or env variable. See [single-host mode](SINGLE_HOST.md).
+- [x] `ow host up`: controller and runner on one machine, the default
+  single-host mode. See [single-host mode](SINGLE_HOST.md).
+- [ ] `deploy/aws/` Pulumi component, `deploy/aws/examples/smoke/` and EC2 timings.
+
 ## Completed local pilot checks
 
 - Real guest boot, exec/exit status, binary file transfer and loopback HTTP access.
