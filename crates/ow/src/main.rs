@@ -24,6 +24,8 @@ mod onboarding;
 mod remote;
 #[cfg(target_os = "linux")]
 mod runtime;
+#[cfg(target_os = "linux")]
+mod selfhost;
 mod ssh_client;
 #[cfg(target_os = "linux")]
 mod ssh_gateway;
@@ -88,6 +90,11 @@ enum Action {
     Host {
         #[command(subcommand)]
         command: HostAction,
+    },
+    /// Runners of the controller started by `ow host up` on this machine.
+    Node {
+        #[command(subcommand)]
+        command: NodeAction,
     },
     /// Sign in through Cloudflare Access and save the remote server.
     Login {
@@ -279,7 +286,59 @@ enum Action {
 }
 
 #[derive(Subcommand)]
+enum NodeAction {
+    /// Turn an SSH-reachable Linux machine into a runner: check KVM/Btrfs, install
+    /// ow and Firecracker, write a single-use join file and start the node agent.
+    Add {
+        /// ssh://user@host[:port]; user@host and ~/.ssh/config aliases also work.
+        target: String,
+        /// Runner ID; defaults to the host's first DNS label.
+        #[arg(long)]
+        name: Option<String>,
+        /// Controller URL the runner dials; defaults to the one saved by `ow host up`.
+        #[arg(long)]
+        controller: Option<String>,
+        /// Remote directory on Btrfs, under 50 bytes (default ~/.ow-node).
+        #[arg(long)]
+        remote_dir: Option<String>,
+        #[arg(long, default_value_t = 2048)]
+        memory: u32,
+        #[arg(long, default_value_t = 2)]
+        slots: u32,
+        #[arg(long, default_value_t = 2)]
+        cpus: u32,
+        /// Also install the Ubuntu developer image (about 8 GiB transfer).
+        #[arg(long)]
+        ubuntu: bool,
+        /// Join a tailnet first with the auth key held in a 0600 file or env variable.
+        #[arg(long, value_name = "file:PATH|env:NAME")]
+        tailscale_auth_key: Option<String>,
+        /// Linux x86-64 ow binary to install (default: bin/ow-linux-amd64 in the
+        /// asset directory, else this binary).
+        #[arg(long)]
+        ow_binary: Option<PathBuf>,
+    },
+    /// List runners and whether each is online.
+    List,
+}
+
+#[derive(Subcommand)]
 enum HostAction {
+    /// Single-host mode: controller and a local runner on this machine, in the foreground.
+    Up {
+        /// Controller listener (default: this machine's Tailscale IPv4, else loopback).
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
+        /// Local runner ID (default: hostname).
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, default_value_t = 2048)]
+        memory: u32,
+        #[arg(long, default_value_t = 2)]
+        slots: u32,
+        #[arg(long, default_value_t = 2)]
+        cpus: u32,
+    },
     /// Check Linux/KVM/storage/tools and current host demand without starting VMs.
     Doctor,
     /// Guided join. Paste a private invitation at the hidden prompt.
@@ -382,7 +441,37 @@ fn main_result() -> anyhow::Result<i32> {
         );
         return mac_host::run(cli.data_dir, command);
     }
+    if let Action::Node { command } = cli.command {
+        anyhow::ensure!(
+            cli.server.is_none(),
+            "node commands manage this machine's controller; omit --server"
+        );
+        #[cfg(target_os = "linux")]
+        return selfhost::node(cli.data_dir, command);
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop(command);
+            anyhow::bail!("ow node runs on the Linux controller machine (ow host up)");
+        }
+    }
     if let Action::Host { command } = cli.command {
+        if let HostAction::Up {
+            listen,
+            node,
+            memory,
+            slots,
+            cpus,
+        } = command
+        {
+            anyhow::ensure!(cli.server.is_none(), "host up is local; omit --server");
+            #[cfg(target_os = "linux")]
+            return selfhost::up(cli.data_dir, listen, node, memory, slots, cpus);
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (listen, node, memory, slots, cpus);
+                anyhow::bail!("host up requires Linux x86-64 with KVM");
+            }
+        }
         if matches!(
             command,
             HostAction::Invite { .. } | HostAction::Revoke { .. } | HostAction::Budget { .. }

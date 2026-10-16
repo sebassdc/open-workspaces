@@ -6,6 +6,26 @@ The broader acceptance gates remain open. Estimates are planning ranges for
 2–3 experienced engineers, not commitments; runtime, security, staffing, and
 product decisions can materially change them.
 
+## Open-source roadmap: OS phase 0, usable on any machine
+
+- [x] `ow node add ssh://user@host` turns an SSH-reachable Linux machine into a
+  runner: checks KVM and Btrfs, installs Firecracker and `ow`, writes a
+  single-use join file, starts `ow node-agent`, optionally joins a tailnet
+  from an auth key in a file or env variable. See [single-host mode](SINGLE_HOST.md).
+- [x] `ow host up`: controller and runner on one machine, the default
+  single-host mode. See [single-host mode](SINGLE_HOST.md).
+- [x] `deploy/aws/` Pulumi component (TypeScript, consumed with
+  `pulumi package add` from a git tag): one nested-virtualization EC2 host with
+  controller and runner, no inbound ports, SSM-only role, IMDSv2 hop limit 1,
+  Btrfs gp3 data volume, `tags` input, optional Tailscale join from a Secrets
+  Manager ARN. See [deploy/aws](../deploy/aws/README.md).
+- [x] `deploy/aws/examples/smoke/`: environment-only inputs, caller's state
+  backend, tag `project=open-workspaces`; create, connect, fork, live fork,
+  hibernate/resume, stop and delete (new local `ow delete`), then
+  `pulumi destroy` of the stack it created.
+- [x] EC2 timings (boot, snapshot, fork, live fork, hibernate) recorded in
+  [EC2 timings](experiments/ec2-timings.md).
+
 ## Completed local pilot checks
 
 - Real guest boot, exec/exit status, binary file transfer and loopback HTTP access.
@@ -38,20 +58,6 @@ boot, console, persistence and paired state recovery. Persistent developer image
 guest-agent integration, host admission and private-pool acceptance remain pending;
 Tahoe installation needs separate allocation/licensing gates. See
 [Mac implementation report](plans/mac-host-report.md).
-
-## Open-source phase 0: usable on any machine
-
-- [x] `deploy/aws/` Pulumi component (TypeScript, consumed with
-  `pulumi package add` from a git tag): one nested-virtualization EC2 host with
-  controller and runner, no inbound ports, SSM-only role, IMDSv2 hop limit 1,
-  Btrfs gp3 data volume, `tags` input, optional Tailscale join from a Secrets
-  Manager ARN. See [deploy/aws](../deploy/aws/README.md).
-- [x] `deploy/aws/examples/smoke/`: environment-only inputs, caller's state
-  backend, tag `project=open-workspaces`; create, connect, fork, live fork,
-  hibernate/resume, stop and delete (new local `ow delete`), then
-  `pulumi destroy` of the stack it created.
-- [x] EC2 timings (boot, snapshot, fork, live fork, hibernate) recorded in
-  [EC2 timings](experiments/ec2-timings.md).
 
 ## Phase 0 — Feasibility (1–2 weeks)
 
