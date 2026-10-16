@@ -109,7 +109,8 @@ yet reserves it: the first verified login with that email (which must still be
 admitted by the Access policy and allowlist) binds it. Sharing grants no login.
 
 `ow unshare` deletes the grant and closes the teammate's open terminal and SSH
-streams to that machine at once; their next request is refused. It does not
+streams to that machine at once; their next request is refused. It does not wait
+for requests already running (an exec the teammate started still finishes). It does not
 remove SSH keys an owner or admin registered for them (they can no longer reach
 the guest's SSH through the gateway, but remove them with `ow ssh-authorize` if
 the guest is reachable another way), and it does not undo what they already did
@@ -129,14 +130,15 @@ For SSH, the owner registers the teammate's public key next to their own:
 Evidence (2026-10-16): `catalog::multinode_tests::sharing_roles_owner_addresses_and_revocation`
 (roles, addressing, reserved email binding, restart) and
 `remote::tests::unshare_closes_a_grantees_live_terminal` (gateway, signed
-tokens, real WSS terminal, fake worker) run with `cargo test`. The ignored
-`remote::tests::sharing_real_vm` passed once on a throwaway `deploy/aws` host
+tokens, real WSS terminal, fake worker, unshare while the grantee's slow exec
+holds the catalog lock) run with `cargo test`. The ignored
+`remote::tests::sharing_real_vm` passed on two throwaway `deploy/aws` host
 (m8i-flex.xlarge, Ubuntu 24.04, Firecracker 1.17.0, Rust 1.97.0): the grantee
 got nothing before the share; after it, saw `owner@example.test/box` under
 `shared`, ran exec and an interactive terminal in the owner's guest, was refused
 resize, and forked a copy holding the owner's file; `unshare` closed the open
 terminal in under 1 ms, then exec and terminal were refused, the fork stayed
-the grantee's and the owner was unaffected. One sample; signed test tokens
+the grantee's and the owner was unaffected. One sample per host; signed test tokens
 stand in for two real Cloudflare or tailnet logins.
 
 ## Acceptance evidence
