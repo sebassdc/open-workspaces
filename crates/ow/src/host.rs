@@ -422,9 +422,14 @@ fn unpublish(root: &Path, id: &str, port: u16) -> Result<()> {
 fn hibernate_all(root: &Path) -> Result<()> {
     // The AWS unit allows 900 s to stop; the worker captures one machine at a time.
     let deadline = Instant::now() + Duration::from_secs(840);
-    wire::request(root, json!({"op":"quiesce"}))?;
+    // Any request can queue behind a capture already running, so each waits as long as one.
+    let request = |value: Value| {
+        wire::connect_waiting(root, &value, wire::reply_wait(&json!({"op":"hibernate"})))
+            .map(|(_, v)| v)
+    };
     let result = (|| -> Result<()> {
-        let list = wire::request(root, json!({"op":"list"}))?;
+        request(json!({"op":"quiesce"}))?;
+        let list = request(json!({"op":"list"}))?;
         for workspace in list.as_array().context("workspace list")? {
             let (Some(id), Some("running")) =
                 (workspace["id"].as_str(), workspace["state"].as_str())
@@ -439,7 +444,7 @@ fn hibernate_all(root: &Path) -> Result<()> {
                 Err(e) => eprintln!("could not hibernate {id}: {e:#}"),
             }
         }
-        let list = wire::request(root, json!({"op":"list"}))?;
+        let list = request(json!({"op":"list"}))?;
         let running: Vec<_> = list
             .as_array()
             .context("workspace list")?
@@ -456,7 +461,8 @@ fn hibernate_all(root: &Path) -> Result<()> {
     })();
     if result.is_err() {
         // Called off: the worker keeps running, so it must accept starts and wakes again.
-        let _ = wire::request(root, json!({"op":"quiesce","closing":false}));
+        // Sent even when the quiesce itself failed: a timed-out one may still be applied.
+        let _ = request(json!({"op":"quiesce","closing":false}));
     }
     result
 }
