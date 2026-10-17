@@ -157,13 +157,19 @@ test("ci-preflight hibernates only when the preview replaces this host's instanc
     f.done();
 
     // An unreadable preview is never taken as "kept".
-    for (const preview of ["{not json", "[]", "{}", JSON.stringify({ steps: "replace" }), ""]) {
+    const invalidSteps = [false, 0, "", {}, null, "replace"].map((steps) => JSON.stringify({ steps, changeSummary: { replace: 1 } }));
+    for (const preview of ["{not json", "[]", "{}", "", ...invalidSteps, JSON.stringify({ steps: [1] })]) {
         f = fake({ preview });
         const result = f.run(["ci-preflight", "--stack", "rain"]);
         assert.notEqual(result.status, 0, JSON.stringify(preview));
         assert.match(result.stderr, /could not read the pulumi preview/);
         f.done();
     }
+    // A preview with no steps key and a summary is a preview that changes nothing.
+    f = fake({ preview: { changeSummary: { same: 12 } } });
+    assert.equal(f.run(["ci-preflight", "--stack", "rain"]).status, 0);
+    assert.equal(f.scripts().length, 0);
+    f.done();
     // The streaming setting is turned off for this preview, so a replacement is still seen.
     f = fake({ preview: { steps: [{ op: "replace", urn: urn("ow-test-host") }] } });
     const result = f.run(["ci-preflight", "--stack", "rain"], { PULUMI_ENABLE_STREAMING_JSON_PREVIEW: "true" });

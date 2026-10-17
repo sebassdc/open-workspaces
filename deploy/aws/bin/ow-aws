@@ -247,7 +247,8 @@ import json, sys
 preview = json.loads(sys.stdin.read())
 if not isinstance(preview, dict) or not ("steps" in preview or "changeSummary" in preview):
     sys.exit("not a pulumi preview --json document")
-steps = preview.get("steps") or []
+# Only a missing key means no steps; any other non-list value is unreadable.
+steps = preview.get("steps", [])
 if not isinstance(steps, list) or not all(isinstance(s, dict) for s in steps):
     sys.exit("unexpected steps in the preview")
 sys.exit(0 if any(s.get("op") in ("replace", "create-replacement", "delete-replaced")
