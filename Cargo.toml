@@ -3,5 +3,7 @@ members = ["crates/ow", "crates/ow-core", "crates/ow-guest"]
 resolver = "2"
 
 [workspace.package]
+# Kept equal to deploy/aws/package.json, the release version (deploy/aws/test/version.test.mjs).
+version = "0.4.1"
 edition = "2024"
 license = "Apache-2.0"
