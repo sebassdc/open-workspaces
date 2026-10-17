@@ -58,8 +58,7 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     private(&path)?;
     let db = Connection::open(path)?;
     db.busy_timeout(Duration::from_secs(5))?;
-    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    ensure!(version <= 3, "catalog schema is newer than this binary");
+    readable(&db)?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY, credential_hash TEXT, revoked INTEGER NOT NULL DEFAULT 0, heartbeat INTEGER NOT NULL DEFAULT 0, memory_mib INTEGER NOT NULL, slots INTEGER NOT NULL, capabilities TEXT NOT NULL DEFAULT '{}', session TEXT);
       CREATE TABLE IF NOT EXISTS node_joins(secret_hash TEXT PRIMARY KEY, node TEXT NOT NULL REFERENCES nodes(id), expires INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);")?;
@@ -68,6 +67,33 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS node_capacity_limits(node TEXT PRIMARY KEY REFERENCES nodes(id), vcpu_cap INTEGER NOT NULL CHECK(vcpu_cap BETWEEN 1 AND 64));")?;
     Ok(db)
 }
+/// Catalog schema this binary writes (`PRAGMA user_version`).
+pub(crate) const SCHEMA: i64 = 3;
+
+/// A binary opens a catalog it can use safely: not newer than SCHEMA, or newer but
+/// declared readable by SCHEMA through `settings.min_reader_schema`, which every
+/// migration sets to the oldest schema whose binaries may still read and write it.
+pub(crate) fn readable(db: &Connection) -> Result<()> {
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version <= SCHEMA {
+        return Ok(());
+    }
+    let floor: Option<i64> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key='min_reader_schema'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .and_then(|v| v.parse().ok());
+    ensure!(
+        floor.is_some_and(|f| f <= SCHEMA),
+        "catalog schema {version} needs a newer binary (this one reads up to {SCHEMA})"
+    );
+    Ok(())
+}
+
 pub(crate) fn private(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
     ensure!(
@@ -472,7 +498,12 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             msg=socket.recv()=>{
                 match msg {Some(Ok(Message::Text(text)))=>{
                     let Ok(v)=serde_json::from_str::<Value>(&text) else {break;};
-                    if common::node_capabilities(&v).is_err() {break;}
+                    if let Err(e)=common::node_capabilities(&v) {
+                        // Say why, so a runner newer than this controller logs it instead of retrying blind.
+                        let reason:String=format!("{e:#}").chars().take(120).collect();
+                        let _=tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code:4001,reason:reason.into()})))).await;
+                        break;
+                    }
                     last=tokio::time::Instant::now();
                     if !c.root.join("nodes").join(&node).join("control.sock").exists(){continue;}
                     if let Ok(db)=db(&c.root)
@@ -1044,9 +1075,9 @@ pub fn agent(
     };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
     #[cfg(target_os = "linux")]
-    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true});
+    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true});
     #[cfg(target_os = "macos")]
-    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
+    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Worker status for the heartbeats, fetched on its own thread: the worker answers
@@ -1094,6 +1125,12 @@ pub fn agent(
                         .context("local worker stopped")?;
                     // Golden images built since the agent started are advertised too.
                     let mut beat = hello.clone();
+                    // Optional fields (older controllers ignore them): releases for upgrade
+                    // health checks, and a drain the host upgrader declares.
+                    beat["version"] = json!(env!("CARGO_PKG_VERSION"));
+                    beat["worker"] =
+                        json!({"version":status["version"],"protocol":status["worker_protocol"]});
+                    beat["drain"] = json!(root.join("drain").exists());
                     if let Some(golden) = status["images"].as_array() {
                         beat["images"]
                             .as_array_mut()
@@ -1144,15 +1181,18 @@ pub fn agent(
                     Ok(tungstenite::Message::Ping(v)) => ws.send(tungstenite::Message::Pong(v))?,
                     Ok(tungstenite::Message::Pong(_)) => {}
                     Err(e) if timed_out(&e) => {}
+                    Ok(tungstenite::Message::Close(Some(frame))) => {
+                        anyhow::bail!("controller closed the channel: {}", frame.reason)
+                    }
                     _ => anyhow::bail!("node channel closed"),
                 }
             }
         })();
-        if result.is_err() {
+        if let Err(e) = result {
             if guided {
                 let _ = channel_status(root, "disconnected", &instance, None);
             }
-            eprintln!("node channel disconnected; reconnecting");
+            eprintln!("node channel disconnected ({e:#}); reconnecting");
         }
         std::thread::sleep(Duration::from_secs(2));
     }

@@ -174,7 +174,7 @@ impl Snapshot {
     /// Whether this host can resume the captured RAM state: same runtime, CPU
     /// (including the host kernel) and guest kernel.
     fn resumable(&self, cpu: &str, kernel_sha256: &str) -> bool {
-        self.runtime == "firecracker-v1.17.0"
+        self.runtime == crate::common::RUNTIME
             && self.cpu == cpu
             && self.kernel_sha256 == kernel_sha256
     }
@@ -864,7 +864,7 @@ impl Runtime {
             memory_mib: workspace.memory_mib,
             vcpu_count: workspace.vcpu_count,
             image: workspace.image,
-            runtime: "firecracker-v1.17.0".into(),
+            runtime: crate::common::RUNTIME.into(),
             cpu: self.cpu.clone(),
             kernel_sha256: self.kernel_hash.clone(),
             files,
@@ -1053,6 +1053,9 @@ impl Runtime {
         match op {
             "status" => Ok(
                 json!({"runtime":"Firecracker v1.17.0","running":self.machines.len(),
+                "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
+                // What this worker writes into captures and requires to resume one (upgrade gate).
+                "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
                 "worker_pid":std::process::id(),"guest_ssh_v1":true,
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),

@@ -233,8 +233,8 @@ impl Catalog {
         db.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
+        crate::nodes::readable(&db)?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 3, "catalog schema is newer than this binary");
         db.execute_batch("BEGIN IMMEDIATE;
           CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, issuer TEXT NOT NULL, subject TEXT, email TEXT NOT NULL, UNIQUE(issuer,subject), UNIQUE(issuer,email));
           CREATE TABLE IF NOT EXISTS resources(owner INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL CHECK(kind IN ('machine','snapshot')), name TEXT NOT NULL, physical TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(owner,kind,name), UNIQUE(kind,physical));
@@ -263,7 +263,8 @@ impl Catalog {
               CREATE UNIQUE INDEX operation_retry ON operations(owner,retry_key);",
             )?;
         }
-        db.execute_batch("UPDATE resources SET reserved_mib=COALESCE(json_extract(metadata,'$.memory_mib'),0) WHERE kind='machine' AND reserved_mib=0 AND json_extract(metadata,'$.state')='running'; PRAGMA user_version=3; COMMIT;")?;
+        // A newer catalog this binary may read (its floor allows it) keeps its version.
+        db.execute_batch(&format!("UPDATE resources SET reserved_mib=COALESCE(json_extract(metadata,'$.memory_mib'),0) WHERE kind='machine' AND reserved_mib=0 AND json_extract(metadata,'$.state')='running'; PRAGMA user_version={}; COMMIT;", version.max(nodes::SCHEMA)))?;
         nodes::db(root)?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS node_usage(node TEXT PRIMARY KEY,extra_mib INTEGER NOT NULL DEFAULT 0,extra_cpus INTEGER NOT NULL DEFAULT 0,extra_slots INTEGER NOT NULL DEFAULT 0);")?;
         // The exclusive gateway lock proves the previous catalog owner is gone.
@@ -849,6 +850,7 @@ impl Catalog {
             if requested.is_some_and(|r| r != id)
                 || common::guest_shape(&n["capabilities"], memory, cpus).is_err()
                 || n["online"] != true
+                || n["capabilities"]["drain"] == true
                 || !n["capabilities"]["images"]
                     .as_array()
                     .is_some_and(|a| a.iter().any(|i| i == image))
@@ -1699,6 +1701,43 @@ mod tests {
             remote_listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn newer_schema_opens_only_under_its_reader_floor() {
+        let root = fixture(false);
+        let owner = identity("owner-sub", "owner@example.test");
+        let next = nodes::SCHEMA + 1;
+        let set = |sql: &str| {
+            Catalog::open(&root, &owner.issuer, None)
+                .map(|c| c.db.execute_batch(sql).unwrap())
+                .unwrap()
+        };
+        set(&format!("PRAGMA user_version={next}"));
+        let refused = Catalog::open(&root, &owner.issuer, None).err().unwrap();
+        assert!(
+            refused.to_string().contains("needs a newer binary"),
+            "{refused}"
+        );
+        assert!(nodes::db(&root).is_err());
+        let floor = |value: i64| {
+            let db = Connection::open(root.join("catalog.sqlite3")).unwrap();
+            db.execute(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES('min_reader_schema',?1)",
+                [value.to_string()],
+            )
+            .unwrap();
+        };
+        floor(next);
+        assert!(Catalog::open(&root, &owner.issuer, None).is_err());
+        floor(nodes::SCHEMA);
+        let c = Catalog::open(&root, &owner.issuer, None).unwrap();
+        let version: i64 =
+            c.db.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(version, next, "an older binary never lowers the version");
+        assert!(nodes::db(&root).is_ok());
+        drop(c);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

@@ -185,6 +185,19 @@ mod capacity_tests {
     }
 }
 
+/// Host-runner protocol this binary speaks, and the oldest a controller built from it
+/// accepts. Controllers upgrade first; see docs/UPGRADES.md for when to bump.
+pub const PROTOCOL: u64 = 1;
+pub const PROTOCOL_MIN: u64 = 1;
+/// Linux runtimes a controller admits. A new Firecracker is added here one release
+/// before any runner reports it.
+pub const RUNTIMES: &[&str] = &["firecracker-v1.17.0"];
+/// The runtime this release's worker runs and resumes captures with.
+pub const RUNTIME: &str = "firecracker-v1.17.0";
+/// Agent-worker protocol (control.sock) and the oldest worker the agent still drives.
+pub const WORKER_PROTOCOL: u64 = 1;
+pub const WORKER_PROTOCOL_MIN: u64 = 1;
+
 /// Explicit Mac v1 slice; absence preserves legacy Linux protocol semantics.
 pub const MAC_OPERATIONS: &[&str] = &[
     "status", "stats", "list", "inspect", "create", "start", "stop", "exec", "put", "get",
@@ -208,9 +221,11 @@ pub fn node_operation(v: &serde_json::Value, op: &str) -> Result<()> {
 }
 pub fn node_capabilities(v: &serde_json::Value) -> Result<()> {
     guest_limits(v)?;
+    ensure!(v["type"] == "heartbeat", "invalid heartbeat");
+    let protocol = v["protocol"].as_u64().unwrap_or(0);
     ensure!(
-        v["type"] == "heartbeat" && v["protocol"] == 1,
-        "invalid heartbeat protocol"
+        (PROTOCOL_MIN..=PROTOCOL).contains(&protocol),
+        "protocol {protocol} unsupported; this controller accepts {PROTOCOL_MIN}..{PROTOCOL}"
     );
     ensure!(
         (256..=HOST_MEMORY_MIB as u64).contains(&v["memory_mib"].as_u64().unwrap_or(0))
@@ -223,7 +238,7 @@ pub fn node_capabilities(v: &serde_json::Value) -> Result<()> {
         && v["runtime"] == "apple-vz-v1";
     let linux = v["backend"] == "firecracker"
         && v["arch"] == "x86_64"
-        && v["runtime"] == "firecracker-v1.17.0";
+        && v["runtime"].as_str().is_some_and(|r| RUNTIMES.contains(&r));
     ensure!(
         mac || linux,
         "unsupported backend/architecture/runtime tuple"
@@ -278,6 +293,26 @@ mod backend_tests {
             assert!(node_capabilities(&golden).is_err());
         }
         assert!(node_operation(&legacy, "fork").is_ok());
+        // Protocol window, runtime admission, and optional fields an older peer adds.
+        let mut beat = legacy.clone();
+        for protocol in [PROTOCOL_MIN, PROTOCOL] {
+            beat["protocol"] = json!(protocol);
+            assert!(node_capabilities(&beat).is_ok());
+        }
+        for protocol in [json!(0), json!(PROTOCOL + 1), json!("1"), json!(null)] {
+            beat["protocol"] = protocol;
+            let error = node_capabilities(&beat).unwrap_err().to_string();
+            assert!(error.contains("unsupported"), "{error}");
+        }
+        beat = legacy.clone();
+        beat["runtime"] = json!("firecracker-v9.9.9");
+        assert!(node_capabilities(&beat).is_err());
+        beat = legacy.clone();
+        beat["version"] = json!("0.5.0");
+        beat["worker"] = json!({"version":"0.5.0","protocol":1});
+        beat["drain"] = json!(true);
+        beat["future_field"] = json!({"any":"shape"});
+        assert!(node_capabilities(&beat).is_ok());
         let mac = json!({"type":"heartbeat","protocol":1,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":2048,"slots":1,"vcpus":2,"images":["ubuntu-arm64"],"max_guest_memory_mib":2048,"max_guest_vcpus":2,"guest_ssh_v1":false,"operations":MAC_OPERATIONS});
         assert!(node_capabilities(&mac).is_ok());
         assert!(node_operation(&mac, "terminal").is_ok());

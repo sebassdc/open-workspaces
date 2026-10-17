@@ -332,6 +332,63 @@ async fn malformed_oversized_frames_and_enrollment_are_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_heartbeat_closes_with_reason_and_drain_is_stored() {
+    let root = root();
+    let credentials = enrollment(&root, "alpha");
+    let c = Controller {
+        root: root.clone(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        jobs: Arc::new(Mutex::new(HashMap::new())),
+        slots: Arc::new(Semaphore::new(32)),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let proxy_loop = tokio::spawn(proxies(c.clone()));
+    let app = routes(c.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let token = credentials["credential"].as_str().unwrap().to_owned();
+    let root1 = root.clone();
+    tokio::task::spawn_blocking(move || {
+        let beat = |protocol: u64| json!({"type":"heartbeat","protocol":protocol,"backend":"firecracker","arch":"x86_64","runtime":common::RUNTIME,"memory_mib":512,"slots":2,"vcpus":2,"images":["alpine"],"version":"0.5.0","worker":{"version":"0.5.0","protocol":1},"drain":true});
+        let mut ws = socket(&origin, "/node/alpha", &token, None).unwrap();
+        timeout_socket(&ws).unwrap();
+        ws.send(tungstenite::Message::Text(beat(common::PROTOCOL + 1).to_string().into())).unwrap();
+        let deadline = std::time::Instant::now();
+        let frame = loop {
+            match ws.read() {
+                Ok(tungstenite::Message::Close(frame)) => break frame.unwrap(),
+                Ok(tungstenite::Message::Ping(v)) => {
+                    let _ = ws.send(tungstenite::Message::Pong(v));
+                }
+                Err(e) if timed_out(&e) => assert!(deadline.elapsed() < Duration::from_secs(5)),
+                other => panic!("expected a close frame, got {other:?}"),
+            }
+        };
+        assert_eq!(u16::from(frame.code), 4001);
+        assert!(frame.reason.contains("unsupported"), "{}", frame.reason);
+        // An accepted heartbeat keeps its optional fields; placement reads drain from them.
+        let mut ws = socket(&origin, "/node/alpha", &token, None).unwrap();
+        timeout_socket(&ws).unwrap();
+        ws.send(tungstenite::Message::Text(beat(common::PROTOCOL).to_string().into())).unwrap();
+        let deadline = std::time::Instant::now();
+        while online(&root1, "alpha").is_err() {
+            assert!(deadline.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let nodes = inventory(&root1).unwrap();
+        assert_eq!(nodes[0]["capabilities"]["drain"], true);
+        assert_eq!(nodes[0]["capabilities"]["worker"]["version"], "0.5.0");
+    })
+    .await
+    .unwrap();
+    server.abort();
+    proxy_loop.abort();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_accepted_lost_reply_reopens_with_one_create_and_one_exec() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let root = root();
