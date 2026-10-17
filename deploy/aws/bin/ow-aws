@@ -126,7 +126,8 @@ case $command in
       esac
     done
     find_instance
-    remote "$wait" ready "$wait" "$images" ;;
+    # Each step (bootstrap, images, runner) may take up to WAIT.
+    remote $(( wait * 3 + 60 )) ready "$wait" "$images" ;;
   authorize)
     (( $# == 1 )) || die "usage: ow-aws --host $host authorize BOX"
     box_name "$1"
@@ -192,13 +193,13 @@ EOF
   restart)
     case ${1:-} in --worker) worker=1 ;; "") worker= ;; *) die "usage: ow-aws --host $host restart [--worker]" ;; esac
     find_instance
-    remote 1200 restart "$worker" ;;
+    remote 1800 restart "$worker" ;;
   stop)
     find_instance
     # Never stop on a guess: an unknown state could mean running boxes that were not hibernated.
     state=$(instance_state) || die "could not read the state of $instance; nothing was stopped"
     case $state in
-      running) remote 1200 hibernate_boxes ;;
+      running) remote 1800 hibernate_boxes ;;
       stopped) echo "$instance is already stopped"; exit 0 ;;
       *) die "$instance is $state; run this again once it is running or stopped" ;;
     esac
@@ -208,7 +209,7 @@ EOF
   start)
     find_instance
     start_instance
-    remote 1200 after_start 600 ;;
+    remote 1800 after_start 600 ;;
   join-tailnet)
     [[ ${1:-} == --secret && ${2:-} =~ ^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$ ]] \
       || die "usage: ow-aws --host $host join-tailnet --secret SECRET_ARN"
@@ -251,7 +252,7 @@ sys.exit(0 if any(s.get("op") in ("replace", "create-replacement", "delete-repla
     find_instance
     state=$(instance_state) || die "could not read the state of $instance; nothing was hibernated"
     case $state in
-      running) echo "the preview replaces the $host instance: hibernating its boxes"; remote 1200 hibernate_for_replacement ;;
+      running) echo "the preview replaces the $host instance: hibernating its boxes"; remote 1800 hibernate_for_replacement ;;
       stopped) echo "the preview replaces the $host instance, which is stopped: its boxes are already hibernated or stopped" ;;
       *) die "$instance is $state; run this again once it is running or stopped" ;;
     esac ;;
@@ -276,7 +277,7 @@ sys.exit(0 if any(s.get("op") in ("replace", "create-replacement", "delete-repla
     if [[ $(instance_state) == stopped ]]; then echo "$host is stopped; starting it"; start_instance; fi
     wait_ssm
     # A fresh host builds from source before it is ready.
-    remote 3600 post_up 3000 ${upgrade_args[@]+"${upgrade_args[@]}"}
+    remote 10800 post_up 3000 ${upgrade_args[@]+"${upgrade_args[@]}"}
     for recipe in ${recipes[@]+"${recipes[@]}"}; do image "$recipe"; done ;;
   *) usage ;;
 esac
