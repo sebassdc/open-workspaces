@@ -116,7 +116,11 @@ mod framing_tests {
     #[test]
     fn captures_wait_longer_than_other_operations() {
         for op in ["hibernate", "snapshot", "fork"] {
-            assert_eq!(reply_wait(&json!({"op":op})), Duration::from_secs(1200), "{op}");
+            assert_eq!(
+                reply_wait(&json!({"op":op})),
+                Duration::from_secs(1200),
+                "{op}"
+            );
         }
         assert_eq!(reply_wait(&json!({"op":"list"})), Duration::from_secs(120));
     }

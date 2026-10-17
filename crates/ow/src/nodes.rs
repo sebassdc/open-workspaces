@@ -1049,9 +1049,35 @@ pub fn agent(
     let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Worker status for the heartbeats, fetched on its own thread: the worker answers
+    // one request at a time, so a long capture must not stall or end the heartbeats.
+    // None once the worker stops answering.
+    let latest = Arc::new(std::sync::Mutex::new(Some(status.clone())));
+    {
+        let (latest, root) = (latest.clone(), root.to_owned());
+        std::thread::spawn(move || {
+            loop {
+                let status = wire::connect_waiting(
+                    &root,
+                    &json!({"op":"status"}),
+                    wire::reply_wait(&json!({"op":"hibernate"})),
+                )
+                .map(|(_, v)| v)
+                .ok();
+                let stopped = status.is_none();
+                *latest.lock().unwrap() = status;
+                if stopped {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+    }
     loop {
-        wire::request(root, json!({"op":"status"}))
-            .context("local worker stopped; host participation ended")?;
+        ensure!(
+            latest.lock().unwrap().is_some(),
+            "local worker stopped; host participation ended"
+        );
         let result = (|| -> Result<()> {
             if guided {
                 channel_status(root, "connecting", &instance, None)?;
@@ -1061,7 +1087,10 @@ pub fn agent(
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
             loop {
                 if heartbeat.elapsed() > Duration::from_secs(3) {
-                    let status = wire::request(root, json!({"op":"status"}))
+                    let status = latest
+                        .lock()
+                        .unwrap()
+                        .clone()
                         .context("local worker stopped")?;
                     // Golden images built since the agent started are advertised too.
                     let mut beat = hello.clone();

@@ -423,36 +423,42 @@ fn hibernate_all(root: &Path) -> Result<()> {
     // The AWS unit allows 900 s to stop; the worker captures one machine at a time.
     let deadline = Instant::now() + Duration::from_secs(840);
     wire::request(root, json!({"op":"quiesce"}))?;
-    let list = wire::request(root, json!({"op":"list"}))?;
-    for workspace in list.as_array().context("workspace list")? {
-        let (Some(id), Some("running")) = (workspace["id"].as_str(), workspace["state"].as_str())
-        else {
-            continue;
-        };
-        let wait = deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_secs(1));
-        match wire::connect_waiting(root, &json!({"op":"hibernate","id":id}), wait) {
-            Ok(_) => println!("hibernated {id}"),
-            Err(e) => eprintln!("could not hibernate {id}: {e:#}"),
+    let result = (|| -> Result<()> {
+        let list = wire::request(root, json!({"op":"list"}))?;
+        for workspace in list.as_array().context("workspace list")? {
+            let (Some(id), Some("running")) =
+                (workspace["id"].as_str(), workspace["state"].as_str())
+            else {
+                continue;
+            };
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_secs(1));
+            match wire::connect_waiting(root, &json!({"op":"hibernate","id":id}), wait) {
+                Ok(_) => println!("hibernated {id}"),
+                Err(e) => eprintln!("could not hibernate {id}: {e:#}"),
+            }
         }
-    }
-    let list = wire::request(root, json!({"op":"list"}))?;
-    let running: Vec<_> = list
-        .as_array()
-        .context("workspace list")?
-        .iter()
-        .filter(|w| w["state"] == "running")
-        .filter_map(|w| w["id"].as_str())
-        .collect();
-    if !running.is_empty() {
-        wire::request(root, json!({"op":"quiesce","closing":false}))?;
-        bail!(
+        let list = wire::request(root, json!({"op":"list"}))?;
+        let running: Vec<_> = list
+            .as_array()
+            .context("workspace list")?
+            .iter()
+            .filter(|w| w["state"] == "running")
+            .filter_map(|w| w["id"].as_str())
+            .collect();
+        ensure!(
+            running.is_empty(),
             "could not hibernate {}; the worker keeps running (nothing was shut down)",
             running.join(", ")
         );
+        Ok(())
+    })();
+    if result.is_err() {
+        // Called off: the worker keeps running, so it must accept starts and wakes again.
+        let _ = wire::request(root, json!({"op":"quiesce","closing":false}));
     }
-    Ok(())
+    result
 }
 
 /// Shut down local HTTP proxies, all of them or only one workspace's.
@@ -943,20 +949,28 @@ mod down_tests {
     /// A stand-in worker on `control.sock`: box `a` runs; its hibernation fails
     /// unless `capture_ok`. Returns the data dir and the requests it saw.
     fn worker(capture_ok: bool) -> (PathBuf, Arc<Mutex<Vec<Value>>>) {
+        worker_with(capture_ok, false)
+    }
+
+    fn worker_with(capture_ok: bool, second_list_fails: bool) -> (PathBuf, Arc<Mutex<Vec<Value>>>) {
         let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
         fs::create_dir(&root).unwrap();
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = seen.clone();
         std::thread::spawn(move || {
-            let mut slept = false;
+            let (mut slept, mut lists) = (false, 0);
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
                 let request = wire::line(&mut stream).unwrap();
                 log.lock().unwrap().push(request.clone());
                 let state = if slept { "hibernated" } else { "running" };
                 let response = match request["op"].as_str().unwrap() {
+                    "list" if second_list_fails && lists == 1 => {
+                        json!({"ok":false,"error":"worker busy"})
+                    }
                     "list" => {
+                        lists += 1;
                         json!({"ok":true,"result":[{"id":"a","state":state},{"id":"b","state":"stopped"}]})
                     }
                     "hibernate" if capture_ok => {
@@ -994,6 +1008,18 @@ mod down_tests {
             false,
             "starts are allowed again"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_check_after_the_round_also_allows_starts_again() {
+        let (root, seen) = worker_with(true, true);
+        assert!(hibernate_all(&root).is_err());
+        assert_eq!(
+            ops(&seen),
+            ["quiesce", "list", "hibernate", "list", "quiesce"]
+        );
+        assert_eq!(seen.lock().unwrap()[4]["closing"], false);
         fs::remove_dir_all(root).unwrap();
     }
 
