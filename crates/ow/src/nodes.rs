@@ -30,6 +30,25 @@ use tokio::{
 };
 
 const FRAME: usize = 65536;
+
+/// Set by `ow host up` on SIGTERM: the controller dispatches no new jobs and the
+/// process exits once BUSY (non-stream jobs the agent accepted) reaches zero.
+pub(crate) static STOPPING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub(crate) static BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// One accepted job, counted from its ID until its reply is sent (streams drop it early).
+struct Busy;
+impl Busy {
+    fn new() -> Self {
+        BUSY.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Busy
+    }
+}
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 const OFFLINE: i64 = 15;
 fn now() -> i64 {
     SystemTime::now()
@@ -558,6 +577,10 @@ async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) 
         "unauthorized proxy peer"
     );
     online(&c.root, &node)?;
+    ensure!(
+        !STOPPING.load(std::sync::atomic::Ordering::SeqCst),
+        "runner restarting; retry"
+    );
     let id = common::nonce()?;
     let (tx, rx) = oneshot::channel();
     let generation;
@@ -1056,10 +1079,9 @@ pub fn agent(
     ensure!(credential.len() == 64, "invalid credential file");
     let status = wire::request(root, json!({"op":"status"}))?;
     let guided = root.join("host.json").exists();
-    let images = if guided {
-        crate::onboarding::verified_images(root)?
-    } else {
-        // Legacy unmanaged nodes retain their separately configured asset contract.
+    // Legacy unmanaged nodes retain their separately configured asset contract. Checked
+    // on every heartbeat, so a developer image built later shows without a restart.
+    let base_images = || {
         ["alpine", "arch", "ubuntu"]
             .into_iter()
             .filter(|image| {
@@ -1073,6 +1095,11 @@ pub fn agent(
             })
             .collect::<Vec<_>>()
     };
+    let images = if guided {
+        crate::onboarding::verified_images(root)?
+    } else {
+        base_images()
+    };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
     #[cfg(target_os = "linux")]
     let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true});
@@ -1082,7 +1109,9 @@ pub fn agent(
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Worker status for the heartbeats, fetched on its own thread: the worker answers
     // one request at a time, so a long capture must not stall or end the heartbeats.
-    // None once the worker stops answering.
+    // None while the worker does not answer: the agent then sends no heartbeats (the
+    // runner shows offline) and waits for a worker to answer again, so the worker can
+    // restart (a runner upgrade) without the agent.
     let latest = Arc::new(std::sync::Mutex::new(Some(status.clone())));
     {
         let (latest, root) = (latest.clone(), root.to_owned());
@@ -1095,20 +1124,12 @@ pub fn agent(
                 )
                 .map(|(_, v)| v)
                 .ok();
-                let stopped = status.is_none();
                 *latest.lock().unwrap() = status;
-                if stopped {
-                    break;
-                }
                 std::thread::sleep(Duration::from_secs(3));
             }
         });
     }
     loop {
-        ensure!(
-            latest.lock().unwrap().is_some(),
-            "local worker stopped; host participation ended"
-        );
         let result = (|| -> Result<()> {
             if guided {
                 channel_status(root, "connecting", &instance, None)?;
@@ -1117,14 +1138,19 @@ pub fn agent(
             timeout_socket(&ws)?;
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
             loop {
-                if heartbeat.elapsed() > Duration::from_secs(3) {
-                    let status = latest
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .context("local worker stopped")?;
+                let status = latest.lock().unwrap().clone();
+                if let Some(status) =
+                    status.filter(|_| heartbeat.elapsed() > Duration::from_secs(3))
+                {
                     // Golden images built since the agent started are advertised too.
                     let mut beat = hello.clone();
+                    if !guided && cfg!(target_os = "linux") {
+                        beat["images"] = json!(base_images());
+                        // A restarted worker may run with new limits.
+                        beat["memory_mib"] = status["max_memory_mib"].clone();
+                        beat["slots"] = status["max_running"].clone();
+                        beat["vcpus"] = status["max_vcpus"].clone();
+                    }
                     // Optional fields (older controllers ignore them): releases for upgrade
                     // health checks, and a drain the host upgrader declares.
                     beat["version"] = json!(env!("CARGO_PKG_VERSION"));
@@ -1172,9 +1198,17 @@ pub fn agent(
                             ca.map(Path::to_owned),
                             active.clone(),
                         );
+                        let busy = Busy::new();
                         std::thread::spawn(move || {
-                            let _ =
-                                agent_job(&root, &origin, &node, &id, &credential, ca.as_deref());
+                            let _ = agent_job(
+                                &root,
+                                &origin,
+                                &node,
+                                &id,
+                                &credential,
+                                ca.as_deref(),
+                                busy,
+                            );
                             active.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
@@ -1204,6 +1238,7 @@ fn agent_job(
     id: &str,
     credential: &str,
     ca: Option<&Path>,
+    busy: Busy,
 ) -> Result<()> {
     let mut socket = socket(origin, &format!("/job/{node}/{id}"), credential, ca)?;
     timeout_socket(&socket)?;
@@ -1263,6 +1298,8 @@ fn agent_job(
         let _ = socket.close(None);
         return Ok(());
     }
+    // Streams (terminal, SSH) end with the process; a graceful stop does not wait for them.
+    drop(busy);
     if op == "ssh" {
         ensure!(
             request

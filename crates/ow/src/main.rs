@@ -462,6 +462,11 @@ enum HostAction {
         slots: u32,
         #[arg(long, default_value_t = 2)]
         cpus: u32,
+        /// Use the worker another service runs (`ow supervisor` in its own systemd unit)
+        /// instead of starting one, so restarting this command leaves the VMs running.
+        /// Idle and budget limits are then the worker's own environment.
+        #[arg(long)]
+        external_worker: bool,
     },
     /// Check Linux/KVM/storage/tools and current host demand without starting VMs.
     Doctor,
@@ -612,6 +617,7 @@ fn main_result() -> anyhow::Result<i32> {
             slots,
             cpus,
             idle_minutes,
+            external_worker,
         } = command
         {
             anyhow::ensure!(cli.server.is_none(), "host up is local; omit --server");
@@ -624,10 +630,19 @@ fn main_result() -> anyhow::Result<i32> {
                 slots,
                 cpus,
                 idle_minutes,
+                external_worker,
             );
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = (listen, node, memory, slots, cpus, idle_minutes);
+                let _ = (
+                    listen,
+                    node,
+                    memory,
+                    slots,
+                    cpus,
+                    idle_minutes,
+                    external_worker,
+                );
                 anyhow::bail!("host up requires Linux x86-64 with KVM");
             }
         }

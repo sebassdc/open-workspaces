@@ -134,6 +134,60 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+/// Waits up to `limit` for a worker someone else starts (a systemd unit) to answer
+/// with its Internet uplink up.
+fn wait_worker(runner: &Path, limit: Duration) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if crate::wire::request(runner, json!({"op":"status"}))
+            .is_ok_and(|status| status["internet"] == true)
+        {
+            return Ok(());
+        }
+        ensure!(
+            started.elapsed() < limit,
+            "no worker answers on {}; start it first (open-workspaces-worker.service)",
+            runner.join("control.sock").display()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// SIGTERM or SIGINT: stop taking jobs and let the ones in flight finish.
+fn stop_on_signal() -> Result<()> {
+    extern "C" fn stopping(_: libc::c_int) {
+        nodes::STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let mut handler: libc::sigaction = unsafe { std::mem::zeroed() };
+        handler.sa_sigaction = stopping as *const () as usize;
+        ensure!(
+            unsafe { libc::sigaction(signal, &handler, std::ptr::null_mut()) } == 0,
+            "cannot install the stop handler"
+        );
+    }
+    Ok(())
+}
+
+/// After a stop signal: the controller already refuses new jobs; wait for the agent's
+/// accepted non-stream jobs (their replies are journaled) up to `limit`.
+fn drain(limit: Duration) {
+    use std::sync::atomic::Ordering;
+    let started = Instant::now();
+    // A job ID sent just before the signal may still be in flight to the agent.
+    std::thread::sleep(Duration::from_secs(1));
+    while nodes::BUSY.load(Ordering::SeqCst) > 0 && started.elapsed() < limit {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let left = nodes::BUSY.load(Ordering::SeqCst);
+    if left > 0 {
+        eprintln!("stopping with {left} job(s) still running after {limit:?}");
+    } else {
+        println!("Stopped: no jobs in flight.");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn up(
     base: Option<PathBuf>,
     listen: Option<SocketAddr>,
@@ -142,6 +196,7 @@ pub fn up(
     slots: u32,
     cpus: u32,
     idle_minutes: u64,
+    external_worker: bool,
 ) -> Result<i32> {
     common::host_limits(memory, slots, cpus)?;
     let base = self::base(base)?;
@@ -206,22 +261,27 @@ pub fn up(
         &json!({"controller":advertised,"local":local,"node":node}),
     )?;
 
-    let started = Command::new(std::env::current_exe()?)
-        .arg("--local")
-        .arg("--data-dir")
-        .arg(&runner)
-        .arg("up")
-        .env("OW_MAX_MEMORY_MIB", memory.to_string())
-        .env("OW_MAX_RUNNING", slots.to_string())
-        .env("OW_MAX_VCPUS", cpus.to_string())
-        .env(ow_core::idle::ENV, (idle_minutes * 60).to_string())
-        .stdout(Stdio::null())
-        .status()?;
-    ensure!(
-        started.success(),
-        "local runner failed to start; see {}",
-        runner.join("worker.log").display()
-    );
+    if external_worker {
+        // The worker has its own unit and limits; restarting this process leaves its VMs running.
+        wait_worker(&runner, Duration::from_secs(60))?;
+    } else {
+        let started = Command::new(std::env::current_exe()?)
+            .arg("--local")
+            .arg("--data-dir")
+            .arg(&runner)
+            .arg("up")
+            .env("OW_MAX_MEMORY_MIB", memory.to_string())
+            .env("OW_MAX_RUNNING", slots.to_string())
+            .env("OW_MAX_VCPUS", cpus.to_string())
+            .env(ow_core::idle::ENV, (idle_minutes * 60).to_string())
+            .stdout(Stdio::null())
+            .status()?;
+        ensure!(
+            started.success(),
+            "local runner failed to start; see {}",
+            runner.join("worker.log").display()
+        );
+    }
     let credential = runner.join("node.json");
     let join = runner.join("join.json");
     if !credential.exists() {
@@ -241,6 +301,7 @@ pub fn up(
         .with_context(|| format!("enrolling local runner {node}; pass --node NEW_ID"))?;
     }
 
+    stop_on_signal()?;
     let (done, finished) = std::sync::mpsc::channel::<(&str, Result<()>)>();
     {
         let (done, controller) = (done.clone(), controller.clone());
@@ -283,7 +344,20 @@ pub fn up(
     if listen.ip().is_loopback() {
         println!("Loopback only: other machines cannot reach this controller (no tailnet found).");
     }
-    let (what, result) = finished.recv()?;
+    let (what, result) = loop {
+        match finished.recv_timeout(Duration::from_millis(200)) {
+            Ok(done) => break done,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                if nodes::STOPPING.load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                // Under systemd's 960 s stop timeout; a capture in flight takes up to 900 s.
+                drain(Duration::from_secs(900));
+                return Ok(0);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(e) => return Err(e.into()),
+        }
+    };
     result.with_context(|| format!("{what} stopped"))?;
     bail!("{what} stopped")
 }
