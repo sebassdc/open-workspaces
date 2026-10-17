@@ -179,11 +179,12 @@ pub fn share_unlocked(root: &Path, identity: &Identity, request: &Value) -> Resu
     share_on(&mut db, user, op, request)
 }
 
-/// What a grantee may do on a machine shared with them. Resize and sharing stay with the owner.
+/// What a grantee may do on a machine shared with them. Resize, delete and sharing stay with
+/// the owner.
 fn permitted(role: &str, op: &str) -> bool {
     match role {
         "owner" => true,
-        "admin" => op != "resize",
+        "admin" => !matches!(op, "resize" | "delete"),
         "use" => matches!(
             op,
             "exec"
@@ -536,6 +537,10 @@ impl Catalog {
                     self.db.execute("UPDATE resources SET reserved_mib=0,reserved_cpus=0 WHERE kind='machine' AND physical=?1 AND node=?2",params![physical,node])?;
                 }
             }
+            // A machine this runner no longer lists is gone from it (deleted there, or the runner
+            // lost its data): flag it so its owner can delete it here. Never-observed creates
+            // stay pending; a machine listed again gets its metadata back on the next pass.
+            self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','missing'),reserved_mib=0,reserved_cpus=0,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND node=?1 AND json_extract(metadata,'$.state') NOT IN ('pending','missing') AND physical NOT IN (SELECT value FROM json_each(?2))",params![node,json!(observed).to_string()])?;
             self.db.execute("INSERT INTO node_usage(node,extra_mib,extra_cpus,extra_slots) VALUES(?1,?2,?3,?4) ON CONFLICT(node) DO UPDATE SET extra_mib=?2,extra_cpus=?3,extra_slots=?4",params![node,extra_mib,extra_cpus,extra_slots])?;
             for snapshot in snapshots.as_array().context("invalid snapshots")? {
                 let physical = snapshot["name"].as_str().context("snapshot ID")?;
@@ -665,6 +670,136 @@ impl Catalog {
             value["state"] = json!("offline");
         }
         self.public(user, kind, &value)
+    }
+    /// Drop a deleted machine: its row, its grants (closing grantees' streams) and the snapshots
+    /// taken from it, whoever took them. Past operations keep their IDs, which name node journal
+    /// entries, but stop claiming the names, so a new machine may reuse them. Returns the
+    /// caller's own snapshot names that went with it.
+    fn forget(&mut self, user: i64, physical: &str) -> Result<Vec<String>> {
+        // Its snapshots: captured ones name it as their workspace; a reservation whose capture
+        // never completed is found through the snapshot operation that made it.
+        const OF: &str = "kind='snapshot' AND (json_extract(metadata,'$.workspace')=?1 OR (json_extract(metadata,'$.state')='pending' AND physical IN (SELECT json_extract(request,'$.request.name') FROM operations WHERE op='snapshot' AND json_extract(request,'$.request.id')=?1)))";
+        let tx = self.db.transaction()?;
+        let grantees = tx
+            .prepare("SELECT grantee FROM grants WHERE physical=?1")?
+            .query_map([physical], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let snapshots = tx
+            .prepare(&format!(
+                "SELECT name FROM resources WHERE {OF} AND owner=?2 ORDER BY name"
+            ))?
+            .query_map(params![physical, user], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op<>'snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1)",[physical])?;
+        tx.execute(&format!("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE {OF})"),[physical])?;
+        tx.execute("DELETE FROM grants WHERE physical=?1", [physical])?;
+        tx.execute(&format!("DELETE FROM resources WHERE {OF}"), [physical])?;
+        tx.execute(
+            "DELETE FROM resources WHERE kind='machine' AND physical=?1",
+            [physical],
+        )?;
+        tx.commit()?;
+        for grantee in grantees {
+            cut(grantee, physical);
+        }
+        Ok(snapshots)
+    }
+    /// Whether the runner lists the machine right now.
+    fn listed(&self, node: &str, physical: &str) -> Result<bool> {
+        let machines = wire::request(&nodes::route(&self.root, node)?, json!({"op":"list"}))
+            .context("runner unreachable; the machine may be back, try again")?;
+        Ok(machines
+            .as_array()
+            .context("invalid machines")?
+            .iter()
+            .any(|m| m["id"] == physical))
+    }
+    /// Whether reconcile found the machine gone from its runner.
+    fn missing(&self, physical: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT json_extract(metadata,'$.state')='missing' FROM resources WHERE kind='machine' AND physical=?1",
+            [physical],
+            |r| r.get::<_, Option<bool>>(0),
+        )? == Some(true))
+    }
+    /// The saved result of a delete retried with its key. A key held by another operation or
+    /// name conflicts; one whose machine went without a recorded result is uncertain.
+    fn delete_replay(&self, user: i64, name: &str, key: Option<&str>) -> Result<Option<Value>> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        common::identifier(key)?;
+        let previous:Option<(i64,String,String,String,Option<String>)>=self.db.query_row("SELECT id,op,resource,state,response FROM operations WHERE owner=?1 AND retry_key=?2",params![user,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let Some((id, op, resource, state, response)) = previous else {
+            return Ok(None);
+        };
+        let forgotten = resource == format!("deleted:{name}");
+        ensure!(
+            op == "delete" && (resource == name || forgotten),
+            "operation key conflicts with original parameters"
+        );
+        if state == "succeeded" {
+            return Ok(Some(serde_json::from_str(
+                &response.context("missing result")?,
+            )?));
+        }
+        if forgotten {
+            return Err(self.outcome_error(user, id));
+        }
+        Ok(None)
+    }
+    /// Delete a machine its runner no longer lists: record the operation under its key, with
+    /// the fingerprint a dispatched delete would have, then drop the entry.
+    fn delete_missing(
+        &mut self,
+        user: i64,
+        name: &str,
+        physical: &str,
+        input: &Value,
+    ) -> Result<Value> {
+        let node = self.placement("machine", physical)?;
+        let mut request = input.clone();
+        request["id"] = json!(physical);
+        let object = request.as_object_mut().context("request")?;
+        object.remove("node");
+        object.remove("operation_key");
+        let fingerprint = json!({"request":request,"node":node}).to_string();
+        let key = match input["operation_key"].as_str() {
+            Some(key) => key.to_owned(),
+            None => common::nonce()?,
+        };
+        let previous: Option<(i64, String, String)> = self
+            .db
+            .query_row(
+                "SELECT id,request,state FROM operations WHERE owner=?1 AND retry_key=?2",
+                params![user, key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let operation = match previous {
+            Some((id, previous, state)) => {
+                ensure!(
+                    previous == fingerprint,
+                    "operation key conflicts with original parameters"
+                );
+                ensure!(
+                    state != "failed",
+                    "operation previously rejected; use a new operation_key for deliberate retry"
+                );
+                id
+            }
+            None => {
+                self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,'delete',?2,'pending',?3,?4,?5)",params![user,name,node,key,fingerprint])?;
+                self.db.last_insert_rowid()
+            }
+        };
+        let mut value = json!({"deleted":name,"snapshots":self.forget(user, physical)?});
+        value["operation"] = self.operation_info(user, operation)?;
+        value["operation"]["state"] = json!("succeeded");
+        value["operation_id"] = json!(operation);
+        value["node"] = json!(node);
+        self.db.execute("UPDATE operations SET state='succeeded',response=?1,finished_at=CURRENT_TIMESTAMP WHERE id=?2",params![value.to_string(),operation])?;
+        Ok(value)
     }
     fn snapshot_source(&self, user: i64, snapshot: &str, physical: &str) -> Result<()> {
         let metadata: String = self.db.query_row(
@@ -875,7 +1010,8 @@ impl Catalog {
                 "fork",
                 "restore",
                 "share",
-                "unshare"
+                "unshare",
+                "delete"
             ]
             .contains(&op.as_str()),
             "unsupported user operation"
@@ -889,9 +1025,24 @@ impl Catalog {
         let name = request["id"].as_str().context("id")?.to_owned();
         common::address(&name)?;
         let input = request.clone();
+        // A finished delete has no row left to resolve: answer its key before looking.
+        if op == "delete"
+            && let Some(cached) =
+                self.delete_replay(user, &name, input["operation_key"].as_str())?
+        {
+            return Ok(cached);
+        }
         // Resolve authority before any worker contact, including inventory refresh.
         if op != "create" {
             let physical = self.machine(user, &name, &op)?;
+            // Confirmed gone from its runner: only the row is left. A runner that is online now
+            // may have it back, so it must still not list it; an unreachable one refuses.
+            if op == "delete" && self.missing(&physical)? {
+                let node = self.placement("machine", &physical)?;
+                if nodes::online(&self.root, &node).is_err() || !self.listed(&node, &physical)? {
+                    return self.delete_missing(user, &name, &physical, &input);
+                }
+            }
             let node = self.placement("machine", &physical)?;
             nodes::online(&self.root, &node)?;
             nodes::operation_capable(&self.root, &node, &op)?;
@@ -914,6 +1065,14 @@ impl Catalog {
             nodes::online(&self.root, node)?;
         }
         self.reconcile()?;
+        if op == "delete" {
+            // The runner no longer has it: nothing to dispatch, only the row to drop.
+            let physical = self.machine(user, &name, &op)?;
+            let node = self.placement("machine", &physical)?;
+            if self.missing(&physical)? && !self.listed(&node, &physical)? {
+                return self.delete_missing(user, &name, &physical, &input);
+            }
+        }
         // Optional protocol-v1 status fields; query outside the SQLite writer. A missing
         // legacy response conservatively retains the original 2 GiB/4 CPU ceiling.
         let local_status = if matches!(
@@ -1181,6 +1340,8 @@ impl Catalog {
             value["name"] == request["name"] && value["workspace"] == request["id"]
         } else if op == "stop" {
             value["workspace"]["id"] == request["id"]
+        } else if op == "delete" {
+            value["deleted"] == request["id"]
         } else {
             value["id"] == target
         };
@@ -1202,6 +1363,8 @@ impl Catalog {
         } else if op == "stop" {
             self.save_node(&node, "machine", &physical, &value["workspace"])?;
             value["workspace"] = self.public(user, "machine", &value["workspace"])?;
+        } else if op == "delete" {
+            value = json!({"deleted":name,"snapshots":self.forget(user, &physical)?});
         } else {
             self.save_node(&node, "machine", &target, &value)?;
             value = self.public(user, "machine", &value)?;

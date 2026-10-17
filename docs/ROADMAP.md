@@ -51,6 +51,12 @@ product decisions can materially change them.
   listing outside its prefix; the box restored onto a fresh runner with its
   process still counting and its disk intact, and the catalog copy passed
   `integrity_check`. See [backups to S3](../deploy/aws/README.md#backups-to-s3).
+- [x] 0.4.1: `ow delete NAME` against a remote server and **Delete** in the
+  dashboard, owner only: the runner removes the machine, its disk and its
+  snapshots, and the catalog drops its row, snapshots and grants (a grantee's
+  open sessions close) and frees the name. A machine an online runner no longer
+  lists is shown as `missing`, releases its reservation, and is deleted without
+  contacting the runner.
 - [x] `ow login https://NAME.TAILNET.ts.net --tailnet`: the remote CLI against a
   dashboard with tailnet sign-in, no Cloudflare login. Checked from a macOS
   laptop on the tailnet against an EC2 host: list, create, SSH key enrollment

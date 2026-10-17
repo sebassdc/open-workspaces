@@ -93,7 +93,7 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             request["memory_mib"] = json!(memory);
             request["vcpu_count"] = json!(cpus);
         }
-        "start" | "stop" | "hibernate" | "ssh-info" => {}
+        "start" | "stop" | "hibernate" | "ssh-info" | "delete" => {}
         "share" | "unshare" => {
             let with = operation.with.context("teammate email required")?;
             crate::common::email(&with)?;
@@ -446,6 +446,10 @@ mod tests {
         assert!(
             validated(br#"{"op":"fork","id":"parent","child":"child","snapshot":"prepared"}"#)
                 .is_ok()
+        );
+        assert_eq!(
+            validated(br#"{"op":"delete","id":"old","command":"x"}"#).unwrap(),
+            json!({"op":"delete","id":"old"})
         );
     }
 }

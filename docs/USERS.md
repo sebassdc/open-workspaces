@@ -101,7 +101,9 @@ each machine, and the dashboard has Share and Unshare buttons.
 | `use` (default) | exec, shell, SSH stream, `put`/`get`, `ssh-info`, start, hibernate, fork into their own namespace |
 | `admin` | `use`, plus stop, snapshot, restore and `ssh-keys` |
 
-Resize and sharing stay with the owner; there is no delete through the gateway.
+Resize, delete and sharing stay with the owner. Delete removes the machine, its
+disk, every snapshot taken from it (a grantee's too) and its grants; past
+operations stay in the history as `deleted:NAME`, and the name can be used again.
 The catalog keeps grants in `grants(physical, grantee, role)` (an additive table:
 an older binary ignores it, so grantees lose access rather than gain it) and resolves every request to a physical ID through the owner or a grant before
 any worker contact, as for owned machines. Sharing with an email nobody has used
