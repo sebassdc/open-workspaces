@@ -56,7 +56,10 @@ product decisions can materially change them.
   snapshots, and the catalog drops its row, snapshots and grants (a grantee's
   open sessions close) and frees the name. A machine an online runner no longer
   lists is shown as `missing`, releases its reservation, and is deleted without
-  contacting the runner.
+  contacting the runner. Checked on EC2: a host built from the `v0.4.1` tag
+  replaced a `v0.4.0` host; from a macOS laptop on the tailnet, `ow create`,
+  `ow stop` and `ow delete` removed the machine, `ow list` was empty, the name
+  could be created again, and the dashboard state listed no workspaces.
 - [x] `ow login https://NAME.TAILNET.ts.net --tailnet`: the remote CLI against a
   dashboard with tailnet sign-in, no Cloudflare login. Checked from a macOS
   laptop on the tailnet against an EC2 host: list, create, SSH key enrollment
