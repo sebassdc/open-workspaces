@@ -101,8 +101,12 @@ tailscale serve --bg http://127.0.0.1:8787   # then open https://NAME.TAILNET.ts
 - The dashboard runs `tailscale whois --json PEER` (cached for a minute), so the
   `tailscale` CLI must be on its `PATH`; tailscaled answers this read-only query
   for any local user.
-- The CLI installer and `ow login` are not offered: the remote CLI signs in
-  through Cloudflare Access only.
+- The CLI installer is not offered. Build `ow` from source (Linux or macOS:
+  `cargo build --release -p ow`) and sign in with
+  `ow login https://NAME.TAILNET.ts.net --tailnet`: no Cloudflare login, the
+  request carries this device's tailnet user through `tailscale serve`, so
+  `ow list`, `ow create`, `ow shell`, `ow ssh` and `ow ssh-config` work for an
+  allowed login. The login checks that the dashboard admits this device.
 - Anyone who can open a TCP connection to the loopback port on this machine can
   claim an allowed login. Use it only where the machine's local users are
   operators; guests cannot reach host loopback.

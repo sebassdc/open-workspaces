@@ -38,6 +38,16 @@ export interface HostArgs {
      * Built once per data volume, in the background. Default: none (Alpine only).
      */
     developerImages?: pulumi.Input<pulumi.Input<string>[]>;
+    /**
+     * Backups to S3, as `s3://bucket/prefix`. The host role may list the bucket under the
+     * prefix and read and write objects there (no delete: retention is the bucket's), and
+     * the host gets the AWS CLI and `/usr/local/bin/ow-backup`: it copies the controller
+     * catalog to `PREFIX/catalog/` and uploads every sealed snapshot the store lacks
+     * (hibernated boxes' captures included) to `PREFIX/snapshots/`. Run it from your own
+     * scheduler, best right after `ow down --hibernate`, when every running box is sealed.
+     * Default: no backups.
+     */
+    backupUrl?: pulumi.Input<string>;
 }
 
 const DEFAULT_REPOSITORY = "https://github.com/sebassdc/open-workspaces.git";
@@ -72,6 +82,36 @@ export function developerImageList(images: string[]): string {
         }
     }
     return [...new Set(images)].join(" ");
+}
+
+/** Splits a backup URL into bucket and prefix; refuses anything but `s3://bucket/prefix`. */
+export function backupLocation(url: string): { bucket: string; prefix: string } {
+    const match = /^s3:\/\/([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])\/([A-Za-z0-9_-][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_-][A-Za-z0-9._-]*)*)\/?$/.exec(url);
+    if (!match || match[2].split("/").some((part) => part === "." || part === "..")) {
+        throw new Error(`backupUrl must be s3://bucket/prefix, not ${JSON.stringify(url)}`);
+    }
+    return { bucket: match[1], prefix: match[2] };
+}
+
+/** Host role policy for backups: list under the prefix, read and write objects there, never delete. */
+export function backupPolicy(partition: string, url: string): string {
+    const { bucket, prefix } = backupLocation(url);
+    return JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+            {
+                Effect: "Allow",
+                Action: "s3:ListBucket",
+                Resource: `arn:${partition}:s3:::${bucket}`,
+                Condition: { StringLike: { "s3:prefix": [`${prefix}/*`] } },
+            },
+            {
+                Effect: "Allow",
+                Action: ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
+                Resource: `arn:${partition}:s3:::${bucket}/${prefix}/*`,
+            },
+        ],
+    });
 }
 
 /**
@@ -138,6 +178,12 @@ export class Host extends pulumi.ComponentResource {
                 })),
             }, parent);
         }
+        if (args.backupUrl) {
+            new aws.iam.RolePolicy(`${name}-backup`, {
+                role: role.id,
+                policy: pulumi.all([partition, args.backupUrl]).apply(([p, url]) => backupPolicy(p, url)),
+            }, parent);
+        }
         const profile = new aws.iam.InstanceProfile(`${name}-host`, { role: role.name, tags }, parent);
 
         // No ingress rules: SSM and Tailscale both connect outbound.
@@ -160,18 +206,23 @@ export class Host extends pulumi.ComponentResource {
         }, parent);
 
         const amiId = args.amiId ?? aws.ssm.getParameterOutput({ name: UBUNTU_AMI_PARAMETER }, parent).value;
+        // pulumi.all types tuples of up to eight values; the backup URL goes alongside.
         const userData = pulumi
             .all([
-                dataVolume.id,
-                args.repository ?? DEFAULT_REPOSITORY,
-                args.ref ?? `v${require("./package.json").version}`,
-                args.tailscaleAuthKeySecretArn ?? "",
-                args.tailscaleHostname ?? name,
-                args.tailscaleSsh ?? false,
-                args.dashboardLogins ?? [],
-                args.developerImages ?? [],
+                args.backupUrl ?? "",
+                pulumi.all([
+                    dataVolume.id,
+                    args.repository ?? DEFAULT_REPOSITORY,
+                    args.ref ?? `v${require("./package.json").version}`,
+                    args.tailscaleAuthKeySecretArn ?? "",
+                    args.tailscaleHostname ?? name,
+                    args.tailscaleSsh ?? false,
+                    args.dashboardLogins ?? [],
+                    args.developerImages ?? [],
+                ]),
             ])
-            .apply(([volumeId, repository, ref, secretArn, hostname, tailscaleSsh, logins, images]) => {
+            .apply(([backupUrl, [volumeId, repository, ref, secretArn, hostname, tailscaleSsh, logins, images]]) => {
+                const backup = backupUrl ? backupLocation(backupUrl) : undefined;
                 if (logins.length > 0 && !secretArn) {
                     throw new Error("dashboardLogins needs tailscaleAuthKeySecretArn: the dashboard is served over the tailnet only");
                 }
@@ -184,6 +235,7 @@ export class Host extends pulumi.ComponentResource {
                     OW_TAILSCALE_SSH: tailscaleSsh ? "1" : "",
                     OW_DASHBOARD_LOGINS: dashboardLoginList(logins),
                     OW_DEVELOPER_IMAGES: developerImageList(images),
+                    OW_BACKUP_URL: backup ? `s3://${backup.bucket}/${backup.prefix}` : "",
                 });
             });
 

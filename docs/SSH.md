@@ -9,7 +9,9 @@ added. Review/publication of this source and new image assets is a planner step.
 
 ## Connect
 
-Install an ordinary OpenSSH client and sign in with `ow login https://PROJECT_HOST`.
+Install an ordinary OpenSSH client and sign in with `ow login https://PROJECT_HOST`
+(or `ow login https://NAME.TAILNET.ts.net --tailnet` for a dashboard with
+[tailnet sign-in](DASHBOARD.md#tailnet-sign-in)).
 Choose an existing **public** Ed25519 key, or explicitly create a dedicated one
 with `ssh-keygen -t ed25519 -f ~/.ssh/ow_ed25519`. Keep the private file local.
 For a new SSH-capable Ubuntu/Arch developer image:

@@ -54,6 +54,7 @@ export const instanceId = host.instanceId;
 | `tailscaleSsh` | `false` | Tailscale SSH, authorized by your tailnet policy. |
 | `dashboardLogins` | none | Tailnet logins allowed into the web dashboard. Needs `tailscaleAuthKeySecretArn`; see below. |
 | `developerImages` | none | `["ubuntu"]`: build the [developer image](../../docs/GUEST_IMAGES.md) (user `dev`, SSH server, toolchains) after boot. SSH into boxes and golden-image recipes need it. |
+| `backupUrl` | none | `s3://bucket/prefix`: install the AWS CLI and `ow-backup`, and let the host role list, read and add objects under the prefix (never delete). See below. |
 
 Outputs: `instanceId`, `privateIp`, `availabilityZone`, `dataVolumeId`,
 `roleName`, `securityGroupId`.
@@ -109,6 +110,38 @@ every 30 s, until the host is on the tailnet, so a later `tailscale up` is
 enough. It uses the controller root, so machines created there are placed on
 the runners.
 
+## Backups to S3
+
+With `backupUrl`, the host gets the AWS CLI v2 and `/usr/local/bin/ow-backup`
+(run it as root). It copies the controller catalog (`ow backup catalog`) to
+`PREFIX/catalog/catalog-UTCSTAMP.sqlite3`, then uploads every sealed snapshot
+the store lacks (`ow backup snapshots`) to `PREFIX/snapshots/`, hibernated
+boxes' captures included. It stops at the first failure and exits non-zero.
+
+Nothing runs it on its own: call it from your scheduler, best right after
+`ow down --hibernate` (for example before a nightly instance stop), when every
+running box is a sealed capture. A running box that was never snapshotted or
+hibernated, and a stopped box, are not in the store.
+
+The host role may list the bucket under the prefix and get and put objects
+there; it cannot delete. Retention is the bucket's: use a private bucket with a
+lifecycle rule (and versioning, so an overwrite keeps the old copy). Snapshots
+hold guest memory and disks, credentials included; the catalog holds owner
+identities and credential hashes.
+
+Restore a box onto a runner (the default `ow host up` runner, or a fresh one
+started with `ow --local --data-dir DIR up`):
+
+```bash
+sudo ow backup list s3://bucket/prefix/snapshots
+sudo ow backup restore SNAPSHOT --from s3://bucket/prefix/snapshots [--to DIR] [--cold]
+```
+
+`--cold` boots the disk when the host's CPU or kernel differs from the one that
+captured it. A restored box is runner-local: reach it with
+`ow --local --data-dir DIR`. Catalog restore steps are in
+[core: catalog](../../docs/CORE.md#catalog).
+
 ## Boot sequence
 
 User data (`bootstrap.sh`) runs once per instance:
@@ -125,7 +158,8 @@ User data (`bootstrap.sh`) runs once per instance:
 6. with `developerImages`, starts `open-workspaces-images.service`, which builds
    each missing developer image in a disposable microVM (10-20 minutes) and then
    publishes it under the built-in name (`ow create --image ubuntu`). It runs
-   once per data volume and retries at the next boot if it failed.
+   once per data volume and retries at the next boot if it failed;
+7. with `backupUrl`, installs the AWS CLI v2 and `ow-backup`.
 
 Progress: `/var/log/open-workspaces-bootstrap.log`; state:
 `/var/lib/open-workspaces/bootstrap-status` (`running`, `failed` or
