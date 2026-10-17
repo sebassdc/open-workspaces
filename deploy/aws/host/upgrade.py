@@ -16,15 +16,12 @@ import subprocess
 import tarfile
 import tempfile
 import time
-from pathlib import Path
 
 import ow_host as h
 from ow_host import Refused, p, say
 
 JOURNAL = f"{h.DATA}/upgrade.json"
 LOCK = f"{h.DATA}/upgrade.lock"
-CLASS = {"component": 0, "config": 0, "guest-agent": 0, "host-layout": 0, "dashboard": 1, "controller": 1,
-         "agent": 1, "worker": 2, "vmm": 2, "guest-kernel": 2, "stage0": 3}
 # The pin (unit) each change moves; host-layout moves the units whose rendered files differ.
 MOVES = {"dashboard": "dashboard", "controller": "agent", "agent": "agent",
          "worker": "worker", "vmm": "worker", "guest-kernel": "worker"}
