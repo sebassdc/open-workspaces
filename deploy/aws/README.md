@@ -22,7 +22,9 @@ Every resource gets the `tags` input plus `Name`.
 
 Versions are this repository's git tags (`vX.Y.Z`). When a new
 `deploy/aws/package.json` version reaches `main`, the `aws-component-release`
-workflow runs the checks and creates that tag. The same tag is the default
+workflow runs the checks and creates that tag. Bump `version` in the root
+`Cargo.toml` and `Cargo.lock` with it (`cargo update --workspace`) so `ow --version`
+reports the release; the checks fail while they disagree. The same tag is the default
 `ref` the host builds, so set `ref` explicitly before the first release exists.
 
 ```bash
