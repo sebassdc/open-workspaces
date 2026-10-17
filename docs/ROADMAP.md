@@ -51,6 +51,10 @@ product decisions can materially change them.
   listing outside its prefix; the box restored onto a fresh runner with its
   process still counting and its disk intact, and the catalog copy passed
   `integrity_check`. See [backups to S3](../deploy/aws/README.md#backups-to-s3).
+- [x] `ow login https://NAME.TAILNET.ts.net --tailnet`: the remote CLI against a
+  dashboard with tailnet sign-in, no Cloudflare login. Checked from a macOS
+  laptop on the tailnet against an EC2 host: list, create, SSH key enrollment
+  and `ssh` through `ow ssh-config` with strict host-key checking.
 
 ## Open-source roadmap: OS phase 1, core traits and pluggable connect
 

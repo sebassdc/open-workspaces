@@ -62,16 +62,30 @@ fn cloudflared() -> PathBuf {
         PathBuf::from("cloudflared")
     }
 }
-pub fn login(url: &str) -> Result<()> {
+/// With `tailnet`, the server's dashboard uses tailnet sign-in: `tailscale serve`
+/// vouches for this device's tailnet user, so there is no token to fetch.
+pub fn login(url: &str, tailnet: bool) -> Result<()> {
     let url = server(url)?;
-    let status = Command::new(cloudflared())
-        .args(["access", "login", &url])
-        .stdout(Stdio::null())
-        .status()
-        .context("install cloudflared on this client for browser login")?;
-    ensure!(status.success(), "Cloudflare login failed");
-    // Verify the token is cached; never print it or put it in command arguments.
-    let _ = token(&url)?;
+    if tailnet {
+        ensure!(
+            reqwest::Url::parse(&url)?
+                .host_str()
+                .is_some_and(|h| h.ends_with(".ts.net")),
+            "--tailnet takes the host's MagicDNS name, e.g. https://NAME.TAILNET.ts.net"
+        );
+        request(&url, "", None).context(
+            "the dashboard refused this device: sign in to the tailnet as an allowed login",
+        )?;
+    } else {
+        let status = Command::new(cloudflared())
+            .args(["access", "login", &url])
+            .stdout(Stdio::null())
+            .status()
+            .context("install cloudflared on this client for browser login")?;
+        ensure!(status.success(), "Cloudflare login failed");
+        // Verify the token is cached; never print it or put it in command arguments.
+        let _ = token(&url)?;
+    }
     let path = config()?;
     fs::create_dir_all(path.parent().unwrap())?;
     fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700))?;
@@ -81,13 +95,35 @@ pub fn login(url: &str) -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&temporary)?;
-    file.write_all(serde_json::to_string_pretty(&json!({"server":url}))?.as_bytes())?;
+    let saved = if tailnet {
+        json!({"server":url,"auth":"tailscale"})
+    } else {
+        json!({"server":url})
+    };
+    file.write_all(serde_json::to_string_pretty(&saved)?.as_bytes())?;
     file.sync_all()?;
     fs::rename(temporary, path)?;
     println!("Signed in to {url}. Use ow list or ow shell <machine>.");
     Ok(())
 }
+/// A server saved by `ow login --tailnet` takes no token: the gateway ignores
+/// `cf-access-token` and trusts only what `tailscale serve` adds.
+fn tailnet_server(url: &str) -> Result<bool> {
+    let path = config()?;
+    Ok(path.exists() && saved_tailnet(&serde_json::from_slice(&fs::read(path)?)?, url))
+}
+fn saved_tailnet(saved: &Value, url: &str) -> bool {
+    saved["auth"] == "tailscale"
+        && saved["server"]
+            .as_str()
+            .and_then(|s| server(s).ok())
+            .as_deref()
+            == Some(url)
+}
 pub(crate) fn token(url: &str) -> Result<String> {
+    if tailnet_server(url)? {
+        return Ok(String::new());
+    }
     let output = Command::new(cloudflared())
         .args(["access", "token", "--app", url])
         .stderr(Stdio::null())
@@ -565,5 +601,33 @@ fn shell(url: &str, token: &str, id: &str) -> Result<i32> {
             Err(_) => bail!("terminal transport failed; reconnect with ow shell {id}"),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_saved_tailnet_server_skips_the_token() {
+        let url = "https://host.example-net.ts.net";
+        assert!(saved_tailnet(
+            &json!({"server":url,"auth":"tailscale"}),
+            url
+        ));
+        assert!(saved_tailnet(
+            &json!({"server":"https://host.example-net.ts.net/","auth":"tailscale"}),
+            url
+        ));
+        assert!(!saved_tailnet(&json!({"server":url}), url), "Access login");
+        assert!(!saved_tailnet(
+            &json!({"server":"https://other.example-net.ts.net","auth":"tailscale"}),
+            url
+        ));
+        assert!(!saved_tailnet(
+            &json!({"server":"http://host.example-net.ts.net","auth":"tailscale"}),
+            url
+        ));
+        assert!(!saved_tailnet(&json!({"auth":"tailscale"}), url));
     }
 }

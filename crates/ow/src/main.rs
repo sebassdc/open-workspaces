@@ -106,9 +106,12 @@ enum Action {
         #[command(subcommand)]
         command: BackupAction,
     },
-    /// Sign in through Cloudflare Access and save the remote server.
+    /// Sign in through Cloudflare Access (or, with --tailnet, the tailnet) and save the remote server.
     Login {
         url: String,
+        /// The server uses tailnet sign-in (`tailscale serve`); no Cloudflare login.
+        #[arg(long)]
+        tailnet: bool,
     },
     /// Authenticated browser dashboard and scoped workspace API.
     Dashboard {
@@ -658,8 +661,8 @@ fn main_result() -> anyhow::Result<i32> {
             );
         }
     }
-    if let Action::Login { url } = &cli.command {
-        client::login(url)?;
+    if let Action::Login { url, tailnet } = &cli.command {
+        client::login(url, *tailnet)?;
         return Ok(0);
     }
     let server = cli
