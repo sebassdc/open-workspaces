@@ -676,22 +676,24 @@ impl Catalog {
     /// entries, but stop claiming the names, so a new machine may reuse them. Returns the
     /// caller's own snapshot names that went with it.
     fn forget(&mut self, user: i64, physical: &str) -> Result<Vec<String>> {
+        // Its snapshots: captured ones name it as their workspace; a reservation whose capture
+        // never completed is found through the snapshot operation that made it.
+        const OF: &str = "kind='snapshot' AND (json_extract(metadata,'$.workspace')=?1 OR (json_extract(metadata,'$.state')='pending' AND physical IN (SELECT json_extract(request,'$.request.name') FROM operations WHERE op='snapshot' AND json_extract(request,'$.request.id')=?1)))";
         let tx = self.db.transaction()?;
         let grantees = tx
             .prepare("SELECT grantee FROM grants WHERE physical=?1")?
             .query_map([physical], |r| r.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let snapshots = tx
-            .prepare("SELECT name FROM resources WHERE kind='snapshot' AND owner=?1 AND json_extract(metadata,'$.workspace')=?2 ORDER BY name")?
-            .query_map(params![user, physical], |r| r.get::<_, String>(0))?
+            .prepare(&format!(
+                "SELECT name FROM resources WHERE {OF} AND owner=?2 ORDER BY name"
+            ))?
+            .query_map(params![physical, user], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op<>'snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1)",[physical])?;
-        tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE kind='snapshot' AND json_extract(metadata,'$.workspace')=?1)",[physical])?;
+        tx.execute(&format!("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE {OF})"),[physical])?;
         tx.execute("DELETE FROM grants WHERE physical=?1", [physical])?;
-        tx.execute(
-            "DELETE FROM resources WHERE kind='snapshot' AND json_extract(metadata,'$.workspace')=?1",
-            [physical],
-        )?;
+        tx.execute(&format!("DELETE FROM resources WHERE {OF}"), [physical])?;
         tx.execute(
             "DELETE FROM resources WHERE kind='machine' AND physical=?1",
             [physical],

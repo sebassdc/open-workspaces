@@ -758,3 +758,44 @@ fn delete_keys_replay_their_result_and_never_touch_a_replacement() {
     assert_eq!(c.operation(a, delete).unwrap(), deleted);
     assert_eq!(c.state(a).unwrap()["workspaces"][0]["state"], "running");
 }
+
+#[test]
+fn delete_drops_reservations_of_failed_snapshots_only_its_own() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    for id in ["demo", "other"] {
+        c.operation(a, json!({"op":"create","id":id,"node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    }
+    *fake.reject.lock().unwrap() = Some("snapshot".into());
+    for name in ["saved", "moved"] {
+        assert!(
+            c.operation(a, json!({"op":"snapshot","id":"demo","name":name}))
+                .is_err()
+        );
+    }
+    *fake.reject.lock().unwrap() = None;
+    // The name of a failed capture taken again on another machine is that machine's now.
+    c.operation(
+        a,
+        json!({"op":"snapshot","id":"other","name":"moved","operation_key":"moved-again"}),
+    )
+    .unwrap();
+    let names = |c: &mut Catalog| {
+        c.state(a).unwrap()["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&mut c), ["moved", "saved"]);
+    c.operation(a, json!({"op":"stop","id":"demo"})).unwrap();
+    let deleted = c.operation(a, json!({"op":"delete","id":"demo"})).unwrap();
+    assert_eq!(deleted["snapshots"], json!(["saved"]));
+    assert_eq!(names(&mut c), ["moved"]);
+    let other = c.physical(a, "machine", "other").unwrap();
+    let moved = c.physical(a, "snapshot", "moved").unwrap();
+    assert!(c.snapshot_source(a, &moved, &other).is_ok());
+}
