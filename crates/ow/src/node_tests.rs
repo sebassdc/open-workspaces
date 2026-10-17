@@ -385,7 +385,8 @@ async fn refused_heartbeat_closes_with_reason_and_drain_is_stored() {
     .unwrap();
     server.abort();
     proxy_loop.abort();
-    fs::remove_dir_all(root).unwrap();
+    // Best effort: the aborted session loop may still be writing its last heartbeat row.
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
