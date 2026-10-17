@@ -295,6 +295,9 @@ if [[ -n "${OW_BACKUP_URL:-}" ]]; then
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 . /etc/open-workspaces/backup.env
+# One run at a time: a second one would share the catalog file and the uploads.
+exec 9> /run/ow-backup.lock
+flock -n 9 || { echo "ow-backup is already running" >&2; exit 1; }
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 install -d -o ow -g ow -m 700 /srv/ow/.ow/backups
 file=/srv/ow/.ow/backups/catalog-$stamp.sqlite3

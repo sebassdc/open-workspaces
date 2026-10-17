@@ -111,7 +111,8 @@ test("ow-backup uploads the catalog, then the snapshots, and stops at the first 
     const backup = bootstrap.slice(bootstrap.indexOf("<<'BACKUP'\n") + 11, bootstrap.indexOf("\nBACKUP\n"))
         .replace("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", `export PATH=${dir}:/usr/bin:/bin`)
         .replace("/etc/open-workspaces/backup.env", join(dir, "backup.env"))
-        .replaceAll("/srv/ow/.ow/backups", join(dir, "backups"));
+        .replaceAll("/srv/ow/.ow/backups", join(dir, "backups"))
+        .replace("/run/ow-backup.lock", join(dir, "lock"));
     // Stand-ins log their arguments; the file "fail" names the one that exits 1.
     for (const tool of ["ow", "aws"]) {
         writeFileSync(join(dir, tool), `#!/bin/sh
@@ -123,6 +124,9 @@ exit 0
 `, { mode: 0o755 });
     }
     writeFileSync(join(dir, "install"), `#!/bin/sh\nfor a; do d=$a; done; mkdir -p "$d"\n`, { mode: 0o755 });
+    // flock(1) is Linux-only; the lock itself is checked on the host.
+    writeFileSync(join(dir, "flock"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    assert.ok(backup.includes('flock -n 9 || { echo "ow-backup is already running" >&2; exit 1; }'), "one run at a time");
     writeFileSync(join(dir, "runuser"), `#!/bin/sh\nshift 3; exec "$@"\n`, { mode: 0o755 });
     const run = (fail) => {
         rmSync(join(dir, "log"), { force: true });
