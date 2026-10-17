@@ -17,11 +17,13 @@ test("the helper and its host functions pass shellcheck", { skip: spawnSync("she
 
 // Stand-ins for aws, pulumi and sleep. Each SSM command's script is decoded and
 // kept; its status and output come from `results`, one per command in order.
-function fake({ state = "running", results = [], preview = { steps: [] } } = {}) {
+// With `hostBin`, each script really runs in bash, with hostBin first on PATH,
+// and its exit status and output become the command's result.
+function fake({ state = "running", results = [], preview = { steps: [] }, hostBin = null } = {}) {
     const dir = mkdtempSync(join(tmpdir(), "ow-aws-"));
     mkdirSync(join(dir, "bin"));
     mkdirSync(join(dir, "scripts"));
-    writeFileSync(join(dir, "config.json"), JSON.stringify({ state, results, preview }));
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ state, results, preview, hostBin }));
     writeFileSync(join(dir, "bin", "aws"), `#!/usr/bin/env node
 const fs = require("fs"), path = require("path");
 const dir = ${JSON.stringify(dir)}, args = process.argv.slice(2);
@@ -37,6 +39,11 @@ else if (args[1] === "send-command") {
     const script = Buffer.from(parameters.commands[0].split(" ")[1], "base64").toString();
     const n = sent();
     fs.writeFileSync(path.join(dir, "scripts", n + ".json"), JSON.stringify({ script, timeout: parameters.executionTimeout[0] }));
+    if (config.hostBin) {
+        const run = require("child_process").spawnSync("bash", ["-c", script], { encoding: "utf8", env: { PATH: config.hostBin + ":" + process.env.PATH } });
+        config.results[n] = { status: run.status === 0 ? "Success" : "Failed", stdout: run.stdout + run.stderr };
+        fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify(config));
+    }
     out("cmd-" + n);
 } else if (args[1] === "get-command-invocation") {
     const result = config.results[Number(arg("--command-id").slice(4))] || {};
@@ -47,7 +54,11 @@ else if (args[1] === "send-command") {
     writeFileSync(join(dir, "bin", "pulumi"), `#!/usr/bin/env node
 const config = JSON.parse(require("fs").readFileSync(${JSON.stringify(join(dir, "config.json"))}, "utf8"));
 const args = process.argv.slice(2);
-if (args[0] === "preview") console.log(JSON.stringify(config.preview));
+// The streaming format: one engine event per line instead of one document.
+if (args[0] === "preview" && process.env.PULUMI_ENABLE_STREAMING_JSON_PREVIEW) {
+    for (const step of config.preview.steps || []) console.log(JSON.stringify({ resourcePreEvent: { metadata: step } }));
+    console.log(JSON.stringify({ summaryEvent: {} }));
+} else if (args[0] === "preview") console.log(typeof config.preview === "string" ? config.preview : JSON.stringify(config.preview));
 else if (args[0] === "stack" && args[2] === "instanceId") console.log(${JSON.stringify(INSTANCE)});
 else process.exit(9);
 `, { mode: 0o755 });
@@ -104,6 +115,17 @@ test("stop hibernates the boxes first and never stops on a failure or an unknown
     f.done();
 });
 
+test("stop never stops the instance when the host cannot list its boxes", () => {
+    const hostBin = mkdtempSync(join(tmpdir(), "ow-aws-hostbin-"));
+    writeFileSync(join(hostBin, "ow"), '#!/bin/sh\n[ "$1" = list ] && { echo "worker unavailable" >&2; exit 1; }\nexit 0\n', { mode: 0o755 });
+    const f = fake({ state: "running", hostBin });
+    const result = f.run(["stop"]);
+    assert.notEqual(result.status, 0, result.stdout);
+    assert.ok(!f.calls().some((c) => c[1] === "stop-instances"), "stopped with an unknown set of running boxes");
+    f.done();
+    rmSync(hostBin, { recursive: true, force: true });
+});
+
 test("start waits for SSM, then readiness, then resumes the remembered boxes", () => {
     const f = fake({ state: "stopped" });
     assert.equal(f.run(["start"]).status, 0);
@@ -129,9 +151,24 @@ test("ci-preflight hibernates only when the preview replaces this host's instanc
         assert.deepEqual(f.scripts().map((s) => f.lastLine(s.script)), hibernates ? ["hibernate_for_replacement"] : [], JSON.stringify(steps));
         f.done();
     }
-    const f = fake({ state: "pending", preview: { steps: [{ op: "replace", urn: urn("ow-test-host") }] } });
+    let f = fake({ state: "pending", preview: { steps: [{ op: "replace", urn: urn("ow-test-host") }] } });
     assert.notEqual(f.run(["ci-preflight", "--stack", "rain"]).status, 0, "replaced on a guess");
     assert.equal(f.scripts().length, 0);
+    f.done();
+
+    // An unreadable preview is never taken as "kept".
+    for (const preview of ["{not json", "[]", "{}", JSON.stringify({ steps: "replace" }), ""]) {
+        f = fake({ preview });
+        const result = f.run(["ci-preflight", "--stack", "rain"]);
+        assert.notEqual(result.status, 0, JSON.stringify(preview));
+        assert.match(result.stderr, /could not read the pulumi preview/);
+        f.done();
+    }
+    // The streaming setting is turned off for this preview, so a replacement is still seen.
+    f = fake({ preview: { steps: [{ op: "replace", urn: urn("ow-test-host") }] } });
+    const result = f.run(["ci-preflight", "--stack", "rain"], { PULUMI_ENABLE_STREAMING_JSON_PREVIEW: "true" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.scripts().map((s) => f.lastLine(s.script)), ["hibernate_for_replacement"]);
     f.done();
 });
 
@@ -215,7 +252,7 @@ function host(body, { list = [], failStart = "", backups = "[]" } = {}) {
     writeFileSync(join(dir, "bin", "ow"), `#!/bin/sh
 echo "ow $*" >> "${dir}/log"
 case $1 in
-  list) cat "${dir}/list.json" ;;
+  list) [ -z "$LIST_FAIL" ] || { echo "worker unavailable" >&2; exit 1; }; cat "${dir}/list.json" ;;
   hibernate) [ "$2" != "$FAIL" ] ;;
   start) [ "$2" != "${failStart}" ] ;;
   "node") echo '[{"online": true}]' ;;
@@ -245,6 +282,9 @@ test("hibernate_boxes remembers each box it hibernated and stops at the first fa
     result = host("FAIL=c; export FAIL; hibernate_boxes", { list: boxes });
     assert.notEqual(result.status, 0);
     assert.equal(result.resume, "a\n", "a box that did not hibernate is not remembered");
+    result = host("LIST_FAIL=1; export LIST_FAIL; hibernate_boxes; echo after", { list: boxes });
+    assert.notEqual(result.status, 0, "an unreadable box list read as no running boxes");
+    assert.ok(!result.stdout.includes("after"));
 });
 
 test("resume_boxes starts remembered boxes and keeps the ones that failed", () => {

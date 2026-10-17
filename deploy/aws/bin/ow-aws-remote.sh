@@ -13,10 +13,12 @@ running_ids() {
 }
 
 # Hibernates every running box and remembers it for resume_boxes. A box that
-# cannot be hibernated stops the script with that box still running.
+# cannot be hibernated, or a box list that cannot be read, stops the script.
 hibernate_boxes() {
-  local box
-  for box in $(running_ids); do
+  local ids box
+  # Assigned first: a failure inside `for box in $(...)` would read as no boxes.
+  ids=$(running_ids)
+  for box in $ids; do
     ow hibernate "$box" > /dev/null
     echo "$box" >> "$resume_list"
     echo "hibernated $box"
@@ -84,7 +86,9 @@ wait_ready() {
       addr=$(ss -Hltn sport = :8790 | awk '{print $4}' | head -n 1)
       if [[ -n $addr && ( $t == none || $addr == "$t:8790" ) ]]; then break; fi
       if [[ -n $addr ]]; then
-        if [[ -n $(running_ids) ]]; then
+        local ids
+        ids=$(running_ids)
+        if [[ -n $ids ]]; then
           echo "the controller listens on $addr, not the tailnet address $t, and boxes are running: run ow-aws restart"
           return 1
         fi

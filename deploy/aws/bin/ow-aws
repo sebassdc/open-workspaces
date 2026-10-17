@@ -237,17 +237,27 @@ EOF
   ci-preflight)
     stack_arg "$@"
     stack=$2
-    preview=$(pulumi preview --stack "$stack" --json)
+    # One JSON document: the streaming event format would not parse below.
+    preview=$(env -u PULUMI_ENABLE_STREAMING_JSON_PREVIEW pulumi preview --stack "$stack" --json)
+    # Exit 0: the instance is replaced; 10: kept; anything else: the preview is unreadable.
+    replaced=0
     # shellcheck disable=SC2016 # `$` is the URN separator
-    if ! python3 -c '
+    python3 -c '
 import json, sys
-steps = json.loads(sys.stdin.read()).get("steps") or []
+preview = json.loads(sys.stdin.read())
+if not isinstance(preview, dict) or not ("steps" in preview or "changeSummary" in preview):
+    sys.exit("not a pulumi preview --json document")
+steps = preview.get("steps") or []
+if not isinstance(steps, list) or not all(isinstance(s, dict) for s in steps):
+    sys.exit("unexpected steps in the preview")
 sys.exit(0 if any(s.get("op") in ("replace", "create-replacement", "delete-replaced")
-                  and s.get("urn", "").endswith("$aws:ec2/instance:Instance::" + sys.argv[1] + "-host") for s in steps) else 1)' \
-      "$host" <<< "$preview"; then
-      echo "the preview keeps the $host instance; nothing to do"
-      exit 0
-    fi
+                  and str(s.get("urn", "")).endswith("$aws:ec2/instance:Instance::" + sys.argv[1] + "-host") for s in steps) else 10)' \
+      "$host" <<< "$preview" || replaced=$?
+    case $replaced in
+      0) ;;
+      10) echo "the preview keeps the $host instance; nothing to do"; exit 0 ;;
+      *) die "could not read the pulumi preview; nothing was hibernated, so do not run pulumi up" ;;
+    esac
     stack_instance "$stack"
     find_instance
     state=$(instance_state) || die "could not read the state of $instance; nothing was hibernated"

@@ -36,7 +36,7 @@ the stack's `instanceId` output. `OW_SSH_KEY` picks the private key (default
 | `image RECIPE` | `ready --images`, then `ow image build RECIPE` on the host's runner. The file must be named `NAME.sh` |
 | `backups [--url S3URL] [OWNER/NAME \| ID]` | backed-up captures, oldest first: `uploaded  owner/machine  box  capture`. Default URL: the host's `backupUrl`. With a box, its newest capture is the last line. Restore one with `sudo ow backup restore` on a runner |
 | `apply`, `upgrade [ARGS]` | `ow-host apply` or `ow-host upgrade` on hosts that ship `ow-host`; refused on others |
-| `ci-preflight --stack S` | before `pulumi up`: if `pulumi preview` replaces this host's instance, hibernates its boxes (`ow down --hibernate`, which keeps them running if one cannot be hibernated) and stops the service. Refuses when the instance is neither running nor stopped |
+| `ci-preflight --stack S` | before `pulumi up`: if `pulumi preview` replaces this host's instance, hibernates its boxes (`ow down --hibernate`, which keeps them running if one cannot be hibernated) and stops the service. Fails (so CI stops before `pulumi up`) when the preview cannot be read or the instance is neither running nor stopped |
 | `ci-post-up --stack S [--image RECIPE].. [--max-class N]` | after `pulumi up`: starts a stopped host, waits until ready (each step up to 50 minutes: a new host builds from source), resumes remembered boxes, runs `ow-host apply` and `ow-host upgrade` where the host has them, then builds each image (an unchanged recipe is a no-op) |
 
 Each SSM command has a local deadline, so an unreachable host ends the command
