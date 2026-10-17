@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "main": "index.ts",
   "scripts": {
-    "check": "tsc --noEmit && node --test test/*.test.mjs"
+    "check": "tsc --noEmit && node --import ./test/resolve-ts.mjs --test test/*.test.mjs"
   },
   "dependencies": {
     "@pulumi/aws": "7.48.0",
