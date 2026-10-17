@@ -111,6 +111,13 @@ class Planner(unittest.TestCase):
                          (True, True, ["agent", "dashboard"]))
         self.assertFalse(u.plan(manifest(entry("0.5.1", ["controller"], 1, schema=(4, 4))), AT, "0.5.1")["rollback_auto"])
 
+    def test_going_back_moves_the_units_whose_releases_are_undone(self):
+        m = manifest(entry("0.5.1", ["controller"], 1), entry("0.5.2", ["dashboard"], 1), entry("0.5.3", ["worker"], 2))
+        plan = u.plan(m, {"worker": "0.5.3", "agent": "0.5.1", "dashboard": "0.5.2"}, "0.5.0", captures=WARM, compat=COMPAT)
+        self.assertEqual((plan["class"], sorted(plan["move"])), (2, ["agent", "dashboard", "worker"]))
+        plan = u.plan(m, {"worker": "0.5.0", "agent": "0.5.0", "dashboard": "0.5.2"}, "0.5.1")
+        self.assertEqual(plan["move"], {"agent": "0.5.1", "dashboard": "0.5.1"})
+
     def test_pending_config_and_rendered_units(self):
         plan = u.plan(manifest(), AT, "0.5.0", pending={"worker"})
         self.assertEqual((plan["class"], plan["move"], plan["restart"]), (2, {}, ["worker"]))

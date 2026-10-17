@@ -21,6 +21,7 @@ import ow_host as h
 from ow_host import Refused, p, say
 
 JOURNAL = f"{h.DATA}/upgrade.json"
+LOG = "/var/log/open-workspaces-stage.log"
 LOCK = f"{h.DATA}/upgrade.lock"
 # The pin (unit) each change moves; host-layout moves the units whose rendered files differ.
 MOVES = {"dashboard": "dashboard", "controller": "agent", "agent": "agent",
@@ -213,9 +214,15 @@ def stage(target):
             cmd = ["systemd-run", "--scope", "--quiet", "-p", "CPUWeight=10", "nice", "-n", "10",
                    "runuser", "-u", "ow", "--", "env", "HOME=/srv/ow", *cmd]
             env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
-        say(f"staging {name} (building on the host)")
+        log = p(LOG)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        say(f"staging {name} (building on the host; output in {LOG})")
         started = time.monotonic()
-        h.run(cmd, capture=False, env=env)
+        with open(log, "a") as out:
+            code = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT, env=env).returncode
+        if code:
+            tail = log.read_text(errors="replace").splitlines()[-30:]
+            raise RuntimeError(f"staging {name} failed ({code}):\n" + "\n".join(tail))
         built = h.run([str(rel / "bin/ow"), "--version"]).split()
         if built[-1:] != [target["version"]]:
             raise Refused(f"{name}: built ow reports {' '.join(built)}, not {target['version']}")
@@ -612,6 +619,10 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None)
         frm = h.pins()
         if None in frm.values():
             raise Refused("this host has no release pins (layout v1): replace it with this release first")
+        newest = max((h.staged(frm[name]) or {"version": "0.0.0"} for name in h.PINS), key=lambda s: version(s["version"]))
+        if version(newest["version"]) > version(target["version"]):
+            # Going back: an older release's manifest does not list what runs now; the newest running one does.
+            target["manifest"] = json.loads(git("show", f"{newest['commit']}:release-impact.json"))
         status = ops.worker_status() or {}
         compat = status.get("compat") or {"cpu": host_cpu()}
         runners = [{"id": n["id"], "protocol": (n.get("capabilities") or {}).get("protocol", 0)}
