@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "releases": [
+    {
+      "version": "0.5.0",
+      "class": 3,
+      "changes": ["controller", "agent", "worker", "host-layout", "stage0"],
+      "protocol": { "speaks": 1, "accepts": [1, 1] },
+      "worker_protocol": { "speaks": 1, "accepts": [1, 1] },
+      "catalog": { "schema": 3, "min_reader": 3 },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": ["firecracker-v1.17.0"]
+      },
+      "host_layout": 2,
+      "in_place_from": null,
+      "notes": "Host layout v2: config in an SSM parameter, worker and control plane in separate units, release directories with per-unit pins, ow-host upgrade. One planned replacement moves a 0.4.x host to it."
+    },
+    {
+      "version": "0.4.1",
+      "class": 3,
+      "changes": ["stage0"],
+      "protocol": { "speaks": 1, "accepts": [1, 1] },
+      "worker_protocol": { "speaks": 1, "accepts": [1, 1] },
+      "catalog": { "schema": 3, "min_reader": 3 },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": ["firecracker-v1.17.0"]
+      },
+      "host_layout": 1,
+      "in_place_from": null,
+      "notes": "Baseline: every release replaces the host."
+    }
+  ]
+}

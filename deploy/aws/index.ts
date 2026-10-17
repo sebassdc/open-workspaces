@@ -19,7 +19,10 @@ export interface HostArgs {
     dataVolumeSizeGib?: pulumi.Input<number>;
     /** Git repository with the Open Workspaces sources. */
     repository?: pulumi.Input<string>;
-    /** Git tag or commit to build on the host. Default: this package's release tag. */
+    /**
+     * Git tag or commit to build on the host. Default: this package's release tag. Part of
+     * the host's config parameter: a change is applied in place by `ow-host upgrade`.
+     */
     ref?: pulumi.Input<string>;
     /** Tags for every resource the component creates. */
     tags?: pulumi.Input<{ [key: string]: pulumi.Input<string> }>;
@@ -47,12 +50,22 @@ export interface HostArgs {
      * the host gets the AWS CLI and `/usr/local/bin/ow-backup`: it copies the controller
      * catalog to `PREFIX/catalog/` and uploads every sealed snapshot the store lacks
      * (hibernated boxes' captures included) to `PREFIX/snapshots/`. Run it from your own
-     * scheduler, best right after `ow down --hibernate`, when every running box is sealed.
-     * Default: no backups.
+     * scheduler, best right after `ow down --hibernate`, when every running box is sealed,
+     * or set `backupSchedule`. Default: no backups.
      */
     backupUrl?: pulumi.Input<string>;
+    /**
+     * When `ow-backup` runs, as a systemd calendar expression (for example
+     * `*-*-* 01:00:00 UTC`); the host installs a timer for it. Needs `backupUrl`.
+     * Default: no timer.
+     */
+    backupSchedule?: pulumi.Input<string>;
+    /** Minutes without a connection or activity before a box hibernates; 0 turns it off. Default: 30. */
+    idleMinutes?: pulumi.Input<number>;
 }
 
+/** Host layout of stage 0 (bootstrap.sh); bump it with any change to that script. */
+const STAGE0 = "2";
 const DEFAULT_REPOSITORY = "https://github.com/sebassdc/open-workspaces.git";
 const UBUNTU_AMI_PARAMETER = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id";
 
@@ -96,6 +109,54 @@ export function backupLocation(url: string): { bucket: string; prefix: string } 
     return { bucket: match[1], prefix: match[2] };
 }
 
+export interface HostConfigInputs {
+    repository: string;
+    ref: string;
+    tailscaleAuthKeySecretArn: string;
+    tailscaleHostname: string;
+    tailscaleSsh: boolean;
+    dashboardLogins: string[];
+    developerImages: string[];
+    backupUrl: string;
+    backupSchedule: string;
+    idleMinutes: number;
+}
+
+/**
+ * The host's config parameter (`/open-workspaces/NAME/config`): everything the host
+ * applies in place. The host validates it again; see deploy/aws/host/ow_host.py.
+ */
+export function hostConfig(c: HostConfigInputs): object {
+    if (c.dashboardLogins.length > 0 && !c.tailscaleAuthKeySecretArn) {
+        throw new Error("dashboardLogins needs tailscaleAuthKeySecretArn: the dashboard is served over the tailnet only");
+    }
+    dashboardLoginList(c.dashboardLogins);
+    const backup = c.backupUrl ? backupLocation(c.backupUrl) : undefined;
+    if (c.backupSchedule && (!backup || !/^[A-Za-z0-9 *:/,.~_-]{1,100}$/.test(c.backupSchedule))) {
+        throw new Error(`backupSchedule needs backupUrl and a systemd calendar expression, not ${JSON.stringify(c.backupSchedule)}`);
+    }
+    if (!Number.isInteger(c.idleMinutes) || c.idleMinutes < 0 || c.idleMinutes > 10080) {
+        throw new Error(`idleMinutes must be a whole number from 0 to 10080, not ${c.idleMinutes}`);
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(c.ref) || c.ref.includes("..")) {
+        throw new Error(`ref must be a tag, branch or commit, not ${JSON.stringify(c.ref)}`);
+    }
+    if (!/^(https:\/\/[A-Za-z0-9._~:/@%+-]+|\/[A-Za-z0-9._/-]+)$/.test(c.repository)) {
+        throw new Error(`repository must be an https URL, not ${JSON.stringify(c.repository)}`);
+    }
+    const images = developerImageList(c.developerImages);
+    return {
+        schema: 1,
+        role: "host",
+        release: { repository: c.repository, ref: c.ref },
+        tailscale: { secretArn: c.tailscaleAuthKeySecretArn, hostname: c.tailscaleHostname, ssh: c.tailscaleSsh },
+        dashboard: { logins: c.dashboardLogins },
+        developerImages: images ? images.split(" ") : [],
+        backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule },
+        idleMinutes: c.idleMinutes,
+    };
+}
+
 /** Host role policy for backups: list under the prefix, read and write objects there, never delete. */
 export function backupPolicy(partition: string, url: string): string {
     const { bucket, prefix } = backupLocation(url);
@@ -129,6 +190,8 @@ export class Host extends pulumi.ComponentResource {
     public readonly dataVolumeId: pulumi.Output<string>;
     public readonly roleName: pulumi.Output<string>;
     public readonly securityGroupId: pulumi.Output<string>;
+    /** SSM parameter holding the host's config; apply a change with `ow-aws apply`. */
+    public readonly configParameter: pulumi.Output<string>;
 
     constructor(name: string, args: HostArgs, opts?: pulumi.ComponentResourceOptions) {
         super("open-workspaces-aws:index:Host", name, {}, opts);
@@ -187,6 +250,34 @@ export class Host extends pulumi.ComponentResource {
                 policy: pulumi.all([partition, args.backupUrl]).apply(([p, url]) => backupPolicy(p, url)),
             }, parent);
         }
+        // Everything the host applies in place: user data only bootstraps (stage 0), so a
+        // config or release change updates this parameter and never replaces the instance.
+        const config = new aws.ssm.Parameter(`${name}-config`, {
+            name: `/open-workspaces/${name}/config`,
+            type: "String",
+            tier: "Standard",
+            insecureValue: pulumi
+                .all([
+                    pulumi.all([args.repository ?? DEFAULT_REPOSITORY, args.ref ?? `v${require("./package.json").version}`]),
+                    pulumi.all([args.tailscaleAuthKeySecretArn ?? "", args.tailscaleHostname ?? name, args.tailscaleSsh ?? false]),
+                    pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? []]),
+                    pulumi.all([args.backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30]),
+                ])
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images], [backupUrl, backupSchedule, idleMinutes]]) =>
+                    JSON.stringify(hostConfig({
+                        repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
+                        dashboardLogins: logins, developerImages: images, backupUrl, backupSchedule, idleMinutes,
+                    })),
+                ),
+            tags,
+        }, parent);
+        const configRead = new aws.iam.RolePolicy(`${name}-config`, {
+            role: role.id,
+            policy: config.arn.apply((arn) => JSON.stringify({
+                Version: "2012-10-17",
+                Statement: [{ Effect: "Allow", Action: "ssm:GetParameter", Resource: arn }],
+            })),
+        }, parent);
         const profile = new aws.iam.InstanceProfile(`${name}-host`, { role: role.name, tags }, parent);
 
         // No ingress rules: SSM and Tailscale both connect outbound.
@@ -209,38 +300,16 @@ export class Host extends pulumi.ComponentResource {
         }, parent);
 
         const amiId = args.amiId ?? aws.ssm.getParameterOutput({ name: UBUNTU_AMI_PARAMETER }, parent).value;
-        // pulumi.all types tuples of up to eight values; the backup URL goes alongside.
+        // Stage 0 only: these values never change with the config or the release.
+        const region = aws.getRegionOutput({}, parent).region;
         const userData = pulumi
-            .all([
-                args.backupUrl ?? "",
-                pulumi.all([
-                    dataVolume.id,
-                    args.repository ?? DEFAULT_REPOSITORY,
-                    args.ref ?? `v${require("./package.json").version}`,
-                    args.tailscaleAuthKeySecretArn ?? "",
-                    args.tailscaleHostname ?? name,
-                    args.tailscaleSsh ?? false,
-                    args.dashboardLogins ?? [],
-                    args.developerImages ?? [],
-                ]),
-            ])
-            .apply(([backupUrl, [volumeId, repository, ref, secretArn, hostname, tailscaleSsh, logins, images]]) => {
-                const backup = backupUrl ? backupLocation(backupUrl) : undefined;
-                if (logins.length > 0 && !secretArn) {
-                    throw new Error("dashboardLogins needs tailscaleAuthKeySecretArn: the dashboard is served over the tailnet only");
-                }
-                return renderUserData({
-                    OW_DATA_VOLUME_ID: volumeId,
-                    OW_REPOSITORY: repository,
-                    OW_REF: ref,
-                    OW_TAILSCALE_SECRET_ARN: secretArn,
-                    OW_TAILSCALE_HOSTNAME: hostname,
-                    OW_TAILSCALE_SSH: tailscaleSsh ? "1" : "",
-                    OW_DASHBOARD_LOGINS: dashboardLoginList(logins),
-                    OW_DEVELOPER_IMAGES: developerImageList(images),
-                    OW_BACKUP_URL: backup ? `s3://${backup.bucket}/${backup.prefix}` : "",
-                });
-            });
+            .all([dataVolume.id, config.name, region])
+            .apply(([volumeId, parameter, regionName]) => renderUserData({
+                OW_DATA_VOLUME_ID: volumeId,
+                OW_CONFIG_PARAMETER: parameter,
+                OW_REGION: regionName,
+                OW_STAGE0: STAGE0,
+            }));
 
         const instance = new aws.ec2.Instance(`${name}-host`, {
             ami: amiId,
@@ -253,10 +322,11 @@ export class Host extends pulumi.ComponentResource {
             metadataOptions: { httpEndpoint: "enabled", httpTokens: "required", httpPutResponseHopLimit: 1 },
             rootBlockDevice: { volumeType: "gp3", volumeSize: 30, encrypted: true },
             userData,
+            // Only a stage 0 change (bootstrap.sh) changes user data: then a replacement is honest.
             userDataReplaceOnChange: true,
             tags: named,
             volumeTags: named,
-        }, { parent: this, deleteBeforeReplace: true });
+        }, { parent: this, deleteBeforeReplace: true, dependsOn: [configRead] });
 
         new aws.ec2.VolumeAttachment(`${name}-data`, {
             instanceId: instance.id,
@@ -271,6 +341,7 @@ export class Host extends pulumi.ComponentResource {
         this.dataVolumeId = dataVolume.id;
         this.roleName = role.name;
         this.securityGroupId = securityGroup.id;
+        this.configParameter = config.name;
         this.registerOutputs({
             instanceId: this.instanceId,
             privateIp: this.privateIp,
@@ -278,6 +349,7 @@ export class Host extends pulumi.ComponentResource {
             dataVolumeId: this.dataVolumeId,
             roleName: this.roleName,
             securityGroupId: this.securityGroupId,
+            configParameter: this.configParameter,
         });
     }
 }

@@ -3,31 +3,123 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { backupLocation, backupPolicy, dashboardLoginList, developerImageList, renderUserData } from "../index.ts";
+import * as pulumi from "@pulumi/pulumi";
+
+// Pulumi runs index.ts as CommonJS; loaded here as an ES module it needs these two.
+globalThis.__dirname = fileURLToPath(new URL("..", import.meta.url));
+globalThis.require = createRequire(new URL("../index.ts", import.meta.url));
+
+// Mocks before the component loads: resources record their inputs, data sources answer.
+const created = [];
+pulumi.runtime.setMocks({
+    newResource: (args) => {
+        created.push(args);
+        return { id: `${args.name}-id`, state: { ...args.inputs, arn: `arn:aws:mock:::${args.name}` } };
+    },
+    call: (args) => ({
+        "aws:ec2/getVpc:getVpc": { id: "vpc-1" },
+        "aws:ec2/getInstanceTypeOfferings:getInstanceTypeOfferings": { locations: ["us-east-1a"] },
+        "aws:ec2/getSubnets:getSubnets": { ids: ["subnet-1"] },
+        "aws:ec2/getSubnet:getSubnet": { id: "subnet-1", vpcId: "vpc-1", availabilityZone: "us-east-1a" },
+        "aws:index/getPartition:getPartition": { partition: "aws" },
+        "aws:index/getRegion:getRegion": { region: "us-east-1", name: "us-east-1" },
+        "aws:ssm/getParameter:getParameter": { value: "ami-1" },
+    })[args.token] ?? {},
+}, "project", "stack", false);
+const { Host, backupLocation, backupPolicy, dashboardLoginList, developerImageList, hostConfig, renderUserData } =
+    await import("../index.ts");
 
 const bootstrap = readFileSync(new URL("../bootstrap.sh", import.meta.url), "utf8");
+const file = (name) => readFileSync(new URL(`../host/files/${name}`, import.meta.url), "utf8");
+const settle = () => new Promise((resolve) => setTimeout(resolve, 200));
 
-test("user data keeps values literal and starts with the bootstrap shebang", () => {
-    for (const value of [`it's $(touch /tmp/pwned) "quoted"`, "release-$&", "release-$$", "a-$'-$`-$1"]) {
-        const script = renderUserData({ OW_REF: value, OW_TAILSCALE_SSH: "" }, bootstrap);
-        assert.ok(script.startsWith("#!/bin/bash\n"));
-        assert.ok(!script.includes("# @OW_ENV@"));
-        const header = script.split("\n").filter((line) => line.startsWith("OW_"));
-        const printed = execFileSync("bash", ["-c", `${header.join("\n")}\nprintf %s "$OW_REF"`], { encoding: "utf8" });
-        assert.equal(printed, value);
+/** The instance user data and the config parameter value of a Host built from args. */
+async function deploy(args) {
+    created.length = 0;
+    new Host("ow-test", args);
+    await settle();
+    const instance = created.find((r) => r.type === "aws:ec2/instance:Instance");
+    const parameter = created.find((r) => r.type === "aws:ssm/parameter:Parameter");
+    return { userData: instance.inputs.userData, config: JSON.parse(parameter.inputs.insecureValue), parameter, instance };
+}
+
+const secretArn = "arn:aws:secretsmanager:us-east-1:111122223333:secret:ow/ts-AbCdEf";
+
+test("config and release changes leave user data byte-identical: they never replace the host", async () => {
+    const a = await deploy({ ref: "v0.5.0" });
+    const b = await deploy({
+        ref: "v0.5.1", repository: "https://example.com/fork.git", tailscaleAuthKeySecretArn: secretArn,
+        tailscaleHostname: "other", tailscaleSsh: true, dashboardLogins: ["you@example.com"], developerImages: ["ubuntu"],
+        backupUrl: "s3://my-bucket/ow/x", backupSchedule: "*-*-* 01:00:00 UTC", idleMinutes: 5,
+    });
+    assert.equal(a.userData, b.userData);
+    assert.equal(a.instance.inputs.userDataReplaceOnChange, true, "a stage 0 change still replaces honestly");
+    for (const key of ["OW_DATA_VOLUME_ID", "OW_CONFIG_PARAMETER", "OW_REGION", "OW_STAGE0"]) {
+        assert.match(a.userData, new RegExp(`^${key}='`, "m"));
+    }
+    assert.ok(!a.userData.includes("v0.5.0"), "the release ref is not in user data");
+    assert.equal(a.parameter.inputs.name, "/open-workspaces/ow-test/config");
+    assert.equal(a.parameter.inputs.type, "String", "not secret: it holds only the Tailscale secret's ARN");
+    assert.deepEqual(b.config, {
+        schema: 1, role: "host",
+        release: { repository: "https://example.com/fork.git", ref: "v0.5.1" },
+        tailscale: { secretArn, hostname: "other", ssh: true },
+        dashboard: { logins: ["you@example.com"] },
+        developerImages: ["ubuntu"],
+        backup: { url: "s3://my-bucket/ow/x", schedule: "*-*-* 01:00:00 UTC" },
+        idleMinutes: 5,
+    });
+    assert.equal(a.config.release.ref, "v0.5.0");
+    assert.equal(a.config.tailscale.hostname, "ow-test");
+    const read = created.find((r) => r.type === "aws:iam/rolePolicy:RolePolicy" && r.name === "ow-test-config");
+    assert.deepEqual(JSON.parse(read.inputs.policy).Statement,
+        [{ Effect: "Allow", Action: "ssm:GetParameter", Resource: "arn:aws:mock:::ow-test-config" }]);
+});
+
+test("the config is validated in the component", () => {
+    const base = { repository: "https://github.com/x/y.git", ref: "v1", tailscaleAuthKeySecretArn: "", tailscaleHostname: "h",
+        tailscaleSsh: false, dashboardLogins: [], developerImages: [], backupUrl: "", backupSchedule: "", idleMinutes: 30 };
+    assert.doesNotThrow(() => hostConfig(base));
+    for (const [bad, message] of [
+        [{ dashboardLogins: ["a@example.com"] }, /needs tailscaleAuthKeySecretArn/],
+        [{ backupSchedule: "daily" }, /backupSchedule needs backupUrl/],
+        [{ backupUrl: "s3://my-bucket/ow", backupSchedule: "daily; id" }, /systemd calendar/],
+        [{ idleMinutes: 1.5 }, /idleMinutes/],
+        [{ ref: "a..b" }, /ref must be/],
+        [{ repository: "http://plain.example/x" }, /repository must be/],
+        [{ developerImages: ["arch"] }, /developerImages takes ubuntu/],
+    ]) {
+        assert.throws(() => hostConfig({ ...base, ...bad }), message);
     }
 });
 
-test("the Tailscale key is piped and an empty key never reaches tailscale up", () => {
-    const join = bootstrap.slice(bootstrap.indexOf("join_tailscale() {"), bootstrap.indexOf("tailscale up --timeout"));
-    assert.ok(join.includes('--output text | cat > "$key"'), "snap aws writes nothing to a redirected file");
-    assert.ok(join.includes('[[ ! -s "$key" ]]') && join.includes("return 1"), "empty key stops before tailscale up");
+test("user data keeps values literal and starts with the bootstrap shebang", () => {
+    for (const value of [`it's $(touch /tmp/pwned) "quoted"`, "release-$&", "release-$$", "a-$'-$`-$1"]) {
+        const script = renderUserData({ OW_CONFIG_PARAMETER: value }, bootstrap);
+        assert.ok(script.startsWith("#!/bin/bash\n"));
+        assert.ok(!script.includes("# @OW_ENV@"));
+        const header = script.split("\n").filter((line) => line.startsWith("OW_"));
+        const printed = execFileSync("bash", ["-c", `${header.join("\n")}\nprintf %s "$OW_CONFIG_PARAMETER"`], { encoding: "utf8" });
+        assert.equal(printed, value);
+    }
+    execFileSync("bash", ["-n"], { input: renderUserData({ OW_CONFIG_PARAMETER: "/p" }, bootstrap) });
+});
+
+test("stage 0 keeps the tailnet identity on the data volume and hands over to the release", () => {
+    const mount = bootstrap.indexOf("mountpoint -q /var/lib/tailscale || mount /var/lib/tailscale");
+    assert.ok(bootstrap.indexOf("mountpoint -q /srv/ow || mount /srv/ow") < mount, "data volume first");
+    assert.ok(mount > 0 && mount < bootstrap.indexOf("ow_host.py boot"), "state mounted before the release installs tailscale");
+    assert.ok(bootstrap.includes("RequiresMountsFor=/var/lib/tailscale"), "tailscaled waits for the state mount at boot");
+    assert.ok(bootstrap.includes("chmod 700 /srv/ow/.tailscale-state"));
+    assert.ok(!bootstrap.includes("snap install"), "one AWS CLI (v2) only");
+    assert.ok(!/set -x|xtrace/.test(bootstrap.replace("Never enable xtrace here.", "")));
 });
 
 test("the controller waits for the tailnet before choosing its listen address", () => {
-    assert.ok(bootstrap.includes("ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet"));
-    const wait = bootstrap.slice(bootstrap.indexOf("<<'WAIT'\n") + 8, bootstrap.indexOf("\nWAIT\n"));
+    const wait = file("wait-tailnet");
     const dir = mkdtempSync(join(tmpdir(), "ow-wait-"));
     // Stand-in tailscale: reports Running only after its second status call.
     writeFileSync(join(dir, "tailscale"), `#!/bin/sh
@@ -49,44 +141,21 @@ esac
     rmSync(dir, { recursive: true });
 });
 
-test("dashboard logins are validated and the dashboard block is valid bash", () => {
+test("dashboard logins and developer images are validated", () => {
     assert.equal(dashboardLoginList(["a@example.com", "b.c+d@example.org"]), "a@example.com,b.c+d@example.org");
     assert.equal(dashboardLoginList([]), "");
     for (const bad of ["no-at-sign", "a@b,c@d", "x@y'", "a b@c", "$(id)@x"]) {
         assert.throws(() => dashboardLoginList([bad]), /invalid dashboard login/);
     }
-    const script = renderUserData({ OW_DASHBOARD_LOGINS: "a@example.com", OW_TAILSCALE_SSH: "" }, bootstrap);
-    execFileSync("bash", ["-n"], { input: script });
-    assert.ok(script.includes("--listen 127.0.0.1:8787"), "dashboard stays on loopback");
-    assert.ok(script.includes("tailscale serve --bg http://127.0.0.1:8787"), "served to the tailnet only");
-    assert.ok(!script.includes("tailscale funnel"), "never public");
-});
-
-test("the tailnet identity is kept on the data volume, mounted before tailscaled starts", () => {
-    const mount = bootstrap.indexOf("mountpoint -q /var/lib/tailscale || mount /var/lib/tailscale");
-    assert.ok(bootstrap.indexOf("mountpoint -q /srv/ow || mount /srv/ow") < mount, "data volume first");
-    assert.ok(mount > 0 && mount < bootstrap.indexOf("apt-get install -y -q tailscale"), "state mounted before tailscale is installed");
-    assert.ok(bootstrap.includes("RequiresMountsFor=/var/lib/tailscale"), "tailscaled waits for the state mount at boot");
-    assert.ok(bootstrap.includes("chmod 700 /srv/ow/.tailscale-state"));
-    assert.ok(bootstrap.includes('--ssh="$([[ -n $OW_TAILSCALE_SSH ]] && echo true || echo false)"'), "restored state cannot keep an old SSH setting");
-});
-
-test("stopping the service hibernates running boxes, with wakes refused", () => {
-    assert.ok(bootstrap.includes("ExecStop=/srv/ow/src/target/release/ow --data-dir /srv/ow/.ow/runner down --hibernate"));
-    assert.ok(bootstrap.includes("TimeoutStopSec=900"));
-});
-
-test("developer images are validated and built by a oneshot unit", () => {
     assert.equal(developerImageList(["ubuntu", "ubuntu"]), "ubuntu");
     assert.equal(developerImageList([]), "");
     for (const bad of ["alpine", "arch", "ubuntu; id", ""]) {
         assert.throws(() => developerImageList([bad]), /developerImages takes ubuntu/);
     }
-    const script = renderUserData({ OW_DEVELOPER_IMAGES: "ubuntu", OW_TAILSCALE_SSH: "" }, bootstrap);
-    execFileSync("bash", ["-n"], { input: script });
-    const images = bootstrap.slice(bootstrap.indexOf("<<'IMAGES'\n") + 11, bootstrap.indexOf("\nIMAGES\n"));
-    execFileSync("bash", ["-n"], { input: images });
-    assert.ok(bootstrap.includes("ExecStart=/usr/local/lib/open-workspaces/developer-images $OW_DEVELOPER_IMAGES"));
+    for (const name of ["dashboard-prepare", "developer-images"]) {
+        execFileSync("bash", ["-n"], { input: file(name) });
+    }
+    assert.ok(!file("developer-images").includes("systemctl restart"), "a new image restarts nothing");
 });
 
 test("backup URLs are checked and the host role can never delete a backup", () => {
@@ -104,11 +173,9 @@ test("backup URLs are checked and the host role can never delete a backup", () =
 });
 
 test("ow-backup uploads the catalog, then the snapshots, and stops at the first failure", () => {
-    const script = renderUserData({ OW_BACKUP_URL: "s3://my-bucket/ow/host-1", OW_TAILSCALE_SSH: "" }, bootstrap);
-    execFileSync("bash", ["-n"], { input: script });
     const dir = mkdtempSync(join(tmpdir(), "ow-backup-"));
     writeFileSync(join(dir, "backup.env"), "OW_BACKUP_URL=s3://my-bucket/ow/host-1\n");
-    const backup = bootstrap.slice(bootstrap.indexOf("<<'BACKUP'\n") + 11, bootstrap.indexOf("\nBACKUP\n"))
+    const backup = file("ow-backup")
         .replace("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", `export PATH=${dir}:/usr/bin:/bin`)
         .replace("/etc/open-workspaces/backup.env", join(dir, "backup.env"))
         .replaceAll("/srv/ow/.ow/backups", join(dir, "backups"))

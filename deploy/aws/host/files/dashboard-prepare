@@ -1,0 +1,18 @@
+#!/bin/bash
+# Root: write the dashboard config for this host's tailnet name, then turn on `tailscale serve`.
+set -euo pipefail
+name=$(tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+sys.exit(1) if s.get("BackendState") != "Running" else print(s["Self"]["DNSName"].rstrip("."))') \
+  || { echo "tailscale is not up; the dashboard starts once this host is on the tailnet"; exit 1; }
+runuser -u ow -- env NAME="$name" LOGINS="$OW_DASHBOARD_LOGINS" python3 -c '
+import json, os
+path = "/srv/ow/.ow/dashboard.json"
+fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump({"auth": "tailscale", "hostname": os.environ["NAME"], "upstream": "http://127.0.0.1:9/",
+               "allowed_emails": os.environ["LOGINS"].split(",")}, f)
+os.replace(path + ".tmp", path)'
+tailscale serve --bg http://127.0.0.1:8787 > /dev/null
+echo "dashboard: https://$name/"

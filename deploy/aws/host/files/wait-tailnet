@@ -1,0 +1,13 @@
+#!/bin/sh
+command -v tailscale > /dev/null || exit 0
+i=0
+while [ "$i" -lt 60 ]; do
+  state=$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null)
+  case $state in
+    Running) tailscale ip -4 > /dev/null 2>&1 && exit 0 ;;
+    NeedsLogin|NeedsMachineAuth|Stopped) exit 0 ;;
+  esac
+  i=$((i + 1))
+  sleep 1
+done
+echo "tailnet not up after 60 s; the controller listens on loopback until the next restart"

@@ -1,11 +1,11 @@
 {
   "name": "open-workspaces-aws",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "One nested-virtualization EC2 host running the Open Workspaces controller and runner.",
   "license": "Apache-2.0",
   "main": "index.ts",
   "scripts": {
-    "check": "tsc --noEmit && node --import ./test/resolve-ts.mjs --test test/*.test.mjs"
+    "check": "tsc --noEmit && node --import ./test/resolve-ts.mjs --test test/*.test.mjs && python3 -m unittest discover -s host -p 'test_*.py'"
   },
   "dependencies": {
     "@pulumi/aws": "7.48.0",

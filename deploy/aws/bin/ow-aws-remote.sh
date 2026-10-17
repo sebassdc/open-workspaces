@@ -191,6 +191,8 @@ authorize() {
 hibernate_for_replacement() {
   ow down --hibernate
   systemctl stop open-workspaces
+  # Layout v2 hosts run the worker in its own unit; the hibernate already stopped it.
+  if systemctl cat open-workspaces-worker > /dev/null 2>&1; then systemctl stop open-workspaces-worker; fi
   echo "boxes hibernated; service stopped"
 }
 
