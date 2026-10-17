@@ -961,10 +961,14 @@ mod down_tests {
     /// A stand-in worker on `control.sock`: box `a` runs; its hibernation fails
     /// unless `capture_ok`. Returns the data dir and the requests it saw.
     fn worker(capture_ok: bool) -> (PathBuf, Arc<Mutex<Vec<Value>>>) {
-        worker_with(capture_ok, false)
+        worker_with(capture_ok, false, false)
     }
 
-    fn worker_with(capture_ok: bool, second_list_fails: bool) -> (PathBuf, Arc<Mutex<Vec<Value>>>) {
+    fn worker_with(
+        capture_ok: bool,
+        second_list_fails: bool,
+        quiesce_fails: bool,
+    ) -> (PathBuf, Arc<Mutex<Vec<Value>>>) {
         let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
         fs::create_dir(&root).unwrap();
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();
@@ -978,6 +982,9 @@ mod down_tests {
                 log.lock().unwrap().push(request.clone());
                 let state = if slept { "hibernated" } else { "running" };
                 let response = match request["op"].as_str().unwrap() {
+                    "quiesce" if quiesce_fails && request["closing"] != false => {
+                        json!({"ok":false,"error":"timed out"})
+                    }
                     "list" if second_list_fails && lists == 1 => {
                         json!({"ok":false,"error":"worker busy"})
                     }
@@ -1025,13 +1032,22 @@ mod down_tests {
 
     #[test]
     fn a_failed_check_after_the_round_also_allows_starts_again() {
-        let (root, seen) = worker_with(true, true);
+        let (root, seen) = worker_with(true, true, false);
         assert!(hibernate_all(&root).is_err());
         assert_eq!(
             ops(&seen),
             ["quiesce", "list", "hibernate", "list", "quiesce"]
         );
         assert_eq!(seen.lock().unwrap()[4]["closing"], false);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_quiesce_is_rolled_back_too() {
+        let (root, seen) = worker_with(true, false, true);
+        assert!(hibernate_all(&root).is_err());
+        assert_eq!(ops(&seen), ["quiesce", "quiesce"]);
+        assert_eq!(seen.lock().unwrap()[1]["closing"], false);
         fs::remove_dir_all(root).unwrap();
     }
 
