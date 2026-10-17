@@ -601,9 +601,8 @@ def bootstrap_done(wait):
         code = subprocess.run(["timeout", str(wait), "cloud-init", "status", "--wait"], capture_output=True).returncode
         if code == 124:
             raise RuntimeError(f"cloud-init still running after {wait} s")
-        # Exit 2 is cloud-init's done-with-warnings; the checks below still catch an unfinished bootstrap.
-        if code not in (0, 2):
-            raise RuntimeError("the host bootstrap (cloud-init) failed; see cloud-init status --long")
+    # The status file decides: cloud-init keeps reporting a failed first run that a
+    # later stage 0 run fixed.
     status = p(STATUS).read_text().strip() if p(STATUS).exists() else "missing"
     if not status.startswith("ok"):
         raise RuntimeError(f"bootstrap status: {status} (log: /var/log/open-workspaces-bootstrap.log)")
