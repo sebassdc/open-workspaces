@@ -1206,7 +1206,8 @@ fn agent_job(
             "terminal",
             "ssh",
             "ssh-info",
-            "ssh-keys"
+            "ssh-keys",
+            "delete"
         ]
         .contains(&op),
         "unsupported node operation"

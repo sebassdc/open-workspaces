@@ -27,8 +27,11 @@ user emails, tokens and deployment logs remain in ignored private storage.
 The command console invokes `/bin/sh -c` for each command, with output after
 completion. **Open Terminal** creates a separate interactive PTY inside the
 selected running VM. See [terminal transport and limits](TERMINALS.md).
-Guest networking now supports filtered IPv4 Internet egress. The page includes a copyable curl installer for the remote Linux x86-64 CLI; see [networking and CLI](NETWORKING.md). The API does not delete machines
-or snapshots, change host configuration, grant Cloudflare permissions, or serve
+Guest networking now supports filtered IPv4 Internet egress. The page includes a copyable curl installer for the remote Linux x86-64 CLI; see [networking and CLI](NETWORKING.md). **Delete** (owner only, on a
+stopped or hibernated machine) removes it with its disk and every snapshot taken
+from it, and closes the sessions of anyone it was shared with. A machine its
+runner no longer lists shows as `missing` and holds no capacity; deleting it
+only drops the entry. The API does not delete snapshots on their own, change host configuration, grant Cloudflare permissions, or serve
 arbitrary guest HTML on the dashboard origin. Public guest-app publishing remains
 a subsequent slice.
 

@@ -347,6 +347,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Fork { .. }
                 | Action::Share { .. }
                 | Action::Unshare { .. }
+                | Action::Delete { .. }
         ),
         "this command is local-only; use --local for the local worker"
     );
@@ -448,6 +449,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         Action::Unshare { id, with } => json!({"op":"unshare","id":id,"with":with}),
         Action::Start { id } => json!({"op":"start","id":id}),
         Action::Stop { id } => json!({"op":"stop","id":id}),
+        Action::Delete { id } => json!({"op":"delete","id":id}),
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),
         Action::Snapshot { id, name } => json!({"op":"snapshot","id":id,"name":name}),
         Action::Restore { id, name } => json!({"op":"restore","id":id,"name":name}),

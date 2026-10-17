@@ -179,11 +179,12 @@ pub fn share_unlocked(root: &Path, identity: &Identity, request: &Value) -> Resu
     share_on(&mut db, user, op, request)
 }
 
-/// What a grantee may do on a machine shared with them. Resize and sharing stay with the owner.
+/// What a grantee may do on a machine shared with them. Resize, delete and sharing stay with
+/// the owner.
 fn permitted(role: &str, op: &str) -> bool {
     match role {
         "owner" => true,
-        "admin" => op != "resize",
+        "admin" => !matches!(op, "resize" | "delete"),
         "use" => matches!(
             op,
             "exec"
@@ -536,6 +537,10 @@ impl Catalog {
                     self.db.execute("UPDATE resources SET reserved_mib=0,reserved_cpus=0 WHERE kind='machine' AND physical=?1 AND node=?2",params![physical,node])?;
                 }
             }
+            // A machine this runner no longer lists is gone from it (deleted there, or the runner
+            // lost its data): flag it so its owner can delete it here. Never-observed creates
+            // stay pending; a machine listed again gets its metadata back on the next pass.
+            self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','missing'),reserved_mib=0,reserved_cpus=0,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND node=?1 AND json_extract(metadata,'$.state') NOT IN ('pending','missing') AND physical NOT IN (SELECT value FROM json_each(?2))",params![node,json!(observed).to_string()])?;
             self.db.execute("INSERT INTO node_usage(node,extra_mib,extra_cpus,extra_slots) VALUES(?1,?2,?3,?4) ON CONFLICT(node) DO UPDATE SET extra_mib=?2,extra_cpus=?3,extra_slots=?4",params![node,extra_mib,extra_cpus,extra_slots])?;
             for snapshot in snapshots.as_array().context("invalid snapshots")? {
                 let physical = snapshot["name"].as_str().context("snapshot ID")?;
@@ -665,6 +670,37 @@ impl Catalog {
             value["state"] = json!("offline");
         }
         self.public(user, kind, &value)
+    }
+    /// Drop a deleted machine: its row, its grants (closing grantees' streams) and the snapshots
+    /// taken from it, whoever took them. Past operations keep their IDs, which name node journal
+    /// entries, but stop claiming the names, so a new machine may reuse them. Returns the
+    /// caller's own snapshot names that went with it.
+    fn forget(&mut self, user: i64, physical: &str) -> Result<Vec<String>> {
+        let tx = self.db.transaction()?;
+        let grantees = tx
+            .prepare("SELECT grantee FROM grants WHERE physical=?1")?
+            .query_map([physical], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let snapshots = tx
+            .prepare("SELECT name FROM resources WHERE kind='snapshot' AND owner=?1 AND json_extract(metadata,'$.workspace')=?2 ORDER BY name")?
+            .query_map(params![user, physical], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op<>'snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1)",[physical])?;
+        tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE kind='snapshot' AND json_extract(metadata,'$.workspace')=?1)",[physical])?;
+        tx.execute("DELETE FROM grants WHERE physical=?1", [physical])?;
+        tx.execute(
+            "DELETE FROM resources WHERE kind='snapshot' AND json_extract(metadata,'$.workspace')=?1",
+            [physical],
+        )?;
+        tx.execute(
+            "DELETE FROM resources WHERE kind='machine' AND physical=?1",
+            [physical],
+        )?;
+        tx.commit()?;
+        for grantee in grantees {
+            cut(grantee, physical);
+        }
+        Ok(snapshots)
     }
     fn snapshot_source(&self, user: i64, snapshot: &str, physical: &str) -> Result<()> {
         let metadata: String = self.db.query_row(
@@ -875,7 +911,8 @@ impl Catalog {
                 "fork",
                 "restore",
                 "share",
-                "unshare"
+                "unshare",
+                "delete"
             ]
             .contains(&op.as_str()),
             "unsupported user operation"
@@ -914,6 +951,18 @@ impl Catalog {
             nodes::online(&self.root, node)?;
         }
         self.reconcile()?;
+        if op == "delete" {
+            // The runner no longer has it: nothing to dispatch, only the row to drop.
+            let physical = self.machine(user, &name, &op)?;
+            let state: Option<String> = self.db.query_row(
+                "SELECT json_extract(metadata,'$.state') FROM resources WHERE kind='machine' AND physical=?1",
+                [&physical],
+                |r| r.get(0),
+            )?;
+            if state.as_deref() == Some("missing") {
+                return Ok(json!({"deleted":name,"snapshots":self.forget(user, &physical)?}));
+            }
+        }
         // Optional protocol-v1 status fields; query outside the SQLite writer. A missing
         // legacy response conservatively retains the original 2 GiB/4 CPU ceiling.
         let local_status = if matches!(
@@ -1181,6 +1230,8 @@ impl Catalog {
             value["name"] == request["name"] && value["workspace"] == request["id"]
         } else if op == "stop" {
             value["workspace"]["id"] == request["id"]
+        } else if op == "delete" {
+            value["deleted"] == request["id"]
         } else {
             value["id"] == target
         };
@@ -1202,6 +1253,8 @@ impl Catalog {
         } else if op == "stop" {
             self.save_node(&node, "machine", &physical, &value["workspace"])?;
             value["workspace"] = self.public(user, "machine", &value["workspace"])?;
+        } else if op == "delete" {
+            value = json!({"deleted":name,"snapshots":self.forget(user, &physical)?});
         } else {
             self.save_node(&node, "machine", &target, &value)?;
             value = self.public(user, "machine", &value)?;

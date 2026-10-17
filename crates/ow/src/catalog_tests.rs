@@ -98,6 +98,28 @@ impl Fake {
                         m["state"] = json!("stopped");
                         json!({"workspace":m})
                     }
+                    "delete" if machines.get(id).is_some_and(|m| m["state"] == "running") => {
+                        wire::send(
+                            &mut stream,
+                            &json!({"ok":false,"error":"workspace is running"}),
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    "delete" => {
+                        machines.remove(id);
+                        let gone: Vec<String> = snapshots
+                            .iter()
+                            .filter(|(_, s)| s["workspace"] == id)
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        for name in &gone {
+                            snapshots.remove(name);
+                        }
+                        json!({"deleted":id,"snapshots":gone})
+                    }
+                    // Test-only: the runner loses a machine (deleted there, or its data is gone).
+                    "lose" => json!(machines.remove(id)),
                     _ => json!({}),
                 };
                 wire::send(&mut stream, &json!({"ok":true,"result":result})).unwrap();
@@ -541,4 +563,126 @@ fn sharing_roles_owner_addresses_and_revocation() {
     drop(c);
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();
     assert_eq!(c.state(b).unwrap()["shared"][0]["id"], shared);
+}
+
+#[test]
+fn delete_is_owner_only_drops_snapshots_grants_and_frees_the_name() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    let b = c.user(&identity("bob")).unwrap();
+    c.operation(a, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    let physical = c.physical(a, "machine", "demo").unwrap();
+    c.operation(a, json!({"op":"snapshot","id":"demo","name":"saved"}))
+        .unwrap();
+    c.operation(
+        a,
+        json!({"op":"share","id":"demo","with":"bob@example.test","role":"admin"}),
+    )
+    .unwrap();
+    let shared = "alice@example.test/demo";
+    let before = fake.calls.load(Ordering::SeqCst);
+    for id in [shared, "demo"] {
+        assert!(c.operation(b, json!({"op":"delete","id":id})).is_err());
+    }
+    assert_eq!(fake.calls.load(Ordering::SeqCst), before);
+    // The runner refuses a running machine; the catalog keeps it.
+    assert!(c.operation(a, json!({"op":"delete","id":"demo"})).is_err());
+    assert_eq!(c.physical(a, "machine", "demo").unwrap(), physical);
+    c.operation(a, json!({"op":"stop","id":"demo"})).unwrap();
+    let (_, _, grantee_stream) = c.terminal_target(b, shared).unwrap();
+    let deleted = c.operation(a, json!({"op":"delete","id":"demo"})).unwrap();
+    assert_eq!(deleted["deleted"], "demo");
+    assert_eq!(deleted["snapshots"], json!(["saved"]));
+    assert!(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), grantee_stream.notified()).await
+            })
+            .is_ok()
+    );
+    let state = c.state(a).unwrap();
+    assert_eq!(state["workspaces"], json!([]));
+    assert_eq!(state["snapshots"], json!([]));
+    assert_eq!(state["operations"][0]["op"], "delete");
+    assert_eq!(state["operations"][0]["resource"], "deleted:demo");
+    assert_eq!(c.state(b).unwrap()["shared"], json!([]));
+    let count = |c: &Catalog, table: &str| {
+        c.db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    assert_eq!((count(&c, "grants"), count(&c, "resources")), (0, 0));
+    // The names are free again, with new parameters and a new runner ID.
+    let again = c
+        .operation(
+            a,
+            json!({"op":"create","id":"demo","memory_mib":512,"vcpu_count":1,"image":"alpine"}),
+        )
+        .unwrap();
+    assert_eq!(
+        (again["id"].as_str(), again["node"].as_str()),
+        (Some("demo"), Some("alpha"))
+    );
+    assert_ne!(c.physical(a, "machine", "demo").unwrap(), physical);
+    c.operation(a, json!({"op":"snapshot","id":"demo","name":"saved"}))
+        .unwrap();
+    assert!(
+        c.operation(a, json!({"op":"delete","id":"nothing"}))
+            .is_err()
+    );
+}
+
+#[test]
+fn machines_the_runner_lost_are_flagged_and_deleted_without_it() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    for id in ["gone", "kept"] {
+        c.operation(a, json!({"op":"create","id":id,"node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    }
+    let gone = c.physical(a, "machine", "gone").unwrap();
+    // Never observed on the runner: a create in flight, not a lost machine.
+    let pending = c.reserve(a, "machine", "pending").unwrap();
+    c.db.execute(
+        "UPDATE resources SET node='alpha' WHERE physical=?1",
+        [&pending],
+    )
+    .unwrap();
+    wire::request(
+        &fake.root.join("nodes/alpha"),
+        json!({"op":"lose","id":gone}),
+    )
+    .unwrap();
+    let state = c.state(a).unwrap();
+    let states: BTreeMap<_, _> = state["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| (w["id"].as_str().unwrap(), w["state"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        states,
+        BTreeMap::from([
+            ("gone", "missing"),
+            ("kept", "running"),
+            ("pending", "pending")
+        ])
+    );
+    // A lost running machine no longer holds capacity.
+    assert_eq!(state["stats"]["reserved_memory_mib"], 256);
+    // Nothing reaches the runner: a dispatched delete would be rejected here.
+    *fake.reject.lock().unwrap() = Some("delete".into());
+    let deleted = c.operation(a, json!({"op":"delete","id":"gone"})).unwrap();
+    assert_eq!(deleted, json!({"deleted":"gone","snapshots":[]}));
+    let state = c.state(a).unwrap();
+    assert_eq!(state["workspaces"].as_array().unwrap().len(), 2);
+    assert_eq!(state["workspaces"][0]["id"], "kept");
+    assert_eq!(state["workspaces"][0]["state"], "running");
 }

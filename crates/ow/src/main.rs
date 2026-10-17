@@ -293,7 +293,8 @@ enum Action {
         #[arg(long)]
         with: String,
     },
-    /// Delete a stopped workspace with its disk and its own snapshots (local worker only).
+    /// Delete a stopped or hibernated workspace with its disk and its own snapshots (on a
+    /// remote server: owner only; a machine the runner no longer has just leaves the list).
     Delete {
         id: String,
     },
