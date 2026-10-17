@@ -582,7 +582,8 @@ def listening():
 
 
 def local_node():
-    return (read_json(f"{DATA}/host.json") or {}).get("node")
+    # The enrolled ID: a replaced host keeps its runner credential, not its hostname.
+    return (read_json(f"{RUNNER}/node.json") or read_json(f"{DATA}/host.json") or {}).get("node")
 
 
 def dashboard_answers():
