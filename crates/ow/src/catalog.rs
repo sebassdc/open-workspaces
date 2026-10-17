@@ -704,6 +704,16 @@ impl Catalog {
         }
         Ok(snapshots)
     }
+    /// Whether the runner lists the machine right now.
+    fn listed(&self, node: &str, physical: &str) -> Result<bool> {
+        let machines = wire::request(&nodes::route(&self.root, node)?, json!({"op":"list"}))
+            .context("runner unreachable; the machine may be back, try again")?;
+        Ok(machines
+            .as_array()
+            .context("invalid machines")?
+            .iter()
+            .any(|m| m["id"] == physical))
+    }
     /// Whether reconcile found the machine gone from its runner.
     fn missing(&self, physical: &str) -> Result<bool> {
         Ok(self.db.query_row(
@@ -1025,10 +1035,13 @@ impl Catalog {
         // Resolve authority before any worker contact, including inventory refresh.
         if op != "create" {
             let physical = self.machine(user, &name, &op)?;
-            // Already confirmed gone from its runner: only the row is left, whatever the runner's
-            // state now.
+            // Confirmed gone from its runner: only the row is left. A runner that is online now
+            // may have it back, so it must still not list it; an unreachable one refuses.
             if op == "delete" && self.missing(&physical)? {
-                return self.delete_missing(user, &name, &physical, &input);
+                let node = self.placement("machine", &physical)?;
+                if nodes::online(&self.root, &node).is_err() || !self.listed(&node, &physical)? {
+                    return self.delete_missing(user, &name, &physical, &input);
+                }
             }
             let node = self.placement("machine", &physical)?;
             nodes::online(&self.root, &node)?;
@@ -1055,7 +1068,8 @@ impl Catalog {
         if op == "delete" {
             // The runner no longer has it: nothing to dispatch, only the row to drop.
             let physical = self.machine(user, &name, &op)?;
-            if self.missing(&physical)? {
+            let node = self.placement("machine", &physical)?;
+            if self.missing(&physical)? && !self.listed(&node, &physical)? {
                 return self.delete_missing(user, &name, &physical, &input);
             }
         }

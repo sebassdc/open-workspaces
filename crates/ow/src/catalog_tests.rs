@@ -38,6 +38,7 @@ impl Fake {
         let reject = self.reject.clone();
         self._thread = Some(std::thread::spawn(move || {
             let mut machines = BTreeMap::<String, Value>::new();
+            let mut lost = BTreeMap::<String, Value>::new();
             let mut snapshots = BTreeMap::<String, Value>::new();
             while !stop.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
@@ -119,7 +120,17 @@ impl Fake {
                         json!({"deleted":id,"snapshots":gone})
                     }
                     // Test-only: the runner loses a machine (deleted there, or its data is gone).
-                    "lose" => json!(machines.remove(id)),
+                    "lose" => {
+                        let m = machines.remove(id).unwrap();
+                        lost.insert(id.into(), m.clone());
+                        m
+                    }
+                    // Test-only: the runner has it back (its data came back, or it was restored).
+                    "recover" => {
+                        let m = lost.remove(id).unwrap();
+                        machines.insert(id.into(), m.clone());
+                        m
+                    }
                     _ => json!({}),
                 };
                 wire::send(&mut stream, &json!({"ok":true,"result":result})).unwrap();
@@ -865,4 +876,53 @@ fn a_missing_machine_is_deleted_while_its_runner_is_offline_or_revoked() {
         .map(|w| w["id"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(ids, ["unseen"]);
+}
+
+#[test]
+fn a_missing_machine_its_runner_has_again_is_deleted_on_the_runner() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    let route = fake.root.join("nodes/alpha");
+    c.operation(a, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    let physical = c.physical(a, "machine", "demo").unwrap();
+    c.operation(a, json!({"op":"snapshot","id":"demo","name":"saved"}))
+        .unwrap();
+    let flag = |c: &mut Catalog| {
+        wire::request(&route, json!({"op":"lose","id":physical})).unwrap();
+        assert_eq!(c.state(a).unwrap()["workspaces"][0]["state"], "missing");
+        wire::request(&route, json!({"op":"recover","id":physical})).unwrap();
+    };
+    let on_runner = || {
+        let machines = wire::request(&route, json!({"op":"list"})).unwrap();
+        let snapshots = wire::request(&route, json!({"op":"snapshots"})).unwrap();
+        (
+            machines.as_array().unwrap().len(),
+            snapshots.as_array().unwrap().len(),
+        )
+    };
+    // Back and running: the runner refuses, and the catalog keeps it.
+    flag(&mut c);
+    assert!(c.operation(a, json!({"op":"delete","id":"demo"})).is_err());
+    let state = c.state(a).unwrap();
+    assert_eq!(state["workspaces"][0]["state"], "running");
+    assert_eq!(state["snapshots"][0]["name"], "saved");
+    assert_eq!(on_runner(), (1, 1));
+    // An online runner that cannot answer gives no evidence: nothing is dropped.
+    c.operation(a, json!({"op":"stop","id":"demo"})).unwrap();
+    flag(&mut c);
+    std::fs::rename(route.join("control.sock"), route.join("away.sock")).unwrap();
+    assert!(c.operation(a, json!({"op":"delete","id":"demo"})).is_err());
+    std::fs::rename(route.join("away.sock"), route.join("control.sock")).unwrap();
+    assert_eq!(c.physical(a, "machine", "demo").unwrap(), physical);
+    // Back and stopped: deleted on the runner, then in the catalog.
+    let deleted = c.operation(a, json!({"op":"delete","id":"demo"})).unwrap();
+    assert_eq!(deleted["snapshots"], json!(["saved"]));
+    assert_eq!(on_runner(), (0, 0));
+    let state = c.state(a).unwrap();
+    assert_eq!(
+        (&state["workspaces"], &state["snapshots"]),
+        (&json!([]), &json!([]))
+    );
 }
