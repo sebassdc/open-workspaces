@@ -423,7 +423,13 @@ async fn proxy(State(app): State<App>, request: Request) -> Response {
     let Ok(_permit) = app.requests.clone().try_acquire_owned() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "Gateway busy").into_response();
     };
-    match tokio::time::timeout(Duration::from_secs(45), handle(&app, request)).await {
+    // Operations may be captures that take minutes (wire::reply_wait); the rest are quick.
+    let wait = if request.uri().path() == "/api/operation" {
+        1260
+    } else {
+        45
+    };
+    match tokio::time::timeout(Duration::from_secs(wait), handle(&app, request)).await {
         Ok(response) => response,
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "Request timed out").into_response(),
     }

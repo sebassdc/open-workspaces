@@ -49,7 +49,16 @@ pub fn send(stream: &mut UnixStream, value: &Value) -> Result<()> {
 }
 
 pub fn connect(root: &Path, request: &Value) -> Result<(UnixStream, Value)> {
-    connect_waiting(root, request, Duration::from_secs(120))
+    connect_waiting(root, request, reply_wait(request))
+}
+
+/// How long to wait for the worker's reply. Captures (hibernate, snapshot, fork)
+/// write guest RAM to disk (the VMM allows 900 s) and then hash it.
+pub fn reply_wait(request: &Value) -> Duration {
+    match request["op"].as_str() {
+        Some("hibernate" | "snapshot" | "fork") => Duration::from_secs(1200),
+        _ => Duration::from_secs(120),
+    }
 }
 
 /// `connect` with a longer wait for the reply, for operations such as a large hibernation.
@@ -95,7 +104,7 @@ pub fn response(result: anyhow::Result<Value>) -> Value {
 /// Preserve the worker error envelope so callers can distinguish a rejection from transport loss.
 pub fn request_envelope(root: &Path, request: &Value) -> Result<Value> {
     let mut stream = UnixStream::connect(root.join("control.sock"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_read_timeout(Some(reply_wait(request)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     send(&mut stream, request)?;
     line(&mut stream)
@@ -104,6 +113,13 @@ pub fn request_envelope(root: &Path, request: &Value) -> Result<Value> {
 #[cfg(test)]
 mod framing_tests {
     use super::*;
+    #[test]
+    fn captures_wait_longer_than_other_operations() {
+        for op in ["hibernate", "snapshot", "fork"] {
+            assert_eq!(reply_wait(&json!({"op":op})), Duration::from_secs(1200), "{op}");
+        }
+        assert_eq!(reply_wait(&json!({"op":"list"})), Duration::from_secs(120));
+    }
     #[test]
     fn line_preserves_stream_suffix() {
         let (mut read, mut write) = UnixStream::pair().unwrap();

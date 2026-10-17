@@ -5,7 +5,7 @@ const histories = new Map();
 const imageNames = {alpine:'Alpine Linux',arch:'Arch Linux',ubuntu:'Ubuntu 24.04', 'ubuntu-arm64':'Ubuntu 24.04 ARM64'};
 // Built-in images, then golden images that the runners advertise (`ow image build`).
 const imageChoices = () => [...Object.entries(imageNames).map(([value,label]) => [value,value === 'alpine' ? label : `${label} · developer tools`]),
-  ...[...new Set((data.nodes || []).flatMap(n => n.capabilities?.images || []))].filter(i => !(i in imageNames)).sort().map(i => [i, `${i} · golden image`])];
+  ...[...new Set((data.nodes || []).flatMap(n => n.capabilities?.images || []))].filter(i => !Object.hasOwn(imageNames, i)).sort().map(i => [i, `${i} · golden image`])];
 const mib = value => value >= 1024 ? `${(value / 1024).toFixed(1)} GiB` : `${Math.round(value)} MiB`;
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
 function notice(text, error = false) { $('notice').textContent = text; $('notice').className = `notice${error ? ' error' : ''}`; $('notice').hidden = !text; }

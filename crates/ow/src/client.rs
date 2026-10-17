@@ -133,7 +133,12 @@ pub(crate) fn request(url: &str, token: &str, operation: Option<Value>) -> Resul
     let client = reqwest::blocking::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(120))
+        // A capture can take minutes (wire::reply_wait); the gateway waits up to 1260 s.
+        .timeout(Duration::from_secs(if operation.is_some() {
+            1260
+        } else {
+            120
+        }))
         .build()?;
     let request = if let Some(operation) = operation {
         client
