@@ -3,6 +3,9 @@ import * as path from "path";
 import * as aws from "@pulumi/aws";
 import * as pulumi from "@pulumi/pulumi";
 
+export { ArtifactStore, storeLifecycleRules, tlsOnlyPolicy } from "./store";
+export type { ArtifactStoreArgs } from "./store";
+
 export interface HostArgs {
     /** Nested-virtualization type: c8i, m8i, r8i or their flex variants. */
     instanceType?: pulumi.Input<string>;

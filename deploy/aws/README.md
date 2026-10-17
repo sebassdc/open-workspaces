@@ -18,6 +18,11 @@ What it creates:
 
 Every resource gets the `tags` input plus `Name`.
 
+Operate a host (SSM shell, readiness, SSH config, stop and start with
+hibernate and resume, images, backups, CI steps) with `bin/ow-aws`, and create
+its backup bucket with the `ArtifactStore` component: see
+[OPERATIONS.md](OPERATIONS.md).
+
 ## Use it
 
 Versions are this repository's git tags (`vX.Y.Z`). When a new
@@ -139,6 +144,10 @@ sudo ow backup list s3://bucket/prefix/snapshots
 sudo ow backup restore SNAPSHOT --from s3://bucket/prefix/snapshots [--to DIR] [--cold]
 ```
 
+`backup list` names each capture's box by owner and machine name, read from the
+newest catalog copy in `PREFIX/catalog/`; the last row of a box is its newest
+capture.
+
 `--cold` boots the disk when the host's CPU or kernel differs from the one that
 captured it. A restored box is runner-local: reach it with
 `ow --local --data-dir DIR`. Catalog restore steps are in
@@ -202,4 +211,4 @@ the run and the stack is still destroyed.
 - Pulumi `destroy` deletes the data volume and every workspace on it. Protect
   the volume (`protect` resource option on the component) for long-lived hosts.
 
-Check: `npm run check` (type check and user-data quoting test; Node 22.18+).
+Check: `npm run check` (type check, user-data, `ArtifactStore` and `ow-aws` tests, shellcheck when installed; Node 22.18+).
