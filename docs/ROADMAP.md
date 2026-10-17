@@ -37,6 +37,12 @@ product decisions can materially change them.
   on EC2: a host replacement kept the tailnet name and address and a hibernated
   box resumed on the new host; a scheduled instance stop hibernated a box whose
   process carried on after the start. See [deploy/aws](../deploy/aws/README.md).
+- [x] 0.3.1: `ow down --hibernate` calls the shutdown off (exits non-zero, the
+  worker keeps its machines running and accepts starts) when a machine cannot be
+  hibernated; captures may take up to 900 s and their callers wait that long,
+  with node heartbeats kept on their own thread; the dashboard lists golden
+  images. Checked on EC2: 4 GiB and 8 GiB boxes hibernated (64 s, 132 s) with
+  the node online throughout; an injected capture failure left the box running.
 
 ## Open-source roadmap: OS phase 1, core traits and pluggable connect
 
