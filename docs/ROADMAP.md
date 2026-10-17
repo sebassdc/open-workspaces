@@ -64,6 +64,17 @@ product decisions can materially change them.
   dashboard with tailnet sign-in, no Cloudflare login. Checked from a macOS
   laptop on the tailnet against an EC2 host: list, create, SSH key enrollment
   and `ssh` through `ow ssh-config` with strict host-key checking.
+- [x] 0.5.0, upgrades in place ([UPGRADES.md](UPGRADES.md),
+  [ADR 0005](adr/0005-change-classes-and-engine-boundary.md)): config and release
+  ref in an SSM parameter instead of user data; worker and control plane in
+  separate units with per-unit release pins; `release-impact.json` with a CI
+  check; `ow-host upgrade` picks the class from it, builds next to the running
+  release, and aborts or rolls back. Versioned host-runner protocol window,
+  close reason on a refused heartbeat, catalog reader floor. Checked on EC2: one
+  planned replacement from v0.4.1 kept the volume, tailnet address and a
+  hibernated box's process; a control-plane upgrade left the worker, VMM and box
+  process untouched; a runner upgrade kept the box process through hibernate;
+  an injected bad worker and a killed upgrader both rolled back.
 
 ## Open-source roadmap: OS phase 1, core traits and pluggable connect
 

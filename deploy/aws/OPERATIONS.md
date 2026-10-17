@@ -35,7 +35,7 @@ the stack's `instanceId` output. `OW_SSH_KEY` picks the private key (default
 | `join-tailnet --secret ARN` | joins the tailnet with the auth key in that Secrets Manager secret (the host role must be allowed to read it: `tailscaleAuthKeySecretArn`), restarts as above, starts the dashboard. The key goes to a root-only file under `/run` and is deleted; it is never printed |
 | `image RECIPE` | `ready --images`, then `ow image build RECIPE` on the host's runner. The file must be named `NAME.sh` |
 | `backups [--url S3URL] [OWNER/NAME \| ID]` | backed-up captures, oldest first: `uploaded  owner/machine  box  capture`. Default URL: the host's `backupUrl`. With a box, its newest capture is the last line. Restore one with `sudo ow backup restore` on a runner |
-| `apply`, `upgrade [ARGS]` | `ow-host apply` or `ow-host upgrade` on hosts that ship `ow-host`; refused on others |
+| `apply`, `upgrade [ARGS]` | `ow-host apply` (the config parameter: class 0 now, the rest reported) or `ow-host upgrade [REF] [--plan] [--accept-cold] [--max-class N]` ([in place](README.md#upgrades-in-place)) on hosts that ship `ow-host` (0.5.0 and later); refused on others |
 | `ci-preflight --stack S` | before `pulumi up`: if `pulumi preview` replaces this host's instance, hibernates its boxes (`ow down --hibernate`, which keeps them running if one cannot be hibernated) and stops the service. Fails (so CI stops before `pulumi up`) when the preview cannot be read or the instance is neither running nor stopped |
 | `ci-post-up --stack S [--image RECIPE].. [--max-class N]` | after `pulumi up`: starts a stopped host, waits until ready (each step up to 50 minutes: a new host builds from source), resumes remembered boxes, runs `ow-host apply` and `ow-host upgrade` where the host has them, then builds each image (an unchanged recipe is a no-op) |
 
@@ -75,7 +75,6 @@ const store = new ow.ArtifactStore("my-host-backups", { bucketName: "my-host-bac
 const host = new ow.Host("my-host", { backupUrl: store.url /* s3://bucket/my-host */ });
 ```
 
-`ow-backup` (installed with `backupUrl`) still needs a scheduler: run it
-nightly, for example with a systemd timer installed through `ow-aws run`. The
-root disk does not survive a host replacement, so reinstall the timer after
-one.
+`ow-backup` (installed with `backupUrl`) runs on the host's own timer when the
+`Host` has `backupSchedule` (for example `*-*-* 01:00:00 UTC`); the timer is
+part of the host's config, so it comes back after a host replacement.
