@@ -151,12 +151,13 @@ case $command in
     entries=
     for box in ${boxes[@]+"${boxes[@]}"}; do
       # Each box answers for its own identity: `ow-IDENTITY ssh-ed25519 KEY`.
-      pin=$(remote 60 ow ssh-info "$box" | python3 -c '
+      info=$(remote 60 ow ssh-info "$box")
+      pin=$(python3 -c '
 import json, re, sys
 i = json.load(sys.stdin)
 if not (re.fullmatch(r"[A-Za-z0-9._-]+", i["identity"]) and re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/=]+", i["host_key"])):
     sys.exit("unexpected ssh-info: " + json.dumps(i))
-print("ow-" + i["identity"], i["host_key"])')
+print("ow-" + i["identity"], i["host_key"])' <<< "$info")
       pins+=$pin$'\n'
       entries+="
 # Box $box through the host's \`ow ssh-proxy\`.

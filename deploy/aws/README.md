@@ -18,6 +18,11 @@ What it creates:
 
 Every resource gets the `tags` input plus `Name`.
 
+Operate a host (SSM shell, readiness, SSH config, stop and start with
+hibernate and resume, images, backups, CI steps) with `bin/ow-aws`, and create
+its backup bucket with the `ArtifactStore` component: see
+[OPERATIONS.md](OPERATIONS.md).
+
 ## Use it
 
 Versions are this repository's git tags (`vX.Y.Z`). When a new
@@ -206,4 +211,4 @@ the run and the stack is still destroyed.
 - Pulumi `destroy` deletes the data volume and every workspace on it. Protect
   the volume (`protect` resource option on the component) for long-lived hosts.
 
-Check: `npm run check` (type check and user-data quoting test; Node 22.18+).
+Check: `npm run check` (type check, user-data, `ArtifactStore` and `ow-aws` tests, shellcheck when installed; Node 22.18+).
