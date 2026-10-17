@@ -78,6 +78,14 @@ prefix per runner: a same-named snapshot in the store that is not this one
 stops the upload instead of being skipped. `--endpoint-url` takes an https store (http only on
 loopback); endpoint settings from the environment or a profile are ignored.
 
+`backup list` prints one JSON row per stored snapshot, oldest upload first:
+`snapshot`, the box it captured (`workspace`), `uploaded`, and the box's
+`owner` and `machine` name. Owner and name come from the newest
+`catalog-*.sqlite3` that `ow-backup` stores beside a store ending in
+`/snapshots` (in its sibling `catalog/`), downloaded into a private temporary
+directory and deleted after reading; they are null for any other store and for
+a box the catalog does not know. The last row of a box is its newest capture.
+
 `backup restore` downloads the snapshot onto the runner (default: the
 `ow host up` runner, whose worker must be running) and brings its box up under
 the same ID: RAM state resumed, or with `--cold` its disk booted fresh, which a

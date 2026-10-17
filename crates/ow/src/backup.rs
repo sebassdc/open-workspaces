@@ -2,14 +2,16 @@
 //! runner's sealed snapshots to an S3-compatible [`SnapshotStore`], restorable
 //! onto another runner.
 use crate::{BackupAction, common, selfhost, wire};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use ow_core::snapshot_store::{S3Store, SnapshotStore};
-use rusqlite::Connection;
-use serde_json::json;
+use rusqlite::{Connection, OpenFlags};
+use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    process::Stdio,
     time::Duration,
 };
 
@@ -69,11 +71,129 @@ pub fn run(base: Option<PathBuf>, action: BackupAction) -> Result<i32> {
             store,
             endpoint_url,
         } => {
-            let names = S3Store::new(&store, endpoint_url.as_deref())?.list()?;
-            println!("{}", json!(names));
+            let s3 = S3Store::new(&store, endpoint_url.as_deref())?;
+            let url = store.trim_end_matches('/');
+            let uploaded = ls(&s3, url)?
+                .into_iter()
+                .filter_map(|(at, key)| {
+                    let name = key.strip_suffix("/manifest.json")?.rsplit('/').next()?;
+                    Some((name.to_owned(), at))
+                })
+                .collect();
+            let owners = match newest_catalog(&s3, url)? {
+                Some(key) => owners_from_s3(&s3, &key)?,
+                None => HashMap::new(),
+            };
+            let rows = listing(&s3, &uploaded, &owners)?;
+            println!("{}", serde_json::to_string_pretty(&rows)?);
             Ok(0)
         }
     }
+}
+
+/// One row per stored snapshot, oldest upload first: the box it captured
+/// (`workspace`, from its manifest) and that box's owner and name from the
+/// catalog (null when the catalog does not know it).
+fn listing(
+    store: &dyn SnapshotStore,
+    uploaded: &HashMap<String, String>,
+    owners: &HashMap<String, (String, String)>,
+) -> Result<Vec<Value>> {
+    let mut rows = Vec::new();
+    for name in store.list()? {
+        let manifest: Value = serde_json::from_slice(&store.manifest(&name)?)
+            .with_context(|| format!("invalid stored manifest for {name}"))?;
+        let workspace = manifest["workspace"].as_str().unwrap_or_default();
+        let owner = owners.get(workspace);
+        rows.push(json!({
+            "snapshot": name,
+            "workspace": workspace,
+            "owner": owner.map(|o| &o.0),
+            "machine": owner.map(|o| &o.1),
+            "uploaded": uploaded.get(&name),
+        }));
+    }
+    let key = |r: &Value| {
+        (
+            r["uploaded"].as_str().map(str::to_owned),
+            r["snapshot"].to_string(),
+        )
+    };
+    rows.sort_by_key(key);
+    Ok(rows)
+}
+
+/// `(date time, key)` of every object under `url`, through `aws s3 ls --recursive`.
+fn ls(store: &S3Store, url: &str) -> Result<Vec<(String, String)>> {
+    let output = store
+        .aws()
+        .args(["s3", "ls", "--recursive", &format!("{url}/")])
+        .stderr(Stdio::inherit())
+        .output()
+        .context("the AWS CLI (aws) is required for snapshot stores")?;
+    // As S3Store::list: exit 1 with no output is an empty prefix, anything else fails.
+    if !output.status.success() && !(output.status.code() == Some(1) && output.stdout.is_empty()) {
+        bail!("listing {url} failed ({})", output.status);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let at = format!("{} {}", parts.next()?, parts.next()?);
+            parts.next()?;
+            Some((at, parts.next()?.to_owned()))
+        })
+        .collect())
+}
+
+/// The newest `catalog-*.sqlite3` that `ow-backup` stored beside a `…/snapshots`
+/// store (in `…/catalog/`), as `s3://bucket/key`; none for any other store.
+fn newest_catalog(store: &S3Store, url: &str) -> Result<Option<String>> {
+    let Some(root) = url
+        .strip_suffix("/snapshots")
+        .filter(|root| root.strip_prefix("s3://").is_some_and(|r| !r.is_empty()))
+    else {
+        return Ok(None);
+    };
+    let bucket = root["s3://".len()..].split('/').next().unwrap_or_default();
+    Ok(ls(store, &format!("{root}/catalog"))?
+        .into_iter()
+        .map(|(_, key)| key)
+        .filter(|key| key.ends_with(".sqlite3"))
+        // ow-backup stamps names as YYYYMMDDTHHMMSSZ, so the greatest is the newest.
+        .max()
+        .map(|key| format!("s3://{bucket}/{key}")))
+}
+
+/// Downloads a catalog copy into a private directory, reads it, and deletes it:
+/// the catalog holds credential hashes.
+fn owners_from_s3(store: &S3Store, key: &str) -> Result<HashMap<String, (String, String)>> {
+    let dir = std::env::temp_dir().join(format!("ow-catalog-{}", common::nonce()?));
+    fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let result = (|| {
+        let path = dir.join("catalog.sqlite3");
+        let status = store
+            .aws()
+            .args(["s3", "cp", "--only-show-errors", key])
+            .arg(&path)
+            .status()
+            .context("the AWS CLI (aws) is required for snapshot stores")?;
+        ensure!(status.success(), "downloading {key} failed ({status})");
+        owners(&path)
+    })();
+    fs::remove_dir_all(&dir)?;
+    result
+}
+
+/// Machine ID to (owner email, machine name), from a catalog copy.
+fn owners(catalog: &Path) -> Result<HashMap<String, (String, String)>> {
+    let db = Connection::open_with_flags(catalog, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut query = db.prepare(
+        "SELECT r.physical, u.email, r.name FROM resources r JOIN users u ON u.id = r.owner \
+         WHERE r.kind = 'machine'",
+    )?;
+    let rows = query.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Uploads every sealed snapshot in `dir` that the store lacks; staging
@@ -256,6 +376,58 @@ mod tests {
                 fs::copy(self.0.join(name).join(f), directory.join(f))?;
             }
             Ok(())
+        }
+    }
+
+    #[test]
+    fn listing_names_each_capture_by_owner_from_the_catalog() {
+        let (controller, remote) = (temp("controller"), temp("listing"));
+        let mut catalog = crate::catalog::Catalog::open(&controller, "test", None).unwrap();
+        let owner = catalog
+            .user(&crate::catalog::Identity {
+                issuer: "test".into(),
+                subject: "a".into(),
+                email: "a@example.test".into(),
+            })
+            .unwrap();
+        drop(catalog);
+        // The real schema, with the row a create would leave.
+        Connection::open(controller.join("catalog.sqlite3"))
+            .unwrap()
+            .execute(
+                "INSERT INTO resources(owner,kind,name,physical,metadata) VALUES(?1,'machine','dev','m-1','{}')",
+                [owner],
+            )
+            .unwrap();
+        let owners = owners(&controller.join("catalog.sqlite3")).unwrap();
+        for (name, workspace) in [
+            ("sleep-new", "m-1"),
+            ("sleep-old", "m-gone"),
+            ("sleep-x", "m-1"),
+        ] {
+            fs::create_dir(remote.join(name)).unwrap();
+            fs::write(
+                remote.join(name).join("manifest.json"),
+                json!({"name":name,"workspace":workspace}).to_string(),
+            )
+            .unwrap();
+        }
+        let uploaded = HashMap::from([
+            ("sleep-new".to_owned(), "2026-10-16 01:00:00".to_owned()),
+            ("sleep-old".to_owned(), "2026-10-15 01:00:00".to_owned()),
+        ]);
+        let rows = listing(&Dir(remote.clone()), &uploaded, &owners).unwrap();
+        assert_eq!(
+            json!(rows),
+            json!([
+                {"snapshot":"sleep-x","workspace":"m-1","owner":"a@example.test","machine":"dev","uploaded":null},
+                {"snapshot":"sleep-old","workspace":"m-gone","owner":null,"machine":null,"uploaded":"2026-10-15 01:00:00"},
+                {"snapshot":"sleep-new","workspace":"m-1","owner":"a@example.test","machine":"dev","uploaded":"2026-10-16 01:00:00"},
+            ])
+        );
+        assert!(listing(&Dir(remote.join("missing")), &uploaded, &owners).is_err());
+        for d in [controller, remote] {
+            fs::remove_dir_all(d).unwrap();
         }
     }
 

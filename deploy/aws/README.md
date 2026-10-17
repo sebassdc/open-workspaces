@@ -139,6 +139,10 @@ sudo ow backup list s3://bucket/prefix/snapshots
 sudo ow backup restore SNAPSHOT --from s3://bucket/prefix/snapshots [--to DIR] [--cold]
 ```
 
+`backup list` names each capture's box by owner and machine name, read from the
+newest catalog copy in `PREFIX/catalog/`; the last row of a box is its newest
+capture.
+
 `--cold` boots the disk when the host's CPU or kernel differs from the one that
 captured it. A restored box is runner-local: reach it with
 `ow --local --data-dir DIR`. Catalog restore steps are in
