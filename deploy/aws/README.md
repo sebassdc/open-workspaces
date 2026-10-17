@@ -26,7 +26,7 @@ workflow runs the checks and creates that tag. The same tag is the default
 `ref` the host builds, so set `ref` explicitly before the first release exists.
 
 ```bash
-pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.3.0
+pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.3.1
 ```
 
 ```typescript
@@ -81,8 +81,10 @@ Boxes idle for 30 minutes hibernate and wake on the next connection; see
 [wake on connect](../../docs/DAILY_USE.md). Stopping the service (a restart, a
 reboot, an instance stop or a host replacement) runs `ow down --hibernate`:
 the worker refuses new starts and wakes, hibernates the running boxes, then
-stops, so their processes carry on when they next wake; only a box that fails
-to hibernate is cold-stopped. EC2 does not promise an instance stop that long a
+stops, so their processes carry on when they next wake. If a box stays running
+(its capture failed), `ow down --hibernate` allows starts again, leaves the
+worker running and exits non-zero; systemd then still stops the service, so on
+this path that box is cold-stopped and the failure is in the journal. EC2 does not promise an instance stop that long a
 shutdown window (captures run one at a time, about 25 s per 1 GiB box), so for
 planned stops and replacements stop the service first and wait for it
 (`sudo systemctl stop open-workspaces`, for example from an SSM Automation

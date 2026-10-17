@@ -844,7 +844,10 @@ impl Runtime {
         let staging = self.snapshot_dir(&format!(".pending-{}", vm::nonce()?));
         fs::create_dir(&staging)?;
         let disk = self.machine_dir(id).join("disk.ext4");
-        self.running(id)?.capture(&staging, &disk, !hibernate)?;
+        if let Err(e) = self.running(id)?.capture(&staging, &disk, !hibernate) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e);
+        }
         if hibernate {
             self.machines.remove(id);
             // Until the capture is sealed, the live disk is the machine's state.
@@ -1056,8 +1059,9 @@ impl Runtime {
             ),
             "list" => Ok(json!(self.state.workspaces.values().collect::<Vec<_>>())),
             "quiesce" => {
-                self.closing = true;
-                Ok(json!({"closing":true}))
+                // `"closing": false` lifts it again (a shutdown that was called off).
+                self.closing = request["closing"].as_bool().unwrap_or(true);
+                Ok(json!({"closing":self.closing}))
             }
             "stats" => {
                 let mut running = BTreeMap::new();

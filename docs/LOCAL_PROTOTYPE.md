@@ -183,7 +183,9 @@ Stop the prototype's worker and its gateways while retaining disks and captures:
 
 `./ow down --hibernate` first refuses new starts and wakes, then hibernates each
 running machine, so its processes resume on the next start or connection
-instead of a cold boot (the AWS host's service stops this way). An OS upgrade
+instead of a cold boot (the AWS host's service stops this way). If a machine
+cannot be hibernated, it exits non-zero and leaves the worker and its machines
+running, with starts allowed again. An OS upgrade
 that changes the host kernel turns that into a cold boot of the hibernated disk.
 
 `--data-dir` or `OW_DATA_DIR` selects another dedicated data directory. The CLI
