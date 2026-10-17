@@ -786,8 +786,14 @@ pub fn run(cli: Cli) -> Result<i32> {
         Action::Down { hibernate } => {
             if hibernate && root.join("control.sock").exists() {
                 hibernate_all(&root)?;
+                if let Err(e) = unpublish_all(&root, None) {
+                    // Called off after the hibernation: the worker keeps running and accepts starts.
+                    let _ = wire::request(&root, json!({"op":"quiesce","closing":false}));
+                    return Err(e);
+                }
+            } else {
+                unpublish_all(&root, None)?;
             }
-            unpublish_all(&root, None)?;
             if root.join("control.sock").exists() {
                 wire::request(&root, json!({"op":"shutdown"}))?;
                 let started = Instant::now();
