@@ -702,6 +702,85 @@ impl Catalog {
         }
         Ok(snapshots)
     }
+    /// The saved result of a delete retried with its key. A key held by another operation or
+    /// name conflicts; one whose machine went without a recorded result is uncertain.
+    fn delete_replay(&self, user: i64, name: &str, key: Option<&str>) -> Result<Option<Value>> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        common::identifier(key)?;
+        let previous:Option<(i64,String,String,String,Option<String>)>=self.db.query_row("SELECT id,op,resource,state,response FROM operations WHERE owner=?1 AND retry_key=?2",params![user,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let Some((id, op, resource, state, response)) = previous else {
+            return Ok(None);
+        };
+        let forgotten = resource == format!("deleted:{name}");
+        ensure!(
+            op == "delete" && (resource == name || forgotten),
+            "operation key conflicts with original parameters"
+        );
+        if state == "succeeded" {
+            return Ok(Some(serde_json::from_str(
+                &response.context("missing result")?,
+            )?));
+        }
+        if forgotten {
+            return Err(self.outcome_error(user, id));
+        }
+        Ok(None)
+    }
+    /// Delete a machine its runner no longer lists: record the operation under its key, with
+    /// the fingerprint a dispatched delete would have, then drop the entry.
+    fn delete_missing(
+        &mut self,
+        user: i64,
+        name: &str,
+        physical: &str,
+        input: &Value,
+    ) -> Result<Value> {
+        let node = self.placement("machine", physical)?;
+        let mut request = input.clone();
+        request["id"] = json!(physical);
+        let object = request.as_object_mut().context("request")?;
+        object.remove("node");
+        object.remove("operation_key");
+        let fingerprint = json!({"request":request,"node":node}).to_string();
+        let key = match input["operation_key"].as_str() {
+            Some(key) => key.to_owned(),
+            None => common::nonce()?,
+        };
+        let previous: Option<(i64, String, String)> = self
+            .db
+            .query_row(
+                "SELECT id,request,state FROM operations WHERE owner=?1 AND retry_key=?2",
+                params![user, key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let operation = match previous {
+            Some((id, previous, state)) => {
+                ensure!(
+                    previous == fingerprint,
+                    "operation key conflicts with original parameters"
+                );
+                ensure!(
+                    state != "failed",
+                    "operation previously rejected; use a new operation_key for deliberate retry"
+                );
+                id
+            }
+            None => {
+                self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,'delete',?2,'pending',?3,?4,?5)",params![user,name,node,key,fingerprint])?;
+                self.db.last_insert_rowid()
+            }
+        };
+        let mut value = json!({"deleted":name,"snapshots":self.forget(user, physical)?});
+        value["operation"] = self.operation_info(user, operation)?;
+        value["operation"]["state"] = json!("succeeded");
+        value["operation_id"] = json!(operation);
+        value["node"] = json!(node);
+        self.db.execute("UPDATE operations SET state='succeeded',response=?1,finished_at=CURRENT_TIMESTAMP WHERE id=?2",params![value.to_string(),operation])?;
+        Ok(value)
+    }
     fn snapshot_source(&self, user: i64, snapshot: &str, physical: &str) -> Result<()> {
         let metadata: String = self.db.query_row(
             "SELECT metadata FROM resources WHERE owner=?1 AND kind='snapshot' AND physical=?2",
@@ -926,6 +1005,13 @@ impl Catalog {
         let name = request["id"].as_str().context("id")?.to_owned();
         common::address(&name)?;
         let input = request.clone();
+        // A finished delete has no row left to resolve: answer its key before looking.
+        if op == "delete"
+            && let Some(cached) =
+                self.delete_replay(user, &name, input["operation_key"].as_str())?
+        {
+            return Ok(cached);
+        }
         // Resolve authority before any worker contact, including inventory refresh.
         if op != "create" {
             let physical = self.machine(user, &name, &op)?;
@@ -960,7 +1046,7 @@ impl Catalog {
                 |r| r.get(0),
             )?;
             if state.as_deref() == Some("missing") {
-                return Ok(json!({"deleted":name,"snapshots":self.forget(user, &physical)?}));
+                return self.delete_missing(user, &name, &physical, &input);
             }
         }
         // Optional protocol-v1 status fields; query outside the SQLite writer. A missing

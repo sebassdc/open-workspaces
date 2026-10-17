@@ -592,7 +592,8 @@ fn delete_is_owner_only_drops_snapshots_grants_and_frees_the_name() {
     assert_eq!(c.physical(a, "machine", "demo").unwrap(), physical);
     c.operation(a, json!({"op":"stop","id":"demo"})).unwrap();
     let (_, _, grantee_stream) = c.terminal_target(b, shared).unwrap();
-    let deleted = c.operation(a, json!({"op":"delete","id":"demo"})).unwrap();
+    let delete = json!({"op":"delete","id":"demo","operation_key":"delete-one"});
+    let deleted = c.operation(a, delete.clone()).unwrap();
     assert_eq!(deleted["deleted"], "demo");
     assert_eq!(deleted["snapshots"], json!(["saved"]));
     assert!(
@@ -679,10 +680,81 @@ fn machines_the_runner_lost_are_flagged_and_deleted_without_it() {
     assert_eq!(state["stats"]["reserved_memory_mib"], 256);
     // Nothing reaches the runner: a dispatched delete would be rejected here.
     *fake.reject.lock().unwrap() = Some("delete".into());
-    let deleted = c.operation(a, json!({"op":"delete","id":"gone"})).unwrap();
-    assert_eq!(deleted, json!({"deleted":"gone","snapshots":[]}));
+    let delete = json!({"op":"delete","id":"gone","operation_key":"gone-once"});
+    let deleted = c.operation(a, delete.clone()).unwrap();
+    assert_eq!(
+        (&deleted["deleted"], &deleted["snapshots"], &deleted["node"]),
+        (&json!("gone"), &json!([]), &json!("alpha"))
+    );
+    assert_eq!(deleted["operation"]["state"], "succeeded");
+    // A lost reply is retried with the same key and gets the same result.
+    assert_eq!(c.operation(a, delete.clone()).unwrap(), deleted);
     let state = c.state(a).unwrap();
     assert_eq!(state["workspaces"].as_array().unwrap().len(), 2);
     assert_eq!(state["workspaces"][0]["id"], "kept");
     assert_eq!(state["workspaces"][0]["state"], "running");
+}
+
+#[test]
+fn delete_keys_replay_their_result_and_never_touch_a_replacement() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    let create = json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"});
+    c.operation(a, create.clone()).unwrap();
+    c.operation(a, json!({"op":"stop","id":"demo"})).unwrap();
+    let delete = json!({"op":"delete","id":"demo","operation_key":"delete-one"});
+    let deleted = c.operation(a, delete.clone()).unwrap();
+    // A lost reply: the same key gets the saved result, without a second delete.
+    *fake.reject.lock().unwrap() = Some("delete".into());
+    assert_eq!(c.operation(a, delete.clone()).unwrap(), deleted);
+    *fake.reject.lock().unwrap() = None;
+    // A replacement under the same name, lost by its runner, survives the old key.
+    c.operation(a, create.clone()).unwrap();
+    let replacement = c.physical(a, "machine", "demo").unwrap();
+    c.operation(
+        a,
+        json!({"op":"snapshot","id":"demo","name":"replacement-save"}),
+    )
+    .unwrap();
+    wire::request(
+        &fake.root.join("nodes/alpha"),
+        json!({"op":"lose","id":replacement}),
+    )
+    .unwrap();
+    assert_eq!(c.operation(a, delete.clone()).unwrap(), deleted);
+    let state = c.state(a).unwrap();
+    assert_eq!(state["workspaces"][0]["id"], "demo");
+    assert_eq!(state["workspaces"][0]["state"], "missing");
+    assert_eq!(state["snapshots"][0]["name"], "replacement-save");
+    // A key belongs to one operation on one name.
+    let create_key: String =
+        c.db.query_row(
+            "SELECT retry_key FROM operations WHERE op='create' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    for reused in [
+        json!({"op":"delete","id":"other","operation_key":"delete-one"}),
+        json!({"op":"delete","id":"demo","operation_key":create_key}),
+    ] {
+        assert!(c.operation(a, reused.clone()).is_err(), "{reused}");
+    }
+    assert_eq!(c.physical(a, "machine", "demo").unwrap(), replacement);
+    // A fresh key deletes the replacement, and its own retry replays.
+    let second = json!({"op":"delete","id":"demo","operation_key":"delete-two"});
+    let removed = c.operation(a, second.clone()).unwrap();
+    assert_eq!(removed["snapshots"], json!(["replacement-save"]));
+    assert_eq!(c.operation(a, second).unwrap(), removed);
+    let state = c.state(a).unwrap();
+    assert_eq!(
+        (&state["workspaces"], &state["snapshots"]),
+        (&json!([]), &json!([]))
+    );
+    // An old key replays only its own result, even once the name is in use again.
+    c.operation(a, create).unwrap();
+    assert_eq!(c.operation(a, delete).unwrap(), deleted);
+    assert_eq!(c.state(a).unwrap()["workspaces"][0]["state"], "running");
 }
