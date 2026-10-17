@@ -416,8 +416,9 @@ fn unpublish(root: &Path, id: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Refuses new starts and wakes, then hibernates every running machine. A machine
-/// that fails to hibernate is left to the shutdown, which stops it.
+/// Refuses new starts and wakes, then hibernates every running machine. If one
+/// stays running (its capture failed), starts are allowed again and this fails, so
+/// the caller does not shut the worker down under it.
 fn hibernate_all(root: &Path) -> Result<()> {
     // The AWS unit allows 900 s to stop; the worker captures one machine at a time.
     let deadline = Instant::now() + Duration::from_secs(840);
@@ -435,6 +436,21 @@ fn hibernate_all(root: &Path) -> Result<()> {
             Ok(_) => println!("hibernated {id}"),
             Err(e) => eprintln!("could not hibernate {id}: {e:#}"),
         }
+    }
+    let list = wire::request(root, json!({"op":"list"}))?;
+    let running: Vec<_> = list
+        .as_array()
+        .context("workspace list")?
+        .iter()
+        .filter(|w| w["state"] == "running")
+        .filter_map(|w| w["id"].as_str())
+        .collect();
+    if !running.is_empty() {
+        wire::request(root, json!({"op":"quiesce","closing":false}))?;
+        bail!(
+            "could not hibernate {}; the worker keeps running (nothing was shut down)",
+            running.join(", ")
+        );
     }
     Ok(())
 }
@@ -762,11 +778,11 @@ pub fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Action::Down { hibernate } => {
+            if hibernate && root.join("control.sock").exists() {
+                hibernate_all(&root)?;
+            }
             unpublish_all(&root, None)?;
             if root.join("control.sock").exists() {
-                if hibernate {
-                    hibernate_all(&root)?;
-                }
                 wire::request(&root, json!({"op":"shutdown"}))?;
                 let started = Instant::now();
                 while root.join("control.sock").exists() {
@@ -916,5 +932,81 @@ mod awake_tests {
         let later = Instant::now() + Duration::from_secs(120);
         // The stream was closed again, so the box can go idle.
         assert!(runtime.lock().unwrap().0.due("box", 0, 0, later));
+    }
+}
+
+#[cfg(test)]
+mod down_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// A stand-in worker on `control.sock`: box `a` runs; its hibernation fails
+    /// unless `capture_ok`. Returns the data dir and the requests it saw.
+    fn worker(capture_ok: bool) -> (PathBuf, Arc<Mutex<Vec<Value>>>) {
+        let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            let mut slept = false;
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let request = wire::line(&mut stream).unwrap();
+                log.lock().unwrap().push(request.clone());
+                let state = if slept { "hibernated" } else { "running" };
+                let response = match request["op"].as_str().unwrap() {
+                    "list" => {
+                        json!({"ok":true,"result":[{"id":"a","state":state},{"id":"b","state":"stopped"}]})
+                    }
+                    "hibernate" if capture_ok => {
+                        slept = true;
+                        json!({"ok":true,"result":{}})
+                    }
+                    "hibernate" => json!({"ok":false,"error":"VMM /snapshot/create: timed out"}),
+                    _ => json!({"ok":true,"result":{}}),
+                };
+                wire::send(&mut stream, &response).unwrap();
+            }
+        });
+        (root, seen)
+    }
+
+    fn ops(seen: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|r| r["op"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_hibernation_calls_off_the_shutdown() {
+        let (root, seen) = worker(false);
+        let error = hibernate_all(&root).unwrap_err().to_string();
+        assert!(error.contains("could not hibernate a"), "{error}");
+        assert_eq!(
+            ops(&seen),
+            ["quiesce", "list", "hibernate", "list", "quiesce"]
+        );
+        assert_eq!(
+            seen.lock().unwrap()[4]["closing"],
+            false,
+            "starts are allowed again"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn running_machines_are_hibernated_with_starts_refused() {
+        let (root, seen) = worker(true);
+        hibernate_all(&root).unwrap();
+        assert_eq!(ops(&seen), ["quiesce", "list", "hibernate", "list"]);
+        assert_eq!(
+            seen.lock().unwrap()[2]["id"],
+            "a",
+            "stopped machines are left alone"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

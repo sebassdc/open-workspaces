@@ -180,8 +180,14 @@ impl Vm {
     }
 
     pub fn api(&self, method: &str, endpoint: &str, body: Value) -> Result<()> {
+        self.api_waiting(method, endpoint, body, 30)
+    }
+
+    /// `api` with a longer limit, for calls that write guest RAM to disk: a 4 GiB
+    /// snapshot took over 30 s on a gp3 volume at its baseline throughput.
+    fn api_waiting(&self, method: &str, endpoint: &str, body: Value, seconds: u32) -> Result<()> {
         let output = Command::new("curl")
-            .args(["-sS", "--max-time", "30", "--unix-socket"])
+            .args(["-sS", "--max-time", &seconds.to_string(), "--unix-socket"])
             .arg(&self.socket)
             .args([
                 "-X",
@@ -327,7 +333,7 @@ impl Vm {
         self.checked("sync")?;
         self.api("PATCH", "/vm", json!({"state":"Paused"}))?;
         let captured = (|| {
-            self.api("PUT", "/snapshot/create", json!({"snapshot_type":"Full","snapshot_path":directory.join("state"),"mem_file_path":directory.join("memory")}))?;
+            self.api_waiting("PUT", "/snapshot/create", json!({"snapshot_type":"Full","snapshot_path":directory.join("state"),"mem_file_path":directory.join("memory")}), 900)?;
             reflink(disk, &directory.join("disk.ext4"))
         })();
         if captured.is_ok() && !resume {
