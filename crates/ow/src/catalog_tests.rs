@@ -788,14 +788,81 @@ fn delete_drops_reservations_of_failed_snapshots_only_its_own() {
             .unwrap()
             .iter()
             .map(|s| s["name"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>()
+            .collect::<std::collections::BTreeSet<_>>()
     };
-    assert_eq!(names(&mut c), ["moved", "saved"]);
+    let set = |n: &[&str]| n.iter().map(|s| s.to_string()).collect();
+    assert_eq!(names(&mut c), set(&["moved", "saved"]));
     c.operation(a, json!({"op":"stop","id":"demo"})).unwrap();
     let deleted = c.operation(a, json!({"op":"delete","id":"demo"})).unwrap();
     assert_eq!(deleted["snapshots"], json!(["saved"]));
-    assert_eq!(names(&mut c), ["moved"]);
+    assert_eq!(names(&mut c), set(&["moved"]));
     let other = c.physical(a, "machine", "other").unwrap();
     let moved = c.physical(a, "snapshot", "moved").unwrap();
     assert!(c.snapshot_source(a, &moved, &other).is_ok());
+}
+
+#[test]
+fn a_missing_machine_is_deleted_while_its_runner_is_offline_or_revoked() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    let b = c.user(&identity("bob")).unwrap();
+    for id in ["offline", "revoked"] {
+        c.operation(a, json!({"op":"create","id":id,"node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    }
+    for id in ["offline", "revoked"] {
+        let physical = c.physical(a, "machine", id).unwrap();
+        wire::request(
+            &fake.root.join("nodes/alpha"),
+            json!({"op":"lose","id":physical}),
+        )
+        .unwrap();
+    }
+    // Lost machines hold no capacity, so another fits on the runner.
+    assert_eq!(c.state(a).unwrap()["stats"]["reserved_memory_mib"], 0);
+    c.operation(a, json!({"op":"create","id":"unseen","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    c.operation(
+        a,
+        json!({"op":"share","id":"offline","with":"bob@example.test","role":"admin"}),
+    )
+    .unwrap();
+    let db = nodes::db(&fake.root).unwrap();
+    db.execute("UPDATE nodes SET heartbeat=0 WHERE id='alpha'", [])
+        .unwrap();
+    // Owner authority still comes first.
+    assert!(
+        c.operation(b, json!({"op":"delete","id":"alice@example.test/offline"}))
+            .is_err()
+    );
+    let deleted = c
+        .operation(
+            a,
+            json!({"op":"delete","id":"offline","operation_key":"off-1"}),
+        )
+        .unwrap();
+    assert_eq!(deleted["deleted"], "offline");
+    assert_eq!(
+        c.operation(
+            a,
+            json!({"op":"delete","id":"offline","operation_key":"off-1"})
+        )
+        .unwrap(),
+        deleted
+    );
+    nodes::revoke(&fake.root, "alpha").unwrap();
+    c.operation(a, json!({"op":"delete","id":"revoked"}))
+        .unwrap();
+    // One never confirmed missing still needs its runner.
+    assert!(
+        c.operation(a, json!({"op":"delete","id":"unseen"}))
+            .is_err()
+    );
+    let ids: Vec<_> = c.state(a).unwrap()["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids, ["unseen"]);
 }

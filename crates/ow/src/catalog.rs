@@ -704,6 +704,14 @@ impl Catalog {
         }
         Ok(snapshots)
     }
+    /// Whether reconcile found the machine gone from its runner.
+    fn missing(&self, physical: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT json_extract(metadata,'$.state')='missing' FROM resources WHERE kind='machine' AND physical=?1",
+            [physical],
+            |r| r.get::<_, Option<bool>>(0),
+        )? == Some(true))
+    }
     /// The saved result of a delete retried with its key. A key held by another operation or
     /// name conflicts; one whose machine went without a recorded result is uncertain.
     fn delete_replay(&self, user: i64, name: &str, key: Option<&str>) -> Result<Option<Value>> {
@@ -1017,6 +1025,11 @@ impl Catalog {
         // Resolve authority before any worker contact, including inventory refresh.
         if op != "create" {
             let physical = self.machine(user, &name, &op)?;
+            // Already confirmed gone from its runner: only the row is left, whatever the runner's
+            // state now.
+            if op == "delete" && self.missing(&physical)? {
+                return self.delete_missing(user, &name, &physical, &input);
+            }
             let node = self.placement("machine", &physical)?;
             nodes::online(&self.root, &node)?;
             nodes::operation_capable(&self.root, &node, &op)?;
@@ -1042,12 +1055,7 @@ impl Catalog {
         if op == "delete" {
             // The runner no longer has it: nothing to dispatch, only the row to drop.
             let physical = self.machine(user, &name, &op)?;
-            let state: Option<String> = self.db.query_row(
-                "SELECT json_extract(metadata,'$.state') FROM resources WHERE kind='machine' AND physical=?1",
-                [&physical],
-                |r| r.get(0),
-            )?;
-            if state.as_deref() == Some("missing") {
+            if self.missing(&physical)? {
                 return self.delete_missing(user, &name, &physical, &input);
             }
         }
