@@ -1,0 +1,281 @@
+#!/bin/bash
+# Operator helper for an Open Workspaces host made by the deploy/aws Host
+# component. Every path goes through SSM: the host has no inbound ports.
+#
+#   ow-aws --host NAME COMMAND [ARGS]
+#
+#   shell                        SSM shell on the host (then: sudo ow list, sudo ow shell BOX)
+#   run 'COMMANDS'               run COMMANDS as root on the host (bash), print the output
+#   ready [--wait S] [--images]  wait (default 600 s) until the bootstrap is done (ow user and
+#                                controller unit exist) and the runner is online; --images also
+#                                waits for the developer image
+#   authorize BOX                let your SSH key into BOX (replaces BOX's key list)
+#   ssh-config [BOX..] [-o FILE] OpenSSH config for the host (NAME) and each BOX (ow-BOX), with
+#                                their host keys pinned in FILE.known_hosts (default
+#                                ~/.ssh/NAME.conf); use: ssh -F FILE NAME
+#   restart [--worker]           restart the controller; boxes hibernate first and resume after
+#                                (hosts with ow-host restart the control plane alone)
+#   stop | start                 stop the instance, running boxes hibernated first | start it,
+#                                wait until ready, resume them
+#   join-tailnet --secret ARN    join the tailnet with the auth key in that Secrets Manager
+#                                secret, restart, start the dashboard
+#   image RECIPE                 build the golden image RECIPE (NAME.sh) on the host's runner
+#   backups [--url S3URL] [OWNER/NAME | ID]
+#                                backed-up captures, oldest first, with the box's owner and name
+#                                (default URL: the host's backupUrl)
+#   apply | upgrade [ARGS]       ow-host apply | upgrade on the host (hosts with ow-host)
+#   ci-preflight --stack S       before `pulumi up`: if the preview replaces the host, hibernate
+#                                its boxes and stop the service
+#   ci-post-up --stack S [--image RECIPE].. [--max-class N]
+#                                after `pulumi up`: start a stopped host, wait until ready,
+#                                apply and upgrade (hosts with ow-host), build each image
+#
+# NAME is the component name (tag Name). Environment: OW_HOST instead of --host,
+# OW_INSTANCE to skip the lookup, OW_SSH_KEY (default ~/.ssh/id_ed25519; its
+# .pub is pushed), and the usual AWS credentials and region. Needs bash,
+# python3 and the AWS CLI with the Session Manager plugin.
+set -euo pipefail
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 2; }
+die() { echo "$*" >&2; exit 1; }
+
+host=${OW_HOST:-}
+if [[ ${1:-} == --host ]]; then host=${2:-}; shift 2 || usage; fi
+[[ -n $host ]] || usage
+[[ $host =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "bad host name: $host"
+command=${1:-}
+shift || usage
+key=${OW_SSH_KEY:-$HOME/.ssh/id_ed25519}
+instance=${OW_INSTANCE:-}
+
+box_name() { [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || die "bad box name: $1"; }
+
+find_instance() {
+  [[ -n $instance ]] || instance=$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=$host" Name=instance-state-name,Values=pending,running,stopping,stopped \
+    --query 'Reservations[].Instances[].InstanceId' --output text)
+  [[ $instance =~ ^i-[0-9a-f]+$ ]] || die "expected one $host instance, found: '$instance'"
+}
+
+instance_state() { aws ec2 describe-instances --instance-ids "$instance" --query 'Reservations[0].Instances[0].State.Name' --output text; }
+
+# remote TIMEOUT CALL [ARG..]: the host functions, then CALL ARG.. with each
+# argument shell-quoted, as root on the host; prints its output, returns its status.
+remote() {
+  local timeout=$1 script id state deadline
+  shift
+  script="$(cat "$here/ow-aws-remote.sh")"$'\n'"$(printf '%q ' "$@")"
+  deadline=$(( $(date +%s) + 600 + timeout + 60 ))
+  id=$(aws ssm send-command --instance-ids "$instance" --document-name AWS-RunShellScript --timeout-seconds 600 \
+    --parameters "$(python3 -c 'import base64,json,sys; print(json.dumps({"commands":["echo "+base64.b64encode(sys.argv[1].encode()).decode()+" | base64 -d | bash"],"executionTimeout":[sys.argv[2]]}))' "$script" "$timeout")" \
+    --query Command.CommandId --output text)
+  while :; do
+    sleep 3
+    state=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$instance" --query Status --output text 2>/dev/null || echo Pending)
+    case $state in Pending|InProgress|Delayed) ;; *) break ;; esac
+    (( $(date +%s) < deadline )) || { echo "SSM command $id gave no result in time" >&2; return 1; }
+  done
+  aws ssm get-command-invocation --command-id "$id" --instance-id "$instance" --query StandardOutputContent --output text
+  aws ssm get-command-invocation --command-id "$id" --instance-id "$instance" --query StandardErrorContent --output text | grep . >&2 || true
+  [[ $state == Success ]]
+}
+
+stack_instance() { # with --stack S and no OW_INSTANCE: the stack's instanceId output
+  [[ -n $instance ]] || instance=$(pulumi stack output instanceId --stack "$1")
+}
+
+stack_arg() { [[ ${1:-} == --stack && -n ${2:-} ]] || die "usage: ow-aws --host $host $command --stack STACK ..."; }
+
+wait_ssm() { # until the host's SSM agent is online (10 minutes at most)
+  local _
+  for _ in $(seq 120); do
+    [[ $(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$instance" \
+      --query 'InstanceInformationList[0].PingStatus' --output text) == Online ]] && return
+    sleep 5
+  done
+  die "the SSM agent on $instance is not online"
+}
+
+start_instance() {
+  aws ec2 start-instances --instance-ids "$instance" > /dev/null
+  aws ec2 wait instance-running --instance-ids "$instance"
+  wait_ssm
+}
+
+check_recipe() {
+  [[ $(basename "$1") =~ ^[a-z0-9][a-z0-9-]*\.sh$ ]] || die "recipe file name must be NAME.sh: $1"
+  [[ -f $1 ]] || die "no recipe at $1"
+}
+
+image() { remote 3600 build_image "$(basename "$1")" "$(base64 < "$1" | tr -d '\n')"; }
+
+case $command in
+  shell) find_instance; exec aws ssm start-session --target "$instance" ;;
+  run)
+    (( $# == 1 )) || die "usage: ow-aws --host $host run 'COMMANDS'"
+    find_instance
+    remote 600 bash -euo pipefail -c "$1" ;;
+  ready)
+    wait=600 images=
+    while (( $# )); do
+      case $1 in
+        --wait) [[ ${2:-} =~ ^[0-9]+$ ]] || die "--wait takes seconds"; wait=$2; shift 2 ;;
+        --images) images=1; shift ;;
+        *) die "unknown option: $1" ;;
+      esac
+    done
+    find_instance
+    remote "$wait" ready "$wait" "$images" ;;
+  authorize)
+    (( $# == 1 )) || die "usage: ow-aws --host $host authorize BOX"
+    box_name "$1"
+    pub=$(cat "$key.pub")
+    [[ $pub =~ ^ssh-ed25519\ [A-Za-z0-9+/=]+(\ [^\']*)?$ ]] || die "$key.pub is not an Ed25519 public key"
+    find_instance
+    remote 120 authorize "$1" "$pub" ;;
+  ssh-config)
+    config=$HOME/.ssh/$host.conf boxes=()
+    while (( $# )); do
+      case $1 in
+        -o) [[ -n ${2:-} ]] || die "-o takes a file"; config=$2; shift 2 ;;
+        *) box_name "$1"; boxes+=("$1"); shift ;;
+      esac
+    done
+    [[ $config$key =~ ^[A-Za-z0-9._/~+-]+$ ]] || die "config and key paths may not contain spaces or quotes"
+    known=$config.known_hosts
+    find_instance
+    hostkey=$(remote 60 cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)
+    [[ $hostkey =~ ^ssh-ed25519\ [A-Za-z0-9+/=]+$ ]] || die "unexpected host key from $host: $hostkey"
+    pins="$host $hostkey"$'\n'
+    entries=
+    for box in ${boxes[@]+"${boxes[@]}"}; do
+      # Each box answers for its own identity: `ow-IDENTITY ssh-ed25519 KEY`.
+      pin=$(remote 60 ow ssh-info "$box" | python3 -c '
+import json, re, sys
+i = json.load(sys.stdin)
+if not (re.fullmatch(r"[A-Za-z0-9._-]+", i["identity"]) and re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/=]+", i["host_key"])):
+    sys.exit("unexpected ssh-info: " + json.dumps(i))
+print("ow-" + i["identity"], i["host_key"])')
+      pins+=$pin$'\n'
+      entries+="
+# Box $box through the host's \`ow ssh-proxy\`.
+Host ow-$box
+    HostName $box
+    User dev
+    IdentityFile $key
+    IdentitiesOnly yes
+    HostKeyAlias ${pin%% *}
+    UserKnownHostsFile $known
+    StrictHostKeyChecking yes
+    ProxyCommand ssh -F $config $host sudo ow ssh-proxy %h"
+    done
+    printf %s "$pins" > "$known.tmp"
+    cat > "$config.tmp" <<EOF
+# Written by ow-aws ssh-config. Use: ssh -F $config $host (or ow-BOX).
+# Host over SSM: EC2 Instance Connect pushes your key for 60 s, SSM carries SSH to port 22.
+# Host keys are pinned in $known; a changed key is refused.
+Host $host
+    HostName $instance
+    HostKeyAlias $host
+    User ubuntu
+    IdentityFile $key
+    IdentitiesOnly yes
+    UserKnownHostsFile $known
+    StrictHostKeyChecking yes
+    ProxyCommand ${AWS_PROFILE:+env AWS_PROFILE=$AWS_PROFILE }${AWS_REGION:+env AWS_REGION=$AWS_REGION }sh -c 'aws ec2-instance-connect send-ssh-public-key --instance-id %h --instance-os-user %r --ssh-public-key file://$key.pub > /dev/null && exec aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p'$entries
+EOF
+    mv "$known.tmp" "$known"
+    mv "$config.tmp" "$config"
+    echo "wrote $config and $known" ;;
+  restart)
+    case ${1:-} in --worker) worker=1 ;; "") worker= ;; *) die "usage: ow-aws --host $host restart [--worker]" ;; esac
+    find_instance
+    remote 1200 restart "$worker" ;;
+  stop)
+    find_instance
+    # Never stop on a guess: an unknown state could mean running boxes that were not hibernated.
+    state=$(instance_state) || die "could not read the state of $instance; nothing was stopped"
+    case $state in
+      running) remote 1200 hibernate_boxes ;;
+      stopped) echo "$instance is already stopped"; exit 0 ;;
+      *) die "$instance is $state; run this again once it is running or stopped" ;;
+    esac
+    aws ec2 stop-instances --instance-ids "$instance" > /dev/null
+    aws ec2 wait instance-stopped --instance-ids "$instance"
+    echo "$instance stopped; only its disks are billed" ;;
+  start)
+    find_instance
+    start_instance
+    remote 1200 after_start 600 ;;
+  join-tailnet)
+    [[ ${1:-} == --secret && ${2:-} =~ ^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$ ]] \
+      || die "usage: ow-aws --host $host join-tailnet --secret SECRET_ARN"
+    find_instance
+    remote 1200 join_tailnet "$2" "$host" ;;
+  image)
+    (( $# == 1 )) || die "usage: ow-aws --host $host image RECIPE"
+    check_recipe "$1"
+    find_instance
+    image "$1" ;;
+  backups)
+    url='' want=''
+    while (( $# )); do
+      case $1 in
+        --url) [[ ${2:-} =~ ^s3://[a-z0-9][a-z0-9.-]+[a-z0-9](/[A-Za-z0-9._/-]*)?$ ]] || die "--url takes s3://bucket/prefix"; url=$2; shift 2 ;;
+        *) [[ -z $want && $1 =~ ^[A-Za-z0-9._%+@/-]+$ ]] || die "usage: ow-aws --host $host backups [--url S3URL] [OWNER/NAME | ID]"; want=$1; shift ;;
+      esac
+    done
+    find_instance
+    remote 600 backups "$url" "$want" ;;
+  apply | upgrade)
+    for arg in "$@"; do [[ $arg =~ ^[A-Za-z0-9._=-]+$ ]] || die "bad argument: $arg"; done
+    find_instance
+    remote 3600 ow_host "$command" "$@" ;;
+  ci-preflight)
+    stack_arg "$@"
+    stack=$2
+    preview=$(pulumi preview --stack "$stack" --json)
+    # shellcheck disable=SC2016 # `$` is the URN separator
+    if ! python3 -c '
+import json, sys
+steps = json.loads(sys.stdin.read()).get("steps") or []
+sys.exit(0 if any(s.get("op") in ("replace", "create-replacement", "delete-replaced")
+                  and s.get("urn", "").endswith("$aws:ec2/instance:Instance::" + sys.argv[1] + "-host") for s in steps) else 1)' \
+      "$host" <<< "$preview"; then
+      echo "the preview keeps the $host instance; nothing to do"
+      exit 0
+    fi
+    stack_instance "$stack"
+    find_instance
+    state=$(instance_state) || die "could not read the state of $instance; nothing was hibernated"
+    case $state in
+      running) echo "the preview replaces the $host instance: hibernating its boxes"; remote 1200 hibernate_for_replacement ;;
+      stopped) echo "the preview replaces the $host instance, which is stopped: its boxes are already hibernated or stopped" ;;
+      *) die "$instance is $state; run this again once it is running or stopped" ;;
+    esac ;;
+  ci-post-up)
+    stack_arg "$@"
+    stack=$2 recipes=() upgrade_args=()
+    shift 2
+    while (( $# )); do
+      case $1 in
+        --image) [[ -n ${2:-} ]] || die "--image takes a recipe"; check_recipe "$2"; recipes+=("$2"); shift 2 ;;
+        --max-class) [[ ${2:-} =~ ^[0-3]$ ]] || die "--max-class takes 0 to 3"; upgrade_args=(--max-class "$2"); shift 2 ;;
+        *) die "unknown option: $1" ;;
+      esac
+    done
+    stack_instance "$stack"
+    find_instance
+    case $(instance_state) in
+      pending) aws ec2 wait instance-running --instance-ids "$instance" ;;
+      stopping) aws ec2 wait instance-stopped --instance-ids "$instance" ;;
+    esac
+    # A host someone stopped is started (and left running) so no recipe is left unbuilt.
+    if [[ $(instance_state) == stopped ]]; then echo "$host is stopped; starting it"; start_instance; fi
+    wait_ssm
+    # A fresh host builds from source before it is ready.
+    remote 3600 post_up 3000 ${upgrade_args[@]+"${upgrade_args[@]}"}
+    for recipe in ${recipes[@]+"${recipes[@]}"}; do image "$recipe"; done ;;
+  *) usage ;;
+esac
