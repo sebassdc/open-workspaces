@@ -20,10 +20,10 @@ RUNTIME = "firecracker-v1.17.0"
 CPU = "model name: x\nflags: y\nhost-kernel:6.8.0-1"
 
 
-def entry(v, changes, cls, in_place="0.5.0", protocol=(1, 1, 1), schema=(3, 3), kernel=KERNEL):
+def entry(v, changes, cls, in_place="0.5.0", protocol=(1, 1, 1), schema=(3, 3), kernel=KERNEL, worker=(1, 1, 1)):
     return {"version": v, "class": cls, "changes": changes,
             "protocol": {"speaks": protocol[0], "accepts": list(protocol[1:])},
-            "worker_protocol": {"speaks": 1, "accepts": [1, 1]},
+            "worker_protocol": {"speaks": worker[0], "accepts": list(worker[1:])},
             "catalog": {"schema": schema[0], "min_reader": schema[1]},
             "runtime": {"vmm": RUNTIME, "guest_kernel_sha256": kernel, "resumes": [RUNTIME]},
             "host_layout": 2, "in_place_from": in_place}
@@ -118,6 +118,20 @@ class Planner(unittest.TestCase):
         plan = u.plan(m, {"worker": "0.5.0", "agent": "0.5.0", "dashboard": "0.5.2"}, "0.5.1")
         self.assertEqual(plan["move"], {"agent": "0.5.1", "dashboard": "0.5.1"})
 
+    def test_agent_and_worker_move_together_when_their_protocols_part(self):
+        # The new agent drives worker protocol 2 only: the old worker (1) must move with it.
+        m = manifest(entry("0.5.1", ["agent"], 1, worker=(2, 2, 2)))
+        plan = u.plan(m, AT, "0.5.1", captures=WARM, compat=COMPAT)
+        self.assertEqual((plan["class"], sorted(plan["move"])), (2, ["agent", "worker"]))
+        # A worker speaking 2 cannot run under the old agent (1..1): the agent moves too.
+        m = manifest(entry("0.5.1", ["worker"], 2, worker=(2, 2, 2)))
+        self.assertEqual(sorted(u.plan(m, AT, "0.5.1", captures=WARM, compat=COMPAT)["move"]), ["agent", "worker"])
+        # Additive: an agent accepting 1..2 next to the old worker stays class 1.
+        m = manifest(entry("0.5.1", ["agent"], 1, worker=(2, 1, 2)))
+        self.assertEqual(u.plan(m, AT, "0.5.1")["move"], {"agent": "0.5.1"})
+        with self.assertRaisesRegex(Refused, "worker protocol window"):
+            u.plan(manifest(entry("0.5.1", ["worker"], 2, worker=(3, 1, 2))), AT, "0.5.1", captures=WARM, compat=COMPAT)
+
     def test_pending_config_and_rendered_units(self):
         plan = u.plan(manifest(), AT, "0.5.0", pending={"worker"})
         self.assertEqual((plan["class"], plan["move"], plan["restart"]), (2, {}, ["worker"]))
@@ -128,12 +142,13 @@ class Planner(unittest.TestCase):
 class Fake:
     """A host: three units, a worker with boxes, and failures to inject."""
 
-    def __init__(self, boxes, fail=(), kill=(), present=("worker", "agent", "dashboard")):
+    def __init__(self, boxes, fail=(), kill=(), present=("worker", "agent", "dashboard"), late=None):
         self.present = list(present)
         self.up = {name: True for name in present}
         self.box = dict(boxes)
         self.fail, self.kill = set(fail), set(kill)
         self.calls, self.drained, self.quiesced = [], False, False
+        self.late = late  # a box someone starts right after the next inventory read
 
     def _hit(self, what):
         self.calls.append(what)
@@ -164,7 +179,17 @@ class Fake:
         return {"internet": True, "version": u.version_of(h.pin("worker")), "compat": COMPAT}
 
     def boxes(self):
-        return dict(self.box)
+        snapshot = dict(self.box)
+        if self.late:
+            # A start (or a wake on connect) racing the upgrade: refused once quiesced.
+            if not self.quiesced:
+                self.box[self.late] = "running"
+            self.late = None
+        return snapshot
+
+    def quiesce(self):
+        self.calls.append("quiesce")
+        self.quiesced = True
 
     def hibernate_all(self, release):
         self.quiesced = True
@@ -264,6 +289,13 @@ class Machine(unittest.TestCase):
         self.assertNotIn("canary", ops.calls)
         self.assertIn("seconds", j)
 
+    def test_a_box_started_during_the_upgrade_is_not_left_hibernated(self):
+        ops = Fake({"original": "running", "late": "stopped"}, late="late")
+        self.run_plan(ops, ["worker"], 2, ["worker"])
+        self.assertEqual(ops.box, {"original": "running", "late": "stopped"}, "the late start was refused, not captured")
+        self.assertLess(ops.calls.index("quiesce"), ops.calls.index("hibernated:original"))
+        self.assertEqual((self.journal()["step"], self.journal()["error"]), ("done", None))
+
     def test_runner_upgrade_without_boxes_runs_a_canary(self):
         ops = Fake({})
         self.run_plan(ops, ["worker"], 2, ["worker"])
@@ -350,6 +382,74 @@ class Machine(unittest.TestCase):
         ops.calls.clear()
         u.recover(ops)
         self.assertEqual(ops.calls, [])
+
+
+class KernelStaging(unittest.TestCase):
+    """A release whose guest kernel pin changed gets that kernel in its own asset set,
+    though the copied set already holds a base image and the old kernel."""
+
+    REPO = Path(__file__).resolve().parents[3]
+
+    def test_setup_fetches_the_pinned_downloads_before_the_base_image_check(self):
+        setup = (self.REPO / "scripts/setup-local.sh").read_text()
+        fetch = setup.index("prepare-guest.py --downloads-only")
+        self.assertLess(fetch, setup.index("if [[ ! -f data/runtime-spike/guest/base.ext4 ]]"))
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "prepare-guest.py needs Python 3.11+ (hashlib.file_digest)")
+    def test_a_stale_kernel_is_fetched_again_and_never_kept_on_a_bad_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            downloads = tmp / "data/downloads"
+            downloads.mkdir(parents=True)
+            for name in ("alpine-minirootfs-3.24.2-x86_64.tar.gz", "vmlinux-6.1.186"):
+                (downloads / name).write_text("an older pin")
+            (tmp / "bin").mkdir()
+            # Stand-in curl: logs its URL, writes bytes that match no pin.
+            (tmp / "bin/curl").write_text(f'#!/bin/sh\necho "$4" >> {tmp}/curl.log\necho wrong > "$6"\n')
+            (tmp / "bin/curl").chmod(0o755)
+            run = subprocess.run([sys.executable, str(self.REPO / "experiments/runtime-spike/prepare-guest.py"),
+                                  "--downloads-only", "--data-dir", str(tmp / "data")],
+                                 env={**os.environ, "PATH": f"{tmp}/bin:{os.environ['PATH']}"},
+                                 capture_output=True, text=True)
+            self.assertIn("Artifact hash mismatch", run.stderr + run.stdout)
+            self.assertTrue((tmp / "curl.log").read_text().strip(), "the stale file is fetched again")
+            self.assertEqual((downloads / "vmlinux-6.1.186").read_text(), "an older pin", "a bad download replaces nothing")
+            self.assertEqual(sorted(p.name for p in downloads.iterdir()), ["alpine-minirootfs-3.24.2-x86_64.tar.gz", "vmlinux-6.1.186"])
+
+
+class Quiesce(unittest.TestCase):
+    """HostOps speaks the worker's control protocol: one JSON line each way."""
+
+    def test_quiesce_and_lift_over_the_control_socket(self):
+        import socket
+        import threading
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            h.ROOT = Path(tmp)
+            path = h.p(f"{h.RUNNER}/control.sock")
+            path.parent.mkdir(parents=True)
+            server = socket.socket(socket.AF_UNIX)
+            server.bind(str(path))
+            server.listen()
+            seen = []
+
+            def serve(answers):
+                for ok in answers:
+                    conn, _ = server.accept()
+                    seen.append(json.loads(conn.makefile().readline()))
+                    conn.sendall(json.dumps({"ok": ok, "result": {}}).encode() + b"\n")
+                    conn.close()
+
+            thread = threading.Thread(target=serve, args=([True, True, False],))
+            thread.start()
+            ops = u.HostOps()
+            ops.quiesce()
+            ops.quiesce_off()
+            with self.assertRaisesRegex(RuntimeError, "did not accept"):
+                ops.quiesce()
+            thread.join()
+            server.close()
+            self.assertEqual(seen, [{"op": "quiesce", "closing": True}, {"op": "quiesce", "closing": False},
+                                    {"op": "quiesce", "closing": True}])
 
 
 class Staging(unittest.TestCase):

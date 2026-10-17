@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--data-dir', type=Path, default=ROOT / 'data/runtime-spike')
 parser.add_argument('--toolchain-root', type=Path, default=ROOT / 'data/runtime-spike')
+parser.add_argument('--downloads-only', action='store_true',
+                    help='fetch and verify the pinned downloads (guest kernel, rootfs) and stop')
 args = parser.parse_args()
 DATA = args.data_dir.absolute()
 TOOLS = args.toolchain_root.absolute()
@@ -26,15 +28,26 @@ ASSETS = {
         'ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8'),
 }
 
+def digest(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
 for name, (url, expected) in ASSETS.items():
     path = DATA / 'downloads' / name
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        subprocess.run(['curl', '-fsSL', '--retry', '2', url, '-o', str(path)], check=True)
-    with path.open('rb') as stream:
-        actual = hashlib.file_digest(stream, 'sha256').hexdigest()
-    if actual != expected:
+    # A file kept from an older pin (same name, other content) is replaced, never reused.
+    if not path.exists() or (args.downloads_only and digest(path) != expected):
+        part = path.with_name(f'.{name}.part')
+        subprocess.run(['curl', '-fsSL', '--retry', '2', url, '-o', str(part)], check=True)
+        if digest(part) != expected:
+            part.unlink()
+            raise SystemExit(f'Artifact hash mismatch: {name}')
+        os.replace(part, path)
+    if digest(path) != expected:
         raise SystemExit(f'Artifact hash mismatch: {name}')
+if args.downloads_only:
+    raise SystemExit(0)
 
 image_dir = DATA / 'guest'
 image_dir.mkdir(exist_ok=True)

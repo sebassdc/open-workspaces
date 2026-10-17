@@ -69,8 +69,9 @@ stays in Secrets Manager):
  "idleMinutes": 30}
 ```
 
-`ow-host apply` fetches, validates and stores it, re-renders the files it owns,
-and acts by class: logins restart the dashboard alone, images and the backup
+`ow-host apply` fetches and validates it, re-renders the files it owns, records
+the restarts those files need as pending (before acting, so a retry after a
+failure keeps them), acts, and stores the config last. It acts by class: logins restart the dashboard alone, images and the backup
 timer start, Tailscale SSH and hostname are set, a grown volume is resized. A
 change that needs the control plane (hostname) or the worker (idle minutes) is
 recorded as pending; `ow-host upgrade` carries it out.
@@ -109,8 +110,12 @@ worker files need `worker`, dashboard files `dashboard`, `nodes.rs`,
   version older would reject or misread. Raise `PROTOCOL_MIN` only in a release
   after one that already speaks the new protocol, so a bridge exists.
 - **Agent-worker.** Worker status reports `version`, `worker_protocol` and
-  `compat` (runtime, CPU string, guest kernel hash). New worker operations are
-  additive.
+  `compat` (runtime, CPU string, guest kernel hash). An agent drives only a
+  worker inside `WORKER_PROTOCOL_MIN..=WORKER_PROTOCOL` (a worker without the
+  field speaks 1); otherwise it refuses at start, or stops heartbeats, and logs
+  why. The planner moves the agent and worker together when the pair a
+  selective upgrade would leave falls outside the agent's window. New worker
+  operations are additive.
 - **Guest interface.** Additive forever: disks keep the guest tools of the
   release that created them.
 - **Catalog.** Migrations are forward-only. Each sets `settings.min_reader_schema`
@@ -138,13 +143,15 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   kernel hash), unless `--accept-cold`; a class above `--max-class` (default 2).
   `--plan` prints the plan and stops.
 - **stage**: a worktree, a reflink copy of the live asset set, the release's own
-  `scripts/setup-local.sh` (niced, `CPUWeight=10`, log in
+  `scripts/setup-local.sh`, which fetches the release's pinned guest kernel even
+  when the copied set has a base image (niced, `CPUWeight=10`, log in
   `/var/log/open-workspaces-stage.log`), `bin/ow --version` must match, `STAGED`
   written last. A complete release is reused.
 - **gate**: again, with the staged kernel's hash and the boxes as they are now.
   With `--accept-cold` and backups configured, `ow-backup` runs first.
-- **hibernate**: the old worker's own `down --hibernate`; the boxes it hibernates
-  are recorded in the journal before it acts.
+- **hibernate**: the worker is quiesced first (it then refuses starts and wakes),
+  so the running boxes read next are exactly the ones the old worker's own
+  `down --hibernate` captures; they are recorded in the journal before it acts.
 - **verify** (each unit against its own pin): the unit is active and its
   `/proc/PID/exe` is its pin's `bin/ow`; the worker answers with its pin's
   version; the runner is online with the agent's and worker's versions; the

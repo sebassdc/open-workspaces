@@ -109,6 +109,29 @@ fn authenticated_handshake_refuses_redirect_and_times_out() {
     server.join().unwrap();
 }
 #[test]
+fn agent_refuses_a_worker_outside_its_protocol_window() {
+    use std::os::unix::net::UnixListener;
+    let root = root();
+    let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        assert_eq!(wire::line(&mut stream).unwrap()["op"], "status");
+        let status = json!({"max_memory_mib":512,"max_running":1,"max_vcpus":1,"max_guest_memory_mib":512,"max_guest_vcpus":1,"worker_protocol":common::WORKER_PROTOCOL + 98});
+        wire::send(&mut stream, &json!({"ok":true,"result":status})).unwrap();
+    });
+    let credential = root.join("node.json");
+    write_private(
+        &credential,
+        &json!({"node":"alpha","credential":"a".repeat(64)}),
+    )
+    .unwrap();
+    let error = agent(&root, "http://127.0.0.1:9", &credential, None, None, true)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("worker protocol 99 unsupported"), "{error}");
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
 fn durable_journal_duplicate_conflict_and_unknown_exec() {
     use std::os::unix::net::UnixListener;
     let root = root();

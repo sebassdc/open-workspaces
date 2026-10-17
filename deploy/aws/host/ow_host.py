@@ -691,38 +691,39 @@ def services():
         systemctl("enable", "--now", "ow-backup.timer")
 
 
-def act(changed, config, old):
-    """Class 0 work for a changed file set; returns the units left pending (class 1-2)."""
-    units = units_changed(changed)
-    if "dashboard" in units and unit_exists(UNITS["dashboard"]):
-        # Logins are read once at start; a dashboard restart drops only its own streams.
-        systemctl("enable", UNITS["dashboard"])
-        systemctl("restart", "--no-block", UNITS["dashboard"])
-    units.discard("dashboard")
+def act(config, old):
+    """Class 0 work, and the dashboard restart a login change needs; returns the Tailscale state.
+    Work it cannot finish stays pending, so a retry after a failure here still does it."""
+    if "dashboard" in pending():
+        if unit_exists(UNITS["dashboard"]):
+            # Logins are read once at start; a dashboard restart drops only its own streams.
+            systemctl("enable", UNITS["dashboard"])
+            systemctl("restart", "--no-block", UNITS["dashboard"])
+        clear_pending({"dashboard"})
     services()
     state, renamed = tailscale(config, old)
     if renamed:
-        units.add("agent")  # the controller's certificate names the tailnet host
+        mark_pending({"agent"}, "tailnet hostname changed")  # the controller's certificate names it
     if p("/proc/mounts").exists() and " /srv/ow btrfs " in p("/proc/mounts").read_text():
         run(["btrfs", "filesystem", "resize", "max", "/srv/ow"], check=False)
-    return units, state
+    return state
 
 
 def apply_config():
-    old = read_json(CONFIG)
-    config = validate(fetch_config())
-    write_json(CONFIG, config)
-    changed = setup(config)
     try:
-        old = validate(old) if old else None
+        old = validate(read_json(CONFIG))
     except Refused:
         old = None
-    units, _ = act(changed, config, old)
-    mark_pending(units, "config changed")
+    config = validate(fetch_config())
+    changed = setup(config)
+    # Recorded before acting: a retry after a failure below finds no file left to rewrite.
+    mark_pending(units_changed(changed), "config changed")
+    act(config, old)
+    # Last: until everything above succeeded, a retry compares against the old config.
+    write_json(CONFIG, config)
     for line in sorted(changed):
         say(f"changed {line}")
-    left = pending()
-    for unit, reason in sorted(left.items()):
+    for unit, reason in sorted(pending().items()):
         cls = 2 if unit == "worker" else 1
         say(f"pending: restart {UNITS[unit]} ({reason}; class {cls}): ow-host upgrade")
     current = staged(pin("current")) or {}

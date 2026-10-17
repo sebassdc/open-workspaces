@@ -57,6 +57,12 @@ test("this release's entry matches the code", () => {
     assert.equal(entry.catalog.schema, Number(read("crates/ow/src/nodes.rs").match(/^pub\(crate\) const SCHEMA: i64 = (\d+);/m)[1]));
     const kernel = read("experiments/runtime-spike/prepare-guest.py").match(/'vmlinux-[^']+': \(\s*'[^']+',\s*'([0-9a-f]{64})'/)[1];
     assert.equal(entry.runtime.guest_kernel_sha256, kernel, "the guest kernel pin in prepare-guest.py");
+    const name = read("experiments/runtime-spike/prepare-guest.py").match(/'(vmlinux-[^']+)': \(/)[1];
+    assert.ok(read("crates/ow-core/src/runtime.rs").includes(`"downloads/${name}"`), `the worker boots the pinned kernel ${name}`);
+    for (const e of manifest.releases) {
+        const [lo, hi] = e.worker_protocol.accepts;
+        assert.ok(lo <= e.worker_protocol.speaks && e.worker_protocol.speaks <= hi, `${e.version}: an agent drives its own worker`);
+    }
 });
 
 // What a diff since the previous release requires the entries in between to declare.

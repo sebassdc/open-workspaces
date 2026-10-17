@@ -198,6 +198,20 @@ pub const RUNTIME: &str = "firecracker-v1.17.0";
 pub const WORKER_PROTOCOL: u64 = 1;
 pub const WORKER_PROTOCOL_MIN: u64 = 1;
 
+/// Whether this agent can drive a worker: its status's `worker_protocol` (absent from
+/// workers before 0.5.0, which speak 1) inside WORKER_PROTOCOL_MIN..=WORKER_PROTOCOL.
+pub fn worker_compatible(status: &serde_json::Value) -> Result<()> {
+    let protocol = status
+        .get("worker_protocol")
+        .map_or(Some(1), |v| v.as_u64())
+        .unwrap_or(0);
+    ensure!(
+        (WORKER_PROTOCOL_MIN..=WORKER_PROTOCOL).contains(&protocol),
+        "worker protocol {protocol} unsupported; this agent drives {WORKER_PROTOCOL_MIN}..{WORKER_PROTOCOL}"
+    );
+    Ok(())
+}
+
 /// Explicit Mac v1 slice; absence preserves legacy Linux protocol semantics.
 pub const MAC_OPERATIONS: &[&str] = &[
     "status", "stats", "list", "inspect", "create", "start", "stop", "exec", "put", "get",
@@ -293,6 +307,15 @@ mod backend_tests {
             assert!(node_capabilities(&golden).is_err());
         }
         assert!(node_operation(&legacy, "fork").is_ok());
+        for (status, compatible) in [
+            (json!({}), true),
+            (json!({"worker_protocol": WORKER_PROTOCOL}), true),
+            (json!({"worker_protocol": WORKER_PROTOCOL + 1}), false),
+            (json!({"worker_protocol": 0}), false),
+            (json!({"worker_protocol": "1"}), false),
+        ] {
+            assert_eq!(worker_compatible(&status).is_ok(), compatible, "{status}");
+        }
         // Protocol window, runtime admission, and optional fields an older peer adds.
         let mut beat = legacy.clone();
         for protocol in [PROTOCOL_MIN, PROTOCOL] {

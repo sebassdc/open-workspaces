@@ -85,6 +85,17 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
         plan_["catalog_backup"] = True
         plan_["rollback_auto"] = min(schema.values()) >= goal["catalog"]["min_reader"]
         move.update(agent=target, dashboard=target)
+    # Agent and worker: the pair each ends on must be inside the agent's worker window;
+    # if moving one alone breaks that, the other moves too.
+    def paired():
+        agent = entries[move.get("agent", pins["agent"])]["worker_protocol"]["accepts"]
+        speaks = entries[move.get("worker", pins["worker"])]["worker_protocol"]["speaks"]
+        return agent[0] <= speaks <= agent[1]
+
+    if not paired():
+        move["worker" if "agent" in move else "agent"] = target
+        if not paired():
+            raise Refused(f"the {target} agent cannot drive the {target} worker (worker protocol window)")
     # Protocol: every other runner must speak what the new controller accepts.
     if "agent" in move:
         lo, hi = goal["protocol"]["accepts"]
@@ -325,12 +336,20 @@ class HostOps:
                    "OW_ASSET_DIR": f"{h.SRV}/run/worker/assets"})
         h.systemctl("stop", h.UNITS["worker"])  # its stop hook finds no worker: a no-op
 
+    def _quiesce(self, closing):
+        script = ("import json,socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(1200); "
+                  "s.connect(sys.argv[1]); s.sendall(json.dumps({'op':'quiesce','closing':sys.argv[2]=='1'}).encode()+b'\\n'); "
+                  "r=json.loads(s.makefile().readline()); sys.exit(0 if r.get('ok') else 1)")
+        return h.ok(["python3", "-c", script, str(p(f"{h.RUNNER}/control.sock")), "1" if closing else "0"], user="ow")
+
+    def quiesce(self):
+        """Makes the worker refuse new starts and wakes (what down --hibernate does first)."""
+        if not self._quiesce(True):
+            raise RuntimeError("the worker did not accept quiesce")
+
     def quiesce_off(self):
         """Lets a quiesced worker take starts and wakes again (idempotent)."""
-        script = ("import json,socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(1200); "
-                  "s.connect(sys.argv[1]); s.sendall(b'{\"op\":\"quiesce\",\"closing\":false}\\n'); "
-                  "s.recv(4096)")
-        h.run(["python3", "-c", script, f"{h.RUNNER}/control.sock"], user="ow", check=False)
+        self._quiesce(False)
 
     def start_box(self, box):
         h.ow("start", box, timeout=1200)
@@ -462,6 +481,10 @@ def execute(plan_, ops, frm, to, target_name):
         if worker:
             j.step("drain")
             ops.drain(True)
+            # Starts and wakes are refused from here on (a start the worker already took
+            # lands first: it answers one request at a time), so this list is every box
+            # the hibernate below captures.
+            ops.quiesce()
             j.value["resume"] = sorted(box for box, state in ops.boxes().items() if state == "running")
             j.step("hibernate")
             ops.hibernate_all(frm["worker"])
@@ -640,12 +663,12 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None)
         release = stage(target)
         if "worker" in result["move"]:
             # The gate again: the staged kernel and the boxes as they are now.
-            kernel = next(p(f"{h.SRV}/releases/{release}/assets/downloads").glob("vmlinux-*"), None)
-            digest = hashlib.sha256(kernel.read_bytes()).hexdigest() if kernel else None
+            kernels = {hashlib.sha256(k.read_bytes()).hexdigest()
+                       for k in p(f"{h.SRV}/releases/{release}/assets/downloads").glob("vmlinux-*")}
             entry = next(e for e in target["manifest"]["releases"] if e["version"] == target["version"])
             want = entry["runtime"]["guest_kernel_sha256"]
-            if digest != want:
-                raise Refused(f"the staged guest kernel ({digest}) is not the manifest's ({want})")
+            if want not in kernels:
+                raise Refused(f"the staged release has no guest kernel with the manifest's hash ({want})")
             result = plan(target["manifest"], current, target["version"],
                           captures=captures((ops.worker_status() or {}).get("compat") or compat), **common)
             if result["cold"] and p("/etc/open-workspaces/backup.env").exists():

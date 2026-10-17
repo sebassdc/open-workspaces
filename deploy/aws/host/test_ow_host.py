@@ -124,10 +124,12 @@ class Setup(unittest.TestCase):
         (h.ROOT / "proc/meminfo").write_text("MemTotal:       16000000 kB\n")
         self.calls = []
         self.real_run = h.run
+        self.real_fetch = h.fetch_config
         h.run = lambda cmd, **kw: self.calls.append(cmd) or ""
 
     def tearDown(self):
         h.run = self.real_run
+        h.fetch_config = self.real_fetch
         self.tmp.cleanup()
 
     def test_setup_writes_only_differences_and_removes_turned_off_features(self):
@@ -145,6 +147,59 @@ class Setup(unittest.TestCase):
         self.assertIn(["systemctl", "disable", "--now", "open-workspaces-dashboard.service"], self.calls)
         self.assertEqual(h.units_changed(changed), {"dashboard", "worker"})
         self.assertEqual(h.diff(h.render(config(dashboard={"logins": []}, idleMinutes=10), h.budgets())), set())
+
+    def test_a_failed_apply_keeps_its_restarts_for_the_retry(self):
+        import upgrade as u
+        h.setup(config())
+        h.write_json(h.CONFIG, config())
+        h.fetch_config = lambda: {**copy.deepcopy(CONFIG), "idleMinutes": 10,
+                                  "tailscale": {**CONFIG["tailscale"], "hostname": "renamed"}}
+        failures = ["tailscale set"]
+
+        def flaky(cmd, **kw):
+            self.calls.append(cmd)
+            if cmd[:2] == ["tailscale", "status"]:
+                return '{"BackendState": "Running"}'
+            if failures and " ".join(cmd).startswith(failures[0]):
+                failures.pop()
+                raise RuntimeError("transient tailscale failure")
+            return ""
+
+        h.run = flaky
+        with self.assertRaisesRegex(RuntimeError, "transient"):
+            h.apply_config()
+        self.assertEqual(h.read_json(h.CONFIG)["idleMinutes"], 30, "the stored config moves only after success")
+        self.assertEqual(h.apply_config(), 0)
+        self.assertEqual(set(h.pending()), {"worker", "agent"}, "the idle change and the tailnet rename survive")
+        self.assertEqual(h.read_json(h.CONFIG)["idleMinutes"], 10)
+        at = {"worker": "0.5.0", "agent": "0.5.0", "dashboard": "0.5.0"}
+        manifest = {"schema": 1, "releases": [{"version": "0.5.0", "changes": [], "class": 0,
+                    "catalog": {"schema": 3, "min_reader": 3}, "protocol": {"speaks": 1, "accepts": [1, 1]},
+                    "worker_protocol": {"speaks": 1, "accepts": [1, 1]}, "in_place_from": None}]}
+        plan = u.plan(manifest, at, "0.5.0", pending=set(h.pending()))
+        self.assertEqual((plan["class"], plan["restart"]), (2, ["agent", "worker"]))
+
+    def test_a_login_change_restarts_the_dashboard_even_after_a_failed_try(self):
+        h.setup(config())
+        h.write_json(h.CONFIG, config())
+        h.fetch_config = lambda: {**copy.deepcopy(CONFIG), "dashboard": {"logins": ["new@example.com"]}}
+
+        def failing(cmd, **kw):
+            self.calls.append(cmd)
+            if cmd[:2] == ["tailscale", "status"]:
+                return '{"BackendState": "Running"}'
+            if cmd[:2] == ["systemctl", "restart"]:
+                raise RuntimeError("transient systemd failure")
+            return ""
+
+        h.run = failing
+        with self.assertRaises(RuntimeError):
+            h.apply_config()
+        h.run = lambda cmd, **kw: self.calls.append(cmd) or ('{"BackendState": "Running"}' if cmd[:2] == ["tailscale", "status"] else "")
+        self.calls.clear()
+        h.apply_config()
+        self.assertIn(["systemctl", "restart", "--no-block", "open-workspaces-dashboard.service"], self.calls)
+        self.assertNotIn("dashboard", h.pending())
 
     def test_tailscale_join_passes_the_key_by_file_and_deletes_it(self):
         key = h.ROOT / "key"

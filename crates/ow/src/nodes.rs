@@ -1078,6 +1078,8 @@ pub fn agent(
         .to_owned();
     ensure!(credential.len() == 64, "invalid credential file");
     let status = wire::request(root, json!({"op":"status"}))?;
+    // A worker outside this agent's protocol window is never driven or advertised.
+    common::worker_compatible(&status)?;
     let guided = root.join("host.json").exists();
     // Legacy unmanaged nodes retain their separately configured asset contract. Checked
     // on every heartbeat, so a developer image built later shows without a restart.
@@ -1116,6 +1118,7 @@ pub fn agent(
     {
         let (latest, root) = (latest.clone(), root.to_owned());
         std::thread::spawn(move || {
+            let mut refused = false;
             loop {
                 let status = wire::connect_waiting(
                     &root,
@@ -1124,6 +1127,21 @@ pub fn agent(
                 )
                 .map(|(_, v)| v)
                 .ok();
+                let status = match status.map(|s| common::worker_compatible(&s).map(|()| s)) {
+                    Some(Err(e)) => {
+                        if !refused {
+                            eprintln!(
+                                "{e:#}; this runner stays offline until a compatible worker runs"
+                            );
+                        }
+                        refused = true;
+                        None
+                    }
+                    other => {
+                        refused = false;
+                        other.and_then(Result::ok)
+                    }
+                };
                 *latest.lock().unwrap() = status;
                 std::thread::sleep(Duration::from_secs(3));
             }
