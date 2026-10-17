@@ -43,6 +43,14 @@ product decisions can materially change them.
   with node heartbeats kept on their own thread; the dashboard lists golden
   images. Checked on EC2: 4 GiB and 8 GiB boxes hibernated (64 s, 132 s) with
   the node online throughout; an injected capture failure left the box running.
+- [x] 0.4.0: `backupUrl: "s3://bucket/prefix"` installs the AWS CLI v2 and
+  `ow-backup` (catalog copy, then every new sealed snapshot) and lets the host
+  role list, read and add objects under that prefix, never delete. Checked on
+  EC2: after `ow down --hibernate`, a 1 GiB box's capture went up as 563 MiB in
+  18 s; a second run uploaded nothing; the host role was refused a delete and a
+  listing outside its prefix; the box restored onto a fresh runner with its
+  process still counting and its disk intact, and the catalog copy passed
+  `integrity_check`. See [backups to S3](../deploy/aws/README.md#backups-to-s3).
 
 ## Open-source roadmap: OS phase 1, core traits and pluggable connect
 

@@ -275,5 +275,37 @@ UNIT
   systemctl start --no-block open-workspaces-images.service
 fi
 
+# Optional backups (input backupUrl): the AWS CLI v2 (the snap build refuses the
+# ow user's home outside /home) and `ow-backup`, run by the caller's scheduler.
+if [[ -n "${OW_BACKUP_URL:-}" ]]; then
+  if [[ ! -x /usr/local/bin/aws ]]; then
+    apt-get install -y -q --no-install-recommends unzip
+    tmp=$(mktemp -d)
+    curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o "$tmp/awscli.zip"
+    unzip -q "$tmp/awscli.zip" -d "$tmp"
+    "$tmp/aws/install"
+    rm -rf "$tmp"
+  fi
+  mkdir -p /etc/open-workspaces
+  printf 'OW_BACKUP_URL=%s\n' "$OW_BACKUP_URL" > /etc/open-workspaces/backup.env
+  cat > /usr/local/bin/ow-backup <<'BACKUP'
+#!/bin/bash
+# Root: copy the controller catalog to $OW_BACKUP_URL/catalog/, then upload every
+# sealed snapshot the store lacks to $OW_BACKUP_URL/snapshots/. Never deletes.
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+. /etc/open-workspaces/backup.env
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+install -d -o ow -g ow -m 700 /srv/ow/.ow/backups
+file=/srv/ow/.ow/backups/catalog-$stamp.sqlite3
+trap 'rm -f "$file"' EXIT
+ow backup catalog --output "$file"
+runuser -u ow -- env HOME=/srv/ow aws s3 cp --only-show-errors "$file" "$OW_BACKUP_URL/catalog/catalog-$stamp.sqlite3"
+ow backup snapshots --to "$OW_BACKUP_URL/snapshots"
+BACKUP
+  chmod 755 /usr/local/bin/ow-backup
+  echo "backups: ow-backup to $OW_BACKUP_URL"
+fi
+
 echo "bootstrap done $(date -Is) tailscale=$tailscale_state"
 echo "ok tailscale=$tailscale_state" > "$status"

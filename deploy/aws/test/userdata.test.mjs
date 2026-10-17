@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { dashboardLoginList, developerImageList, renderUserData } from "../index.ts";
+import { backupLocation, backupPolicy, dashboardLoginList, developerImageList, renderUserData } from "../index.ts";
 
 const bootstrap = readFileSync(new URL("../bootstrap.sh", import.meta.url), "utf8");
 
@@ -87,4 +87,62 @@ test("developer images are validated and built by a oneshot unit", () => {
     const images = bootstrap.slice(bootstrap.indexOf("<<'IMAGES'\n") + 11, bootstrap.indexOf("\nIMAGES\n"));
     execFileSync("bash", ["-n"], { input: images });
     assert.ok(bootstrap.includes("ExecStart=/usr/local/lib/open-workspaces/developer-images $OW_DEVELOPER_IMAGES"));
+});
+
+test("backup URLs are checked and the host role can never delete a backup", () => {
+    assert.deepEqual(backupLocation("s3://my-bucket/ow/host-1/"), { bucket: "my-bucket", prefix: "ow/host-1" });
+    for (const bad of ["s3://my-bucket", "s3://my-bucket/", "https://my-bucket/ow", "s3://My_Bucket/ow", "s3://b/ow",
+        "s3://my-bucket/ow/../x", "s3://my-bucket/a//b", "s3://my-bucket/ow'x", "s3://my-bucket/$(id)"]) {
+        assert.throws(() => backupLocation(bad), /backupUrl must be/, bad);
+    }
+    const policy = JSON.parse(backupPolicy("aws", "s3://my-bucket/ow/host-1"));
+    assert.deepEqual(policy.Statement.flatMap((s) => [s.Action].flat()).sort(),
+        ["s3:AbortMultipartUpload", "s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
+    assert.equal(policy.Statement[0].Resource, "arn:aws:s3:::my-bucket");
+    assert.deepEqual(policy.Statement[0].Condition, { StringLike: { "s3:prefix": ["ow/host-1/*"] } });
+    assert.equal(policy.Statement[1].Resource, "arn:aws:s3:::my-bucket/ow/host-1/*");
+});
+
+test("ow-backup uploads the catalog, then the snapshots, and stops at the first failure", () => {
+    const script = renderUserData({ OW_BACKUP_URL: "s3://my-bucket/ow/host-1", OW_TAILSCALE_SSH: "" }, bootstrap);
+    execFileSync("bash", ["-n"], { input: script });
+    const dir = mkdtempSync(join(tmpdir(), "ow-backup-"));
+    writeFileSync(join(dir, "backup.env"), "OW_BACKUP_URL=s3://my-bucket/ow/host-1\n");
+    const backup = bootstrap.slice(bootstrap.indexOf("<<'BACKUP'\n") + 11, bootstrap.indexOf("\nBACKUP\n"))
+        .replace("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", `export PATH=${dir}:/usr/bin:/bin`)
+        .replace("/etc/open-workspaces/backup.env", join(dir, "backup.env"))
+        .replaceAll("/srv/ow/.ow/backups", join(dir, "backups"));
+    // Stand-ins log their arguments; FAIL names the one that exits 1.
+    for (const tool of ["ow", "aws"]) {
+        writeFileSync(join(dir, tool), `#!/bin/sh
+echo "${tool} $*" >> "${dir}/log"
+[ "$FAIL" = "${tool} $1" ] && exit 1
+[ "$1" = backup ] && [ "$2" = catalog ] && touch "$4"
+exit 0
+`, { mode: 0o755 });
+    }
+    writeFileSync(join(dir, "install"), `#!/bin/sh\nfor a; do d=$a; done; mkdir -p "$d"\n`, { mode: 0o755 });
+    writeFileSync(join(dir, "runuser"), `#!/bin/sh\nshift 3; exec "$@"\n`, { mode: 0o755 });
+    const run = (fail) => {
+        rmSync(join(dir, "log"), { force: true });
+        let code = 0;
+        try {
+            execFileSync("bash", ["-c", backup], { env: { ...process.env, FAIL: fail }, stdio: "pipe" });
+        } catch (e) {
+            code = e.status;
+        }
+        const log = readFileSync(join(dir, "log"), "utf8").trim().split("\n");
+        return { code, log };
+    };
+    const ok = run("");
+    assert.equal(ok.code, 0);
+    assert.match(ok.log[0], /^ow backup catalog --output .*\/backups\/catalog-\d{8}T\d{6}Z\.sqlite3$/);
+    assert.match(ok.log[1], /^aws s3 cp --only-show-errors .*catalog-\d{8}T\d{6}Z\.sqlite3 s3:\/\/my-bucket\/ow\/host-1\/catalog\/catalog-\d{8}T\d{6}Z\.sqlite3$/);
+    assert.equal(ok.log[2], "ow backup snapshots --to s3://my-bucket/ow/host-1/snapshots");
+    assert.deepEqual(readdirSync(join(dir, "backups")), [], "the local catalog copy is removed");
+    const upload = run("aws s3");
+    assert.notEqual(upload.code, 0);
+    assert.equal(upload.log.length, 2, "a failed catalog upload stops before the snapshots");
+    assert.notEqual(run("ow backup").code, 0, "a failed catalog copy fails the run");
+    rmSync(dir, { recursive: true });
 });
