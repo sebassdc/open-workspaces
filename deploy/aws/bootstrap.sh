@@ -300,7 +300,9 @@ install -d -o ow -g ow -m 700 /srv/ow/.ow/backups
 file=/srv/ow/.ow/backups/catalog-$stamp.sqlite3
 trap 'rm -f "$file"' EXIT
 ow backup catalog --output "$file"
-runuser -u ow -- env HOME=/srv/ow aws s3 cp --only-show-errors "$file" "$OW_BACKUP_URL/catalog/catalog-$stamp.sqlite3"
+# As S3Store does: no endpoint from the environment or a profile, so the catalog goes to S3 only.
+runuser -u ow -- env -i HOME=/srv/ow PATH="$PATH" AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true \
+  aws s3 cp --only-show-errors "$file" "$OW_BACKUP_URL/catalog/catalog-$stamp.sqlite3"
 ow backup snapshots --to "$OW_BACKUP_URL/snapshots"
 BACKUP
   chmod 755 /usr/local/bin/ow-backup

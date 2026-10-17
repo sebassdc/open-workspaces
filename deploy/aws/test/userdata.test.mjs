@@ -112,11 +112,12 @@ test("ow-backup uploads the catalog, then the snapshots, and stops at the first 
         .replace("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", `export PATH=${dir}:/usr/bin:/bin`)
         .replace("/etc/open-workspaces/backup.env", join(dir, "backup.env"))
         .replaceAll("/srv/ow/.ow/backups", join(dir, "backups"));
-    // Stand-ins log their arguments; FAIL names the one that exits 1.
+    // Stand-ins log their arguments; the file "fail" names the one that exits 1.
     for (const tool of ["ow", "aws"]) {
         writeFileSync(join(dir, tool), `#!/bin/sh
+[ "${tool}" = aws ] && env | grep '^AWS_' | sort > "${dir}/aws-env"
 echo "${tool} $*" >> "${dir}/log"
-[ "$FAIL" = "${tool} $1" ] && exit 1
+[ "$(cat "${dir}/fail")" = "${tool} $1" ] && exit 1
 [ "$1" = backup ] && [ "$2" = catalog ] && touch "$4"
 exit 0
 `, { mode: 0o755 });
@@ -125,9 +126,13 @@ exit 0
     writeFileSync(join(dir, "runuser"), `#!/bin/sh\nshift 3; exec "$@"\n`, { mode: 0o755 });
     const run = (fail) => {
         rmSync(join(dir, "log"), { force: true });
+        writeFileSync(join(dir, "fail"), fail);
         let code = 0;
         try {
-            execFileSync("bash", ["-c", backup], { env: { ...process.env, FAIL: fail }, stdio: "pipe" });
+            execFileSync("bash", ["-c", backup], {
+                env: { ...process.env, AWS_ENDPOINT_URL: "http://127.0.0.1:9", AWS_PROFILE: "evil" },
+                stdio: "pipe",
+            });
         } catch (e) {
             code = e.status;
         }
@@ -139,6 +144,8 @@ exit 0
     assert.match(ok.log[0], /^ow backup catalog --output .*\/backups\/catalog-\d{8}T\d{6}Z\.sqlite3$/);
     assert.match(ok.log[1], /^aws s3 cp --only-show-errors .*catalog-\d{8}T\d{6}Z\.sqlite3 s3:\/\/my-bucket\/ow\/host-1\/catalog\/catalog-\d{8}T\d{6}Z\.sqlite3$/);
     assert.equal(ok.log[2], "ow backup snapshots --to s3://my-bucket/ow/host-1/snapshots");
+    assert.equal(readFileSync(join(dir, "aws-env"), "utf8"), "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true\n",
+        "the catalog upload ignores endpoints from the environment and profiles");
     assert.deepEqual(readdirSync(join(dir, "backups")), [], "the local catalog copy is removed");
     const upload = run("aws s3");
     assert.notEqual(upload.code, 0);
