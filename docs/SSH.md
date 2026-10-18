@@ -138,6 +138,12 @@ Worker: shared SSH/terminal cap of 16, fixed endpoint, 16 KiB buffer,
 Stdout backpressure has a five-second deadline. Disconnect drops both upstream
 sides and releases slots; no per-connection unbounded queues or copy threads.
 
+The CLI and outbound node drain available WebSocket bytes and check local input
+before waiting on either descriptor. They do not wait for a reply after every
+upload chunk or wait for client input before forwarding guest output. Reads
+check buffered TLS/WebSocket data too; writes retain their existing deadlines.
+Update both the client and node agent to v0.6.2 or newer for this behavior.
+
 Outbound node jobs retain existing 64 KiB transport frames, one-use job binding,
 controller capacity, 10-second dispatch and 5-second writes. Revocation/session
 replacement checks precede reads/writes in both directions and are polled every
@@ -150,6 +156,21 @@ that every image contains a server. This contract is backend-independent; Mac
 hardware/server capability has not been tested by this lane.
 
 ## Provisioning and evidence
+
+Run the throughput regressions without a VM or production login (requires
+OpenSSL on the test host):
+
+```sh
+cargo test --locked -p ow --test ssh_proxy -- --nocapture
+cargo test --locked -p ow node_stream_100_mib_each_way -- --nocapture # Linux
+```
+
+The first runs the real `ow ssh-proxy` process against a private-CA TLS fixture;
+the second runs the production node stream loop against a simulated worker.
+Each transfers and checks 100 MiB in both directions with a 30-second limit per
+direction. They check the transport, byte count and payload; real OpenSSH/guest
+acceptance remains the separate test below. Release CI runs both regressions
+before creating a tag.
 
 New developer image recipe version is `developer-v2-ssh`, with a versioned
 `/etc/ow-ssh-v1` marker, distribution OpenSSH/procps and no host keys or enrolled

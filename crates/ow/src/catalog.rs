@@ -25,7 +25,14 @@ pub struct Catalog {
 }
 
 #[derive(Debug)]
-pub struct OperationFailure(pub Value);
+pub struct OperationFailure(pub Value, pub Option<&'static str>);
+impl OperationFailure {
+    pub fn message(&self) -> &'static str {
+        self.1.unwrap_or(
+            "Operation did not complete. Check its status before retrying; use the same retry key.",
+        )
+    }
+}
 impl std::fmt::Display for OperationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -462,6 +469,7 @@ impl Catalog {
         OperationFailure(
             self.operation_info(user, operation)
                 .unwrap_or(json!({"id":operation,"state":"uncertain"})),
+            None,
         )
         .into()
     }
@@ -1359,7 +1367,30 @@ impl Catalog {
             // A runtime error can follow partial effects. Reconcile positive inventory before
             // releasing demand; the error itself is never proof the target stopped.
             self.reconcile()?;
-            return Err(self.outcome_error(user, operation));
+            // Only fixed, known rejections may cross the host-diagnostic boundary.
+            let diagnostic = envelope["error"].as_str().unwrap_or("");
+            let hint = if uncertain {
+                None
+            } else {
+                match op.as_str() {
+                    "delete"
+                        if diagnostic == "workspace is running; stop or hibernate it first" =>
+                    {
+                        Some(
+                            "Box is running. Stop the box first with ow stop, then retry ow delete with a new operation key.",
+                        )
+                    }
+                    "ssh-info"
+                        if diagnostic.starts_with("SSH not enrolled; use ow ssh-authorize:") =>
+                    {
+                        Some(
+                            "SSH has no registered key. Run ow ssh-authorize BOX --key PATH_TO_PUBLIC_KEY, then retry ssh-info.",
+                        )
+                    }
+                    _ => None,
+                }
+            };
+            return Err(OperationFailure(self.operation_info(user, operation)?, hint).into());
         }
         let mut value = envelope["result"].clone();
         let correlated = if matches!(

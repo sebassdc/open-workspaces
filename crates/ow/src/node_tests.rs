@@ -1,5 +1,89 @@
 //! Focused security/durability tests. Mock runtime evidence is distinct from real guest acceptance.
 use crate::{common, nodes::*, wire};
+
+#[test]
+fn node_stream_100_mib_each_way() {
+    use std::{
+        net::{Shutdown, TcpListener},
+        os::unix::net::UnixStream,
+    };
+    const BYTES: usize = 100 * 1024 * 1024;
+    const CHUNK: usize = 16384;
+    for upload in [true, false] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (mut worker, unix) = UnixStream::pair().unwrap();
+        let node = std::thread::spawn(move || {
+            let ws = socket(&origin, "/job/test", "fixture", None).unwrap();
+            timeout_socket(&ws).unwrap();
+            agent_stream(ws, unix).unwrap();
+        });
+        let (tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        tcp.set_nodelay(true).unwrap();
+        let watchdog = tcp.try_clone().unwrap();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if matches!(
+                wait.recv_timeout(Duration::from_secs(30)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let _ = watchdog.shutdown(Shutdown::Both);
+            }
+        });
+        let mut controller = tungstenite::accept(tcp).unwrap();
+        let guest = std::thread::spawn(move || {
+            if upload {
+                let mut count = 0;
+                let mut buf = [0; CHUNK];
+                while count < BYTES {
+                    let n = worker.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    assert!(buf[..n].iter().all(|b| *b == 0xa5));
+                    count += n;
+                }
+                assert_eq!(count, BYTES);
+                worker.write_all(&count.to_be_bytes()).unwrap();
+            } else {
+                for _ in 0..BYTES / CHUNK {
+                    worker.write_all(&[0x5a; CHUNK]).unwrap();
+                }
+            }
+        });
+        let start = std::time::Instant::now();
+        if upload {
+            for _ in 0..BYTES / CHUNK {
+                controller
+                    .send(tungstenite::Message::Binary(vec![0xa5; CHUNK].into()))
+                    .unwrap();
+            }
+            let count = controller.read().unwrap().into_data();
+            assert_eq!(count.as_ref(), &BYTES.to_be_bytes());
+        } else {
+            let mut count = 0;
+            while count < BYTES {
+                let bytes = controller.read().unwrap().into_data();
+                assert!(!bytes.is_empty() && bytes.len() <= CHUNK);
+                assert!(bytes.iter().all(|b| *b == 0x5a));
+                count += bytes.len();
+            }
+            assert_eq!(count, BYTES);
+        }
+        assert!(start.elapsed() < Duration::from_secs(30));
+        eprintln!(
+            "node {}: {BYTES} bytes in {:.3}s",
+            if upload { "upload" } else { "download" },
+            start.elapsed().as_secs_f64()
+        );
+        let _ = controller.close(None);
+        drop(controller);
+        guest.join().unwrap();
+        node.join().unwrap();
+        let _ = done.send(());
+    }
+}
+
 fn root() -> PathBuf {
     let p = std::env::temp_dir().join(format!("ow-n-{}", common::nonce().unwrap()));
     fs::create_dir(&p).unwrap();
@@ -583,7 +667,11 @@ fn an_agent_whose_worker_leaves_its_protocol_window_drives_it_no_more() {
         beats,
         "no heartbeat once the worker is incompatible"
     );
-    assert_eq!(status()["online"], false, "the dropped channel reads offline");
+    assert_eq!(
+        status()["online"],
+        false,
+        "the dropped channel reads offline"
+    );
     // ... and a job that still reaches it is answered with an error, not forwarded.
     for checked in [
         None,
