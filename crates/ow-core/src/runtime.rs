@@ -15,6 +15,9 @@ use std::{
     process::Command,
 };
 
+#[path = "runtime_recovery.rs"]
+mod recovery_operations;
+
 const MAX_RUNNING: usize = 8;
 const MAX_MEMORY_MIB: u32 = 4096;
 fn parse_limit(value: &str, maximum: u32) -> Result<u32> {
@@ -217,6 +220,10 @@ use lifecycle::Managed;
 
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
+    #[serde(default)]
+    captured_at: u64,
+    #[serde(default)]
+    managed_recovery: bool,
     name: String,
     workspace: String,
     #[serde(default)]
@@ -369,6 +376,7 @@ fn install_file(machine: &mut Vm, binary: &Path, guest: &str, digest: &str) -> R
 }
 
 const SLEEP: &str = "sleep-";
+const RECOVERY: &str = "sleep-recovery-";
 
 /// utime + stime of a process, in clock ticks.
 fn cpu_ticks(pid: u32) -> Option<u64> {
@@ -504,7 +512,7 @@ impl Runtime {
         }
         minimum_free_gib()?;
         max_disk_gib()?;
-        for directory in ["machines", "snapshots"] {
+        for directory in ["machines", "snapshots", "recovery"] {
             fs::create_dir_all(root.join(directory))?;
         }
         let mut state: State = if root.join("state.json").exists() {
@@ -799,6 +807,11 @@ impl Runtime {
             .as_object_mut()
             .unwrap()
             .extend(usage.as_object().unwrap().clone());
+        let path = self.root.join("recovery").join(format!("{id}.json"));
+        if path.exists() {
+            let recovery: crate::recovery::Recovery = serde_json::from_slice(&fs::read(path)?)?;
+            summary["durability"] = recovery.summary(crate::recovery::now());
+        }
         Ok(summary)
     }
     fn create(
@@ -955,6 +968,10 @@ impl Runtime {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             result => result?,
         }
+        match fs::remove_file(self.root.join("recovery").join(format!("{id}.json"))) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
+        }
         self.state.workspaces.remove(id);
         self.save()?;
         Ok(json!({"deleted":id,"snapshots":snapshots}))
@@ -1020,6 +1037,17 @@ impl Runtime {
     /// Seals a RAM+disk snapshot. With `hibernate` the paused VM is dropped right after
     /// the capture, so nothing the guest does while the files are hashed is lost.
     fn capture(&mut self, id: &str, name: &str, hibernate: bool) -> Result<Value> {
+        self.capture_inner(id, name, hibernate, false)
+    }
+
+    fn capture_inner(
+        &mut self,
+        id: &str,
+        name: &str,
+        hibernate: bool,
+        managed: bool,
+    ) -> Result<Value> {
+        let captured_at = crate::recovery::now();
         identifier(name)?;
         ensure!(
             !self.lifecycle_capture(name),
@@ -1038,7 +1066,7 @@ impl Runtime {
         }
         // A capture reflinks an existing disk; only RAM is a new data allocation.
         self.storage_headroom(workspace.memory_mib as u64 * 1024 * 1024)?;
-        if !hibernate {
+        if !hibernate && !managed {
             ensure!(
                 self.named_snapshot_count()? < MAX_SNAPSHOTS,
                 "snapshot limit ({MAX_SNAPSHOTS}) reached"
@@ -1065,6 +1093,8 @@ impl Runtime {
                 files.insert(file.into(), hash(&staging.join(file))?);
             }
             let snapshot = Snapshot {
+                managed_recovery: managed,
+                captured_at,
                 name: name.into(),
                 workspace: id.into(),
                 managed: workspace.managed,
@@ -1336,7 +1366,7 @@ impl Runtime {
                 "managed operation requires lifecycle coordination"
             );
         }
-        if !id.is_empty() && op != "hibernate" {
+        if !id.is_empty() && !matches!(op, "hibernate" | "recovery-prepare" | "recovery-result") {
             self.idle.touch(id, std::time::Instant::now());
         }
         if matches!(op, "exec" | "shell-exec" | "put" | "get" | "ssh-keys") {
@@ -1348,7 +1378,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"recovery_points_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "image_store_v1":true,"image_digests":self.images()?.iter().filter(|i| i["image_digest"].as_str().is_some()).map(|i| json!({"name":i["name"],"digest":i["image_digest"]})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
@@ -1405,6 +1435,7 @@ impl Runtime {
                 self.check_replay(request)?;
                 Ok(json!({}))
             }
+            "recovery-prepare" | "recovery-result" => self.recovery_operation(request),
             "create" => self.create(
                 id,
                 u32::try_from(request["memory_mib"].as_u64().unwrap_or(256))?,
@@ -1543,11 +1574,14 @@ impl Runtime {
                 STANDARD.decode(&clean).context("invalid file response")?;
                 Ok(json!({"data":clean}))
             }
-            "snapshot" => self.capture(
-                id,
-                request["name"].as_str().context("missing snapshot name")?,
-                false,
-            ),
+            "snapshot" => {
+                let name = request["name"].as_str().context("missing snapshot name")?;
+                ensure!(
+                    !name.starts_with(RECOVERY),
+                    "sleep-recovery- is reserved for managed recovery points"
+                );
+                self.capture(id, name, false)
+            }
             "snapshots" => {
                 let mut snapshots = Vec::<Snapshot>::new();
                 for item in fs::read_dir(self.root.join("snapshots"))? {
@@ -1558,7 +1592,10 @@ impl Runtime {
                         && !item.file_name().to_string_lossy().starts_with('.')
                         && !item.file_name().to_string_lossy().starts_with(SLEEP)
                     {
-                        snapshots.push(serde_json::from_slice(&fs::read(path)?)?);
+                        let snapshot: Snapshot = serde_json::from_slice(&fs::read(path)?)?;
+                        if !snapshot.managed_recovery {
+                            snapshots.push(snapshot);
+                        }
                     }
                 }
                 Ok(json!(
@@ -1703,6 +1740,99 @@ mod disk_tests {
     }
 
     #[test]
+    fn recovery_pins_sleep_retries_after_restart_and_rotates_only_owned_points() {
+        use crate::recovery::{Recovery, now};
+        let mut runtime = fixture();
+        fs::create_dir(runtime.root.join("recovery")).unwrap();
+        let sleep = runtime.snapshot_dir("sleep-fixture");
+        fs::create_dir(&sleep).unwrap();
+        let mut files = BTreeMap::new();
+        for file in ["state", "memory", "disk.ext4"] {
+            fs::write(sleep.join(file), file).unwrap();
+            files.insert(file.to_owned(), hash(&sleep.join(file)).unwrap());
+        }
+        let snapshot = Snapshot {
+            managed_recovery: false,
+            captured_at: now() - 601,
+            name: "sleep-fixture".into(),
+            workspace: "legacy".into(),
+            memory_mib: 1024,
+            vcpu_count: 2,
+            image: "alpine".into(),
+            runtime: crate::common::RUNTIME.into(),
+            cpu: "old host".into(),
+            kernel_sha256: "old kernel".into(),
+            files,
+        };
+        atomic_json(&sleep.join("manifest.json"), &snapshot).unwrap();
+        let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
+        workspace.state = "hibernated".into();
+        workspace.hibernation = Some("sleep-fixture".into());
+        let store = "a".repeat(64);
+        let point = runtime
+            .request(&json!({"op":"recovery-prepare","id":"legacy","store":store}))
+            .unwrap();
+        let name = point["snapshot"].as_str().unwrap();
+        assert_eq!(point["captured_at"], snapshot.captured_at);
+        assert_eq!(runtime.named_snapshot_count().unwrap(), 0);
+        assert_eq!(
+            runtime.request(&json!({"op":"snapshots"})).unwrap(),
+            json!([])
+        );
+        // Wake may remove the original while an upload owns the pinned inode set.
+        fs::remove_dir_all(&sleep).unwrap();
+        let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
+        workspace.state = "stopped".into();
+        workspace.hibernation = None;
+        runtime.request(&json!({"op":"recovery-result","id":"legacy","store":store,"snapshot":name,"uploaded":false})).unwrap();
+        let journal = runtime.root.join("recovery/legacy.json");
+        let mut saved: Recovery = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        assert_eq!(saved.failures, 1);
+        assert!(saved.error.is_some());
+        assert!(saved.durable.is_none());
+        saved.attempted_at = now() - 301;
+        atomic_json(&journal, &saved).unwrap();
+        let retry = runtime
+            .request(&json!({"op":"recovery-prepare","id":"legacy","store":store}))
+            .unwrap();
+        assert_eq!(retry, point, "restart captured a different point");
+        assert!(runtime.request(&json!({"op":"recovery-result","id":"legacy","store":store,"snapshot":"other","uploaded":true})).is_err());
+        for old in ["sleep-recovery-old", "manual", "recovery-manual"] {
+            fs::create_dir(runtime.snapshot_dir(old)).unwrap();
+            let mut old_snapshot: Value = serde_json::to_value(&snapshot).unwrap();
+            old_snapshot["name"] = json!(old);
+            old_snapshot["managed_recovery"] = json!(old == "sleep-recovery-old");
+            atomic_json(
+                &runtime.snapshot_dir(old).join("manifest.json"),
+                &old_snapshot,
+            )
+            .unwrap();
+        }
+        let ack = json!({"op":"recovery-result","id":"legacy","store":store,"snapshot":name,"uploaded":true});
+        runtime.request(&ack).unwrap();
+        runtime.request(&ack).unwrap(); // lost-response replay
+        assert!(!runtime.snapshot_dir("sleep-recovery-old").exists());
+        assert!(runtime.snapshot_dir("manual").exists());
+        assert!(runtime.snapshot_dir("recovery-manual").exists());
+        assert_eq!(runtime.named_snapshot_count().unwrap(), 2);
+        assert!(runtime.snapshot_dir(name).exists());
+        let summary = runtime.workspace_summary("legacy").unwrap();
+        assert_eq!(
+            summary["durability"]["last_durable_at"],
+            snapshot.captured_at
+        );
+        assert!(summary["durability"]["error"].is_null());
+        // A different destination cannot inherit the old store's durable claim.
+        runtime
+            .request(&json!({"op":"recovery-prepare","id":"legacy","store":"b".repeat(64)}))
+            .unwrap();
+        assert!(
+            runtime.workspace_summary("legacy").unwrap()["durability"]["last_durable_at"].is_null()
+        );
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
     fn snapshot_admission_does_not_reserve_another_writable_disk() {
         let mut runtime = fixture();
         // Sparse capacity exceeds this test volume; capture adds RAM, not a new disk.
@@ -1743,6 +1873,8 @@ mod disk_tests {
             .unwrap()
             .memory_mib = u32::MAX;
         let snapshot = Snapshot {
+            managed_recovery: false,
+            captured_at: crate::recovery::now(),
             name: "saved".into(),
             workspace: "legacy".into(),
             managed: false,
@@ -1953,6 +2085,8 @@ mod disk_tests {
         fs::write(saved.join("state"), b"state").unwrap();
         fs::write(saved.join("memory"), b"memory").unwrap();
         let snapshot = Snapshot {
+            managed_recovery: false,
+            captured_at: crate::recovery::now(),
             name: "before-growth".into(),
             workspace: "legacy".into(),
             managed: false,

@@ -18,6 +18,7 @@ pub mod disk;
 pub mod idle;
 #[cfg(target_os = "linux")]
 pub mod network;
+pub mod recovery;
 #[cfg(target_os = "linux")]
 pub mod runtime;
 pub mod snapshot_store;
