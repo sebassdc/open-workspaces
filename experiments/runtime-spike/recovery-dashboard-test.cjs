@@ -15,7 +15,8 @@ const fixture = {user:{email:'owner@example.test'},host_controls:false,workspace
   {id:'overdue',durability:{last_durable_at:now-7200,retention:retained}},
   {id:'retrying',durability:{last_durable_at:now-1800,error:'Upload failed; retry scheduled.',pending:'recovery-pending',retry_at:now+120,retention:retained}},
   {id:'first-upload',durability:{pending:'recovery-new',retention:retained}},
-  {id:'unconfigured'}
+  {id:'unconfigured'},
+  {id:'sleep-protected',state:'hibernated',durability:{last_durable_at:now-86400,current_state_durable:true,retention:retained}}
 ].map(item=>({state:'running',image:'ubuntu',memory_mib:1024,vcpu_count:1,disk_bytes:32*1073741824,disk_used_bytes:2*1073741824,...item})),snapshots:[],stats:{},nodes:[]};
 let baseline=false;
 const server=http.createServer((req,res)=>{
@@ -45,6 +46,8 @@ const server=http.createServer((req,res)=>{
           assert.match(await page.locator('[data-machine=unconfigured]').textContent(),/Off-host recovery status unavailable/);
           assert.equal(await page.locator('[data-machine=overdue] .recovery-warning').count(),1);
           assert.equal(await page.locator('[data-machine=protected] .recovery-warning').count(),0);
+          assert.equal(await page.locator('[data-machine=sleep-protected] .recovery-warning').count(),0);
+          assert(!/target exceeded/.test(await page.locator('[data-machine=sleep-protected]').textContent()));
         }
         assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'horizontal overflow');
         await page.screenshot({path:path.join(output,`${mode}-${label}.png`),fullPage:true});

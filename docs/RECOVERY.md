@@ -56,8 +56,9 @@ Disk-only recovery is filesystem/crash recovery: applications may replay their
 journals, and writes still in RAM require compatible RAM restore to continue.
 Application-specific quiescing is not provided.
 
-After ten hibernated minutes, the worker pins that sealed sleep capture under a
-unique managed name. A wake may delete the sleep directory while the upload
+After ten minutes from the first observation of a sealed hibernation, the worker pins that sealed sleep capture under a
+unique managed name. That observation is journaled, so worker restarts preserve
+the delay; capture/hash time is not counted as time spent hibernated. A wake may delete the sleep directory while the upload
 continues; the pinned file inodes remain valid. Each sleep is uploaded once.
 Legacy sleep captures without a capture-start timestamp report zero (unknown) rather than claiming a measured durable age.
 Stopped boxes do not create new points, but an already pending upload is retried.
@@ -71,6 +72,8 @@ start with `sleep-recovery-`, are excluded from the user snapshot list/limit, an
 cannot be used by a user snapshot request.
 
 The 30-minute interval leaves a provisional 30-minute capture/transfer budget.
+A durable point matching the current frozen sleep state stays protected even
+when its capture timestamp is older than an hour; no newer writes exist there.
 The one-hour target is **not a measured service guarantee**: full RAM capture,
 full-file hashing, busy disks, serialized captures, queueing, network throughput
 or failures can exceed it. Overdue status stays visible and never advances on

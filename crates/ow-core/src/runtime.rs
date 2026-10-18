@@ -799,7 +799,8 @@ impl Runtime {
     }
 
     fn workspace_summary(&self, id: &str) -> Result<Value> {
-        let mut summary = json!(self.workspace(id)?);
+        let workspace = self.workspace(id)?;
+        let mut summary = json!(&workspace);
         let usage = disk::summary(&self.machine_dir(id).join("disk.ext4")).unwrap_or_else(
             |_| json!({"disk_bytes":null,"disk_used_bytes":null,"disk_allocated_bytes":null}),
         );
@@ -811,6 +812,15 @@ impl Runtime {
         if path.exists() {
             let recovery: crate::recovery::Recovery = serde_json::from_slice(&fs::read(path)?)?;
             summary["durability"] = recovery.summary(crate::recovery::now());
+            let sealed_sleep = workspace.state == "hibernated"
+                && recovery
+                    .durable
+                    .as_ref()
+                    .is_some_and(|p| p.source.is_some() && p.source == workspace.hibernation);
+            summary["durability"]["current_state_durable"] = json!(sealed_sleep);
+            if sealed_sleep {
+                summary["durability"]["overdue"] = json!(false);
+            }
         }
         Ok(summary)
     }
@@ -1769,6 +1779,16 @@ mod disk_tests {
         workspace.state = "hibernated".into();
         workspace.hibernation = Some("sleep-fixture".into());
         let store = "a".repeat(64);
+        assert!(
+            runtime
+                .request(&json!({"op":"recovery-prepare","id":"legacy","store":store}))
+                .unwrap()
+                .is_null()
+        );
+        let journal = runtime.root.join("recovery/legacy.json");
+        let mut observed: Recovery = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        observed.sleep_observed_at = now() - 601;
+        atomic_json(&journal, &observed).unwrap();
         let point = runtime
             .request(&json!({"op":"recovery-prepare","id":"legacy","store":store}))
             .unwrap();
@@ -1822,6 +1842,17 @@ mod disk_tests {
             snapshot.captured_at
         );
         assert!(summary["durability"]["error"].is_null());
+        let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
+        workspace.state = "hibernated".into();
+        workspace.hibernation = Some("sleep-fixture".into());
+        assert_eq!(
+            runtime.workspace_summary("legacy").unwrap()["durability"]["current_state_durable"],
+            true
+        );
+        let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
+        workspace.state = "stopped".into();
+        workspace.hibernation = None;
+
         // A different destination cannot inherit the old store's durable claim.
         runtime
             .request(&json!({"op":"recovery-prepare","id":"legacy","store":"b".repeat(64)}))
@@ -1829,6 +1860,44 @@ mod disk_tests {
         assert!(
             runtime.workspace_summary("legacy").unwrap()["durability"]["last_durable_at"].is_null()
         );
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
+    fn recovery_replaces_an_unpinned_sleep_source_after_wake() {
+        use crate::recovery::{Point, Recovery};
+        let mut runtime = fixture();
+        fs::create_dir(runtime.root.join("recovery")).unwrap();
+        let store = "a".repeat(64);
+        let journal = runtime.root.join("recovery/legacy.json");
+        let saved = Recovery {
+            store: store.clone(),
+            pending: Some(Point {
+                snapshot: "sleep-recovery-missing".into(),
+                source: Some("sleep-missing".into()),
+                captured_at: 1,
+            }),
+            ..Recovery::default()
+        };
+        atomic_json(&journal, &saved).unwrap();
+        assert!(
+            runtime
+                .request(&json!({"op":"recovery-prepare","id":"legacy","store":store}))
+                .unwrap()
+                .is_null()
+        );
+        let saved: Recovery = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        assert!(saved.pending.is_none());
+        runtime.state.workspaces.get_mut("legacy").unwrap().state = "running".into();
+        assert!(
+            runtime
+                .request(&json!({"op":"recovery-prepare","id":"legacy","store":store}))
+                .is_err()
+        );
+        let saved: Recovery = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        let pending = saved.pending.unwrap();
+        assert_ne!(pending.snapshot, "sleep-recovery-missing");
+        assert!(pending.source.is_none());
         fs::remove_dir_all(runtime.root).unwrap();
     }
 

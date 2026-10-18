@@ -26,6 +26,10 @@ pub struct Point {
 pub struct Recovery {
     #[serde(default)]
     pub store: String,
+    #[serde(default)]
+    pub sleep: Option<String>,
+    #[serde(default)]
+    pub sleep_observed_at: u64,
     pub pending: Option<Point>,
     pub durable: Option<Point>,
     pub uploaded_at: Option<u64>,

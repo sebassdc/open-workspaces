@@ -63,25 +63,44 @@ impl Runtime {
             self.prune_recovery(id, &recovery)?;
             return Ok(recovery.summary(at));
         }
+        if workspace.state == "hibernated" {
+            if recovery.sleep != workspace.hibernation {
+                recovery.sleep = workspace.hibernation.clone();
+                recovery.sleep_observed_at = at;
+            }
+        } else {
+            recovery.sleep = None;
+            recovery.sleep_observed_at = 0;
+        }
         let sleep = workspace
             .hibernation
             .as_deref()
             .map(|name| -> Result<_> {
-                let manifest = self.snapshot_dir(name).join("manifest.json");
-                let snapshot: Snapshot = serde_json::from_slice(&fs::read(&manifest)?)?;
-                let at = if snapshot.captured_at > 0 {
-                    snapshot.captured_at
-                } else {
-                    // Legacy captures have no start time; mtime only schedules their upload.
-                    manifest
-                        .metadata()?
-                        .modified()?
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs()
-                };
-                Ok((name.to_owned(), at, snapshot.captured_at))
+                let snapshot: Snapshot = serde_json::from_slice(&fs::read(
+                    self.snapshot_dir(name).join("manifest.json"),
+                )?)?;
+                Ok((
+                    name.to_owned(),
+                    recovery.sleep_observed_at,
+                    snapshot.captured_at,
+                ))
             })
             .transpose()?;
+        if recovery.pending.as_ref().is_some_and(|p| {
+            p.source.as_ref().is_some_and(|source| {
+                !self.snapshot_dir(source).join("manifest.json").exists()
+                    && !self
+                        .snapshot_dir(&p.snapshot)
+                        .join("manifest.json")
+                        .exists()
+            })
+        }) {
+            // A wake after failed pinning removed the source; never recycle a possibly uploaded name.
+            recovery.pending = None;
+            recovery.error = Some(
+                "Sleep capture unavailable; a new point will be taken when the box runs.".into(),
+            );
+        }
         if !recovery.due(
             &workspace.state,
             sleep.as_ref().map(|(n, t, _)| (n.as_str(), *t)),
