@@ -53,6 +53,8 @@ struct Operation {
     with: Option<String>,
     #[serde(default)]
     role: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 fn validated(bytes: &[u8]) -> Result<Value> {
@@ -60,6 +62,14 @@ fn validated(bytes: &[u8]) -> Result<Value> {
     if matches!(raw["op"].as_str(), Some("create" | "resize")) {
         crate::common::requested_resources(&raw)?;
         crate::common::requested_disk(&raw)?;
+    }
+    if matches!(raw["op"].as_str(), Some("publish" | "unpublish"))
+        && let Some(port) = raw.get("port")
+    {
+        ensure!(
+            port.as_u64().is_some_and(|p| (1..=65535).contains(&p)),
+            "invalid port"
+        );
     }
     let operation: Operation = serde_json::from_value(raw)?;
     ensure!(
@@ -113,6 +123,14 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             }
         }
         "start" | "stop" | "hibernate" | "ssh-info" | "delete" => {}
+        "publish" | "unpublish" => {
+            if let Some(port) = operation.port {
+                ensure!(port > 0, "invalid port");
+                request["port"] = json!(port);
+            } else {
+                ensure!(operation.op == "unpublish", "port required");
+            }
+        }
         "share" | "unshare" => {
             let with = operation.with.context("teammate email required")?;
             crate::common::email(&with)?;
@@ -299,6 +317,7 @@ pub async fn handle(
     identity: Identity,
     request: Request,
     host_controls: bool,
+    preview_host: Option<String>,
 ) -> Response {
     let path = request.uri().path();
     let method = request.method().clone();
@@ -334,6 +353,16 @@ pub async fn handle(
     if path == "/api/state" && method == Method::GET {
         let result = with_catalog(catalog, identity, move |catalog, user| {
             let mut state = catalog.state(user)?;
+            state["previews"] = json!(preview_host.is_some());
+            for group in ["workspaces", "shared"] {
+                for item in state[group].as_array_mut().into_iter().flatten() {
+                    if let Some(host) = &preview_host {
+                        crate::preview::urls(item, host);
+                    } else {
+                        item["published_ports"] = json!([]);
+                    }
+                }
+            }
             state["host_controls"] = json!(host_controls);
             state["pool_policy"] = json!(crate::nodes::POOL_POLICY);
             Ok(state)
@@ -393,6 +422,18 @@ pub async fn handle(
             .and_then(|r| r),
             None => Err(anyhow::anyhow!("ownership catalog unavailable")),
         }
+    } else if matches!(operation["op"].as_str(), Some("publish" | "unpublish")) {
+        match preview_host {
+            Some(host) => {
+                with_catalog(catalog, identity, move |catalog, user| {
+                    let mut value = catalog.publication(user, &operation, crate::preview::serve)?;
+                    crate::preview::urls(&mut value, &host);
+                    Ok(value)
+                })
+                .await
+            }
+            None => Err(anyhow::anyhow!("tailnet previews are not configured")),
+        }
     } else {
         with_catalog(catalog, identity, move |catalog, user| {
             catalog.operation(user, operation)
@@ -421,6 +462,34 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preview_ports_are_explicit_valid_numbers() {
+        assert_eq!(
+            validated(br#"{"op":"unpublish","id":"demo"}"#).unwrap(),
+            json!({"op":"unpublish","id":"demo"})
+        );
+        assert!(validated(br#"{"op":"publish","id":"demo","port":3000}"#).is_ok());
+        assert!(validated(br#"{"op":"publish","id":"demo"}"#).is_err());
+        for op in ["publish", "unpublish"] {
+            for port in [
+                json!(null),
+                json!(0),
+                json!(65536),
+                json!(-1),
+                json!(1.5),
+                json!("3000"),
+            ] {
+                assert!(
+                    validated(
+                        json!({"op":op,"id":"demo","port":port})
+                            .to_string()
+                            .as_bytes()
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
     #[test]
     fn larger_shapes_and_malformed_resources() {
         for op in ["create", "resize"] {

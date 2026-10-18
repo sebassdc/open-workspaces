@@ -22,6 +22,8 @@ mod onboarding;
 #[cfg(target_os = "linux")]
 mod onboarding;
 #[cfg(target_os = "linux")]
+mod preview;
+#[cfg(target_os = "linux")]
 mod remote;
 #[cfg(target_os = "linux")]
 mod selfhost;
@@ -315,8 +317,8 @@ enum Action {
     },
     Unpublish {
         id: String,
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
     },
     #[command(hide = true)]
     Worker,
@@ -778,6 +780,31 @@ mod capability_tests {
         operation(&cli.command).and_then(|r| Capability::required(&r))
     }
 
+    #[test]
+    fn preview_cli_accepts_one_or_all_unpublish_ports() {
+        assert!(matches!(
+            Cli::try_parse_from(["ow", "publish", "demo", "--port", "3000"])
+                .unwrap()
+                .command,
+            Action::Publish { port: 3000, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ow", "unpublish", "demo"])
+                .unwrap()
+                .command,
+            Action::Unpublish { port: None, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ow", "unpublish", "demo", "--port", "3000"])
+                .unwrap()
+                .command,
+            Action::Unpublish {
+                port: Some(3000),
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["ow", "publish", "demo", "--port", "65536"]).is_err());
+    }
     #[test]
     fn commands_need_their_flags() {
         assert_eq!(needed(&["fork", "a", "b"]), Some(Capability::LiveFork));

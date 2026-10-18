@@ -1337,6 +1337,7 @@ fn agent_job(
             "restore",
             "hibernate",
             "terminal",
+            "tunnel",
             "ssh",
             "ssh-info",
             "ssh-keys",
@@ -1357,7 +1358,7 @@ fn agent_job(
         return Ok(());
     };
     wire::expect_worker(checked["worker_pid"].as_u64().map(|pid| pid as u32));
-    if op != "terminal" && op != "ssh" {
+    if op != "terminal" && op != "ssh" && op != "tunnel" {
         let response = journal_request(root, &request)?;
         let data = serde_json::to_vec(&response)?;
         ensure!(data.len() < 1024 * 1024, "response too large");
@@ -1378,6 +1379,19 @@ fn agent_job(
             "invalid SSH stream request"
         );
         common::identifier(request["id"].as_str().context("SSH ID")?)?;
+    }
+    if op == "tunnel" {
+        ensure!(
+            request.as_object().is_some_and(|o| o.len() == 3),
+            "invalid tunnel request"
+        );
+        common::identifier(request["id"].as_str().context("tunnel ID")?)?;
+        ensure!(
+            request["port"]
+                .as_u64()
+                .is_some_and(|p| (1..=65535).contains(&p)),
+            "invalid tunnel port"
+        );
     }
     let (unix, response) = wire::connect(root, &request)?;
     socket.send(tungstenite::Message::Binary(

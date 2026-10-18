@@ -1120,3 +1120,71 @@ fn lowering_inventory_has_absolute_deadline_without_sqlite_writer_hold() {
     mock.join().unwrap();
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn preview_tunnel_job_uses_the_existing_worker_stream() {
+    use std::net::TcpListener;
+    let worker = root();
+    let listener = std::os::unix::net::UnixListener::bind(worker.join("control.sock")).unwrap();
+    let runtime = std::thread::spawn(move || {
+        let (mut unix, _) = listener.accept().unwrap();
+        assert_eq!(
+            wire::line(&mut unix).unwrap(),
+            json!({"op":"tunnel","id":"box","port":3000})
+        );
+        wire::send(&mut unix, &json!({"ok":true,"result":{}})).unwrap();
+        let mut bytes = [0; 5];
+        unix.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"hello");
+        unix.write_all(b"reply").unwrap();
+        let mut end = [0; 1];
+        let _ = unix.read(&mut end);
+    });
+    for request in [
+        json!({"op":"tunnel","id":"box","port":3000}),
+        json!({"op":"tunnel","id":"box","port":0}),
+        json!({"op":"tunnel","id":"box","port":3000,"host":"127.0.0.1"}),
+    ] {
+        let valid = request["port"] == 3000 && request.get("host").is_none();
+        let controller = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", controller.local_addr().unwrap());
+        let path = worker.clone();
+        let agent = std::thread::spawn(move || {
+            agent_job(
+                &path,
+                &origin,
+                "alpha",
+                "job",
+                "fixture",
+                None,
+                Busy::new(),
+                &Mutex::new(Some(
+                    json!({"worker_protocol":1,"worker_pid":std::process::id()}),
+                )),
+            )
+        });
+        let (tcp, _) = controller.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut socket = tungstenite::accept(tcp).unwrap();
+        socket
+            .send(tungstenite::Message::Binary(
+                format!("{request}\n").into_bytes().into(),
+            ))
+            .unwrap();
+        if valid {
+            let reply = socket.read().unwrap().into_data();
+            assert!(serde_json::from_slice::<Value>(&reply).unwrap()["ok"] == true);
+            socket
+                .send(tungstenite::Message::Binary(b"hello".to_vec().into()))
+                .unwrap();
+            assert_eq!(socket.read().unwrap().into_data().as_ref(), b"reply");
+            let _ = socket.close(None);
+            drop(socket);
+            assert!(agent.join().unwrap().is_ok());
+        } else {
+            assert!(agent.join().unwrap().is_err());
+        }
+    }
+    runtime.join().unwrap();
+    fs::remove_dir_all(worker).unwrap();
+}

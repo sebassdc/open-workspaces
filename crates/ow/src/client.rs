@@ -347,6 +347,8 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Fork { .. }
                 | Action::Share { .. }
                 | Action::Unshare { .. }
+                | Action::Publish { .. }
+                | Action::Unpublish { .. }
                 | Action::Delete { .. }
         ),
         "this command is local-only; use --local for the local worker"
@@ -464,6 +466,14 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             file.write_all(&data)?;
             return Ok(0);
         }
+        Action::Publish { id, port } => json!({"op":"publish","id":id,"port":port}),
+        Action::Unpublish { id, port } => {
+            let mut v = json!({"op":"unpublish","id":id});
+            if let Some(port) = port {
+                v["port"] = json!(port);
+            }
+            v
+        }
         Action::Share { id, with, role } => json!({"op":"share","id":id,"with":with,"role":role}),
         Action::Unshare { id, with } => json!({"op":"unshare","id":id,"with":with}),
         Action::Start { id } => json!({"op":"start","id":id}),
@@ -504,10 +514,13 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         _ => unreachable!(),
     };
     operation["operation_key"] = json!(key);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&request(&url, &token, Some(operation))?)?
-    );
+    let published = operation["op"] == "publish";
+    let result = request(&url, &token, Some(operation))?;
+    if published {
+        println!("{}", result["url"].as_str().context("missing preview URL")?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
     Ok(0)
 }
 

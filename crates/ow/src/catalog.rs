@@ -197,6 +197,7 @@ fn permitted(role: &str, op: &str) -> bool {
             "exec"
                 | "put"
                 | "get"
+                | "preview"
                 | "terminal"
                 | "ssh"
                 | "ssh-info"
@@ -248,6 +249,8 @@ impl Catalog {
           CREATE TABLE IF NOT EXISTS operations(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL REFERENCES users(id), op TEXT NOT NULL, resource TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, finished_at TEXT);
           CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           -- Additive, like node_usage: an older binary ignores grants, so grantees lose access.
+          -- Never reassign an origin to another box/port: browser storage and service workers persist.
+          CREATE TABLE IF NOT EXISTS publications(https_port INTEGER PRIMARY KEY CHECK(https_port BETWEEN 11000 AND 65535),physical TEXT NOT NULL,guest_port INTEGER NOT NULL CHECK(guest_port BETWEEN 1 AND 65535),active INTEGER NOT NULL DEFAULT 0,UNIQUE(physical,guest_port));
           CREATE TABLE IF NOT EXISTS grants(physical TEXT NOT NULL, grantee INTEGER NOT NULL REFERENCES users(id), role TEXT NOT NULL CHECK(role IN ('use','admin')), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(physical,grantee));
           ")?;
         if version == 1 {
@@ -586,6 +589,7 @@ impl Catalog {
             if kind == "machine" {
                 reserved += memory;
                 value["shared_with"] = shared_with(&self.db, &physical)?;
+                value["published_ports"] = self.publications(&physical)?;
                 machines.push(value);
             } else {
                 snapshots.push(value);
@@ -605,6 +609,7 @@ impl Catalog {
         for row in rows {
             let (physical, metadata, node, owner, role) = row?;
             let mut value = self.view(user, "machine", &physical, &metadata, &node)?;
+            value["published_ports"] = self.publications(&physical)?;
             value["owner"] = json!(owner);
             value["role"] = json!(role);
             shared.push(value);
@@ -701,6 +706,10 @@ impl Catalog {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op<>'snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1)",[physical])?;
         tx.execute(&format!("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE {OF})"),[physical])?;
+        tx.execute(
+            "UPDATE publications SET active=0 WHERE physical=?1",
+            [physical],
+        )?;
         tx.execute("DELETE FROM grants WHERE physical=?1", [physical])?;
         tx.execute(&format!("DELETE FROM resources WHERE {OF}"), [physical])?;
         tx.execute(
@@ -708,6 +717,7 @@ impl Catalog {
             [physical],
         )?;
         tx.commit()?;
+        cut(user, physical);
         for grantee in grantees {
             cut(grantee, physical);
         }
@@ -1442,6 +1452,88 @@ impl Catalog {
         self.reconcile()?;
         Ok(value)
     }
+    pub fn publications(&self, physical: &str) -> Result<Value> {
+        let mut stmt = self.db.prepare("SELECT guest_port,https_port FROM publications WHERE physical=?1 AND active=1 ORDER BY guest_port")?;
+        let rows = stmt.query_map([physical], |r| {
+            Ok(json!({"port":r.get::<_,u16>(0)?,"https_port":r.get::<_,u16>(1)?}))
+        })?;
+        Ok(json!(rows.collect::<rusqlite::Result<Vec<_>>>()?))
+    }
+
+    pub fn publication(
+        &mut self,
+        user: i64,
+        request: &Value,
+        serve: impl Fn(u16, bool) -> Result<()>,
+    ) -> Result<Value> {
+        let name = request["id"].as_str().context("id")?;
+        // Publication settings belong exclusively to the owner, including admin shares.
+        let physical = self.physical(user, "machine", name)?;
+        let port = request
+            .get("port")
+            .map(|p| {
+                p.as_u64()
+                    .filter(|p| (1..=65535).contains(p))
+                    .map(|p| p as u16)
+                    .context("invalid port")
+            })
+            .transpose()?;
+        if request["op"] == "publish" {
+            let port = port.context("port required")?;
+            let node = self.placement("machine", &physical)?;
+            nodes::operation_capable(&self.root, &node, "tunnel")?;
+            self.db.execute("INSERT OR IGNORE INTO publications(https_port,physical,guest_port) SELECT COALESCE(MAX(https_port),10999)+1,?1,?2 FROM publications", params![physical,port])?;
+            let https: u16 = self.db.query_row(
+                "SELECT https_port FROM publications WHERE physical=?1 AND guest_port=?2",
+                params![physical, port],
+                |r| r.get(0),
+            )?;
+            serve(https, true)?;
+            self.db.execute(
+                "UPDATE publications SET active=1 WHERE https_port=?1",
+                [https],
+            )?;
+            Ok(json!({"id":name,"port":port,"https_port":https}))
+        } else {
+            ensure!(
+                request["op"] == "unpublish",
+                "invalid publication operation"
+            );
+            let ports = self.db.prepare("SELECT https_port FROM publications WHERE physical=?1 AND (?2 IS NULL OR guest_port=?2)")?.query_map(params![physical,port],|r|r.get::<_,u16>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            self.db.execute("UPDATE publications SET active=0 WHERE physical=?1 AND (?2 IS NULL OR guest_port=?2)",params![physical,port])?;
+            for https in &ports {
+                let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+                for (_, key, notify) in sessions.iter() {
+                    if key == &format!("preview:{https}") {
+                        notify.upgrade().inspect(|n| n.notify_one());
+                    }
+                }
+                drop(sessions);
+            }
+            for https in ports {
+                serve(https, false)?;
+            }
+            Ok(json!({"id":name,"published_ports":self.publications(&physical)?}))
+        }
+    }
+
+    pub fn preview_target(&self, user: i64, https: u16) -> Result<crate::preview::Target> {
+        let (physical, port): (String,u16) = self.db.query_row("SELECT p.physical,p.guest_port FROM publications p JOIN resources r ON r.kind='machine' AND r.physical=p.physical WHERE p.https_port=?1 AND p.active=1",[https],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let name = self
+            .logical(user, "machine", &physical)?
+            .context("not shared")?;
+        let node = self.placement("machine", &physical)?;
+        nodes::operation_capable(&self.root, &node, "tunnel")?;
+        let revoked = self.watched(user, &name, "preview", &physical)?;
+        Ok(crate::preview::Target {
+            root: nodes::route(&self.root, &node)?,
+            id: physical,
+            port,
+            revoked,
+            unpublished: session(user, &format!("preview:{https}")),
+        })
+    }
+
     /// Register a stream, then check access again: unshare runs outside the catalog lock, so a
     /// grant deleted before this check denies the stream and one deleted after it cuts it.
     fn watched(

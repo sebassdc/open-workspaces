@@ -1027,3 +1027,99 @@ fn disk_resize_is_owner_only_and_requires_a_capable_stopped_runner() {
         64 * common::GIB
     );
 }
+
+#[tokio::test]
+async fn preview_publication_is_owner_only_durable_and_never_reassigns_origins() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let alice = c.user(&identity("alice")).unwrap();
+    let bob = c.user(&identity("bob")).unwrap();
+    let eve = c.user(&identity("eve")).unwrap();
+    c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata) VALUES(?1,'machine','demo','physical-a','{}')",[alice]).unwrap();
+    let request = json!({"op":"publish","id":"demo","port":3000});
+    let first = c.publication(alice, &request, |_, _| Ok(())).unwrap();
+    let https = first["https_port"].as_u64().unwrap() as u16;
+    assert!(c.preview_target(alice, https).is_ok());
+    assert!(c.preview_target(bob, https).is_err());
+    c.operation(
+        alice,
+        json!({"op":"share","id":"demo","with":"bob@example.test","role":"admin"}),
+    )
+    .unwrap();
+    let shared = c.preview_target(bob, https).unwrap();
+    let mut nonowner = request.clone();
+    nonowner["id"] = json!("alice@example.test/demo");
+    assert!(
+        c.publication(bob, &nonowner, |_, _| panic!("must not configure Serve"))
+            .is_err()
+    );
+    assert!(c.preview_target(eve, https).is_err());
+    c.operation(
+        alice,
+        json!({"op":"unshare","id":"demo","with":"bob@example.test"}),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_millis(100), shared.revoked.notified())
+        .await
+        .unwrap();
+    assert!(c.preview_target(bob, https).is_err());
+    c.publication(
+        alice,
+        &json!({"op":"unpublish","id":"demo","port":3000}),
+        |_, _| Err(anyhow::anyhow!("serve offline")),
+    )
+    .unwrap_err();
+    assert!(
+        c.preview_target(alice, https).is_err(),
+        "fail closed even if route removal fails"
+    );
+    assert_eq!(
+        first,
+        c.publication(alice, &request, |_, _| Ok(())).unwrap()
+    );
+    // A failed creation is reserved but cannot forward anything.
+    assert!(
+        c.publication(
+            alice,
+            &json!({"op":"publish","id":"demo","port":4000}),
+            |_, _| Err(anyhow::anyhow!("conflict"))
+        )
+        .is_err()
+    );
+    assert_eq!(
+        c.publications("physical-a")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(c);
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(
+        first,
+        c.publication(alice, &request, |_, _| Ok(())).unwrap()
+    );
+    c.forget(alice, "physical-a").unwrap();
+    assert!(c.preview_target(alice, https).is_err());
+    c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata) VALUES(?1,'machine','demo','physical-b','{}')",[alice]).unwrap();
+    let next = c.publication(alice, &request, |_, _| Ok(())).unwrap();
+    assert!(
+        next["https_port"].as_u64().unwrap() > https as u64,
+        "new box cannot inherit old browser storage"
+    );
+    for invalid in [
+        json!(0),
+        json!(65536),
+        json!(-1),
+        json!("3000"),
+        json!(null),
+    ] {
+        let mut bad = request.clone();
+        bad["port"] = invalid;
+        assert!(
+            c.publication(alice, &bad, |_, _| panic!("invalid port reached helper"))
+                .is_err()
+        );
+    }
+}

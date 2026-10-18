@@ -2,6 +2,47 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.8.0",
+      "class": 1,
+      "changes": [
+        "controller",
+        "agent",
+        "dashboard",
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "catalog": {
+        "schema": 3,
+        "min_reader": 3
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Tailnet-only per-box HTTP/WebSocket previews with existing ownership/sharing grants, isolated HTTPS origins, persistent catalog routes and a restricted Serve helper. Upgrade controller/dashboard and runner agents; workers and running boxes remain untouched.",
+      "waivers": {
+        "worker": "host.rs changes only local CLI unpublish dispatch; the worker and existing tunnel protocol are unchanged."
+      }
+    },
+    {
       "version": "0.7.3",
       "class": 0,
       "changes": [

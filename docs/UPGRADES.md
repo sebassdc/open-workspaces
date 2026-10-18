@@ -275,3 +275,18 @@ Found and fixed during the run: developer images never built on a layout v2
 host (the build VM's socket path under `/srv/ow/releases/…` is longer than
 Linux allows); the component did not compile for a consumer without
 `strictNullChecks`.
+
+## Tailnet previews (v0.8.0)
+
+Class 1: update the controller/dashboard and every runner agent, including the
+agent on the controller host. Existing workers, runtime protocol and guest
+images are unchanged; no box hibernation, stop or restart is needed. The host
+layout installs the restricted `preview-serve` helper and its sudo rule.
+The helper manages only dedicated HTTPS ports 11000–65535, with a fixed
+loopback dashboard upstream; unrelated Serve listeners are never reset.
+
+Publication records are an additive catalog table; the schema/read floor stays
+at 3 and older binaries ignore it. Older gateways never route preview hosts.
+No new dashboard JSON config keys are written, preserving older gateway config
+readability during rollback. Upgrade runner agents before accepting previews
+on them: older agents reject the additive `tunnel` stream operation.
