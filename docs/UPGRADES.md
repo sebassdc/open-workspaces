@@ -236,3 +236,42 @@ going back to an older tag was refused because its manifest predates what runs.
 Not run on the host (covered by `test_upgrade.py`): abort after a partial
 hibernate, the guest-kernel-only refusal, the protocol bridge refusal, and a
 catalog schema change (the catalog stays at schema 3 through 0.5.x).
+
+## Sandbox EC2 check: a Runner (2026-10-18)
+
+Observed on a throwaway stack in the sandbox account, destroyed afterwards: a
+Host `ow-wrk14` (m8i-flex.xlarge, 4 vCPUs, 16 GiB) and a Runner `ow-wrk14r`
+(m8i-flex.2xlarge, 8 vCPUs, 32 GiB, Intel Xeon 6975P-C), both on AMI
+`ami-02a9cdd4e98bc3c78` (host kernel 7.0.0-1014-aws), `developerImages:
+["ubuntu"]`, `idleMinutes: 0`, an `ArtifactStore` for backups. The releases were
+this branch plus test tags (version bumps and manifest entries). A box `keep1`
+on the Host's own runner ran a counter (`echo $n > /tmp/t` every second) for the
+whole run; its PID and guest uptime were read after every step. Each
+measurement is a single run (n = 1), so no p50/p95.
+
+| Step | Result |
+| --- | --- |
+| `pulumi preview` adding the Runner to a running Host | 15 creates (the Runner's resources and the controller role's `ow-wrk14r-invite` policy); nothing of the Host changes |
+| `ow-aws --host ow-wrk14 runner-add ow-wrk14r` | 35 s: join minted on the controller into the runner's secret, redeemed, secret overwritten with `{"used": …}`, runner online (23664 MiB, 8 slots, 8 vCPUs) |
+| Placement | four automatic creates alternated between the two runners; `--node` put a box on each |
+| Runner 2 box lifecycle | create, exec, terminal (`ow shell` through a pty), SSH as `dev` (Ubuntu box, `ow ssh-config` with a pinned host key), snapshot, fork (the fork stayed on runner 2 with the source's files), hibernate (4.8 s) and wake on exec (same PID, counter carried on) |
+| Golden image | the same recipe built on each runner (`ow-aws --host … image`); both advertised it without a restart and booted a box from it |
+| Runner 2 control-plane restart | 10 s; runner 2 box process kept |
+| Runner 2 worker restart | 103 s, six boxes hibernated and resumed with their processes |
+| Runner 2 in place: v0.6.0 (claims protocol 2) with the controller on 0.5.0 | refused at plan: "the controller (0.5.0) accepts protocol 1..1 … upgrade the controller first" |
+| Runner 2 in place: class 1, then class 2 | 268 s and 365 s (both mostly the build); the runner ran agent 0.5.1 and worker 0.5.2 against a 0.5.0 controller |
+| Controller class 1, then the runner | controller 264 s, runner 2's Firecracker PIDs and box process unchanged; then the runner's agent followed (`Stopped: no jobs in flight.`, then `agent.json` online with 0.5.1) |
+| Runner 2 offline (`ow-aws stop`) | 110 s; its boxes listed `offline`, an automatic create went to runner 1, `--node ow-wrk14r` and exec on its boxes were refused; `ow-aws start` (96 s) resumed all six with their processes |
+| Runner 2 replacement (`pulumi up --replace` its instance) | 73 s; only its instance and volume attachment replaced, 32 resources unchanged; it came back as node `ow-wrk14r` (credential on the data volume), `ci-post-up` 44 s, a box resumed warm on exec |
+| Admission | filling with 2048 MiB boxes: runner 1 stopped at 4 of 4 vCPUs, runner 2 at 8 of 8 slots; the next create and a 256 MiB one were refused |
+| Backups | `ow-backup` on each: the catalog and runner 1's captures under `PREFIX/`, runner 2's captures under `PREFIX/runners/ow-wrk14r/snapshots` only; `ow-aws --host ow-wrk14r backups` lists them with owners (run on the controller) |
+| Dashboard | `/api/state` over the tailnet listed both nodes and every box with its node |
+| Runner removal | `runner-remove` refused while online; after the Runner was destroyed (15 deletes, 19 unchanged), it revoked the node |
+
+`keep1` kept the same PID through every step above (its counter matched its
+uptime), except where it was hibernated on purpose.
+
+Found and fixed during the run: developer images never built on a layout v2
+host (the build VM's socket path under `/srv/ow/releases/…` is longer than
+Linux allows); the component did not compile for a consumer without
+`strictNullChecks`.
