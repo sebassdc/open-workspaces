@@ -688,7 +688,9 @@ impl Runtime {
 
     fn workspace_summary(&self, id: &str) -> Result<Value> {
         let mut summary = json!(self.workspace(id)?);
-        let usage = disk::summary(&self.machine_dir(id).join("disk.ext4"))?;
+        let usage = disk::summary(&self.machine_dir(id).join("disk.ext4")).unwrap_or_else(
+            |_| json!({"disk_bytes":null,"disk_used_bytes":null,"disk_allocated_bytes":null}),
+        );
         summary
             .as_object_mut()
             .unwrap()
@@ -1439,6 +1441,73 @@ mod disk_tests {
             idle: crate::idle::Idle::from_env().unwrap(),
             closing: false,
         }
+    }
+
+    #[test]
+    fn unavailable_disk_does_not_hide_other_workspaces() {
+        let mut runtime = fixture();
+        let mut missing = runtime.workspace("legacy").unwrap();
+        missing.id = "missing".into();
+        runtime.state.workspaces.insert(missing.id.clone(), missing);
+        let healthy = runtime
+            .request(&json!({"op":"inspect","id":"legacy"}))
+            .unwrap();
+        assert_eq!(healthy["disk_bytes"], 8 * GIB);
+        let listed = runtime.request(&json!({"op":"list"})).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+        assert_eq!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["id"] == "legacy")
+                .unwrap(),
+            &healthy
+        );
+        let missing = runtime
+            .request(&json!({"op":"inspect","id":"missing"}))
+            .unwrap();
+        assert_eq!(missing["state"], "stopped");
+        for key in ["disk_bytes", "disk_used_bytes", "disk_allocated_bytes"] {
+            assert_eq!(missing.get(key), Some(&Value::Null));
+        }
+        assert_eq!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["id"] == "missing")
+                .unwrap(),
+            &missing
+        );
+        assert!(
+            runtime
+                .request(&json!({"op":"inspect","id":"unknown"}))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .request(&json!({"op":"start","id":"missing"}))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .request(&json!({"op":"resize","id":"missing","disk_gib":2}))
+                .is_err()
+        );
+        assert_eq!(runtime.workspace("missing").unwrap().state, "stopped");
+        fs::create_dir(runtime.machine_dir("missing")).unwrap();
+        File::create(runtime.machine_dir("missing").join("disk.ext4"))
+            .unwrap()
+            .set_len(GIB)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .request(&json!({"op":"inspect","id":"missing"}))
+                .unwrap()["disk_bytes"],
+            GIB
+        );
+        fs::remove_dir_all(&runtime.root).unwrap();
     }
 
     #[test]

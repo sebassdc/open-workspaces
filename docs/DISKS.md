@@ -92,6 +92,10 @@ No runtime quota or snapshot garbage collector is added by this feature.
 - `disk_allocated_bytes`: host blocks attributed to the sparse file; shared
   extents can appear in more than one file's count.
 
+If a disk is missing or unreadable, its three disk fields are `null`; its
+workspace record and other boxes on the runner remain visible. This reporting
+fallback does not bypass the disk checks required to start a box or grow its disk.
+
 The dashboard shows capacity and filesystem use on each machine card. Offline
 runner values are cached, as with other machine metadata. Inside a resized box,
 `df -h /` shows its expanded filesystem after start.

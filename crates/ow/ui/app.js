@@ -83,7 +83,7 @@ function openDialog(op, id, snapshot) {
   if (op === 'create' || op === 'resize') {
     const size = op === 'resize' ? Math.ceil((machine()?.disk_bytes || 0) / 1073741824) : 32;
     const disk = field('disk_gib', 'Root disk (GiB)', String(size || 32));
-    const input = disk.querySelector('input'); input.type = 'number'; input.removeAttribute('pattern'); input.removeAttribute('maxlength'); input.min = String(Math.max(1, size)); input.max = '16384'; input.step = '1';
+    const input = disk.querySelector('input'); input.type = 'number'; input.removeAttribute('pattern'); input.removeAttribute('maxlength'); input.min = op === 'create' ? '1' : String(Math.max(1, size)); input.max = '16384'; input.step = '1';
     $('dialog-fields').append(disk);
   }
   if (op === 'create') {

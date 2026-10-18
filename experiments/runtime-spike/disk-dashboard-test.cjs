@@ -53,6 +53,7 @@ const server = http.createServer(async (req,res) => {
     await page.getByRole('button',{name:'Resize',exact:true}).click();
     const disk=page.locator('[name=disk_gib]');
     assert.equal(await disk.inputValue(),'8'); assert.equal(await disk.getAttribute('min'),'8');
+    await disk.fill('7'); assert.equal(await disk.evaluate(el=>el.checkValidity()),false);
     await disk.fill('64'); await page.locator('#dialog-submit').click();
     await page.locator('#operation-dialog').waitFor({state:'hidden'});
     const resize=requests.at(-1);assert.equal(resize.op,'resize');assert.equal(resize.disk_gib,64);
@@ -70,6 +71,21 @@ const server = http.createServer(async (req,res) => {
     }
     await page.locator('#dialog-submit').click();await page.locator('#operation-dialog').waitFor({state:'hidden'});
     assert.equal(requests.at(-1).disk_gib,64);assert.equal(requests.at(-1).op,'create');
+    for (const [size,width,height] of [[16,390,844],[1,1440,1000]]) {
+      await page.setViewportSize({width,height});
+      await page.locator('#create').click();
+      assert.equal(await disk.inputValue(),'32');
+      await page.locator('[name=id]').fill(`small-${size}`);
+      await disk.fill('0'); assert.equal(await disk.evaluate(el=>el.checkValidity()),false);
+      await disk.fill(String(size));
+      assert.equal(await disk.evaluate(el=>el.checkValidity()),true,`${size} GiB must be valid for creation`);
+      await page.screenshot({path:path.join(output,`create-${size}gib.png`)});
+      const count=requests.length;
+      await page.locator('#dialog-submit').click();
+      await page.locator('#operation-dialog').waitFor({state:'hidden'});
+      assert.equal(requests.length,count+1);assert.equal(requests.at(-1).disk_gib,size);
+      assert.equal(requests.at(-1).image,'alpine');
+    }
     assert.deepEqual(errors,[]);
     fs.writeFileSync(path.join(output,'result.json'),JSON.stringify({passed:true,baseline:execFileSync('git',['rev-parse',baseRef],{cwd:root,encoding:'utf8'}).trim(),ui_sha256:createHash('sha256').update(fs.readFileSync(path.join(ui,'app.js'))).digest('hex'),fixture:'same fixed owner/stopped, owner/running, shared/admin boxes',requests,errors},null,2));
     console.log('PASS: create, disk-only resize, defaults, owner/state controls, Mac refusal, desktop/narrow rendering');
