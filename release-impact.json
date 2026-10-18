@@ -7,7 +7,9 @@
       "changes": [
         "worker",
         "controller",
-        "dashboard"
+        "dashboard",
+        "component",
+        "host-layout"
       ],
       "protocol": {
         "speaks": 1,
@@ -36,7 +38,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "Capture admission reserves new RAM and host headroom without reserving the existing disk again. Failed captures clean staging, named limits exclude internal captures, and failed operation causes persist with safe client guidance. Worker move uses normal hibernate/resume; no guest disk migration or cold boot is required."
+      "notes": "Capture admission reserves new RAM and host headroom without reserving the existing disk again. Failed captures clean staging, named limits exclude internal captures, and failed operation causes persist with safe client guidance. Worker move uses normal hibernate/resume; no guest disk migration or cold boot is required. Optional dashboardCapability is carried through the component and in-place host config to dashboard admission, with fresh Tailscale grant checks and terminal/SSH revocation. Host layout remains v2 and stage 0 is unchanged; no instance replacement is required."
     },
     {
       "version": "0.7.3",
