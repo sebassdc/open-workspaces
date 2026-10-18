@@ -2,7 +2,7 @@
   "schema": 1,
   "releases": [
     {
-      "version": "0.6.1",
+      "version": "0.6.2",
       "class": 1,
       "changes": ["controller", "agent", "dashboard"],
       "protocol": { "speaks": 1, "accepts": [1, 1] },
@@ -16,6 +16,22 @@
       "host_layout": 2,
       "in_place_from": "0.5.0",
       "notes": "SSH proxy throughput: readiness-driven client and node streams; actionable running-box delete and SSH enrollment errors. Update clients as well as controller, agent and dashboard. Worker, guest images and protocols are unchanged; no host replacement required."
+    },
+    {
+      "version": "0.6.1",
+      "class": 0,
+      "changes": ["component"],
+      "protocol": { "speaks": 1, "accepts": [1, 1] },
+      "worker_protocol": { "speaks": 1, "accepts": [1, 1] },
+      "catalog": { "schema": 3, "min_reader": 3 },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": ["firecracker-v1.17.0"]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Component fix: `pulumi package add` failed on 0.6.0 (Runner not found). Runner extends ComponentResource itself and takes its controller as { hostName, roleName }. Hosts are unchanged."
     },
     {
       "version": "0.6.0",

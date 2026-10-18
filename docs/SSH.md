@@ -142,7 +142,7 @@ The CLI and outbound node drain available WebSocket bytes and check local input
 before waiting on either descriptor. They do not wait for a reply after every
 upload chunk or wait for client input before forwarding guest output. Reads
 check buffered TLS/WebSocket data too; writes retain their existing deadlines.
-Update both the client and node agent to v0.6.1 or newer for this behavior.
+Update both the client and node agent to v0.6.2 or newer for this behavior.
 
 Outbound node jobs retain existing 64 KiB transport frames, one-use job binding,
 controller capacity, 10-second dispatch and 5-second writes. Revocation/session

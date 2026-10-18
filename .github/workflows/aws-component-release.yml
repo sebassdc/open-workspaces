@@ -22,6 +22,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      # test/schema.test.mjs generates the package schema as `pulumi package add` does.
+      - uses: pulumi/actions@v5
       - run: npm ci --no-audit --no-fund
       - run: npm run check
       - name: Check SSH throughput and actionable errors before tagging
@@ -36,7 +38,11 @@ jobs:
         run: |
           tag="v$(node -p 'require("./package.json").version')"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            echo "$tag already exists"
+            if [ "$(git rev-parse "$tag^{commit}")" != "$GITHUB_SHA" ]; then
+              echo "::error::$tag already names a different commit; choose a fresh release version"
+              exit 1
+            fi
+            echo "$tag already names this commit"
           else
             git tag "$tag" "$GITHUB_SHA"
             git push origin "refs/tags/$tag"
