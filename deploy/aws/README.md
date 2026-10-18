@@ -44,7 +44,7 @@ checks fail while they disagree. The same tag is the default `ref` the host
 builds, so set `ref` explicitly before the first release exists.
 
 ```bash
-pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.6.1
+pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.7.1
 ```
 
 ```typescript
@@ -69,6 +69,7 @@ export const instanceId = host.instanceId;
 | `tags` | `{}` | Applied to every resource. |
 | `tailscaleAuthKeySecretArn` | none | Full secret ARN; the secret string is the raw auth key. |
 | `tailscaleHostname` | component name | |
+| `tailscaleDirect` | none | `{ subnetId: "subnet-public" }`: secondary interface and Elastic IP for UDP 41641 only. Public subnet must be in the same VPC/AZ, with an internet gateway route. Needs `tailscaleAuthKeySecretArn`; leaves the running host in its private subnet. |
 | `tailscaleSsh` | `false` | Tailscale SSH, authorized by your tailnet policy. |
 | `dashboardLogins` | none | Tailnet logins allowed into the web dashboard. Needs `tailscaleAuthKeySecretArn`; see below. |
 | `developerImages` | none | `["ubuntu"]`: build the [developer image](../../docs/GUEST_IMAGES.md) (user `dev`, SSH server, toolchains) after boot. SSH into boxes and golden-image recipes need it. |
@@ -80,13 +81,13 @@ Outputs: `instanceId`, `privateIp`, `availabilityZone`, `dataVolumeId`,
 `roleName`, `securityGroupId`, `configParameter`.
 
 Every input except `instanceType`, `subnetId`, `associatePublicIpAddress`,
-`amiId`, `dataVolumeSizeGib` and `tags` lives in the config parameter. After
+`amiId`, `dataVolumeSizeGib`, `tailscaleDirect` and `tags` lives in the config parameter. After
 `pulumi up` changes it, apply it with `ow-aws apply` (or `ci-post-up`, which also
 upgrades); the host keeps the last applied copy on its data volume.
 
 ## Reach the host
 
-There are no inbound ports. Use SSM:
+By default there are no inbound ports. SSM also works with `tailscaleDirect`:
 
 ```bash
 aws ssm start-session --target "$(pulumi stack output instanceId)"
@@ -126,6 +127,31 @@ auth key is read once at boot into a root-only file under `/run`, passed to
 bootstrap; SSM keeps working. The Tailscale state (`/var/lib/tailscale`) is kept
 on the data volume, so a replaced host (new AMI or stage 0) comes back as the
 same tailnet device, with the same name and address.
+
+## Direct Tailscale connections
+
+By default the primary security group has no inbound rules. For a host behind
+NAT, opt into `tailscaleDirect: { subnetId: "subnet-public" }`: the component
+hot-attaches an interface at device index 1 with its own security group and
+Elastic IP. Its only inbound rule is IPv4 UDP 41641; egress on that interface
+is UDP only (peer ports vary). The primary interface and its security group,
+instance inputs and user data stay identical. Device index 1 must be free.
+The public subnet must route `0.0.0.0/0` to an internet gateway; allocating a
+public IPv4 incurs your provider's usual charge.
+
+After `pulumi up`, `ow-aws ci-post-up` upgrades and applies the host files in
+place. Ubuntu 24.04's networkd config matches the new interface by MAC, obtains
+its address and gateway by DHCP in routing table 41641, and routes only locally
+originated UDP source port 41641 through it (priority 5100, before Tailscale's
+rules). Other traffic keeps its primary route, DNS and NTP. A Tailscale service
+drop-in pins its port to 41641; installing/removing it restarts only tailscaled
+(a brief tailnet reconnect). SSH and the dashboard keep their existing tailnet
+bindings; the public interface permits neither TCP service. No worker or box
+is restarted. Removing the input removes these resources, policy route and
+port override. Check `tailscale ping HOST` from another tailnet device for a
+direct public endpoint, and `ip route get 1.1.1.1 ipproto udp sport 41641` on
+the host for the secondary interface. Other peers' firewalls can still prevent
+a direct connection.
 
 ## Dashboard over the tailnet
 

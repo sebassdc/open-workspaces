@@ -53,6 +53,9 @@ PENDING = f"{DATA}/pending.json"
 HOST_ENV = "/etc/open-workspaces/host.env"
 STATUS = "/var/lib/open-workspaces/bootstrap-status"
 SETUP_DUE = "/var/lib/open-workspaces/setup-due.json"
+DIRECT_NETWORK = "/etc/systemd/network/05-open-workspaces-tailscale.network"
+DIRECT_PORT = "/etc/systemd/system/tailscaled.service.d/90-open-workspaces-direct.conf"
+DIRECT_ENV = "/etc/open-workspaces/tailscale-direct.env"
 UNITS = {
     "worker": "open-workspaces-worker.service",
     "agent": "open-workspaces.service",
@@ -180,6 +183,12 @@ def validate(config):
         raise Refused(f"config: tailscale.hostname {tailscale['hostname']!r} is invalid")
     if not isinstance(tailscale["ssh"], bool):
         raise Refused("config: tailscale.ssh must be true or false")
+    direct = tailscale.get("direct")
+    if direct is not None:
+        if (not isinstance(direct, dict) or set(direct) != {"mac"}
+                or not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", str(direct.get("mac", "")))
+                or not tailscale["secretArn"]):
+            raise Refused("config: tailscale.direct needs a MAC and tailscale.secretArn")
     logins = (config.get("dashboard") or {}).get("logins") or []
     for login in logins:
         if not isinstance(login, str) or not LOGIN.match(login) or len(login) > 254:
@@ -432,11 +441,42 @@ WantedBy=timers.target
 """,
                 0o644,
             )
+    direct = config["tailscale"].get("direct")
+    if direct:
+        files[DIRECT_NETWORK] = (f"""[Match]
+MACAddress={direct['mac']}
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=no
+LinkLocalAddressing=no
+IPv4ReversePathFilter=loose
+
+[DHCPv4]
+RouteTable=41641
+UseDNS=no
+UseNTP=no
+UseHostname=no
+
+[RoutingPolicyRule]
+Family=ipv4
+IncomingInterface=lo
+IPProtocol=udp
+SourcePort=41641
+Table=41641
+Priority=5100
+""", 0o644)
+        files[DIRECT_PORT] = (f"[Service]\nEnvironmentFile={DIRECT_ENV}\n", 0o644)
+        files[DIRECT_ENV] = ("PORT=41641\n", 0o644)
     return files
 
 
 # Every path render can produce: a feature turned off removes its files.
 OWNED = (
+    DIRECT_NETWORK, DIRECT_PORT, DIRECT_ENV,
     "/etc/open-workspaces/worker.env",
     "/etc/open-workspaces/dashboard.env",
     "/etc/open-workspaces/backup.env",
@@ -493,6 +533,14 @@ def setup(config):
         due.add("daemon-reload")
     if "/etc/apparmor.d/open-workspaces" in ahead:
         due.add("apparmor")
+    if DIRECT_NETWORK in ahead:
+        for text in (p(DIRECT_NETWORK).read_text() if p(DIRECT_NETWORK).exists() else "",
+                     files.get(DIRECT_NETWORK, ("",))[0]):
+            match = re.search(r"^MACAddress=(.+)$", text, re.M)
+            if match:
+                due.add(f"direct-network:{match[1]}")
+    if DIRECT_PORT in ahead or DIRECT_ENV in ahead:
+        due.add("tailscale-restart")
     if due:
         write_json(SETUP_DUE, sorted(due))
     changed = set()
@@ -510,6 +558,35 @@ def setup(config):
         systemctl("daemon-reload")
     if "apparmor" in due:
         run(["apparmor_parser", "-r", "/etc/apparmor.d/open-workspaces"])
+    network = {item.split(":", 1)[1] for item in due if item.startswith("direct-network:")}
+    if network:
+        run(["networkctl", "reload"])
+        direct = config["tailscale"].get("direct")
+        # Hot attachment can finish after stage 0 has started; never reconfigure the primary link.
+        deadline = time.monotonic() + 60
+        while True:
+            links = json.loads(run(["ip", "-j", "link", "show"]))
+            interfaces = {link["address"]: link["ifname"] for link in links if link.get("address") in network}
+            if not direct or direct["mac"] in interfaces:
+                break
+            if time.monotonic() >= deadline:
+                raise Refused("Tailscale direct interface has not attached; retry ow-host apply")
+            time.sleep(1)
+        for interface in interfaces.values():
+            run(["networkctl", "reconfigure", interface])
+        if direct:
+            while True:
+                routes = json.loads(run(["ip", "-j", "route", "get", "1.1.1.1", "ipproto", "udp", "sport", "41641"]))
+                if routes and routes[0].get("dev") == interfaces[direct["mac"]]:
+                    break
+                if time.monotonic() >= deadline:
+                    raise Refused("Tailscale direct DHCP route is not ready; retry ow-host apply")
+                time.sleep(1)
+        else:
+            run(["ip", "rule", "del", "priority", "5100", "ipproto", "udp", "sport", "41641", "table", "41641"], check=False)
+            run(["ip", "route", "flush", "table", "41641"], check=False)
+    if "tailscale-restart" in due and active("tailscaled.service"):
+        systemctl("restart", "tailscaled.service")
     if due:
         p(SETUP_DUE).unlink()
     return changed

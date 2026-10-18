@@ -6,6 +6,11 @@ import * as pulumi from "@pulumi/pulumi";
 export { ArtifactStore, storeLifecycleRules, tlsOnlyPolicy } from "./store";
 export type { ArtifactStoreArgs } from "./store";
 
+export interface TailscaleDirectArgs {
+    /** Public subnet in the host's VPC and availability zone, routed to an internet gateway. */
+    subnetId: pulumi.Input<string>;
+}
+
 export interface HostArgs {
     /** Nested-virtualization type: c8i, m8i, r8i or their flex variants. */
     instanceType?: pulumi.Input<string>;
@@ -32,6 +37,8 @@ export interface HostArgs {
     tailscaleHostname?: pulumi.Input<string>;
     /** Enable Tailscale SSH, authorized by the tailnet policy. */
     tailscaleSsh?: pulumi.Input<boolean>;
+    /** Attach a secondary interface and Elastic IP for direct Tailscale UDP 41641 only; never moves or stops the host. */
+    tailscaleDirect?: pulumi.Input<TailscaleDirectArgs>;
     /**
      * Tailnet logins (for example `you@example.com`) allowed into the web dashboard.
      * The dashboard listens on loopback and is served to the tailnet only, through
@@ -66,6 +73,8 @@ export interface HostArgs {
 
 /** A runner host: everything a Host takes except the dashboard, plus the controller it joins. */
 export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins"> {
+    // The package analyzer loses nested optional types inherited through Omit.
+    tailscaleDirect?: pulumi.Input<TailscaleDirectArgs>;
     /**
      * The Host whose controller this runner joins (a Host itself fits): its component
      * name and role. That role may write this runner's join secret; nothing of that host
@@ -147,6 +156,7 @@ export interface HostConfigInputs {
     backupUrl: string;
     backupSchedule: string;
     idleMinutes: number;
+    directMac?: string;
 }
 
 /**
@@ -156,6 +166,9 @@ export interface HostConfigInputs {
 export function hostConfig(c: HostConfigInputs): object {
     if (c.dashboardLogins.length > 0 && !c.tailscaleAuthKeySecretArn) {
         throw new Error("dashboardLogins needs tailscaleAuthKeySecretArn: the dashboard is served over the tailnet only");
+    }
+    if (c.directMac && (!c.tailscaleAuthKeySecretArn || !/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(c.directMac))) {
+        throw new Error("tailscaleDirect needs tailscaleAuthKeySecretArn and a valid interface MAC");
     }
     dashboardLoginList(c.dashboardLogins);
     const backup = c.backupUrl ? backupLocation(c.backupUrl) : undefined;
@@ -183,13 +196,25 @@ export function hostConfig(c: HostConfigInputs): object {
         schema: 1,
         role: c.runner ? "runner" : "host",
         release: { repository: c.repository, ref: c.ref },
-        tailscale: { secretArn: c.tailscaleAuthKeySecretArn, hostname: c.tailscaleHostname, ssh: c.tailscaleSsh },
+        tailscale: { secretArn: c.tailscaleAuthKeySecretArn, hostname: c.tailscaleHostname, ssh: c.tailscaleSsh,
+            ...(c.directMac ? { direct: { mac: c.directMac } } : {}) },
         dashboard: { logins: c.dashboardLogins },
         developerImages: images ? images.split(" ") : [],
         backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule },
         idleMinutes: c.idleMinutes,
         ...(c.runner ? { runner: c.runner } : {}),
     };
+}
+
+/** A hot-attached interface must stay in this VPC/AZ, on its own public subnet. */
+export function tailscaleDirectSubnet(
+    host: Pick<aws.ec2.GetSubnetResult, "id" | "vpcId" | "availabilityZone">,
+    direct: Pick<aws.ec2.GetSubnetResult, "id" | "vpcId" | "availabilityZone">,
+): string {
+    if (host.vpcId !== direct.vpcId || host.availabilityZone !== direct.availabilityZone || host.id === direct.id) {
+        throw new Error("tailscaleDirect needs a separate public subnet in the host's VPC and availability zone");
+    }
+    return direct.id;
 }
 
 /** A runner's node ID is its component name: 1 to 32 letters, digits, `-` or `_`. */
@@ -343,6 +368,27 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
             }, parent);
             runner = join.arn.apply((arn): RunnerConfig | undefined => ({ node: name, controller: controller.hostName, joinSecretArn: arn }));
         }
+        let directInterface: aws.ec2.NetworkInterface | undefined;
+        if (args.tailscaleDirect) {
+            if (!args.tailscaleAuthKeySecretArn) throw new Error("tailscaleDirect needs tailscaleAuthKeySecretArn");
+            const directSubnet = aws.ec2.getSubnetOutput({ id: pulumi.output(args.tailscaleDirect).apply((direct) => direct.subnetId) }, parent);
+            const checkedSubnet = pulumi.all([subnet, directSubnet]).apply(([host, direct]) => tailscaleDirectSubnet(host, direct));
+            const directSg = new aws.ec2.SecurityGroup(`${name}-tailscale-direct`, {
+                description: "Direct Tailscale WireGuard only",
+                vpcId: subnet.vpcId,
+                ingress: [{ protocol: "udp", fromPort: 41641, toPort: 41641, cidrBlocks: ["0.0.0.0/0"] }],
+                // Peers can listen on any UDP port; STUN also uses this socket.
+                egress: [{ protocol: "udp", fromPort: 0, toPort: 65535, cidrBlocks: ["0.0.0.0/0"] }],
+                tags: named,
+            }, parent);
+            directInterface = new aws.ec2.NetworkInterface(`${name}-tailscale-direct`, {
+                subnetId: checkedSubnet, securityGroups: [directSg.id], tags: named,
+            }, parent);
+            const address = new aws.ec2.Eip(`${name}-tailscale-direct`, { domain: "vpc", tags: named }, parent);
+            new aws.ec2.EipAssociation(`${name}-tailscale-direct`, {
+                allocationId: address.id, networkInterfaceId: directInterface.id,
+            }, parent);
+        }
         // Everything the host applies in place: user data only bootstraps (stage 0), so a
         // config or release change updates this parameter and never replaces the instance.
         const config = new aws.ssm.Parameter(`${name}-config`, {
@@ -356,11 +402,12 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                     pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? []]),
                     pulumi.all([backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30]),
                     runner,
+                    directInterface ? directInterface.macAddress : pulumi.output(""),
                 ])
-                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images], [backupUrl, backupSchedule, idleMinutes], runner]) =>
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images], [backupUrl, backupSchedule, idleMinutes], runner, directMac]) =>
                     JSON.stringify(hostConfig({
                         repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
-                        dashboardLogins: logins, developerImages: images, backupUrl, backupSchedule, idleMinutes, runner,
+                        dashboardLogins: logins, developerImages: images, backupUrl, backupSchedule, idleMinutes, runner, directMac,
                     })),
                 ),
             tags,
@@ -421,6 +468,12 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
             tags: named,
             volumeTags: named,
         }, { parent: self, deleteBeforeReplace: true, dependsOn: [configRead] });
+
+        if (directInterface) {
+            new aws.ec2.NetworkInterfaceAttachment(`${name}-tailscale-direct`, {
+                instanceId: instance.id, networkInterfaceId: directInterface.id, deviceIndex: 1,
+            }, parent);
+        }
 
         new aws.ec2.VolumeAttachment(`${name}-data`, {
             instanceId: instance.id,

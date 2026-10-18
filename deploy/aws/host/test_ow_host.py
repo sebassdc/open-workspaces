@@ -95,6 +95,23 @@ class Render(unittest.TestCase):
         self.assertLessEqual(set(h.RESTARTS.values()), set(h.PINS))
 
 
+    def test_direct_tailscale_routes_only_local_wireguard_and_pins_port(self):
+        direct = config(tailscale__direct={"mac": "02:00:00:00:00:01"})
+        files = {k: v[0] for k, v in h.render(direct, BUDGET).items()}
+        net = files[h.DIRECT_NETWORK]
+        for line in ("MACAddress=02:00:00:00:00:01", "RouteTable=41641", "IncomingInterface=lo",
+                     "IPProtocol=udp", "SourcePort=41641", "Priority=5100", "IPv4ReversePathFilter=loose",
+                     "UseDNS=no", "UseNTP=no"):
+            self.assertIn(line, net)
+        self.assertIn(f"EnvironmentFile={h.DIRECT_ENV}", files[h.DIRECT_PORT])
+        self.assertEqual(files[h.DIRECT_ENV], "PORT=41641\n")
+        for path in (h.DIRECT_NETWORK, h.DIRECT_PORT, h.DIRECT_ENV):
+            self.assertNotIn(path, self.files)
+        self.assertEqual(h.units_changed({h.DIRECT_NETWORK, h.DIRECT_PORT, h.DIRECT_ENV}), set())
+        self.assertEqual(files["/etc/systemd/system/open-workspaces-worker.service"],
+                         self.files["/etc/systemd/system/open-workspaces-worker.service"])
+
+
 class Validate(unittest.TestCase):
     def test_bad_values_are_refused(self):
         for key, value in [("dashboard__logins", ["no-at-sign"]), ("dashboard__logins", ["$(id)@x"]),
@@ -110,6 +127,13 @@ class Validate(unittest.TestCase):
             config(tailscale__secretArn="")
         with self.assertRaisesRegex(Refused, "schema"):
             h.validate({"schema": 2})
+
+    def test_direct_tailscale_validates_untrusted_config(self):
+        for bad in ({}, {"mac": "$(id)"}, {"mac": "02:00:00:00:00:01", "port": 22}, "bad"):
+            with self.assertRaisesRegex(Refused, "tailscale.direct"):
+                config(tailscale__direct=bad)
+        with self.assertRaisesRegex(Refused, "tailscale.direct"):
+            config(tailscale__direct={"mac": "02:00:00:00:00:01"}, tailscale__secretArn="")
 
     def test_defaults(self):
         c = h.validate({"schema": 1, "release": {"repository": "/srv/seed.bundle", "ref": "main"}})
@@ -232,6 +256,49 @@ class Setup(unittest.TestCase):
         h.apply_config()
         self.assertIn(["systemctl", "restart", "--no-block", "open-workspaces-dashboard.service"], self.calls)
         self.assertNotIn("dashboard", h.pending())
+
+    def test_direct_setup_is_targeted_idempotent_and_retries_after_network_failure(self):
+        h.setup(config())
+        direct = config(tailscale__direct={"mac": "02:00:00:00:00:01"})
+        failures = [True]
+
+        def fake(cmd, **kw):
+            self.calls.append(cmd)
+            if cmd == ["networkctl", "reload"] and failures:
+                failures.pop()
+                raise RuntimeError("network reload failed")
+            if cmd == ["ip", "route", "flush", "table", "41641"]:
+                # A detached interface (or an apply that failed before DHCP) can leave no table.
+                if kw.get("check", True):
+                    raise RuntimeError("FIB table does not exist")
+                return ""
+            if cmd == ["systemctl", "is-active", "tailscaled.service"]:
+                return "active"
+            if cmd == ["ip", "-j", "link", "show"]:
+                return '[{"address":"02:00:00:00:00:01","ifname":"ens6"},{"address":"02:00:00:00:00:02","ifname":"ens5"}]'
+            if cmd[:4] == ["ip", "-j", "route", "get"]:
+                return '[{"dev":"ens6"}]'
+            return ""
+
+        h.run = fake
+        with self.assertRaisesRegex(RuntimeError, "network reload"):
+            h.setup(direct)
+        self.assertTrue(h.p(h.SETUP_DUE).exists())
+        self.calls.clear()
+        h.setup(direct)
+        self.assertIn(["networkctl", "reload"], self.calls)
+        self.assertIn(["networkctl", "reconfigure", "ens6"], self.calls)
+        self.assertNotIn(["networkctl", "reconfigure", "ens5"], self.calls)
+        self.assertIn(["systemctl", "restart", "tailscaled.service"], self.calls)
+        self.assertFalse(any("open-workspaces-worker.service" in c for c in self.calls))
+        self.calls.clear()
+        self.assertEqual(h.setup(direct), set())
+        self.assertEqual(self.calls, [])
+        h.setup(config())
+        self.assertIn(["networkctl", "reconfigure", "ens6"], self.calls)
+        self.assertIn(["ip", "route", "flush", "table", "41641"], self.calls)
+        self.assertFalse(h.p(h.DIRECT_NETWORK).exists())
+        self.assertFalse(h.p(h.DIRECT_PORT).exists())
 
     def test_tailscale_join_passes_the_key_by_file_and_deletes_it(self):
         key = h.ROOT / "key"
