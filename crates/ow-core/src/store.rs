@@ -278,7 +278,8 @@ pub fn pull(store: &dyn Objects, reference: &Reference, directory: &Path) -> Res
         for (name, file) in &manifest.files {
             let mut output = private_file(&directory.join(name))?;
             let input = store.get(&file.objects[0].key)?;
-            let decoder = zstd::Decoder::new(input)?;
+            let mut decoder = zstd::Decoder::new(input)?;
+            decoder.window_log_max(26)?;
             // Never let a hostile compressed object expand beyond its pinned logical size.
             let mut bounded = decoder.take(file.size + 1);
             let hash = crate::snapshot_store::write_sparse(&mut bounded, &mut output)?;

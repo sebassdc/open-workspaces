@@ -90,7 +90,24 @@ impl S3Objects {
         };
         let versioning = read("get-bucket-versioning")?;
         let lifecycle = read("get-bucket-lifecycle-configuration")?;
-        check_configuration(&versioning, &lifecycle, &self.prefix)
+        check_configuration(&versioning, &lifecycle, &self.prefix)?;
+        let policy = read("get-bucket-policy")?;
+        let policy: Value = serde_json::from_str(
+            policy["Policy"]
+                .as_str()
+                .context("artifact bucket policy missing")?,
+        )?;
+        ensure!(
+            ["aws", "aws-us-gov", "aws-cn"]
+                .iter()
+                .any(|partition| check_bucket_policy(
+                    &policy,
+                    &format!("arn:{partition}:s3:::{}/{}*", self.bucket, self.prefix)
+                )
+                .is_ok()),
+            "artifact bucket lacks the write-once creation policy"
+        );
+        Ok(())
     }
     fn command(&self, operation: &str, key: &str) -> Result<std::process::Command> {
         key_path(key)?;
@@ -219,6 +236,7 @@ impl Objects for S3Objects {
             let mut composite = Sha256::new();
             loop {
                 let number = parts.len() + 1;
+                // shortcut: 64 MiB parts cap compressed objects at 625 GiB; raise part size before supporting larger ones.
                 ensure!(number <= 10000, "multipart limit exceeded");
                 let checksum = STANDARD.encode(&hash);
                 let uploaded = self.call(
@@ -445,4 +463,43 @@ fn s3_store_configuration_rejects_expiring_live_artifacts() {
         assert!(check_configuration(&versioning, &bad, "root/store/v1/").is_err());
     }
     assert!(check_configuration(&json!({"Status":"Suspended"}), &good, "root/store/v1/").is_err());
+}
+
+fn check_bucket_policy(policy: &Value, resource: &str) -> Result<()> {
+    let statements = policy["Statement"]
+        .as_array()
+        .context("bucket policy statements missing")?;
+    let covered = |value: &Value, expected: &str| {
+        value == expected
+            || value
+                .as_array()
+                .is_some_and(|values| values.iter().any(|v| v == expected))
+    };
+    ensure!(
+        statements.iter().any(|s| s["Effect"] == "Deny"
+            && s["Principal"] == "*"
+            && covered(&s["Action"], "s3:PutObject")
+            && covered(&s["Resource"], resource)
+            && s["Condition"].as_object().is_some_and(|o| o.len() == 2)
+            && s["Condition"]["Null"]
+                .as_object()
+                .is_some_and(|o| o.len() == 1)
+            && s["Condition"]["Bool"]
+                .as_object()
+                .is_some_and(|o| o.len() == 1)
+            && s["Condition"]["Null"]["s3:if-none-match"] == "true"
+            && s["Condition"]["Bool"]["s3:ObjectCreationOperation"] == "true"),
+        "artifact bucket lacks the write-once creation policy"
+    );
+    Ok(())
+}
+#[cfg(test)]
+#[test]
+fn s3_store_requires_write_once_policy_for_every_principal() {
+    let resource = "arn:aws:s3:::bucket/root/store/v1/*";
+    let mut policy = json!({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":resource,"Condition":{"Null":{"s3:if-none-match":"true"},"Bool":{"s3:ObjectCreationOperation":"true"}}}]});
+    assert!(check_bucket_policy(&policy, resource).is_ok());
+    policy["Statement"][0]["Principal"] = json!({"AWS":"one-role"});
+    assert!(check_bucket_policy(&policy, resource).is_err());
+    assert!(check_bucket_policy(&json!({"Statement":[]}), resource).is_err());
 }

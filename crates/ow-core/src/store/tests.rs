@@ -188,3 +188,20 @@ fn store_manifest_cannot_refer_to_another_attempt() {
     manifest.format = 2;
     assert!(manifest.validate().is_err());
 }
+
+#[test]
+fn store_image_selectors_are_bounded_paths_and_canonical_versions() {
+    for selector in ["tools", "ubuntu@1", "a-b_1@9223372036854775807"] {
+        assert!(image_name(selector).is_ok(), "{selector}");
+    }
+    for selector in [
+        "../tools@1",
+        "tools@0",
+        "tools@01",
+        "tools@-1",
+        "tools@1@2",
+        "tools@9223372036854775808",
+    ] {
+        assert!(image_name(selector).is_err(), "{selector}");
+    }
+}
