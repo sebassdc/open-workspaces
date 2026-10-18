@@ -180,8 +180,8 @@ test("backup URLs are checked and the host role can never delete a backup", () =
     assert.deepEqual(policy.Statement.flatMap((s) => [s.Action].flat()).sort(),
         ["s3:AbortMultipartUpload", "s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
     assert.equal(policy.Statement[0].Resource, "arn:aws:s3:::my-bucket");
-    assert.deepEqual(policy.Statement[0].Condition, { StringLike: { "s3:prefix": ["ow/host-1/*"] } });
-    assert.equal(policy.Statement[1].Resource, "arn:aws:s3:::my-bucket/ow/host-1/*");
+    assert.deepEqual(policy.Statement[0].Condition, { StringLike: { "s3:prefix": ["ow/host-1/catalog/*", "ow/host-1/snapshots/*"] } });
+    assert.deepEqual(policy.Statement[1].Resource, ["arn:aws:s3:::my-bucket/ow/host-1/catalog/*", "arn:aws:s3:::my-bucket/ow/host-1/snapshots/*"]);
 });
 
 test("ow-backup uploads the catalog, then the snapshots, and stops at the first failure", () => {

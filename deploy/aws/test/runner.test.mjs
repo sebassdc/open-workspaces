@@ -90,9 +90,9 @@ test("a runner has its own instance, volume, role, join secret and backup prefix
     assert.deepEqual(policy("ow-big-join"), [{ Effect: "Allow",
         Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"], Resource: "arn:aws:mock:::ow-big-join" }]);
     const backup = policy("ow-big-backup");
-    assert.equal(backup[1].Resource, "arn:aws:s3:::my-bucket/ow/runners/ow-big/*", "its own prefix only");
-    assert.deepEqual(backup[0].Condition, { StringLike: { "s3:prefix": ["ow/runners/ow-big/*"] } });
-    assert.equal(policy("ow-ctl-backup")[1].Resource, "arn:aws:s3:::my-bucket/ow/*");
+    assert.deepEqual(backup[1].Resource, ["arn:aws:s3:::my-bucket/ow/runners/ow-big/catalog/*", "arn:aws:s3:::my-bucket/ow/runners/ow-big/snapshots/*"], "its own backup prefixes only");
+    assert.deepEqual(backup[0].Condition, { StringLike: { "s3:prefix": ["ow/runners/ow-big/catalog/*", "ow/runners/ow-big/snapshots/*"] } });
+    assert.deepEqual(policy("ow-ctl-backup")[1].Resource, ["arn:aws:s3:::my-bucket/ow/catalog/*", "arn:aws:s3:::my-bucket/ow/snapshots/*"]);
 });
 
 test("a runner's name is its node ID, and it needs the tailnet and no dashboard", () => {

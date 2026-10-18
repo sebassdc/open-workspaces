@@ -3,8 +3,15 @@ import * as path from "path";
 import * as aws from "@pulumi/aws";
 import * as pulumi from "@pulumi/pulumi";
 
-export { ArtifactStore, storeLifecycleRules, tlsOnlyPolicy } from "./store";
+import { storeRunnerPolicy } from "./store";
+export { ArtifactStore, storeLifecycleRules, tlsOnlyPolicy, storeBucketPolicy, storeRunnerPolicy } from "./store";
 export type { ArtifactStoreArgs } from "./store";
+
+export interface ImageArtifact {
+    version: pulumi.Input<number>;
+    attempt: pulumi.Input<string>;
+    digest: pulumi.Input<string>;
+}
 
 export interface TailscaleDirectArgs {
     /** Public subnet in the host's VPC and availability zone, routed to an internet gateway. */
@@ -64,6 +71,10 @@ export interface HostArgs {
      * or set `backupSchedule`. Default: no backups.
      */
     backupUrl?: pulumi.Input<string>;
+    /** Opt-in write-once image store root, s3://bucket/prefix. No list/delete rights. */
+    storeUrl?: pulumi.Input<string>;
+    /** Digest-pinned base images to pull instead of building developerImages locally. */
+    imageArtifacts?: pulumi.Input<{ [profile: string]: pulumi.Input<ImageArtifact> }>;
     /**
      * When `ow-backup` runs, as a systemd calendar expression (for example
      * `*-*-* 01:00:00 UTC`); the host installs a timer for it. Needs `backupUrl`.
@@ -78,6 +89,8 @@ export interface HostArgs {
 export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability"> {
     // The package analyzer loses nested optional types inherited through Omit.
     tailscaleDirect?: pulumi.Input<TailscaleDirectArgs>;
+    storeUrl?: pulumi.Input<string>;
+    imageArtifacts?: pulumi.Input<{ [profile: string]: pulumi.Input<ImageArtifact> }>;
     /**
      * The Host whose controller this runner joins (a Host itself fits): its component
      * name and role. That role may write this runner's join secret; nothing of that host
@@ -158,6 +171,8 @@ export interface HostConfigInputs {
     dashboardCapability?: string;
     developerImages: string[];
     backupUrl: string;
+    storeUrl?: string;
+    imageArtifacts?: { [profile: string]: { version: number; attempt: string; digest: string } };
     backupSchedule: string;
     idleMinutes: number;
     directMac?: string;
@@ -184,6 +199,13 @@ export function hostConfig(c: HostConfigInputs): object {
         throw new Error("tailscaleDirect needs tailscaleAuthKeySecretArn and a valid interface MAC");
     }
     dashboardLoginList(c.dashboardLogins);
+    if (c.storeUrl) storeRunnerPolicy("aws", c.storeUrl);
+    const artifacts = c.imageArtifacts ?? {};
+    if (Object.keys(artifacts).length && !c.storeUrl) throw new Error("imageArtifacts needs storeUrl");
+    for (const [profile, a] of Object.entries(artifacts)) {
+        if (!["ubuntu", "arch", "alpine"].includes(profile) || !Number.isSafeInteger(a.version) || a.version < 1
+            || !/^[0-9a-f]{32}$/.test(a.attempt) || !/^[0-9a-f]{64}$/.test(a.digest)) throw new Error("invalid imageArtifacts pin");
+    }
     const backup = c.backupUrl ? backupLocation(c.backupUrl) : undefined;
     if (c.backupSchedule && (!backup || !/^[A-Za-z0-9 *:/,.~_-]{1,100}$/.test(c.backupSchedule))) {
         throw new Error(`backupSchedule needs backupUrl and a systemd calendar expression, not ${JSON.stringify(c.backupSchedule)}`);
@@ -213,6 +235,7 @@ export function hostConfig(c: HostConfigInputs): object {
             ...(c.directMac ? { direct: { mac: c.directMac } } : {}) },
         dashboard: { logins: c.dashboardLogins, ...(capability ? { capability } : {}) },
         developerImages: images ? images.split(" ") : [],
+        ...(c.storeUrl ? { store: { url: c.storeUrl, images: artifacts } } : {}),
         backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule },
         idleMinutes: c.idleMinutes,
         ...(c.runner ? { runner: c.runner } : {}),
@@ -248,12 +271,12 @@ export function backupPolicy(partition: string, url: string): string {
                 Effect: "Allow",
                 Action: "s3:ListBucket",
                 Resource: `arn:${partition}:s3:::${bucket}`,
-                Condition: { StringLike: { "s3:prefix": [`${prefix}/*`] } },
+                Condition: { StringLike: { "s3:prefix": [`${prefix}/catalog/*`, `${prefix}/snapshots/*`] } },
             },
             {
                 Effect: "Allow",
                 Action: ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
-                Resource: `arn:${partition}:s3:::${bucket}/${prefix}/*`,
+                Resource: ["catalog", "snapshots"].map((p) => `arn:${partition}:s3:::${bucket}/${prefix}/${p}/*`),
             },
         ],
     });
@@ -349,6 +372,10 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                 })),
             }, parent);
         }
+        if (args.storeUrl) {
+            new aws.iam.RolePolicy(`${name}-store`, { role: role.id,
+                policy: pulumi.all([partition, args.storeUrl]).apply(([p, url]) => storeRunnerPolicy(p, url)) }, parent);
+        }
         if (backupUrl) {
             new aws.iam.RolePolicy(`${name}-backup`, {
                 role: role.id,
@@ -416,11 +443,12 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                     pulumi.all([backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30]),
                     runner,
                     directInterface ? directInterface.macAddress : pulumi.output(""),
+                    pulumi.all([args.storeUrl ?? "", args.imageArtifacts ?? {}]),
                 ])
                 .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes], runner, directMac]) =>
                     JSON.stringify(hostConfig({
                         repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
-                        dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, runner, directMac,
+                        dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, runner, directMac, storeUrl, imageArtifacts,
                     })),
                 ),
             tags,

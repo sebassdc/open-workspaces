@@ -1,16 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { storeLifecycleRules, tlsOnlyPolicy } from "../store.ts";
+import { storeLifecycleRules, tlsOnlyPolicy, storeBucketPolicy, storeRunnerPolicy } from "../store.ts";
 
-test("age expiry covers only the backup prefixes, never store/", () => {
+test("only catalog backups expire by age; data keeps seven-day noncurrent undo", () => {
     const rules = storeLifecycleRules("ow-host/", 30, 7);
-    const expiring = rules.filter((rule) => rule.expiration || rule.noncurrentVersionExpiration);
-    assert.deepEqual(expiring.map((rule) => rule.filter.prefix), ["ow-host/catalog/", "ow-host/snapshots/", "ow-host/runners/"]);
-    assert.ok(expiring.every((rule) => rule.expiration.days === 30 && rule.noncurrentVersionExpiration.noncurrentDays === 7));
-    // The one bucket-wide rule only drops unfinished multipart uploads.
-    const wide = rules.filter((rule) => !rule.filter.prefix);
-    assert.deepEqual(wide.map((rule) => Object.keys(rule).sort()), [["abortIncompleteMultipartUpload", "filter", "id", "status"]]);
-    assert.ok(!JSON.stringify(rules).includes("store/"));
+    assert.deepEqual(rules.filter((r) => r.expiration).map((r) => r.filter.prefix), ["ow-host/catalog/"]);
+    assert.deepEqual(rules.filter((r) => r.noncurrentVersionExpiration).map((r) => r.filter.prefix), ["ow-host/catalog/", "ow-host/snapshots/", "ow-host/runners/", "ow-host/store/"]);
+    assert.ok(rules.filter((r) => r.noncurrentVersionExpiration).every((r) => r.noncurrentVersionExpiration.noncurrentDays === 7));
+    assert.deepEqual(rules.filter((r) => !r.filter.prefix).map((r) => Object.keys(r).sort()), [["abortIncompleteMultipartUpload", "filter", "id", "status"]]);
+    assert.throws(() => storeLifecycleRules("p", 30, 6), /whole number/);
 });
 
 test("store prefixes and retention days are checked", () => {
@@ -59,7 +57,21 @@ test("the component creates a private, versioned, TLS-only bucket with prefix-sc
         { bucket: undefined, blockPublicAcls: true, blockPublicPolicy: true, ignorePublicAcls: true, restrictPublicBuckets: true },
     );
     assert.equal(byType["aws:s3/bucketVersioning:BucketVersioning"].versioningConfiguration.status, "Enabled");
-    assert.deepEqual(JSON.parse(byType["aws:s3/bucketPolicy:BucketPolicy"].policy), JSON.parse(tlsOnlyPolicy("arn:aws:s3:::example-backups")));
+    assert.deepEqual(JSON.parse(byType["aws:s3/bucketPolicy:BucketPolicy"].policy), JSON.parse(storeBucketPolicy("arn:aws:s3:::example-backups", "ow-host")));
     const rules = byType["aws:s3/bucketLifecycleConfiguration:BucketLifecycleConfiguration"].rules;
-    assert.deepEqual(rules.map((rule) => rule.filter.prefix ?? null), ["ow-host/catalog/", "ow-host/snapshots/", "ow-host/runners/", null]);
+    assert.deepEqual(rules.map((rule) => rule.filter.prefix ?? null), ["ow-host/catalog/", "ow-host/snapshots/", "ow-host/runners/", "ow-host/store/", null]);
+});
+
+
+test("store creation is conditional and image roles cannot list or delete", () => {
+    const policy = JSON.parse(storeBucketPolicy("arn:aws:s3:::bucket", "prefix"));
+    const once = policy.Statement.find((s) => s.Sid === "StoreIsWriteOnce");
+    assert.equal(once.Resource, "arn:aws:s3:::bucket/prefix/store/v1/*");
+    assert.deepEqual(once.Condition, { Null: { "s3:if-none-match": "true" }, Bool: { "s3:ObjectCreationOperation": "true" } });
+    const runner = JSON.parse(storeRunnerPolicy("aws", "s3://bucket/prefix"));
+    assert.equal(runner.Statement[0].Resource, "arn:aws:s3:::bucket/prefix/store/v1/u/*");
+    const actions = runner.Statement.flatMap((s) => s.Action);
+    assert.ok(!actions.some((a) => /Delete|List/.test(a)));
+    assert.ok(actions.includes("s3:AbortMultipartUpload") && actions.includes("s3:GetBucketVersioning"));
+    for (const url of ["s3://bucket", "s3://bucket/a/../b", "s3://bucket/a//b"]) assert.throws(() => storeRunnerPolicy("aws", url));
 });

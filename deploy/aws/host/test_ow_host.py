@@ -3,6 +3,7 @@
 Run: python3 -m unittest discover -s deploy/aws/host
 """
 import copy
+import json
 import subprocess
 import sys
 import tempfile
@@ -405,6 +406,22 @@ class Setup(unittest.TestCase):
         state = h.tailscale(config(tailscale__hostname="new-name", tailscale__ssh=True), old=config())
         self.assertEqual(state, ("joined", True))
         self.assertIn(["tailscale", "set", "--ssh=true", "--hostname=new-name"], self.calls)
+
+
+class StoreImages(unittest.TestCase):
+    def test_opt_in_store_pin_is_class_zero_and_existing_config_stays_unchanged(self):
+        pin = {"version": 1, "attempt": "a" * 32, "digest": "b" * 64}
+        c = config(store={"url": "s3://my-bucket/ow", "images": {"ubuntu": pin}})
+        files = h.render(c, BUDGET)
+        path = "/etc/open-workspaces/store.json"
+        self.assertEqual(json.loads(files[path][0]), c["store"])
+        self.assertEqual(h.units_changed({path}), set())
+        self.assertNotIn(path, h.render(config(), BUDGET))
+        for bad in [dict(pin, version=0), dict(pin, attempt="../x"), dict(pin, digest="z" * 64)]:
+            with self.assertRaises(h.Refused):
+                config(store={"url": "s3://my-bucket/ow", "images": {"ubuntu": bad}})
+        with self.assertRaises(h.Refused):
+            config(store={"images": {"ubuntu": pin}})
 
 
 if __name__ == "__main__":
