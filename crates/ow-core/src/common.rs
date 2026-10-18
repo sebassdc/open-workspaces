@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{fs::File, io::Read};
 pub fn identifier(id: &str) -> Result<()> {
     ensure!(
@@ -74,6 +74,40 @@ pub fn nonce() -> Result<String> {
 pub const HOST_MEMORY_MIB: u32 = 65536;
 pub const HOST_CPUS: u32 = 64;
 pub const HOST_SLOTS: u32 = 8;
+pub const DEFAULT_DISK_GIB: u32 = 32;
+pub const MAX_DISK_GIB: u32 = 16384;
+pub const GIB: u64 = 1024 * 1024 * 1024;
+
+/// CLI sizes are whole GiB, optionally suffixed with G or GiB.
+pub fn parse_disk_size(value: &str) -> Result<u32> {
+    let size = value
+        .strip_suffix("GiB")
+        .or_else(|| value.strip_suffix('G'))
+        .unwrap_or(value);
+    let n: u32 = size
+        .parse()
+        .context("disk size must be whole GiB (for example 64GiB)")?;
+    ensure!(
+        (1..=MAX_DISK_GIB).contains(&n),
+        "disk must be 1–{MAX_DISK_GIB} GiB"
+    );
+    Ok(n)
+}
+
+/// Validate before durable intent; JSON accepts integer GiB, never strings/null.
+pub fn requested_disk(request: &serde_json::Value) -> Result<Option<u32>> {
+    request
+        .get("disk_gib")
+        .map(|v| {
+            let n = v.as_u64().context("disk_gib must be an integer")?;
+            ensure!(
+                (1..=u64::from(MAX_DISK_GIB)).contains(&n),
+                "disk_gib out of range"
+            );
+            Ok(n as u32)
+        })
+        .transpose()
+}
 pub const SHAPES_MIB: [u32; 7] = [256, 512, 1024, 2048, 4096, 8192, 16384];
 pub fn host_limits(memory: u32, slots: u32, cpus: u32) -> Result<()> {
     ensure!(
@@ -360,6 +394,41 @@ mod backend_tests {
             let mut bad = mac.clone();
             bad[k] = val;
             assert!(node_capabilities(&bad).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod disk_size_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn sizes_are_bounded_whole_gib() {
+        for text in ["64", "64G", "64GiB"] {
+            assert_eq!(parse_disk_size(text).unwrap(), 64);
+        }
+        for text in [
+            "0",
+            "-1",
+            "1.5G",
+            "64GB",
+            "16MiB",
+            "16385",
+            "999999999999999999999",
+        ] {
+            assert!(parse_disk_size(text).is_err(), "{text}");
+        }
+        assert_eq!(requested_disk(&json!({})).unwrap(), None);
+        assert_eq!(requested_disk(&json!({"disk_gib":32})).unwrap(), Some(32));
+        for bad in [
+            json!(0),
+            json!(null),
+            json!(-1),
+            json!(1.5),
+            json!("64"),
+            json!(u64::MAX),
+        ] {
+            assert!(requested_disk(&json!({"disk_gib":bad})).is_err());
         }
     }
 }

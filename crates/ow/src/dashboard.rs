@@ -40,6 +40,8 @@ struct Operation {
     #[serde(default)]
     memory_mib: Option<u32>,
     #[serde(default)]
+    disk_gib: Option<u32>,
+    #[serde(default)]
     image: Option<String>,
     #[serde(default)]
     vcpu_count: Option<u32>,
@@ -57,6 +59,7 @@ fn validated(bytes: &[u8]) -> Result<Value> {
     let raw: Value = serde_json::from_slice(bytes)?;
     if matches!(raw["op"].as_str(), Some("create" | "resize")) {
         crate::common::requested_resources(&raw)?;
+        crate::common::requested_disk(&raw)?;
     }
     let operation: Operation = serde_json::from_value(raw)?;
     ensure!(
@@ -85,13 +88,29 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             crate::common::resources(memory, cpus)?;
             request["memory_mib"] = json!(memory);
             request["vcpu_count"] = json!(cpus);
+            if let Some(disk) = operation
+                .disk_gib
+                .or((image != "ubuntu-arm64").then_some(crate::common::DEFAULT_DISK_GIB))
+            {
+                request["disk_gib"] = json!(disk);
+            }
         }
         "resize" => {
-            let memory = operation.memory_mib.context("memory required")?;
-            let cpus = operation.vcpu_count.context("CPU required")?;
-            crate::common::resources(memory, cpus)?;
-            request["memory_mib"] = json!(memory);
-            request["vcpu_count"] = json!(cpus);
+            ensure!(
+                operation.memory_mib.is_some()
+                    || operation.vcpu_count.is_some()
+                    || operation.disk_gib.is_some(),
+                "specify memory_mib, vcpu_count or disk_gib"
+            );
+            for (key, value) in [
+                ("memory_mib", operation.memory_mib),
+                ("vcpu_count", operation.vcpu_count),
+                ("disk_gib", operation.disk_gib),
+            ] {
+                if let Some(value) = value {
+                    request[key] = json!(value);
+                }
+            }
         }
         "start" | "stop" | "hibernate" | "ssh-info" | "delete" => {}
         "share" | "unshare" => {
@@ -414,13 +433,31 @@ mod tests {
                 json!(1.5),
                 json!(u64::MAX),
             ] {
-                for key in ["memory_mib", "vcpu_count"] {
+                for key in ["memory_mib", "vcpu_count", "disk_gib"] {
                     let mut v = json!({"op":op,"id":"large","memory_mib":4096,"vcpu_count":2});
                     v[key] = bad.clone();
                     assert!(validated(v.to_string().as_bytes()).is_err(), "{v}");
                 }
             }
         }
+    }
+    #[test]
+    fn disk_only_resize_and_default_create() {
+        let r = validated(br#"{"op":"resize","id":"box","disk_gib":64}"#).unwrap();
+        assert_eq!(r["disk_gib"], 64);
+        assert!(r.get("memory_mib").is_none());
+        assert!(r.get("vcpu_count").is_none());
+        assert!(validated(br#"{"op":"resize","id":"box"}"#).is_err());
+        assert_eq!(
+            validated(br#"{"op":"create","id":"box"}"#).unwrap()["disk_gib"],
+            32
+        );
+        assert!(
+            validated(br#"{"op":"create","id":"box","image":"ubuntu-arm64"}"#)
+                .unwrap()
+                .get("disk_gib")
+                .is_none()
+        );
     }
     #[test]
     fn dashboard_cannot_forward_arbitrary_worker_operations() {

@@ -1,5 +1,5 @@
 use crate::runtime::Runtime;
-use crate::{Action, Cli, assets, network, remote, runtime, terminal, vm, wire};
+use crate::{Action, Cli, assets, common, network, remote, runtime, terminal, vm, wire};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ow_core::ComputeProvider;
@@ -846,13 +846,28 @@ pub fn run(cli: Cli) -> Result<i32> {
             memory,
             image,
             cpus,
+            disk,
             node,
         } => {
             ensure!(node.is_none(), "--node requires a remote controller");
-            json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus})
+            json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"disk_gib":disk.unwrap_or(common::DEFAULT_DISK_GIB)})
         }
-        Action::Resize { id, memory, cpus } => {
-            json!({"op":"resize","id":id,"memory_mib":memory,"vcpu_count":cpus})
+        Action::Resize {
+            id,
+            memory,
+            cpus,
+            disk,
+        } => {
+            ensure!(
+                memory.is_some() || cpus.is_some() || disk.is_some(),
+                "specify --memory, --cpus or --disk"
+            );
+            let mut request = json!({"op":"resize","id":id,"memory_mib":memory,"vcpu_count":cpus,"disk_gib":disk});
+            request
+                .as_object_mut()
+                .unwrap()
+                .retain(|_, value| !value.is_null());
+            request
         }
         Action::Start { id } => json!({"op":"start","id":id}),
         Action::Stop { id } => json!({"op":"stop","id":id}),

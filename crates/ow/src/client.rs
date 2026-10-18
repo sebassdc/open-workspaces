@@ -412,12 +412,31 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             memory,
             image,
             cpus,
+            disk,
             node,
         } => {
-            json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"node":node})
+            let mut request = json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"disk_gib":disk.or((image != "ubuntu-arm64").then_some(crate::common::DEFAULT_DISK_GIB)),"node":node});
+            if request["disk_gib"].is_null() {
+                request.as_object_mut().unwrap().remove("disk_gib");
+            }
+            request
         }
-        Action::Resize { id, memory, cpus } => {
-            json!({"op":"resize","id":id,"memory_mib":memory,"vcpu_count":cpus})
+        Action::Resize {
+            id,
+            memory,
+            cpus,
+            disk,
+        } => {
+            ensure!(
+                memory.is_some() || cpus.is_some() || disk.is_some(),
+                "specify --memory, --cpus or --disk"
+            );
+            let mut request = json!({"op":"resize","id":id,"memory_mib":memory,"vcpu_count":cpus,"disk_gib":disk});
+            request
+                .as_object_mut()
+                .unwrap()
+                .retain(|_, value| !value.is_null());
+            request
         }
         Action::Put { id, local, guest } => {
             use base64::Engine;

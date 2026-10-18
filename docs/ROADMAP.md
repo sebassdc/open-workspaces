@@ -208,6 +208,14 @@ Gate: demonstrated tenant separation, revocation behavior, worker-loss recovery,
 
 Gate: end-to-end automation survives sleeping guests and service restarts, uses scoped connections, exposes failures, and prevents shared/isolated guests from accessing personal devices or connections.
 
+## Per-box disks (0.7.0)
+
+- [x] Owner-only create/grow sizing through CLI, remote API and dashboard; sparse
+  32 GiB default, stopped/grow-only resize, ext4 expansion before cold boot, host
+  admission and disk capacity/use reporting. Existing boxes retain their size.
+  See [disk semantics and acceptance](DISKS.md). Local filesystem and unit
+  acceptance is separate from the dedicated KVM rollout check.
+
 ## Release discipline
 
 - Track capability completion by WS IDs in RESEARCH.md.

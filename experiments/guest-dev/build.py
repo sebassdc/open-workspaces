@@ -30,7 +30,7 @@ def fsck(disk,discard=False):
     if r.returncode not in [0,1]:raise RuntimeError(r.stdout+r.stderr)
 try:
     if not args.adopt_build:
-        run('up');run('create',id,'--image',profile,'--memory','1024');run('stop',id)
+        run('up');run('create',id,'--image',profile,'--memory','1024','--disk','8GiB');run('stop',id)
         disk=root/'machines'/id/'disk.ext4'
         with disk.open('r+b') as stream:stream.truncate(8*1024**3)
         fsck(disk);subprocess.run(['resize2fs',str(disk)],check=True,capture_output=True);run('start',id)

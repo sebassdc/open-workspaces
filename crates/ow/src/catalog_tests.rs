@@ -64,8 +64,20 @@ impl Fake {
                     "list" => json!(machines.values().collect::<Vec<_>>()),
                     "snapshots" => json!(snapshots.values().collect::<Vec<_>>()),
                     "stats" => json!({"running":{},"reserved_memory_mib":0}),
+                    "resize" => {
+                        let m = machines.get_mut(id).unwrap();
+                        for key in ["memory_mib", "vcpu_count"] {
+                            if let Some(v) = request.get(key) {
+                                m[key] = v.clone();
+                            }
+                        }
+                        if let Some(n) = request["disk_gib"].as_u64() {
+                            m["disk_bytes"] = json!(n * common::GIB);
+                        }
+                        m.clone()
+                    }
                     "create" => {
-                        let m = json!({"id":id,"memory_mib":request["memory_mib"],"vcpu_count":request["vcpu_count"],"image":request["image"],"state":"running","source":null});
+                        let m = json!({"id":id,"memory_mib":request["memory_mib"],"vcpu_count":request["vcpu_count"],"image":request["image"],"state":"running","source":null,"disk_bytes":request["disk_gib"].as_u64().unwrap_or(8)*common::GIB});
                         machines.insert(id.into(), m.clone());
                         m
                     }
@@ -924,5 +936,46 @@ fn a_missing_machine_its_runner_has_again_is_deleted_on_the_runner() {
     assert_eq!(
         (&state["workspaces"], &state["snapshots"]),
         (&json!([]), &json!([]))
+    );
+}
+
+#[test]
+fn disk_resize_is_owner_only_and_requires_a_capable_stopped_runner() {
+    let mut fake = Fake::new();
+    fake.worker("disk-node");
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let owner = c.user(&identity("owner")).unwrap();
+    let other = c.user(&identity("other")).unwrap();
+    // No disk capability: explicit sizing must fail rather than silently create 8 GiB.
+    let create = json!({"op":"create","id":"diskbox","node":"disk-node","disk_gib":32,"memory_mib":256,"vcpu_count":1,"image":"alpine"});
+    assert!(c.operation(owner, create.clone()).is_err());
+    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.disk_resize_v1',json('true')) WHERE id='disk-node'", []).unwrap();
+    let created = c.operation(owner, create).unwrap();
+    assert_eq!(created["disk_bytes"], 32 * common::GIB);
+    let grow = json!({"op":"resize","id":"diskbox","disk_gib":64});
+    assert!(c.operation(owner, grow.clone()).is_err());
+    c.operation(owner, json!({"op":"stop","id":"diskbox"}))
+        .unwrap();
+    c.operation(
+        owner,
+        json!({"op":"share","id":"diskbox","with":"other@example.test","role":"admin"}),
+    )
+    .unwrap();
+    let calls = fake.calls.load(Ordering::SeqCst);
+    assert!(
+        c.operation(
+            other,
+            json!({"op":"resize","id":"owner@example.test/diskbox","disk_gib":64})
+        )
+        .is_err()
+    );
+    assert_eq!(calls, fake.calls.load(Ordering::SeqCst));
+    let resized = c.operation(owner, grow).unwrap();
+    assert_eq!(resized["disk_bytes"], 64 * common::GIB);
+    assert_eq!(resized["memory_mib"], created["memory_mib"]);
+    assert_eq!(resized["vcpu_count"], created["vcpu_count"]);
+    assert_eq!(
+        c.state(owner).unwrap()["workspaces"][0]["disk_bytes"],
+        64 * common::GIB
     );
 }

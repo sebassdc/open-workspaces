@@ -838,6 +838,7 @@ impl Catalog {
         image: &str,
         cpus: u64,
         local_status: &Value,
+        disk: bool,
     ) -> Result<String> {
         let inventory = nodes::inventory(&self.root)?;
         if inventory.as_array().unwrap().is_empty() && requested.is_none() {
@@ -848,6 +849,7 @@ impl Catalog {
         for n in inventory.as_array().unwrap() {
             let id = n["id"].as_str().unwrap();
             if requested.is_some_and(|r| r != id)
+                || (disk && n["capabilities"]["disk_resize_v1"] != true)
                 || common::guest_shape(&n["capabilities"], memory, cpus).is_err()
                 || n["online"] != true
                 || n["capabilities"]["drain"] == true
@@ -937,8 +939,29 @@ impl Catalog {
                 .context("node")?;
             common::node_operation(&n["capabilities"], op)?;
         }
+        if request.get("disk_gib").is_some() {
+            let capable = if node == "local" {
+                local_status["disk_resize_v1"] == true
+            } else {
+                nodes::inventory(&self.root)?
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n["id"] == node && n["capabilities"]["disk_resize_v1"] == true)
+            };
+            ensure!(
+                capable,
+                "runner does not support disk sizing; upgrade its worker and agent first (Linux Firecracker only)"
+            );
+        }
         if op == "resize" {
-            let (ram, cpus) = common::requested_resources(request)?;
+            let mut shape = request.clone();
+            for key in ["memory_mib", "vcpu_count"] {
+                if shape.get(key).is_none() {
+                    shape[key] = metadata[key].clone();
+                }
+            }
+            let (ram, cpus) = common::requested_resources(&shape)?;
             ensure!(
                 metadata["state"] == "stopped",
                 "resize requires a positively stopped workspace"
@@ -1023,6 +1046,7 @@ impl Catalog {
         }
         if matches!(op.as_str(), "create" | "resize") {
             common::requested_resources(&request)?;
+            common::requested_disk(&request)?;
         }
         let name = request["id"].as_str().context("id")?.to_owned();
         common::address(&name)?;
@@ -1109,6 +1133,10 @@ impl Catalog {
                             == request["vcpu_count"].as_u64().unwrap_or(1)
                         && metadata["image"].as_str().unwrap_or("alpine")
                             == request["image"].as_str().unwrap_or("alpine")
+                        && request
+                            .get("disk_gib")
+                            .is_none_or(|n| metadata["disk_bytes"].as_u64()
+                                == n.as_u64().map(|n| n * common::GIB))
                         && metadata["source"].is_null(),
                     "existing machine parameters conflict"
                 );
@@ -1124,6 +1152,7 @@ impl Catalog {
                         request["image"].as_str().unwrap_or("alpine"),
                         request["vcpu_count"].as_u64().unwrap_or(1),
                         &local_status,
+                        request.get("disk_gib").is_some(),
                     )?;
                     self.db.execute(
                         "UPDATE resources SET node=?1 WHERE kind='machine' AND physical=?2",

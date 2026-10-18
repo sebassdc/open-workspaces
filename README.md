@@ -54,6 +54,10 @@ Idle boxes hibernate and wake on the next connection, snapshots restore from S3
 onto another runner, and `ow image build` makes golden images from recipes; see
 [wake on connect, snapshot store and golden images](docs/DAILY_USE.md).
 
+Owners can create larger sparse root disks with `ow create NAME --disk 64GiB` and
+grow a stopped box with `ow resize NAME --disk 128GiB`; new Linux boxes default to
+32 GiB. See [disk sizing, host admission and reporting](docs/DISKS.md).
+
 ## Read first
 
 1. [Agent handoff](docs/HANDOFF.md): context, first task, and acceptance criteria.
