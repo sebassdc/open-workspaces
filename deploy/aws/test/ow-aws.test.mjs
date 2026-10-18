@@ -19,11 +19,13 @@ test("the helper and its host functions pass shellcheck", { skip: spawnSync("she
 // kept; its status and output come from `results`, one per command in order.
 // With `hostBin`, each script really runs in bash, with hostBin first on PATH,
 // and its exit status and output become the command's result.
-function fake({ state = "running", results = [], preview = { steps: [] }, hostBin = null } = {}) {
+// `instances` maps tag names to instance IDs (default: every name is INSTANCE); `parameter`
+// is what `aws ssm get-parameter` prints (a host's config parameter).
+function fake({ state = "running", results = [], preview = { steps: [] }, hostBin = null, instances = null, parameter = "" } = {}) {
     const dir = mkdtempSync(join(tmpdir(), "ow-aws-"));
     mkdirSync(join(dir, "bin"));
     mkdirSync(join(dir, "scripts"));
-    writeFileSync(join(dir, "config.json"), JSON.stringify({ state, results, preview, hostBin }));
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ state, results, preview, hostBin, instances, parameter }));
     writeFileSync(join(dir, "bin", "aws"), `#!/usr/bin/env node
 const fs = require("fs"), path = require("path");
 const dir = ${JSON.stringify(dir)}, args = process.argv.slice(2);
@@ -32,13 +34,15 @@ fs.appendFileSync(path.join(dir, "calls.log"), JSON.stringify(args) + "\\n");
 const arg = (name) => args[args.indexOf(name) + 1];
 const out = (text) => process.stdout.write(text + "\\n");
 const sent = () => fs.readdirSync(path.join(dir, "scripts")).length;
-if (args[1] === "describe-instances") out(arg("--query").includes("State") ? config.state : ${JSON.stringify(INSTANCE)});
+const tag = (args.find((a) => a.startsWith("Name=tag:Name,Values=")) || "").split("=").pop();
+if (args[1] === "describe-instances") out(arg("--query").includes("State") ? config.state : (config.instances || {})[tag] || ${JSON.stringify(INSTANCE)});
+else if (args[1] === "get-parameter") { if (config.parameter) out(config.parameter); else process.exit(254); }
 else if (args[1] === "describe-instance-information") out("Online");
 else if (args[1] === "send-command") {
     const parameters = JSON.parse(arg("--parameters"));
     const script = Buffer.from(parameters.commands[0].split(" ")[1], "base64").toString();
     const n = sent();
-    fs.writeFileSync(path.join(dir, "scripts", n + ".json"), JSON.stringify({ script, timeout: parameters.executionTimeout[0] }));
+    fs.writeFileSync(path.join(dir, "scripts", n + ".json"), JSON.stringify({ script, timeout: parameters.executionTimeout[0], instance: arg("--instance-ids") }));
     if (config.hostBin) {
         const run = require("child_process").spawnSync("bash", ["-c", script], { encoding: "utf8", env: { PATH: config.hostBin + ":" + process.env.PATH } });
         config.results[n] = { status: run.status === 0 ? "Success" : "Failed", stdout: run.stdout + run.stderr };
@@ -328,4 +332,98 @@ test("backups lists captures by owner and machine, oldest first, and filters by 
     assert.equal(host("backups s3://b/p m-gone", { backups }).stdout, "2026-10-15 01:00:00  -  m-gone  sleep-1\n");
     // Hosts before this release list names only.
     assert.equal(host("backups s3://b/p ''", { backups: '["sleep-1"]' }).stdout, "-  -  -  sleep-1\n");
+});
+
+const RUNNER_CONFIG = JSON.stringify({ schema: 1, role: "runner", runner: { node: "ow-big", controller: "ow-test", joinSecretArn: "arn" } });
+const CONTROLLER_ID = "i-0aaaaaaaaaaaaaaa1", RUNNER_ID = "i-0bbbbbbbbbbbbbbb2";
+
+test("runner-add mints on the controller and enrols on the runner; the join never passes through here", () => {
+    const status = JSON.stringify({ role: "runner", node: null, budget: { memory: 49152, slots: 8, cpus: 16 } });
+    const f = fake({ instances: { "ow-test": CONTROLLER_ID, "ow-big": RUNNER_ID }, results: [{}, { stdout: status }] });
+    const result = f.run(["runner-add", "ow-big"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.scripts().map((s) => [s.instance, f.lastLine(s.script)]), [
+        [RUNNER_ID, "ready 3000 ''"],
+        [RUNNER_ID, "ow_host status"],
+        [CONTROLLER_ID, "ow_host invite-runner ow-big --memory 49152 --slots 8 --cpus 16"],
+        [RUNNER_ID, "ow_host enrol --wait 300"],
+        [CONTROLLER_ID, "node_online ow-big 120"],
+    ]);
+    assert.ok(!f.calls().some((c) => c.includes("secretsmanager")), "this machine never reads or writes the join");
+    f.done();
+});
+
+test("runner-add on an enrolled runner only checks that it is online, and refuses a non-runner", () => {
+    let f = fake({ results: [{}, { stdout: JSON.stringify({ role: "runner", node: "ow-big", budget: { memory: 1024, slots: 2, cpus: 2 } }) }] });
+    assert.equal(f.run(["runner-add", "ow-big"]).status, 0);
+    assert.deepEqual(f.scripts().map((s) => f.lastLine(s.script)), ["ready 3000 ''", "ow_host status", "node_online ow-big 120"]);
+    f.done();
+    f = fake({ results: [{}, { stdout: JSON.stringify({ role: "host", node: "ow-big", budget: { memory: 1024, slots: 2, cpus: 2 } }) }] });
+    const result = f.run(["runner-add", "ow-big"]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /not a runner host/);
+    assert.equal(f.scripts().length, 2, "nothing minted");
+    f.done();
+    f = fake();
+    for (const args of [["runner-add"], ["runner-add", "ow-test"], ["runner-add", "a b"], ["runner-remove", "x;y"]]) {
+        assert.notEqual(f.run(args).status, 0, args.join(" "));
+    }
+    assert.equal(f.scripts().length, 0);
+    f.done();
+});
+
+test("a runner upgrades only to an agent its controller accepts: the controller's release is passed", () => {
+    const f = fake({ parameter: RUNNER_CONFIG, instances: { "ow-test": CONTROLLER_ID, "ow-big": RUNNER_ID },
+        results: [{ stdout: JSON.stringify({ versions: { agent: "0.6.0" } }) }] });
+    const result = f.run(["upgrade", "--max-class", "1"], { OW_HOST: "ow-big" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.scripts().map((s) => [s.instance, f.lastLine(s.script)]), [
+        [CONTROLLER_ID, "ow_host status"],
+        [RUNNER_ID, "ow_host upgrade --max-class 1 --controller-version 0.6.0"],
+    ]);
+    f.done();
+});
+
+test("ci-post-up on a runner: ready, enrolled with its controller, then apply and upgrade", () => {
+    const status = JSON.stringify({ role: "runner", node: "ow-big", budget: { memory: 1024, slots: 2, cpus: 2 } });
+    const f = fake({ parameter: RUNNER_CONFIG, instances: { "ow-test": CONTROLLER_ID, "ow-big": RUNNER_ID },
+        results: [{}, {}, { stdout: status }, {}, {}, { stdout: JSON.stringify({ versions: { agent: "0.6.0" } }) }] });
+    const result = f.run(["ci-post-up", "--stack", "s"], { OW_HOST: "ow-big", OW_INSTANCE: RUNNER_ID });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.scripts().map((s) => [s.instance, f.lastLine(s.script)]), [
+        [RUNNER_ID, "after_start 3000"],
+        [RUNNER_ID, "ready 3000 ''"],
+        [RUNNER_ID, "ow_host status"],
+        [CONTROLLER_ID, "node_online ow-big 120"],
+        [RUNNER_ID, "ow_host apply"],
+        [CONTROLLER_ID, "ow_host status"],
+        [RUNNER_ID, "ow_host upgrade --controller-version 0.6.0"],
+    ]);
+    f.done();
+});
+
+test("a host with no config parameter (older than 0.5.0) still takes the host path", () => {
+    const f = fake();
+    assert.equal(f.run(["ci-post-up", "--stack", "s"]).status, 0);
+    assert.deepEqual(f.scripts().map((s) => f.lastLine(s.script)), ["post_up 3000"]);
+    f.done();
+});
+
+test("node_online waits for the node, and runner_remove never revokes an online runner", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ow-node-"));
+    const list = join(dir, "list.json");
+    writeFileSync(join(dir, "ow"), `#!/bin/sh\n[ "$1 $2" = "node list" ] && exec cat ${list}\necho "$@" >> ${join(dir, "revoked")}\n`, { mode: 0o755 });
+    writeFileSync(join(dir, "sleep"), "#!/bin/sh\n", { mode: 0o755 });
+    const host = (call) => spawnSync("bash", ["-c", `. ${remoteLib}; ${call}`], { encoding: "utf8", env: { PATH: `${dir}:${process.env.PATH}` } });
+    writeFileSync(list, JSON.stringify([{ id: "ow-big", online: true }]));
+    assert.equal(host("node_online ow-big 5").status, 0);
+    const refused = host("runner_remove ow-big");
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stdout, /is online/);
+    assert.ok(!existsSync(join(dir, "revoked")));
+    writeFileSync(list, JSON.stringify([{ id: "ow-big", online: false }]));
+    assert.notEqual(host("node_online ow-big 0").status, 0);
+    assert.equal(host("runner_remove ow-big").status, 0);
+    assert.equal(readFileSync(join(dir, "revoked"), "utf8"), "--data-dir /srv/ow/.ow/controller node-revoke ow-big\n");
+    rmSync(dir, { recursive: true });
 });

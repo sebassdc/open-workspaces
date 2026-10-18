@@ -327,7 +327,9 @@ class HostOps:
     """The host side effects the state machine uses; tests use a fake with the same methods."""
 
     def units(self):
-        return [name for name in h.PINS if h.unit_exists(h.UNITS[name])]
+        # An unenrolled runner's agent has nothing to run (its unit's condition keeps it down).
+        idle = h.role() == "runner" and not p(f"{h.RUNNER}/node.json").exists()
+        return [name for name in h.PINS if h.unit_exists(h.UNITS[name]) and not (idle and name == "agent")]
 
     def active(self, name):
         return h.active(h.UNITS[name])
@@ -439,6 +441,8 @@ class HostOps:
         status = self.worker_status() or {}
         if status.get("internet") is not True or status.get("version") != expected["worker"]:
             return f"worker answers {status.get('version')!r} (internet {status.get('internet')}), want {expected['worker']}"
+        if "agent" not in self.units():
+            return ""
         try:
             if not h.node_online(expected["agent"], expected["worker"]):
                 return f"runner not online with agent {expected['agent']} and worker {expected['worker']}"
