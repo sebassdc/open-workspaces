@@ -267,6 +267,11 @@ class Setup(unittest.TestCase):
             if cmd == ["networkctl", "reload"] and failures:
                 failures.pop()
                 raise RuntimeError("network reload failed")
+            if cmd == ["ip", "route", "flush", "table", "41641"]:
+                # A detached interface (or an apply that failed before DHCP) can leave no table.
+                if kw.get("check", True):
+                    raise RuntimeError("FIB table does not exist")
+                return ""
             if cmd == ["systemctl", "is-active", "tailscaled.service"]:
                 return "active"
             if cmd == ["ip", "-j", "link", "show"]:

@@ -584,7 +584,7 @@ def setup(config):
                 time.sleep(1)
         else:
             run(["ip", "rule", "del", "priority", "5100", "ipproto", "udp", "sport", "41641", "table", "41641"], check=False)
-            run(["ip", "route", "flush", "table", "41641"])
+            run(["ip", "route", "flush", "table", "41641"], check=False)
     if "tailscale-restart" in due and active("tailscaled.service"):
         systemctl("restart", "tailscaled.service")
     if due:
