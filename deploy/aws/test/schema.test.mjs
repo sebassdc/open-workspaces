@@ -1,0 +1,21 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { test } from "node:test";
+
+// Consumers install this package with `pulumi package add`, which generates their SDK from
+// this schema; 0.6.0 shipped a Runner the analyzer could not find. Needs the Pulumi CLI.
+test("pulumi package get-schema finds every component", (t) => {
+    try {
+        execFileSync("pulumi", ["version"], { stdio: "ignore" });
+    } catch {
+        t.skip("no pulumi CLI");
+        return;
+    }
+    const dir = fileURLToPath(new URL("..", import.meta.url));
+    const schema = JSON.parse(execFileSync("pulumi", ["package", "get-schema", dir], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
+    for (const name of ["Host", "Runner", "ArtifactStore"]) {
+        assert.ok(schema.resources?.[`open-workspaces-aws:index:${name}`]?.isComponent, `${name} in the schema`);
+    }
+    assert.equal(schema.resources["open-workspaces-aws:index:Runner"].inputProperties.controller.$ref, "#/types/open-workspaces-aws:index:RunnerController");
+});
