@@ -22,7 +22,8 @@
 #   image RECIPE                 build the golden image RECIPE (NAME.sh) on the host's runner
 #   backups [--url S3URL] [OWNER/NAME | ID]
 #                                backed-up captures, oldest first, with the box's owner and name
-#                                (default URL: the host's backupUrl)
+#                                (default URL: the host's backupUrl; a runner's are listed
+#                                from its controller host)
 #   apply | upgrade [ARGS]       ow-host apply | upgrade on the host (hosts with ow-host); on a
 #                                runner, upgrade passes the release its controller runs
 #   runner-add RUNNER            enrol the Runner RUNNER with this host's controller: a
@@ -295,7 +296,17 @@ EOF
       esac
     done
     find_instance
-    remote 600 backups "$url" "$want" ;;
+    controller=$(controller_of "$host")
+    if [[ -n $controller && -z $url ]]; then
+      # A runner's own prefix, listed from its controller host, which can read the
+      # catalog copies that name each box's owner (the runner's role cannot).
+      url=$(aws ssm get-parameter --name "/open-workspaces/$host/config" --query Parameter.Value --output text \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["backup"]["url"])')
+      [[ -n $url ]] || die "$host has no backupUrl"
+      on "$controller" 600 backups "$url" "$want"
+    else
+      remote 600 backups "$url" "$want"
+    fi ;;
   apply | upgrade)
     for arg in "$@"; do [[ $arg =~ ^[A-Za-z0-9._=-]+$ ]] || die "bad argument: $arg"; done
     find_instance

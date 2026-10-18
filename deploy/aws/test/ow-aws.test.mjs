@@ -427,3 +427,12 @@ test("node_online waits for the node, and runner_remove never revokes an online 
     assert.equal(readFileSync(join(dir, "revoked"), "utf8"), "--data-dir /srv/ow/.ow/controller node-revoke ow-big\n");
     rmSync(dir, { recursive: true });
 });
+
+test("a runner's backups are listed from its controller, under the runner's own prefix", () => {
+    const parameter = JSON.stringify({ ...JSON.parse(RUNNER_CONFIG), backup: { url: "s3://my-bucket/ow/runners/ow-big", schedule: "" } });
+    const f = fake({ parameter, instances: { "ow-test": CONTROLLER_ID, "ow-big": RUNNER_ID } });
+    assert.equal(f.run(["backups", "ow-big-box"], { OW_HOST: "ow-big" }).status, 0);
+    assert.deepEqual(f.scripts().map((s) => [s.instance, f.lastLine(s.script)]),
+        [[CONTROLLER_ID, "backups s3://my-bucket/ow/runners/ow-big ow-big-box"]]);
+    f.done();
+});
