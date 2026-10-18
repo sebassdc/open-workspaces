@@ -67,10 +67,19 @@ export interface HostArgs {
 /** A runner host: everything a Host takes except the dashboard, plus the controller it joins. */
 export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins"> {
     /**
-     * The Host whose controller this runner joins. Its role may write this runner's
-     * join secret; nothing of that host changes otherwise.
+     * The Host whose controller this runner joins (a Host itself fits): its component
+     * name and role. That role may write this runner's join secret; nothing of that host
+     * changes otherwise.
      */
-    controller: Host;
+    controller: RunnerController;
+}
+
+/** A plain object, not the Host: a component cannot be an input of a Pulumi package. */
+export interface RunnerController {
+    /** The Host's component name. */
+    hostName: string;
+    /** The Host's `roleName` output. */
+    roleName: pulumi.Input<string>;
 }
 
 /** Host layout of stage 0 (bootstrap.sh); bump it with any change to that script. */
@@ -229,11 +238,26 @@ export class Host extends pulumi.ComponentResource {
     /** The component name: the tag Name `ow-aws --host` finds, and a runner's node ID. */
     public readonly hostName: string;
 
-    /** `type` is for Runner only. */
-    constructor(name: string, args: HostArgs, opts?: pulumi.ComponentResourceOptions, type = "open-workspaces-aws:index:Host") {
-        super(type, name, {}, opts);
-        const parent = { parent: this };
+    constructor(name: string, args: HostArgs, opts?: pulumi.ComponentResourceOptions) {
+        super("open-workspaces-aws:index:Host", name, {}, opts);
         this.hostName = name;
+        const out = provision(this, name, args);
+        this.instanceId = out.instanceId;
+        this.privateIp = out.privateIp;
+        this.availabilityZone = out.availabilityZone;
+        this.dataVolumeId = out.dataVolumeId;
+        this.roleName = out.roleName;
+        this.securityGroupId = out.securityGroupId;
+        this.configParameter = out.configParameter;
+        this.registerOutputs(out);
+    }
+}
+
+type HostOutputs = Pick<Host, "instanceId" | "privateIp" | "availabilityZone" | "dataVolumeId" | "roleName" | "securityGroupId" | "configParameter">;
+
+/** The resources of a Host or a Runner, as children of `self`. */
+function provision(self: pulumi.ComponentResource, name: string, args: HostArgs): HostOutputs {
+        const parent = { parent: self };
         const controller = (args as Partial<RunnerArgs>).controller;
         // A runner keeps its snapshots under its own prefix of the shared store.
         const backupUrl = args.backupUrl && controller
@@ -396,32 +420,24 @@ export class Host extends pulumi.ComponentResource {
             userDataReplaceOnChange: true,
             tags: named,
             volumeTags: named,
-        }, { parent: this, deleteBeforeReplace: true, dependsOn: [configRead] });
+        }, { parent: self, deleteBeforeReplace: true, dependsOn: [configRead] });
 
         new aws.ec2.VolumeAttachment(`${name}-data`, {
             instanceId: instance.id,
             volumeId: dataVolume.id,
             deviceName: "/dev/sdf",
             stopInstanceBeforeDetaching: true,
-        }, { parent: this, deleteBeforeReplace: true });
+        }, { parent: self, deleteBeforeReplace: true });
 
-        this.instanceId = instance.id;
-        this.privateIp = instance.privateIp;
-        this.availabilityZone = subnet.availabilityZone;
-        this.dataVolumeId = dataVolume.id;
-        this.roleName = role.name;
-        this.securityGroupId = securityGroup.id;
-        this.configParameter = config.name;
-        this.registerOutputs({
-            instanceId: this.instanceId,
-            privateIp: this.privateIp,
-            availabilityZone: this.availabilityZone,
-            dataVolumeId: this.dataVolumeId,
-            roleName: this.roleName,
-            securityGroupId: this.securityGroupId,
-            configParameter: this.configParameter,
-        });
-    }
+        return {
+            instanceId: instance.id,
+            privateIp: instance.privateIp,
+            availabilityZone: subnet.availabilityZone,
+            dataVolumeId: dataVolume.id,
+            roleName: role.name,
+            securityGroupId: securityGroup.id,
+            configParameter: config.name,
+        };
 }
 
 /**
@@ -433,9 +449,32 @@ export class Host extends pulumi.ComponentResource {
  * Creating or changing it touches no other host: the controller's role only gains the
  * right to write this runner's join secret.
  */
-export class Runner extends Host {
+// Extends ComponentResource itself, not Host: Pulumi's component analyzer finds only
+// direct subclasses, so `pulumi package add` failed on 0.6.0 ("Failed to find ... Runner").
+export class Runner extends pulumi.ComponentResource {
+    public readonly instanceId: pulumi.Output<string>;
+    public readonly privateIp: pulumi.Output<string>;
+    public readonly availabilityZone: pulumi.Output<string>;
+    public readonly dataVolumeId: pulumi.Output<string>;
+    public readonly roleName: pulumi.Output<string>;
+    public readonly securityGroupId: pulumi.Output<string>;
+    /** SSM parameter holding the host's config; apply a change with `ow-aws apply`. */
+    public readonly configParameter: pulumi.Output<string>;
+    /** The component name: the tag Name `ow-aws --host` finds, and a runner's node ID. */
+    public readonly hostName: string;
+
     constructor(name: string, args: RunnerArgs, opts?: pulumi.ComponentResourceOptions) {
         nodeId(name);
-        super(name, args, opts, "open-workspaces-aws:index:Runner");
+        super("open-workspaces-aws:index:Runner", name, {}, opts);
+        this.hostName = name;
+        const out = provision(this, name, args);
+        this.instanceId = out.instanceId;
+        this.privateIp = out.privateIp;
+        this.availabilityZone = out.availabilityZone;
+        this.dataVolumeId = out.dataVolumeId;
+        this.roleName = out.roleName;
+        this.securityGroupId = out.securityGroupId;
+        this.configParameter = out.configParameter;
+        this.registerOutputs(out);
     }
 }

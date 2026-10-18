@@ -42,7 +42,7 @@ checks fail while they disagree. The same tag is the default `ref` the host
 builds, so set `ref` explicitly before the first release exists.
 
 ```bash
-pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.6.0
+pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.6.1
 ```
 
 ```typescript
@@ -210,7 +210,7 @@ a node agent, and no controller or dashboard. The component name is its node ID
 ```typescript
 const host = new ow.Host("workspaces", { tailscaleAuthKeySecretArn: key, backupUrl: store.url });
 const big = new ow.Runner("workspaces-2", {
-    controller: host,
+    controller: { hostName: "workspaces", roleName: host.roleName },
     instanceType: "m8i.4xlarge",
     tailscaleAuthKeySecretArn: key,      // required: the controller listens on the tailnet only
     backupUrl: store.url,                // its snapshots go to backupUrl/runners/workspaces-2
@@ -218,7 +218,9 @@ const big = new ow.Runner("workspaces-2", {
 });
 ```
 
-It takes the Host inputs except `dashboardLogins`, plus `controller`. On top
+It takes the Host inputs except `dashboardLogins`, plus `controller`: the
+Host's component name and its `roleName` output (a component cannot be a
+package input; in TypeScript source the Host itself fits). On top
 of what a Host creates, it adds a Secrets Manager secret
 `open-workspaces/NAME/join` (no value), lets its own role read and overwrite
 it, and lets the controller host's role write it. Nothing else of the
