@@ -222,6 +222,147 @@ fn known_rejections_give_safe_actions_without_worker_details() {
 }
 
 #[test]
+fn failed_snapshots_keep_the_cause_reconcile_legacy_pending_and_retry() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let owner = c.user(&identity("alice")).unwrap();
+    c.operation(owner, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    *fake.reject.lock().unwrap() = Some("snapshot".into());
+    let diagnostic =
+        "storage headroom exhausted: 72000000000 bytes available, 73000000000 bytes required";
+    *fake.diagnostic.lock().unwrap() = diagnostic.into();
+    let request = json!({"op":"snapshot","id":"demo","name":"saved","operation_key":"capture-1"});
+    let failure = c.operation(owner, request.clone()).unwrap_err();
+    let failure = failure.downcast_ref::<OperationFailure>().unwrap();
+    assert_eq!(failure.message(), diagnostic);
+    assert!(failure.to_string().contains(diagnostic));
+    let id = failure.0["id"].as_i64().unwrap();
+    let response: String =
+        c.db.query_row("SELECT response FROM operations WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["error"],
+        diagnostic
+    );
+    assert!(
+        c.db.query_row(
+            "SELECT finished_at IS NOT NULL FROM operations WHERE id=?1",
+            [id],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "failed");
+    // Simulate a failed reservation written by an older controller, then reopen it.
+    c.db.execute(
+        "UPDATE resources SET metadata='{\"state\":\"pending\"}' WHERE kind='snapshot'",
+        [],
+    )
+    .unwrap();
+    drop(c);
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "failed");
+    assert_eq!(c.operation_info(owner, id).unwrap()["error"], diagnostic);
+    *fake.diagnostic.lock().unwrap() = "a new capture must not run during replay".into();
+    assert_eq!(
+        c.operation(owner, request)
+            .unwrap_err()
+            .downcast_ref::<OperationFailure>()
+            .unwrap()
+            .message(),
+        diagnostic
+    );
+    // Unknown outcomes stay pending; absence alone is not failure.
+    c.db.execute("UPDATE operations SET state='uncertain' WHERE id=?1", [id])
+        .unwrap();
+    c.db.execute(
+        "UPDATE resources SET metadata='{\"state\":\"pending\"}' WHERE kind='snapshot'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "pending");
+    c.db.execute("UPDATE operations SET state='failed' WHERE id=?1", [id])
+        .unwrap();
+    *fake.reject.lock().unwrap() = None;
+    let saved = c
+        .operation(
+            owner,
+            json!({"op":"snapshot","id":"demo","name":"saved","operation_key":"capture-2"}),
+        )
+        .unwrap();
+    assert_eq!(saved["state"], "ready");
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "ready");
+    let other = c.user(&identity("bob")).unwrap();
+    assert!(
+        c.state(other).unwrap()["operations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_snapshot_dashboard_response_preserves_safe_cause() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let owner = c.user(&identity("alice")).unwrap();
+    c.operation(owner, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    *fake.reject.lock().unwrap() = Some("snapshot".into());
+    let catalog = Arc::new(Mutex::new(c));
+    for (key, diagnostic, expected) in [
+        (
+            "capacity",
+            "storage headroom exhausted: 72 bytes available, 73 bytes required",
+            "72 bytes available",
+        ),
+        (
+            "private",
+            "private /srv/operator/token=secret",
+            "host journal",
+        ),
+    ] {
+        *fake.diagnostic.lock().unwrap() = diagnostic.into();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/operation")
+            .header("content-type", "application/json")
+            .header("x-ow-request", "dashboard")
+            .body(Body::from(
+                json!({"op":"snapshot","id":"demo","name":"saved","operation_key":key}).to_string(),
+            ))
+            .unwrap();
+        let response = crate::dashboard::handle(
+            Some(catalog.clone()),
+            Some(fake.root.clone()),
+            identity("alice"),
+            request,
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ok"], false);
+        assert!(value["error"].as_str().unwrap().contains(expected));
+        assert_eq!(value["operation"]["error"], value["error"]);
+        assert_eq!(value["operation"]["state"], "failed");
+        assert!(
+            !String::from_utf8(bytes.to_vec())
+                .unwrap()
+                .contains("token=secret")
+        );
+    }
+}
+
+#[test]
 fn placement_ownership_snapshots_duplicate_and_offline_state() {
     let mut fake = Fake::new();
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();

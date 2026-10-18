@@ -471,6 +471,7 @@ impl Runtime {
             idle: crate::idle::Idle::from_env()?,
             closing: false,
         };
+        runtime.cleanup_pending_snapshots()?;
         runtime.save()?;
         Ok(runtime)
     }
@@ -659,7 +660,12 @@ impl Runtime {
                 <= u64::from(max_disk_gib()?) * GIB,
             "host disk cap exhausted (OW_MAX_DISK_GIB)"
         );
-        self.storage_headroom(additional)
+        // Shared reflink extents cannot establish exclusive ownership: reserve full sizes.
+        self.storage_headroom(
+            self.disk_reserved()?
+                .checked_add(additional)
+                .context("disk reservation overflow")?,
+        )
     }
 
     fn storage_headroom(&self, extra: u64) -> Result<()> {
@@ -672,16 +678,14 @@ impl Runtime {
             "storage capacity unavailable"
         );
         let stats = unsafe { stats.assume_init() };
-        // Reflink extents may be shared: reserve full logical sizes, not st_blocks.
         let reserve = minimum_free_bytes()?;
-        let required = self
-            .disk_reserved()?
-            .checked_add(extra)
-            .and_then(|n| n.checked_add(reserve))
+        let required = extra
+            .checked_add(reserve)
             .context("disk reservation overflow")?;
+        let available = stats.f_bavail.saturating_mul(stats.f_frsize);
         ensure!(
-            stats.f_bavail.saturating_mul(stats.f_frsize) >= required,
-            "storage headroom exhausted (full disk reservations plus host reserve)"
+            available >= required,
+            "storage headroom exhausted: {available} bytes available, {required} bytes required"
         );
         Ok(())
     }
@@ -891,7 +895,6 @@ impl Runtime {
     fn capture(&mut self, id: &str, name: &str, hibernate: bool) -> Result<Value> {
         identifier(name)?;
         let workspace = self.workspace(id)?;
-        self.storage_headroom(workspace.memory_mib as u64 * 1024 * 1024)?;
         let destination = self.snapshot_dir(name);
         if destination.join("manifest.json").exists() {
             let previous: Snapshot =
@@ -902,52 +905,91 @@ impl Runtime {
             );
             return Ok(previous.summary());
         }
-        let count = fs::read_dir(self.root.join("snapshots"))?.count();
-        ensure!(
-            count < MAX_SNAPSHOTS,
-            "snapshot limit ({MAX_SNAPSHOTS}) reached"
-        );
+        // A capture reflinks an existing disk; only RAM is a new data allocation.
+        self.storage_headroom(workspace.memory_mib as u64 * 1024 * 1024)?;
+        if !hibernate {
+            ensure!(
+                self.named_snapshot_count()? < MAX_SNAPSHOTS,
+                "snapshot limit ({MAX_SNAPSHOTS}) reached"
+            );
+        }
         ensure!(
             !destination.exists(),
             "incomplete snapshot exists; preserve and inspect it"
         );
+        self.running(id)?;
         let staging = self.snapshot_dir(&format!(".pending-{}", vm::nonce()?));
         fs::create_dir(&staging)?;
-        let disk = self.machine_dir(id).join("disk.ext4");
-        if let Err(e) = self.running(id)?.capture(&staging, &disk, !hibernate) {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(e);
+        let result = (|| {
+            let disk = self.machine_dir(id).join("disk.ext4");
+            self.running(id)?.capture(&staging, &disk, !hibernate)?;
+            if hibernate {
+                self.machines.remove(id);
+                // Until the capture is sealed, the live disk is the machine's state.
+                self.state.workspaces.get_mut(id).unwrap().state = "stopped".into();
+                self.save()?;
+            }
+            let mut files = BTreeMap::new();
+            for file in ["state", "memory", "disk.ext4"] {
+                files.insert(file.into(), hash(&staging.join(file))?);
+            }
+            let snapshot = Snapshot {
+                name: name.into(),
+                workspace: id.into(),
+                memory_mib: workspace.memory_mib,
+                vcpu_count: workspace.vcpu_count,
+                image: workspace.image,
+                runtime: crate::common::RUNTIME.into(),
+                cpu: self.cpu.clone(),
+                kernel_sha256: self.kernel_hash.clone(),
+                files,
+            };
+            atomic_json(&staging.join("manifest.json"), &snapshot)?;
+            fs::rename(&staging, &destination)?;
+            for file in ["state", "memory", "disk.ext4", "manifest.json"] {
+                fs::set_permissions(destination.join(file), fs::Permissions::from_mode(0o400))?;
+            }
+            File::open(self.root.join("snapshots"))?.sync_all()?;
+            self.verified
+                .insert(name.into(), fingerprints(&destination)?);
+            Ok(snapshot.summary())
+        })();
+        if result.is_err() && staging.exists() {
+            if let Err(error) = fs::remove_dir_all(&staging) {
+                eprintln!("removing failed snapshot staging: {error:#}");
+            }
         }
-        if hibernate {
-            self.machines.remove(id);
-            // Until the capture is sealed, the live disk is the machine's state.
-            self.state.workspaces.get_mut(id).unwrap().state = "stopped".into();
-            self.save()?;
+        result
+    }
+
+    fn named_snapshot_count(&self) -> Result<usize> {
+        let mut count = 0;
+        for entry in fs::read_dir(self.root.join("snapshots"))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with('.')
+                && !name.starts_with(SLEEP)
+                && entry.path().join("manifest.json").is_file()
+            {
+                count += 1;
+            }
         }
-        let mut files = BTreeMap::new();
-        for file in ["state", "memory", "disk.ext4"] {
-            files.insert(file.into(), hash(&staging.join(file))?);
+        Ok(count)
+    }
+
+    // Called only at startup: the exclusive worker lock and dead VM children make
+    // unpublished staging directories unreachable by any running capture or guest.
+    fn cleanup_pending_snapshots(&self) -> Result<()> {
+        for entry in fs::read_dir(self.root.join("snapshots"))? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with(".pending-")
+                && entry.file_type()?.is_dir()
+            {
+                fs::remove_dir_all(entry.path()).context("removing abandoned snapshot staging")?;
+            }
         }
-        let snapshot = Snapshot {
-            name: name.into(),
-            workspace: id.into(),
-            memory_mib: workspace.memory_mib,
-            vcpu_count: workspace.vcpu_count,
-            image: workspace.image,
-            runtime: crate::common::RUNTIME.into(),
-            cpu: self.cpu.clone(),
-            kernel_sha256: self.kernel_hash.clone(),
-            files,
-        };
-        atomic_json(&staging.join("manifest.json"), &snapshot)?;
-        fs::rename(&staging, &destination)?;
-        for file in ["state", "memory", "disk.ext4", "manifest.json"] {
-            fs::set_permissions(destination.join(file), fs::Permissions::from_mode(0o400))?;
-        }
-        File::open(self.root.join("snapshots"))?.sync_all()?;
-        self.verified
-            .insert(name.into(), fingerprints(&destination)?);
-        Ok(snapshot.summary())
+        Ok(())
     }
 
     fn validate_snapshot(&mut self, name: &str) -> Result<PathBuf> {
@@ -1324,7 +1366,10 @@ impl Runtime {
                     let item = item?;
                     let path = item.path().join("manifest.json");
                     // Hibernation captures are internal to their machine.
-                    if path.exists() && !item.file_name().to_string_lossy().starts_with(SLEEP) {
+                    if path.exists()
+                        && !item.file_name().to_string_lossy().starts_with('.')
+                        && !item.file_name().to_string_lossy().starts_with(SLEEP)
+                    {
                         snapshots.push(serde_json::from_slice(&fs::read(path)?)?);
                     }
                 }
@@ -1441,6 +1486,119 @@ mod disk_tests {
             idle: crate::idle::Idle::from_env().unwrap(),
             closing: false,
         }
+    }
+
+    #[test]
+    fn snapshot_admission_does_not_reserve_another_writable_disk() {
+        let mut runtime = fixture();
+        // Sparse capacity exceeds this test volume; capture adds RAM, not a new disk.
+        File::options()
+            .write(true)
+            .open(runtime.machine_dir("legacy").join("disk.ext4"))
+            .unwrap()
+            .set_len(1024 * GIB)
+            .unwrap();
+        assert!(
+            runtime
+                .reserve_disk(0)
+                .unwrap_err()
+                .to_string()
+                .contains("headroom")
+        );
+        runtime.storage_headroom(GIB).unwrap();
+        assert!(runtime.storage_headroom(1024 * GIB).is_err());
+        let error = runtime.capture("legacy", "test", false).unwrap_err();
+        assert!(error.to_string().contains("not running"), "{error:#}");
+        assert_eq!(
+            fs::read_dir(runtime.root.join("snapshots"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(runtime.storage_headroom(u64::MAX).is_err());
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn ready_snapshot_retry_needs_no_new_headroom() {
+        let mut runtime = fixture();
+        runtime
+            .state
+            .workspaces
+            .get_mut("legacy")
+            .unwrap()
+            .memory_mib = u32::MAX;
+        let snapshot = Snapshot {
+            name: "saved".into(),
+            workspace: "legacy".into(),
+            memory_mib: 1024,
+            vcpu_count: 2,
+            image: "alpine".into(),
+            runtime: crate::common::RUNTIME.into(),
+            cpu: String::new(),
+            kernel_sha256: String::new(),
+            files: BTreeMap::new(),
+        };
+        let directory = runtime.snapshot_dir("saved");
+        fs::create_dir(&directory).unwrap();
+        atomic_json(&directory.join("manifest.json"), &snapshot).unwrap();
+        assert_eq!(
+            runtime.capture("legacy", "saved", false).unwrap()["state"],
+            "ready"
+        );
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_limit_ignores_staging_and_sleep_and_startup_cleans_staging() {
+        let mut runtime = fixture();
+        for i in 0..MAX_SNAPSHOTS {
+            for prefix in [".pending-", SLEEP] {
+                let dir = runtime.snapshot_dir(&format!("{prefix}{i}"));
+                fs::create_dir(&dir).unwrap();
+                fs::write(dir.join("memory"), b"capture RAM").unwrap();
+                fs::write(dir.join("manifest.json"), b"{}").unwrap();
+            }
+        }
+        assert_eq!(runtime.named_snapshot_count().unwrap(), 0);
+        let error = runtime.capture("legacy", "test", false).unwrap_err();
+        assert!(error.to_string().contains("not running"), "{error:#}");
+        for i in 0..MAX_SNAPSHOTS {
+            let dir = runtime.snapshot_dir(&format!("saved-{i}"));
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("manifest.json"), b"{}").unwrap();
+        }
+        assert_eq!(runtime.named_snapshot_count().unwrap(), MAX_SNAPSHOTS);
+        assert!(
+            runtime
+                .capture("legacy", "test", false)
+                .unwrap_err()
+                .to_string()
+                .contains("snapshot limit")
+        );
+        // Hibernation must still be possible at the named-snapshot limit.
+        assert!(
+            runtime
+                .capture("legacy", "sleep-test", true)
+                .unwrap_err()
+                .to_string()
+                .contains("not running")
+        );
+        runtime.cleanup_pending_snapshots().unwrap();
+        assert!(!runtime.snapshot_dir(".pending-0").exists());
+        assert!(
+            runtime
+                .snapshot_dir("sleep-0")
+                .join("manifest.json")
+                .exists()
+        );
+        assert!(
+            runtime
+                .snapshot_dir("saved-0")
+                .join("manifest.json")
+                .exists()
+        );
+        fs::remove_dir_all(&runtime.root).unwrap();
     }
 
     #[test]

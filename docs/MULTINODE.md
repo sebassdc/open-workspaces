@@ -134,15 +134,18 @@ save private intent under the client config `operations/` directory. Reuse
 a new key means a deliberate new execution. Client intents contain user command
 text/file bytes, so treat that private directory as sensitive and remove old
 intents under the operator's retention policy. Browser pending intents use
-sessionStorage and survive reload in the same tab; confirmed success removes the
-key. Independent browser reload acceptance is recorded by node-verify.
+sessionStorage and survive reload in the same tab; confirmed success or definitive failure removes the
+key. Uncertain outcomes retain it. Independent browser reload acceptance is recorded by node-verify.
 
 ## Operation and recovery contract
 
 `/api/state` contains the caller's latest 100 operations only, with `id`, `op`,
 logical `resource`, `state`, fixed `node` and `retry_key`; request bodies, host
 paths and other owners' operations are not included. Typed operation errors carry
-the same safe operation object. Successful replies carry `operation_id`,
+the same safe operation object, including `error` for failed outcomes. Known capacity
+and lifecycle rejections include actionable causes; arbitrary worker diagnostics
+remain in the private operation response and host journal, correlated by ID.
+Failed replies are persisted across restarts and same-key retries. Successful replies carry `operation_id`,
 `operation`, and `node`.
 
 States are pending, succeeded, failed, uncertain and not_dispatched. Routing
