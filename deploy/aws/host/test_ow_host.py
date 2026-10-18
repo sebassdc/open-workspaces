@@ -67,6 +67,9 @@ class Render(unittest.TestCase):
         prepare = self.files["/usr/local/lib/open-workspaces/dashboard-prepare"]
         self.assertIn("tailscale serve --bg http://127.0.0.1:8787", prepare)
         self.assertNotIn("funnel", prepare)
+        self.assertEqual(self.files["/etc/sudoers.d/ow-preview"], "ow ALL=(root) NOPASSWD: /usr/local/lib/open-workspaces/preview-serve *\n")
+        self.assertIn("/usr/bin/tailscale", self.files["/usr/local/lib/open-workspaces/preview-serve"])
+        self.assertEqual(h.units_changed(["/usr/local/lib/open-workspaces/preview-serve"]), {"dashboard"})
         self.assertEqual(self.files["/etc/open-workspaces/dashboard.env"], "OW_DASHBOARD_LOGINS=you@example.com\nOW_DASHBOARD_CAPABILITY=\n")
 
     def test_capability_alone_enables_dashboard_and_changes_only_dashboard_config(self):
@@ -77,6 +80,8 @@ class Render(unittest.TestCase):
                       files["/etc/open-workspaces/dashboard.env"])
         changed = {path for path in files if files[path] != self.files[path]}
         self.assertEqual(changed, {"/etc/open-workspaces/dashboard.env"})
+        for path in ("/usr/local/lib/open-workspaces/preview-serve", "/etc/sudoers.d/ow-preview"):
+            self.assertEqual(files[path], self.files[path], "capability-only dashboards retain preview support")
         self.assertEqual(h.units_changed(changed), {"dashboard"})
 
     def test_dashboard_prepare_writes_capability_only_and_email_configs(self):

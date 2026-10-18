@@ -941,7 +941,11 @@ pub fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Action::Unpublish { id, port } => {
-            unpublish(&root, &id, port)?;
+            if let Some(port) = port {
+                unpublish(&root, &id, port)?;
+            } else {
+                unpublish_all(&root, Some(&id))?;
+            }
             return Ok(0);
         }
     };

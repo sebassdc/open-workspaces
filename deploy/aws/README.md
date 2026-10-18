@@ -181,7 +181,7 @@ destination host tag, permit HTTPS and grant that capability; see the
 [policy example and revocation checks](../../docs/DASHBOARD.md#admission-through-a-capability-grant).
 After the initial configuration, group/grant additions and removals require no
 per-person application update, host redeploy or dashboard restart. The dashboard
-checks fresh whois answers per request; terminal/SSH streams recheck every 30
+checks fresh whois answers per request; terminal/SSH/preview streams recheck every 30
 seconds. Revocation takes effect after policy propagation (within 35 seconds for
 streams once the host sees it). An email-list fallback still admits listed users
 after grant removal, so omit it for grant-only administration. Capabilities admit

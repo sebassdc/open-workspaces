@@ -114,7 +114,7 @@ tailscale serve --bg http://127.0.0.1:8787   # then open https://NAME.TAILNET.ts
 - Anyone who can open a TCP connection to the loopback port on this machine can
   claim an allowed login. Use it only where the machine's local users are
   operators; guests cannot reach host loopback.
-- Terminal and SSH streams also recheck admission every 30 seconds and close on
+- Terminal, SSH and preview streams also recheck admission every 30 seconds and close on
   denial, a changed user ID or a failed lookup (up to five seconds per lookup).
   Their existing session deadlines still apply; reconnect to continue.
   Removing a login from `allowed_emails` takes effect on dashboard restart.
@@ -156,7 +156,7 @@ The explicit email allowlist is still required for Cloudflare Access and for
 `bootstrap_owner_email` legacy ownership migration.
 
 After Tailscale propagates a policy removal to the host, the next request is
-denied and existing terminal/SSH streams close within 35 seconds. No dashboard
+denied and existing terminal/SSH/preview streams close within 35 seconds. No dashboard
 restart or per-person application config update is needed. Work already
 dispatched to a guest is not cancelled by admission revocation; ownership and
 machine data are preserved. The existing AWS in-place config path already avoids

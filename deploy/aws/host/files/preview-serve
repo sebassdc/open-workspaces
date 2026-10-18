@@ -1,0 +1,58 @@
+#!/usr/bin/python3 -I
+"""Manage only authenticated OW preview routes. Never reset shared Serve configuration."""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+
+TAILSCALE = "/usr/bin/tailscale"
+TARGET = "http://127.0.0.1:8787"
+
+
+def route_commands(config, hostname, port, enabled):
+    key = f"{hostname}:{port}"
+    tcp = config.get("TCP", {}).get(str(port))
+    web = config.get("Web", {}).get(key)
+    expected = {"Handlers": {"/": {"Proxy": TARGET}}}
+    if config.get("AllowFunnel", {}).get(key):
+        raise ValueError("preview port has public ingress; refusing to change it")
+    if (tcp is not None or web is not None) and (tcp != {"HTTPS": True} or web != expected):
+        raise ValueError("preview port belongs to another Serve listener")
+    if any(k != key and k.endswith(f":{port}") for k in config.get("Web", {})):
+        raise ValueError("preview port belongs to another hostname")
+    if enabled:
+        if web:
+            return []
+        return [[TAILSCALE, "serve", "--bg", "--yes", f"--https={port}", TARGET]]
+    return [[TAILSCALE, "serve", f"--https={port}", "off"]] if web else []
+
+
+def run(args):
+    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=10).stdout
+
+
+def main(args):
+    if len(args) != 2 or not args[0].isascii() or not args[0].isdecimal() or str(int(args[0])) != args[0] or not 11000 <= int(args[0]) <= 65535 or args[1] not in ("on", "off"):
+        raise ValueError("expected preview HTTPS port 11000..65535 and on|off")
+    fd = os.open("/run/lock/ow-preview-serve.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        if os.fstat(lock.fileno()).st_uid != 0:
+            raise ValueError("preview lock is not root-owned")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        status = json.loads(run([TAILSCALE, "status", "--json"]))
+        if status.get("BackendState") != "Running":
+            raise ValueError("Tailscale is not running")
+        hostname = status["Self"]["DNSName"].rstrip(".")
+        if not hostname.endswith(".ts.net"):
+            raise ValueError("missing tailnet DNS name")
+        config = json.loads(run([TAILSCALE, "serve", "status", "--json"]))
+        for command in route_commands(config, hostname, int(args[0]), args[1] == "on"):
+            run(command)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except (ValueError, KeyError, OSError, subprocess.SubprocessError):
+        sys.exit("Preview route unavailable; check Tailscale and reserved port conflicts")

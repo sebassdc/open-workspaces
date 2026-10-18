@@ -38,6 +38,8 @@ enum Auth {
 #[serde(deny_unknown_fields)]
 struct Config {
     hostname: String,
+    #[serde(skip)]
+    previews: bool,
     #[serde(default)]
     auth: Auth,
     #[serde(default)]
@@ -403,7 +405,7 @@ async fn authorized_until(
 }
 
 // Hop-by-hop headers and credentials must never enter a guest or escape from it.
-fn clean_headers(source: &HeaderMap, request: bool) -> HeaderMap {
+pub(crate) fn clean_headers(source: &HeaderMap, request: bool) -> HeaderMap {
     let nominated: Vec<String> = source
         .get_all("connection")
         .iter()
@@ -491,8 +493,16 @@ async fn handle(app: &App, mut request: Request) -> Response {
         .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    if host != app.config.hostname && host != format!("{}:443", app.config.hostname) {
+        .unwrap_or("")
+        .to_owned();
+    let preview_port = host
+        .strip_prefix(&format!("{}:", app.config.hostname))
+        .and_then(|p| p.parse::<u16>().ok())
+        .filter(|p| *p >= 11000);
+    if preview_port.is_none()
+        && host != app.config.hostname
+        && host != format!("{}:443", app.config.hostname)
+    {
         return (StatusCode::MISDIRECTED_REQUEST, "Unknown hostname").into_response();
     }
     // The CLI signs in through Cloudflare Access only, so tailnet mode offers no installer.
@@ -522,6 +532,19 @@ async fn handle(app: &App, mut request: Request) -> Response {
             subject: identity.subject.clone(),
         };
         request.extensions_mut().insert(session);
+    }
+    if let Some(port) = preview_port {
+        if !app.config.previews || app.config.auth != Auth::Tailscale || app.dashboard.is_none() {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        let target = crate::dashboard::with_catalog(app.catalog.clone(), identity, move |c, u| {
+            c.preview_target(u, port)
+        })
+        .await;
+        let Ok(target) = target else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        return crate::preview::proxy(target, request, expires, &host).await;
     }
     if app.dashboard.is_some() && request.uri().path().starts_with("/api/ssh/") {
         if request
@@ -620,6 +643,8 @@ async fn handle(app: &App, mut request: Request) -> Response {
             identity,
             request,
             controls,
+            (app.config.previews && app.config.auth == Auth::Tailscale)
+                .then(|| app.config.hostname.clone()),
         )
         .await;
     }
@@ -824,7 +849,10 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
             && metadata.mode() & 0o077 == 0,
         "gateway config must be an owner-only file (chmod 600)"
     );
-    let config: Config = serde_json::from_slice(&fs::read(path)?)?;
+    let mut config: Config = serde_json::from_slice(&fs::read(path)?)?;
+    config.previews = config.auth == Auth::Tailscale
+        && dashboard.is_some()
+        && Path::new("/usr/local/lib/open-workspaces/preview-serve").is_file();
     config.validate()?;
     let catalog = dashboard
         .as_ref()
@@ -965,6 +993,7 @@ mod tests {
             bootstrap_owner_email: None,
             node_owner_subject: None,
             node_owner_user_id: None,
+            previews: false,
             whois: Whois::default(),
         }
     }
@@ -1017,7 +1046,7 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
-    fn tailnet_config() -> Config {
+    pub(super) fn tailnet_config() -> Config {
         // Stand-in `tailscale whois --json ADDR`: two tailnet users, nothing else.
         let dir =
             std::env::temp_dir().join(format!("ow-whois-test-{}", crate::common::nonce().unwrap()));
@@ -1093,7 +1122,7 @@ mod tests {
         assert!(access.validate().is_err());
     }
 
-    fn capability_config() -> Config {
+    pub(super) fn capability_config() -> Config {
         use std::os::unix::fs::PermissionsExt;
         let mut cfg = tailnet_config();
         cfg.allowed_emails.clear();
@@ -1115,7 +1144,7 @@ mod tests {
         .unwrap();
     }
 
-    fn capability_answer() -> Value {
+    pub(super) fn capability_answer() -> Value {
         json!({"Node":{"Tags":[]}, "UserProfile":{"ID":42,"LoginName":"owner@example.test"},
             "CapMap":{"example.test/cap/open-workspaces":[{}]}})
     }
@@ -2758,3 +2787,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "preview_tests.rs"]
+mod preview_tests;

@@ -11,7 +11,10 @@ but arbitrary guest HTML is not served on the management origin.
 The local prototype now includes `ow serve`: a Rust gateway for **one guest HTTP
 app**, protected by Cloudflare Access JWT verification. It binds only to loopback
 and has no worker connection, workspace lifecycle API, terminal, or dashboard.
-The existing `ow publish` loopback relay remains available for local use.
+The existing `ow --local publish` loopback relay remains available for local use.
+Remote tailnet publishing uses the dashboard catalog and existing sharing grants;
+see [tailnet HTTPS previews](DAILY_USE.md#tailnet-https-previews-v080). It does
+not use the Cloudflare single-app gateway described here.
 
 The owner authorized a dedicated Cloudflare setup for this project. Tunnel login,
 named-tunnel creation, Access app/policy creation and public DNS routing succeeded.

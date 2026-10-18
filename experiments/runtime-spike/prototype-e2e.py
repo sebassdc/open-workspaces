@@ -31,6 +31,11 @@ def run():
     def value(*args):
         return json.loads(cli(*args))
 
+    def clock_is_current(machine):
+        before = int(time.time())
+        guest = int(cli('exec', machine, '--', 'date +%s').strip())
+        assert before - 2 <= guest <= time.time() + 2, (machine, guest, before)
+
     def http(url, expected):
         with urllib.request.urlopen(url, timeout=10) as response:
             assert response.status == 200
@@ -64,14 +69,18 @@ def run():
         assert cli('publish', 'dev').strip() == url
         http(url, 1)
         checks.append('loopback HTTP publishing and publish idempotency')
+        # Capture an intentionally stale wall clock, not just a short time asleep.
+        cli('exec', 'dev', '--', f'date -u -s @{int(time.time()) - 17 * 60}')
         started = time.monotonic()
         snapshot = value('snapshot', 'dev', 'ready')
         timings['snapshot_with_integrity_hashes'] = (time.monotonic() - started) * 1000
+        clock_is_current('dev')
         assert snapshot == value('snapshot', 'dev', 'ready')
         http(url, 2)
         started = time.monotonic()
         child = value('fork', 'dev', 'branch', '--snapshot', 'ready')
         timings['fork_from_verified_snapshot'] = (time.monotonic() - started) * 1000
+        clock_is_current('branch')
         assert child == value('fork', 'dev', 'branch', '--snapshot', 'ready')
         child_url = cli('publish', 'branch').strip()
         http(child_url, 2)  # Snapshot had counter 1; parent has since advanced.
@@ -85,16 +94,16 @@ def run():
         cli('exec', 'dev', '--', 'echo 1 > /proc/sys/net/ipv4/ip_forward; ip route replace 198.18.0.4/30 via 198.18.0.1; ping -c 1 -W 1 198.18.0.6', code=1)
         checks.append('guest root enabling its own forwarding cannot reach peer VM through worker')
 
+        cli('exec', 'branch', '--', f'date -u -s @{int(time.time()) - 17 * 60}')
         value('hibernate', 'branch')
         assert value('inspect', 'branch')['state'] == 'hibernated'
         assert value('status')['running'] == 1
         time.sleep(1.1)
         value('start', 'branch')
         http(child_url, 3)
-        guest_time = int(cli('exec', 'branch', '--', 'date +%s').strip())
-        assert abs(guest_time - time.time()) < 3
+        clock_is_current('branch')
         checks.append('hibernate releases VMM; resume preserves HTTP counter')
-        checks.append('resume advances guest wall clock to current time')
+        checks.append('capture/fork/resume correct a guest clock 17 minutes behind')
 
         value('stop', 'dev')
         value('stop', 'dev')
@@ -105,6 +114,7 @@ def run():
         checks.append('cold restart preserves binary files and parent disk')
 
         value('restore', 'dev', 'ready')
+        clock_is_current('dev')
         http(url, 2)
         cli('exec', 'dev', '--', 'test ! -e /persist/branch')
         checks.append('restore rewinds paired RAM and disk')
