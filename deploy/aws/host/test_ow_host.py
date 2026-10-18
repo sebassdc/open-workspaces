@@ -179,6 +179,38 @@ class Setup(unittest.TestCase):
         plan = u.plan(manifest, at, "0.5.0", pending=set(h.pending()))
         self.assertEqual((plan["class"], plan["restart"]), (2, ["agent", "worker"]))
 
+    def test_a_failure_inside_setup_keeps_the_reload_and_restarts_for_the_retry(self):
+        import upgrade as u
+        h.setup(config(dashboard={"logins": []}))
+        h.write_json(h.CONFIG, config(dashboard={"logins": []}))
+        h.fetch_config = lambda: {**copy.deepcopy(CONFIG), "idleMinutes": 10}
+        failures = ["systemctl daemon-reload"]
+
+        def flaky(cmd, **kw):
+            self.calls.append(cmd)
+            if cmd[:2] == ["tailscale", "status"]:
+                return '{"BackendState": "Running"}'
+            if failures and " ".join(cmd) == failures[0]:
+                failures.pop()
+                raise RuntimeError("transient daemon-reload failure")
+            return ""
+
+        h.run = flaky
+        with self.assertRaisesRegex(RuntimeError, "daemon-reload"):
+            h.apply_config()
+        self.assertEqual(set(h.pending()), {"worker", "dashboard"}, "recorded before setup wrote anything")
+        self.calls.clear()
+        self.assertEqual(h.apply_config(), 0)
+        self.assertIn(["systemctl", "daemon-reload"], self.calls, "the reload the first try missed")
+        self.assertIn(["systemctl", "restart", "--no-block", "open-workspaces-dashboard.service"], self.calls)
+        self.assertEqual(set(h.pending()), {"worker"})
+        self.assertFalse(h.p(h.SETUP_DUE).exists())
+        at = {"worker": "0.5.0", "agent": "0.5.0", "dashboard": "0.5.0"}
+        manifest = {"schema": 1, "releases": [{"version": "0.5.0", "changes": [], "class": 0,
+                    "catalog": {"schema": 3, "min_reader": 3}, "protocol": {"speaks": 1, "accepts": [1, 1]},
+                    "worker_protocol": {"speaks": 1, "accepts": [1, 1]}, "in_place_from": None}]}
+        self.assertEqual(u.plan(manifest, at, "0.5.0", pending=set(h.pending()))["restart"], ["worker"])
+
     def test_a_login_change_restarts_the_dashboard_even_after_a_failed_try(self):
         h.setup(config())
         h.write_json(h.CONFIG, config())

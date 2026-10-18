@@ -1156,10 +1156,14 @@ pub fn agent(
             timeout_socket(&ws)?;
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
             loop {
-                let status = latest.lock().unwrap().clone();
-                if let Some(status) =
-                    status.filter(|_| heartbeat.elapsed() > Duration::from_secs(3))
-                {
+                // Without a compatible worker the channel closes at once: the controller then
+                // sees this runner offline and dispatches nothing to it.
+                let status = latest
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .context("no compatible worker answers")?;
+                if heartbeat.elapsed() > Duration::from_secs(3) {
                     // Golden images built since the agent started are advertised too.
                     let mut beat = hello.clone();
                     if !guided && cfg!(target_os = "linux") {
@@ -1208,13 +1212,14 @@ pub fn agent(
                         {
                             continue;
                         }
-                        let (root, origin, node, credential, ca, active) = (
+                        let (root, origin, node, credential, ca, active, worker) = (
                             root.to_owned(),
                             origin.clone(),
                             node.clone(),
                             credential.clone(),
                             ca.map(Path::to_owned),
                             active.clone(),
+                            latest.clone(),
                         );
                         let busy = Busy::new();
                         std::thread::spawn(move || {
@@ -1226,6 +1231,7 @@ pub fn agent(
                                 &credential,
                                 ca.as_deref(),
                                 busy,
+                                &worker,
                             );
                             active.fetch_sub(1, Ordering::SeqCst);
                         });
@@ -1257,6 +1263,7 @@ fn agent_job(
     credential: &str,
     ca: Option<&Path>,
     busy: Busy,
+    worker: &std::sync::Mutex<Option<Value>>,
 ) -> Result<()> {
     let mut socket = socket(origin, &format!("/job/{node}/{id}"), credential, ca)?;
     timeout_socket(&socket)?;
@@ -1305,6 +1312,18 @@ fn agent_job(
         .contains(&op),
         "unsupported node operation"
     );
+    // Only the worker process whose status passed the protocol check is driven; a job
+    // that finds none (or another process on the socket) is answered with an error.
+    let checked = worker.lock().unwrap().clone();
+    let Some(checked) = checked.filter(|s| common::worker_compatible(s).is_ok()) else {
+        let refusal = json!({"ok":false,"error":"no compatible worker on this runner; retry"});
+        socket.send(tungstenite::Message::Binary(
+            format!("{refusal}\n").into_bytes().into(),
+        ))?;
+        let _ = socket.close(None);
+        return Ok(());
+    };
+    wire::expect_worker(checked["worker_pid"].as_u64().map(|pid| pid as u32));
     if op != "terminal" && op != "ssh" {
         let response = journal_request(root, &request)?;
         let data = serde_json::to_vec(&response)?;

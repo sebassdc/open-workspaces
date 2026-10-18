@@ -69,9 +69,10 @@ stays in Secrets Manager):
  "idleMinutes": 30}
 ```
 
-`ow-host apply` fetches and validates it, re-renders the files it owns, records
-the restarts those files need as pending (before acting, so a retry after a
-failure keeps them), acts, and stores the config last. It acts by class: logins restart the dashboard alone, images and the backup
+`ow-host apply` fetches and validates it, records the restarts the new files
+need as pending before writing any (so a retry after a failure, in setup or
+later, keeps them), re-renders the files it owns (a systemd or AppArmor reload
+they need stays due across a failure), acts, and stores the config last. It acts by class: logins restart the dashboard alone, images and the backup
 timer start, Tailscale SSH and hostname are set, a grown volume is resized. A
 change that needs the control plane (hostname) or the worker (idle minutes) is
 recorded as pending; `ow-host upgrade` carries it out.
@@ -152,6 +153,9 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
 - **hibernate**: the worker is quiesced first (it then refuses starts and wakes),
   so the running boxes read next are exactly the ones the old worker's own
   `down --hibernate` captures; they are recorded in the journal before it acts.
+  The capture gate runs a last time here, on every capture now present, so a
+  box started after planning cannot lose its RAM state without `--accept-cold`;
+  a refusal aborts (quiesce lifted, drain removed).
 - **verify** (each unit against its own pin): the unit is active and its
   `/proc/PID/exe` is its pin's `bin/ow`; the worker answers with its pin's
   version; the runner is online with the agent's and worker's versions; the

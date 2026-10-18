@@ -412,6 +412,200 @@ async fn refused_heartbeat_closes_with_reason_and_drain_is_stored() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// A stand-in controller: counts heartbeats, sends job IDs on the session, and serves
+/// each job's request, keeping the agent's reply. It checks nothing (any architecture).
+struct FakeController {
+    origin: String,
+    beats: Arc<std::sync::atomic::AtomicUsize>,
+    jobs: std::sync::mpsc::Sender<String>,
+    replies: Arc<Mutex<Vec<Value>>>,
+}
+impl FakeController {
+    fn start(request: Value) -> Self {
+        use std::sync::atomic::Ordering;
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", tcp.local_addr().unwrap());
+        let (jobs, ids) = std::sync::mpsc::channel::<String>();
+        let ids = Arc::new(Mutex::new(ids));
+        let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let (beats1, replies1) = (beats.clone(), replies.clone());
+        std::thread::spawn(move || {
+            for stream in tcp.incoming() {
+                let stream = stream.unwrap();
+                let (ids, beats, replies, request) = (
+                    ids.clone(),
+                    beats1.clone(),
+                    replies1.clone(),
+                    request.clone(),
+                );
+                std::thread::spawn(move || {
+                    let mut path = String::new();
+                    let Ok(mut ws) = tungstenite::accept_hdr(
+                        stream,
+                        |req: &tungstenite::handshake::server::Request, resp| {
+                            path = req.uri().path().to_owned();
+                            Ok(resp)
+                        },
+                    ) else {
+                        return;
+                    };
+                    ws.get_ref()
+                        .set_read_timeout(Some(Duration::from_millis(50)))
+                        .unwrap();
+                    if path.starts_with("/job/") {
+                        ws.send(tungstenite::Message::Binary(
+                            format!("{request}\n").into_bytes().into(),
+                        ))
+                        .unwrap();
+                        let mut bytes = Vec::new();
+                        while !bytes.ends_with(b"\n") {
+                            match ws.read() {
+                                Ok(tungstenite::Message::Binary(b)) => bytes.extend_from_slice(&b),
+                                Err(e) if timed_out(&e) => {}
+                                _ => return,
+                            }
+                        }
+                        replies
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&bytes).unwrap());
+                        return;
+                    }
+                    loop {
+                        match ws.read() {
+                            Ok(tungstenite::Message::Text(t)) if t.contains("heartbeat") => {
+                                beats.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Ok(tungstenite::Message::Ping(v)) => {
+                                let _ = ws.send(tungstenite::Message::Pong(v));
+                            }
+                            Err(e) if timed_out(&e) => {}
+                            _ => return,
+                        }
+                        if let Ok(id) = ids.lock().unwrap().try_recv() {
+                            ws.send(tungstenite::Message::Text(id.into())).unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            origin,
+            beats,
+            jobs,
+            replies,
+        }
+    }
+}
+
+#[test]
+fn an_agent_whose_worker_leaves_its_protocol_window_drives_it_no_more() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    let worker = root();
+    let protocol = Arc::new(AtomicU64::new(common::WORKER_PROTOCOL));
+    let execs = Arc::new(AtomicUsize::new(0));
+    let listener = std::os::unix::net::UnixListener::bind(worker.join("control.sock")).unwrap();
+    {
+        let (protocol, execs) = (protocol.clone(), execs.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let Ok(req) = wire::line(&mut stream) else {
+                    continue;
+                };
+                let value = match req["op"].as_str().unwrap() {
+                    "status" => {
+                        json!({"max_memory_mib":512,"max_running":2,"max_vcpus":2,"max_guest_memory_mib":512,"max_guest_vcpus":2,
+                        "guest_ssh_v1":true,"internet":true,"images":[],"version":"0.5.0","worker_pid":std::process::id(),
+                        "worker_protocol":protocol.load(Ordering::SeqCst)})
+                    }
+                    "exec" => {
+                        execs.fetch_add(1, Ordering::SeqCst);
+                        json!({"output":"ran","exit_code":0})
+                    }
+                    other => panic!("unexpected op {other}"),
+                };
+                let _ = wire::send(&mut stream, &json!({"ok":true,"result":value}));
+            }
+        });
+    }
+    let fake = FakeController::start(
+        json!({"op":"exec","id":"box","command":"true","operation_key":"k1"}),
+    );
+    let credential = worker.join("node.json");
+    write_private(
+        &credential,
+        &json!({"node":"alpha","credential":"a".repeat(64)}),
+    )
+    .unwrap();
+    {
+        let (worker, origin, credential) =
+            (worker.clone(), fake.origin.clone(), credential.clone());
+        std::thread::spawn(move || agent(&worker, &origin, &credential, None, None, true));
+    }
+    let until = |what: &str, done: &dyn Fn() -> bool| {
+        let started = std::time::Instant::now();
+        while !done() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    until("a heartbeat", &|| fake.beats.load(Ordering::SeqCst) > 0);
+    fake.jobs.send("j1".into()).unwrap();
+    until("the first reply", &|| {
+        fake.replies.lock().unwrap().len() == 1
+    });
+    assert_eq!(
+        fake.replies.lock().unwrap()[0]["result"]["output"],
+        "ran",
+        "a compatible worker is driven"
+    );
+    // The worker now speaks a protocol outside the window: the agent stops heartbeats and
+    // drops its channel (the controller sees it offline at once) ...
+    protocol.store(common::WORKER_PROTOCOL + 98, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_secs(5));
+    let beats = fake.beats.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        fake.beats.load(Ordering::SeqCst),
+        beats,
+        "no heartbeat once the worker is incompatible"
+    );
+    // ... and a job that still reaches it is answered with an error, not forwarded.
+    for checked in [
+        None,
+        Some(json!({"worker_protocol": common::WORKER_PROTOCOL + 98})),
+    ] {
+        let before = fake.replies.lock().unwrap().len();
+        agent_job(
+            &worker,
+            &fake.origin,
+            "alpha",
+            "j2",
+            &"a".repeat(64),
+            None,
+            Busy::new(),
+            &Mutex::new(checked),
+        )
+        .unwrap();
+        until("the refusal", &|| {
+            fake.replies.lock().unwrap().len() == before + 1
+        });
+        let reply = fake.replies.lock().unwrap()[before].clone();
+        assert_eq!(reply["ok"], false, "{reply}");
+    }
+    assert_eq!(
+        execs.load(Ordering::SeqCst),
+        1,
+        "the incompatible worker never ran a job"
+    );
+    let _ = fs::remove_dir_all(worker);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_accepted_lost_reply_reopens_with_one_create_and_one_exec() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

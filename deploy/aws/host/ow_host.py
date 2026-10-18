@@ -42,6 +42,7 @@ CONFIG = f"{DATA}/host-config.json"
 PENDING = f"{DATA}/pending.json"
 HOST_ENV = "/etc/open-workspaces/host.env"
 STATUS = "/var/lib/open-workspaces/bootstrap-status"
+SETUP_DUE = "/var/lib/open-workspaces/setup-due.json"
 UNITS = {
     "worker": "open-workspaces-worker.service",
     "agent": "open-workspaces.service",
@@ -435,6 +436,16 @@ def setup(config):
     os.chmod(p(DATA), 0o700)
     chown(p(DATA), "ow")
     files = render(config, budgets())
+    # The reloads these writes need are recorded first, so a failure on the way leaves
+    # them due for the next setup, which finds no file left to rewrite.
+    due = set(read_json(SETUP_DUE, []))
+    ahead = diff(files)
+    if any(path.startswith("/etc/systemd/") for path in ahead):
+        due.add("daemon-reload")
+    if "/etc/apparmor.d/open-workspaces" in ahead:
+        due.add("apparmor")
+    if due:
+        write_json(SETUP_DUE, sorted(due))
     changed = set()
     for path, (text, mode) in files.items():
         if write_atomic(path, text, mode):
@@ -446,10 +457,12 @@ def setup(config):
                 run(["systemctl", "disable", "--now", unit], check=False)
             p(path).unlink()
             changed.add(path)
-    if any(path.startswith("/etc/systemd/") for path in changed):
+    if "daemon-reload" in due:
         systemctl("daemon-reload")
-    if "/etc/apparmor.d/open-workspaces" in changed:
+    if "apparmor" in due:
         run(["apparmor_parser", "-r", "/etc/apparmor.d/open-workspaces"])
+    if due:
+        p(SETUP_DUE).unlink()
     return changed
 
 
@@ -715,9 +728,10 @@ def apply_config():
     except Refused:
         old = None
     config = validate(fetch_config())
+    # Recorded before anything is written: a retry after a failure below (in setup too)
+    # finds no file left to rewrite.
+    mark_pending(units_changed(diff(render(config, budgets()))), "config changed")
     changed = setup(config)
-    # Recorded before acting: a retry after a failure below finds no file left to rewrite.
-    mark_pending(units_changed(changed), "config changed")
     act(config, old)
     # Last: until everything above succeeded, a retry compares against the old config.
     write_json(CONFIG, config)

@@ -191,6 +191,9 @@ class Fake:
         self.calls.append("quiesce")
         self.quiesced = True
 
+    def captures(self):
+        return [{"name": box, **COMPAT} for box, state in self.box.items() if state in ("running", "hibernated")]
+
     def hibernate_all(self, release):
         self.quiesced = True
         failed = []
@@ -255,11 +258,11 @@ class Machine(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_plan(self, ops, move, cls, restart, catalog=False):
+    def run_plan(self, ops, move, cls, restart, catalog=False, plan=None):
         to = {name: self.new if name in move else self.old for name in h.PINS}
         to["current"] = self.new
-        plan = {"class": cls, "move": dict.fromkeys(move, "0.5.1"), "restart": restart, "catalog_backup": catalog,
-                "rollback_auto": True}
+        plan = plan or {"class": cls, "move": dict.fromkeys(move, "0.5.1"), "restart": restart,
+                        "catalog_backup": catalog, "rollback_auto": True}
         u.execute(plan, ops, self.frm, to, "0.5.1")
 
     def journal(self):
@@ -295,6 +298,24 @@ class Machine(unittest.TestCase):
         self.assertEqual(ops.box, {"original": "running", "late": "stopped"}, "the late start was refused, not captured")
         self.assertLess(ops.calls.index("quiesce"), ops.calls.index("hibernated:original"))
         self.assertEqual((self.journal()["step"], self.journal()["error"]), ("done", None))
+
+    def test_a_box_started_after_the_last_plan_still_meets_the_capture_gate(self):
+        # Planned with no box at all, for a release with another guest kernel.
+        m = manifest(entry("0.5.1", ["guest-kernel"], 2, kernel="f" * 64))
+        for accept_cold in (False, True):
+            plan = u.plan(m, AT, "0.5.1", captures=[], compat=COMPAT, accept_cold=accept_cold)
+            for name in (*h.PINS, "current"):
+                h.set_pin(name, self.old)
+            ops = Fake({"late": "running"})  # started between the last plan and the quiesce
+            if not accept_cold:
+                with self.assertRaisesRegex(Refused, "cannot resume late.*--accept-cold"):
+                    self.run_plan(ops, ["worker"], 2, ["worker"], plan=plan)
+                self.assertEqual((ops.box, self.journal()["step"], h.pin("worker")), ({"late": "running"}, "aborted", self.old))
+                self.assertNotIn("hibernate", ops.calls)
+                self.assertFalse(ops.quiesced or ops.drained)
+            else:
+                self.run_plan(ops, ["worker"], 2, ["worker"], plan=plan)
+                self.assertEqual((self.journal()["step"], self.journal()["cold"]), ("done", ["late"]))
 
     def test_runner_upgrade_without_boxes_runs_a_canary(self):
         ops = Fake({})

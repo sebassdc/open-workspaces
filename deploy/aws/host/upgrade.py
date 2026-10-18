@@ -42,6 +42,18 @@ def version(text):
 # ---------------------------------------------------------------- planner
 
 
+def gate(rule, captures):
+    """The captures the target worker cannot resume (they would boot cold and be deleted);
+    refused unless the rule accepts cold boots."""
+    cold = sorted(c["name"] for c in captures if not (
+        c.get("runtime") in rule["resumes"] and c.get("cpu") == rule["cpu"]
+        and c.get("kernel_sha256") == rule["kernel_sha256"]))
+    if cold and not rule["accept_cold"]:
+        raise Refused(f"{rule['target']} cannot resume {', '.join(cold)} (another runtime, CPU or guest "
+                      "kernel): their processes would be lost. Pass --accept-cold to boot them cold")
+    return cold
+
+
 def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), captures=(), compat=None,
          accept_cold=False, max_class=2):
     """The upgrade of one host from `pins` (pin -> release version) to version `target`.
@@ -115,14 +127,10 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
     plan_["class"] = max([PIN_CLASS[name] for name in restart], default=0)
     # Capture gate: a capture the target worker cannot resume boots cold and is deleted.
     if "worker" in move:
-        resumes = goal["runtime"]["resumes"]
-        kernel = goal["runtime"]["guest_kernel_sha256"]
-        cpu = (compat or {}).get("cpu")
-        plan_["cold"] = sorted(c["name"] for c in captures if not (
-            c.get("runtime") in resumes and c.get("cpu") == cpu and c.get("kernel_sha256") == kernel))
-        if plan_["cold"] and not accept_cold:
-            raise Refused(f"{target} cannot resume {', '.join(plan_['cold'])} (another runtime, CPU or guest "
-                          "kernel): their processes would be lost. Pass --accept-cold to boot them cold")
+        # Kept in the plan: the state machine checks the boxes again once the worker is quiesced.
+        plan_["gate"] = {"target": target, "resumes": goal["runtime"]["resumes"], "accept_cold": accept_cold,
+                         "kernel_sha256": goal["runtime"]["guest_kernel_sha256"], "cpu": (compat or {}).get("cpu")}
+        plan_["cold"] = gate(plan_["gate"], captures)
     if plan_["class"] > max_class:
         raise Refused(f"class {plan_['class']} ({', '.join(restart)}) exceeds --max-class {max_class}")
     return plan_
@@ -318,6 +326,9 @@ class HostOps:
     def stop(self, name):
         h.systemctl("stop", h.UNITS[name])
 
+    def captures(self):
+        return captures((self.worker_status() or {}).get("compat"))
+
     def worker_status(self):
         try:
             return h.ow("status", timeout=60)
@@ -486,6 +497,9 @@ def execute(plan_, ops, frm, to, target_name):
             # the hibernate below captures.
             ops.quiesce()
             j.value["resume"] = sorted(box for box, state in ops.boxes().items() if state == "running")
+            if plan_.get("gate"):
+                # The last gate: nothing can start now, so this is every capture the new worker meets.
+                j.value["cold"] = gate(plan_["gate"], ops.captures())
             j.step("hibernate")
             ops.hibernate_all(frm["worker"])
         j.step("stop")
