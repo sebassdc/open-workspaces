@@ -168,6 +168,10 @@ Gate: reproducible evidence and runtime decision, per HANDOFF.md.
 - Create/list/inspect/exec/files/start/stop/reboot/delete, streamed output, exit codes, readiness checks.
 - Initial local pilot includes named paired RAM+disk snapshots and independent full-state forks, with identity/entropy refresh and measured fan-out resource use. Validate the primitives in Phase 0 before productizing them.
 - Resource limits, isolated guest networks, scoped credentials and basic host-enforced network policy.
+  Credential-free foundation: [CredentialBroker](CREDENTIAL_BROKER.md) now has
+  per-box policy and host provider interfaces tested with fakes. Guest transport,
+  live AWS adapters, lifecycle fencing and approved IAM/secrets remain pending;
+  existing boxes receive no broker access.
 - Persistent disk, initial immutable base images, protected HTTP publishing and explicit public routes.
 - Off-worker disk backup and restore onto a replacement worker; basic logs and operational metrics.
 

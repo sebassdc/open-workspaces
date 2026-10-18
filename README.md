@@ -58,6 +58,12 @@ Owners can create larger sparse root disks with `ow create NAME --disk 64GiB` an
 grow a stopped box with `ow resize NAME --disk 128GiB`; new Linux boxes default to
 32 GiB. See [disk sizing, host admission and reporting](docs/DISKS.md).
 
+## Install the remote client
+
+Use the [versioned GitHub Release installer](docs/INSTALL.md) for a compiled
+macOS or Linux client. Tailnet clients need no Rust, root or cloudflared.
+Connection endpoints and release pins belong in the consuming project.
+
 ## Read first
 
 1. [Agent handoff](docs/HANDOFF.md): context, first task, and acceptance criteria.
