@@ -27,14 +27,14 @@ test("an existing release tag must name this commit", () => {
 });
 
 
-test("main publishes a release only after tagging; retries preserve published releases", () => {
+test("main stages a release only after tagging; retries preserve published releases", () => {
     const workflow = read("../../../.github/workflows/aws-component-release.yml");
-    const step = workflow.split("      - name: Publish GitHub release\n")[1];
+    const step = workflow.split("      - name: Prepare GitHub release\n")[1];
     assert.ok(step, "a tag alone is not a published GitHub Release");
     assert.match(step, /if: github.event_name == 'push'/);
     assert.match(workflow, /push:\n    branches: \[main\]/);
-    assert.ok(workflow.indexOf("- name: Tag the release") < workflow.indexOf("- name: Publish GitHub release"));
-    const script = step.split("        run: |\n")[1].split("\n").map((line) => line.slice(10)).join("\n");
+    assert.ok(workflow.indexOf("- name: Tag the release") < workflow.indexOf("- name: Prepare GitHub release"));
+    const script = step.split("        run: |\n")[1].split("\n      - ")[0].split("\n").map((line) => line.slice(10)).join("\n");
     const directory = mkdtempSync(join(tmpdir(), "ow-release-"));
     const log = join(directory, "calls.jsonl");
     const gh = join(directory, "gh");
@@ -58,11 +58,26 @@ if (args[1] === "view") {
             });
             const calls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
             const expected = [["release", "view", tag, "--json", "isDraft", "--jq", ".isDraft"]];
-            if (state === "missing") expected.push(["release", "create", tag, "--verify-tag", "--generate-notes"]);
-            if (state === "draft") expected.push(["release", "edit", tag, "--draft=false"]);
+            if (state === "missing") expected.push(["release", "create", tag, "--verify-tag", "--generate-notes", "--draft"]);
             assert.deepEqual(calls, expected, state);
         }
     } finally {
         rmSync(directory, { recursive: true, force: true });
     }
+});
+
+
+test("release assets gate tagging and publication", () => {
+    const workflow = read("../../../.github/workflows/aws-component-release.yml");
+    assert.match(workflow, /check-and-tag:\n    needs: clients/);
+    for (const artifact of ["ow-linux-amd64", "ow-darwin-arm64", "ow-darwin-amd64"]) {
+        assert.ok(workflow.includes(`artifact: ${artifact}`));
+    }
+    const assembly = workflow.indexOf("- name: Assemble verified release assets");
+    const tag = workflow.indexOf("- name: Tag the release");
+    const attach = workflow.indexOf("- name: Attach clients");
+    const publish = workflow.indexOf("- name: Publish complete GitHub release");
+    assert.ok(assembly > 0 && assembly < tag && tag < attach && attach < publish);
+    assert.match(workflow, /python3 scripts\/test-cli-install.py/);
+    assert.match(workflow, /printf '%s\\n' "\$GITHUB_SHA" > source-commit.txt/);
 });

@@ -43,6 +43,9 @@ and fork do not preserve external TCP/WebSocket connections; reconnect clients.
 
 ## Connect from macOS or Linux
 
+For pinned clients, use the [GitHub Release installation reference](INSTALL.md).
+The host-served installer below remains an Access-mode compatibility path.
+
 The dashboard shows a copyable command using its existing hostname:
 
 ```bash
