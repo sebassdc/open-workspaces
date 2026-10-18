@@ -6,6 +6,12 @@ The Firecracker runtime moved into it unchanged (`vm`, `runtime`, `network`,
 `ssh_guest`, and the shared limits in `common`); the `ow` binary uses it
 through the same module paths as before, so behaviour is unchanged.
 
+The dormant [CredentialBroker](CREDENTIAL_BROKER.md) module adds exact per-box
+policy, host identity/provider interfaces and fake-tested request dispatch for
+temporary AWS sessions and write-only Secrets Manager uploads. It installs no
+runtime endpoint; live adapters, lifecycle fencing and IAM/secret approval remain
+activation gates.
+
 ## ComputeProvider
 
 A machine backend behind the worker's JSON operation protocol
