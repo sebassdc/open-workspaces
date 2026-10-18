@@ -4,6 +4,8 @@ const {chromium} = require(process.env.OW_PLAYWRIGHT_MODULE || 'playwright');
 const fs = require('node:fs'), path = require('node:path'), http = require('node:http');
 const {execFileSync} = require('node:child_process');
 const assert = require('node:assert/strict');
+const {createHash} = require('node:crypto');
+const baseRef = process.env.OW_BASE_REF || 'v0.6.1';
 const root = path.resolve(__dirname, '../..'), ui = path.join(root, 'crates/ow/ui');
 const output = path.resolve(process.argv[2]); fs.mkdirSync(output, {recursive:true});
 const gib = 1073741824;
@@ -13,7 +15,7 @@ const fixture = () => ({user:{email:'owner@example.test'},workspaces:[
   shared:[{id:'other@example.test/shared',owner:'other@example.test',role:'admin',state:'stopped',memory_mib:512,vcpu_count:1,disk_bytes:32*gib,disk_used_bytes:gib,node:'local'}],
   snapshots:[],stats:{},nodes:[{id:'local',online:true,capabilities:{disk_resize_v1:true}}]});
 let baseline = false, state = fixture(); const requests = [];
-const before = execFileSync('git', ['show','HEAD:crates/ow/ui/app.js'], {cwd:root});
+const before = execFileSync('git', ['show',`${baseRef}:crates/ow/ui/app.js`], {cwd:root});
 const server = http.createServer(async (req,res) => {
   const send = value => {res.setHeader('content-type','application/json');res.end(JSON.stringify({ok:true,result:value}));};
   if (req.url === '/api/state') return send(state);
@@ -69,7 +71,7 @@ const server = http.createServer(async (req,res) => {
     await page.locator('#dialog-submit').click();await page.locator('#operation-dialog').waitFor({state:'hidden'});
     assert.equal(requests.at(-1).disk_gib,64);assert.equal(requests.at(-1).op,'create');
     assert.deepEqual(errors,[]);
-    fs.writeFileSync(path.join(output,'result.json'),JSON.stringify({passed:true,baseline:execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim(),fixture:'same fixed owner/stopped, owner/running, shared/admin boxes',requests,errors},null,2));
+    fs.writeFileSync(path.join(output,'result.json'),JSON.stringify({passed:true,baseline:execFileSync('git',['rev-parse',baseRef],{cwd:root,encoding:'utf8'}).trim(),ui_sha256:createHash('sha256').update(fs.readFileSync(path.join(ui,'app.js'))).digest('hex'),fixture:'same fixed owner/stopped, owner/running, shared/admin boxes',requests,errors},null,2));
     console.log('PASS: create, disk-only resize, defaults, owner/state controls, Mac refusal, desktop/narrow rendering');
   } finally {await browser.close();server.close();}
 })().catch(error=>{console.error(error);server.close();process.exitCode=1;});
