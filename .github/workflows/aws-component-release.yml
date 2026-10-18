@@ -4,13 +4,55 @@ name: aws-component-release
 on:
   push:
     branches: [main]
-    paths: [deploy/aws/**, Cargo.toml, Cargo.lock, crates/**, release-impact.json, experiments/runtime-spike/**]
+    paths: [deploy/aws/**, Cargo.toml, Cargo.lock, crates/**, release-impact.json, experiments/runtime-spike/**, scripts/**, .github/workflows/aws-component-release.yml]
   pull_request:
-    paths: [deploy/aws/**, Cargo.toml, Cargo.lock, crates/**, release-impact.json, experiments/runtime-spike/**]
+    paths: [deploy/aws/**, Cargo.toml, Cargo.lock, crates/**, release-impact.json, experiments/runtime-spike/**, scripts/**, .github/workflows/aws-component-release.yml]
 permissions:
   contents: write
 jobs:
+  clients:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: ow-linux-amd64
+          - runner: macos-15
+            artifact: ow-darwin-arm64
+          - runner: macos-15-intel
+            artifact: ow-darwin-amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal --no-self-update
+      - name: Build portable Linux CLI using existing build machinery
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add --toolchain 1.97.0 x86_64-unknown-linux-musl
+          bash scripts/build-local.sh
+          # A musl container with no host libraries catches accidental glibc linkage.
+          docker run --rm --user 65534:65534 -v "$PWD/data/runtime-spike/bin:/client:ro" alpine:3.22 /client/ow-linux-amd64 --version
+      - name: Build native macOS CLI using existing build machinery
+        if: runner.os == 'macOS'
+        run: bash scripts/build-macos.sh
+      - name: Check installer failures and clean native install without Rust or cloudflared
+        env:
+          OW_TEST_CLIENT: ${{ github.workspace }}/data/runtime-spike/bin/${{ matrix.artifact }}
+        run: python3 scripts/test-cli-install.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            data/runtime-spike/bin/${{ matrix.artifact }}
+            data/runtime-spike/bin/${{ matrix.artifact }}.sha256
+          if-no-files-found: error
   check-and-tag:
+    needs: clients
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -38,6 +80,24 @@ jobs:
         run: |
           cargo +1.97.0 test --locked -p ow-core snapshot_
           cargo +1.97.0 test --locked -p ow --bin ow failed_snapshot
+      - uses: actions/download-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          pattern: ow-*
+          path: release-clients
+          merge-multiple: true
+      - name: Assemble verified release assets from this commit
+        if: github.event_name == 'push'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          cd release-clients
+          for artifact in ow-linux-amd64 ow-darwin-arm64 ow-darwin-amd64; do
+            test "$(sha256sum "$artifact" | cut -d ' ' -f 1)" = "$(cat "$artifact.sha256")"
+          done
+          cp ../crates/ow/cli/install.sh install.sh
+          printf '%s\n' "$GITHUB_SHA" > source-commit.txt
+          sha256sum ow-* install.sh source-commit.txt > SHA256SUMS
       - name: Tag the release
         if: github.event_name == 'push'
         run: |
@@ -52,17 +112,47 @@ jobs:
             git tag "$tag" "$GITHUB_SHA"
             git push origin "refs/tags/$tag"
           fi
-      - name: Publish GitHub release
+      - name: Prepare GitHub release
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           tag="v$(node -p 'require("./package.json").version')"
-          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft); then
-            if [ "$draft" = true ]; then
-              gh release edit "$tag" --draft=false
-            fi
-          else
-            gh release create "$tag" --verify-tag --generate-notes
+          if ! gh release view "$tag" --json isDraft --jq .isDraft; then
+            gh release create "$tag" --verify-tag --generate-notes --draft
           fi
+      - name: Attach clients without replacing published assets
+        if: github.event_name == 'push'
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/publish-release-clients.sh "v$(node -p 'require("./deploy/aws/package.json").version')" release-clients
+      - name: Publish complete GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="v$(node -p 'require("./package.json").version')"
+          if [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true ]; then
+            gh release edit "$tag" --draft=false
+          fi
+  published-clients:
+    if: github.event_name == 'push'
+    needs: check-and-tag
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the published version twice in a clean client directory
+        env:
+          OW_TEST_PUBLISHED_RELEASE: '1'
+          OW_TEST_SOURCE_COMMIT: ${{ github.sha }}
+        run: python3 scripts/test-cli-install.py InstallTests.test_published_release_download
