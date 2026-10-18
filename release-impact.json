@@ -2,6 +2,23 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.6.0",
+      "class": 1,
+      "changes": ["controller", "agent", "host-layout", "component"],
+      "protocol": { "speaks": 1, "accepts": [1, 1] },
+      "worker_protocol": { "speaks": 1, "accepts": [1, 1] },
+      "catalog": { "schema": 3, "min_reader": 3 },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": ["firecracker-v1.17.0"]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "waivers": { "worker": "crates/ow/src/host.rs changes only `ow node agent` (a runner host's agent drains on SIGTERM), not the worker" },
+      "notes": "Runner component: a runner host joins an existing controller (#24). Controller, agent and host-layout changes; the worker is unchanged, so boxes keep running."
+    },
+    {
       "version": "0.5.0",
       "class": 3,
       "changes": ["controller", "agent", "worker", "host-layout", "stage0"],
