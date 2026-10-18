@@ -278,9 +278,11 @@ Linux allows); the component did not compile for a consumer without
 
 ## Tailnet previews (v0.8.0)
 
-Class 1: update the controller/dashboard and every runner agent, including the
-agent on the controller host. Existing workers, runtime protocol and guest
-images are unchanged; no box hibernation, stop or restart is needed. The host
+Preview routing alone is class 1: update the controller/dashboard and every
+runner agent, including the agent on the controller host. The combined v0.8.0
+release also fixes snapshot capture admission, so it is class 2 and requires
+one warm worker hibernate/swap/resume cycle. Keep capture compatibility and
+cold-memory-loss gates; protocol, guest images and host instances are unchanged. The host
 layout installs the restricted `preview-serve` helper and its sudo rule.
 The helper manages only dedicated HTTPS ports 11000–65535, with a fixed
 loopback dashboard upstream; unrelated Serve listeners are never reset.

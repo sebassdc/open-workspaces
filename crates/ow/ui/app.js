@@ -15,7 +15,7 @@ async function api(path, body) {
   const kind = response.headers.get('content-type') || '';
   if (!kind.includes('application/json')) throw Error('Your login may have expired. Reload the page to sign in again.');
   const value = await response.json();
-  if (!response.ok || !value.ok) throw Error((value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : ''));
+  if (!response.ok || !value.ok) { const error = Error((value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : '')); error.operation = value.operation; throw error; }
   return value.result;
 }
 async function refresh() { try { data = await api('/api/state'); $('host-controls').hidden = !data.host_controls; $('pool-policy').textContent = data.pool_policy || ''; render(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; } }
@@ -71,8 +71,8 @@ function render() {
   }
   $('snapshot-list').replaceChildren();
   for (const item of data.snapshots.slice().reverse()) {
-    const row = element('article', undefined, 'snapshot-row'), info = element('div'); info.append(element('h3', item.name), element('p', `${item.workspace} · ${mib(item.memory_mib)} · memory + disk`));
-    const buttons = element('div', undefined, 'actions'); buttons.append(action('Fork a machine', () => openDialog('fork', item.workspace, item.name)), action('Restore', () => openDialog('restore', item.workspace, item.name)));
+    const row = element('article', undefined, 'snapshot-row'), info = element('div'); info.append(element('h3', item.name), element('p', item.state === 'ready' ? `${item.workspace} · ${mib(item.memory_mib)} · memory + disk` : item.state === 'failed' ? 'Capture failed. Retry from the running machine.' : `Capture ${item.state || 'pending'}. Check operation status before retrying.`));
+    const buttons = element('div', undefined, 'actions'); if (item.state === 'ready') buttons.append(action('Fork a machine', () => openDialog('fork', item.workspace, item.name)), action('Restore', () => openDialog('restore', item.workspace, item.name)));
     row.append(info, buttons); $('snapshot-list').append(row);
   }
   if (!data.snapshots.length) $('snapshot-list').append(element('div', 'No checkpoints yet. Select a running machine and capture a snapshot.', 'empty'));
@@ -111,7 +111,7 @@ async function operate(operation) {
   const {operation_key: suppliedKey, ...parameters} = operation; const intent = JSON.stringify(parameters); const storageKey = 'ow-operation:' + intent; operation.operation_key ||= sessionStorage.getItem(storageKey) || crypto.randomUUID().replaceAll('-',''); sessionStorage.setItem(storageKey, operation.operation_key);
   busy = true; render(); notice(`${operation.op === 'exec' ? 'Running command' : 'Working on your machine'}…`);
   try { const result = await api('/api/operation', operation); if (operation.op === 'fork' || operation.op === 'create') selected = result.id; sessionStorage.removeItem(storageKey); const messages = {publish:'Port published. Open the preview below.', unpublish:'Port unpublished; preview connections closed.', resize:'Machine resized. Start it to grow the filesystem.', create:'Machine created.', start:'Machine started.', hibernate:'Machine hibernated. Memory and disk state saved.', stop:'Machine stopped. Disk changes retained.', snapshot:'Snapshot saved.', fork:'Independent fork created.', restore:'Snapshot restored.', share:'Machine shared.', delete:'Machine deleted.', unshare:'Access removed; their open sessions were closed.'}; notice(operation.op === 'exec' ? `Command finished · exit ${result.exit_code}` : messages[operation.op], operation.op === 'exec' && result.exit_code !== 0); return result; }
-  catch (error) { notice(error.message, true); throw error; }
+  catch (error) { if (error.operation?.state === 'failed') sessionStorage.removeItem(storageKey); notice(error.message, true); throw error; }
   finally { busy = false; await refresh(); }
 }
 $('operation-form').addEventListener('submit', async event => { event.preventDefault(); const fields = Object.fromEntries(new FormData(event.currentTarget)); const op = {...dialogOperation, ...fields}; if (op.port) op.port = Number(op.port); if (op.disk_gib) op.disk_gib = Number(op.disk_gib); if (op.memory_mib) op.memory_mib = Number(op.memory_mib); if (op.vcpu_count) op.vcpu_count = Number(op.vcpu_count); if (op.op === 'restore') op.name = op.snapshot; if (!op.node) delete op.node; if (!op.snapshot) delete op.snapshot; if (!op.id) delete op.id; if (op.op === 'restore') delete op.snapshot; $('dialog-submit').disabled = true; $('cancel-dialog').disabled = true; $('close-dialog').disabled = true; try { await operate(op); $('operation-dialog').close(); } catch (error) { $('dialog-error').textContent = error.message; $('dialog-error').hidden = false; } finally { $('dialog-submit').disabled = false; $('cancel-dialog').disabled = false; $('close-dialog').disabled = false; } });

@@ -70,9 +70,11 @@ The worker serializes disk admission with its normal operations. It checks both:
 This deliberately conservative reservation counts full disk sizes, even when
 already allocated or shared by reflinks: `st_blocks` cannot establish exclusive
 ownership of shared extents. Creating, growing, forking and importing boxes
-cannot overcommit the worker's disk budget. Snapshot admission also preserves
-these reservations and accounts for the new RAM capture. Deleting a box frees
-its reservation. A same-size retry or cold start of an existing box does not
+cannot overcommit the worker's disk budget. A snapshot reflinks the existing
+disk rather than creating another writable box, so its admission requires only
+its RAM capture plus the host reserve. Later copy-on-write disk growth still
+consumes free space; captures are not a guarantee of capacity for arbitrary
+future writes. Deleting a box frees its reservation. A same-size retry or cold start of an existing box does not
 require a new reservation.
 
 Use one worker/data root per dedicated host volume, as in the supported host

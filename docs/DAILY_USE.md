@@ -46,6 +46,17 @@ A resumed hibernation capture is deleted (before, every hibernation left one
 behind), and hibernation captures (`sleep-…`) are no longer listed by
 `ow snapshots`.
 
+The 24-snapshot limit counts sealed named captures only; internal sleep captures
+and unpublished `.pending-*` staging directories do not consume it. A failed
+capture removes its staging files; worker startup removes abandoned staging left
+by an interrupted capture, while retaining sealed snapshots and hibernation
+captures. The controller reconciles definitively failed snapshot reservations
+from `pending` to `failed` after online inventory, and keeps uncertain outcomes
+pending. Retry a failed capture with a new operation key and the same name;
+retry an uncertain outcome with its original key. A ready snapshot retry returns
+the existing seal even if current free space is low.
+
+
 ## Snapshot store
 
 `SnapshotStore` (`ow_core::snapshot_store`) keeps sealed snapshots off the host:

@@ -25,10 +25,10 @@ pub struct Catalog {
 }
 
 #[derive(Debug)]
-pub struct OperationFailure(pub Value, pub Option<&'static str>);
+pub struct OperationFailure(pub Value);
 impl OperationFailure {
-    pub fn message(&self) -> &'static str {
-        self.1.unwrap_or(
+    pub fn message(&self) -> &str {
+        self.0["error"].as_str().unwrap_or(
             "Operation did not complete. Check its status before retrying; use the same retry key.",
         )
     }
@@ -37,12 +37,49 @@ impl std::fmt::Display for OperationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Workspace operation {} is {}",
-            self.0["id"], self.0["state"]
+            "Workspace operation {} is {}: {}",
+            self.0["id"],
+            self.0["state"],
+            self.message()
         )
     }
 }
 impl std::error::Error for OperationFailure {}
+
+/// Only known diagnostics cross the human API boundary. Raw errors stay in the private
+/// operation response and host journal, where the operation ID makes them discoverable.
+fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
+    match (op, diagnostic) {
+        ("delete", "workspace is running; stop or hibernate it first") => {
+            "Box is running. Stop the box first with ow stop, then retry ow delete with a new operation key."
+        }
+        ("ssh-info", d) if d.starts_with("SSH not enrolled; use ow ssh-authorize:") => {
+            "SSH has no registered key. Run ow ssh-authorize BOX --key PATH_TO_PUBLIC_KEY, then retry ssh-info."
+        }
+        (_, "storage headroom exhausted (full disk reservations plus host reserve)") => diagnostic,
+        (_, d)
+            if d.strip_prefix("storage headroom exhausted: ")
+                .and_then(|s| s.split_once(" bytes available, "))
+                .is_some_and(|(a, b)| {
+                    a.parse::<u64>().is_ok()
+                        && b.strip_suffix(" bytes required")
+                            .is_some_and(|s| s.parse::<u64>().is_ok())
+                }) =>
+        {
+            diagnostic
+        }
+        (_, "snapshot limit (24) reached") => {
+            "Named snapshot limit (24) reached. Remove unneeded snapshots on the host before retrying with a new operation key."
+        }
+        (_, "incomplete snapshot exists; preserve and inspect it") => diagnostic,
+        (_, "node route unavailable before dispatch") => {
+            "Node is unavailable; no operation was dispatched. Retry with the same operation key when it reconnects."
+        }
+        _ => {
+            "Operation did not complete. Check its status before retrying; use the same retry key. The host journal records the cause under this operation ID."
+        }
+    }
+}
 
 /// Open gateway streams (terminal, SSH) by user and machine, so unsharing closes them at once.
 type Sessions = Vec<(i64, String, std::sync::Weak<tokio::sync::Notify>)>;
@@ -466,13 +503,25 @@ impl Catalog {
         Ok(())
     }
     fn operation_info(&self, user: i64, operation: i64) -> Result<Value> {
-        Ok(self.db.query_row("SELECT id,op,resource,state,node,retry_key FROM operations WHERE owner=?1 AND id=?2",params![user,operation],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"op":r.get::<_,String>(1)?,"resource":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"node":r.get::<_,String>(4)?,"retry_key":r.get::<_,Option<String>>(5)?})))?)
+        let (mut info, response): (Value, Option<String>) = self.db.query_row("SELECT id,op,resource,state,node,retry_key,response FROM operations WHERE owner=?1 AND id=?2",params![user,operation],|r|Ok((json!({"id":r.get::<_,i64>(0)?,"op":r.get::<_,String>(1)?,"resource":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"node":r.get::<_,String>(4)?,"retry_key":r.get::<_,Option<String>>(5)?}),r.get(6)?)))?;
+        if matches!(
+            info["state"].as_str(),
+            Some("failed" | "uncertain" | "not_dispatched")
+        ) {
+            let response: Value = response
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(Value::Null);
+            info["error"] = json!(public_operation_error(
+                info["op"].as_str().unwrap_or(""),
+                response["error"].as_str().unwrap_or("")
+            ));
+        }
+        Ok(info)
     }
     fn outcome_error(&self, user: i64, operation: i64) -> anyhow::Error {
         OperationFailure(
             self.operation_info(user, operation)
                 .unwrap_or(json!({"id":operation,"state":"uncertain"})),
-            None,
         )
         .into()
     }
@@ -565,6 +614,7 @@ impl Catalog {
                     all_snapshots.push(snapshot.clone());
                 }
             }
+            self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','failed'),updated_at=CURRENT_TIMESTAMP WHERE kind='snapshot' AND node=?1 AND json_extract(metadata,'$.state')='pending' AND (SELECT state FROM operations WHERE owner=resources.owner AND node=resources.node AND op='snapshot' AND json_extract(request,'$.request.name')=resources.physical ORDER BY id DESC LIMIT 1)='failed'",[&node])?;
         }
         Ok((json!(all_machines), json!(all_snapshots)))
     }
@@ -692,7 +742,7 @@ impl Catalog {
     fn forget(&mut self, user: i64, physical: &str) -> Result<Vec<String>> {
         // Its snapshots: captured ones name it as their workspace; a reservation whose capture
         // never completed is found through the snapshot operation that made it.
-        const OF: &str = "kind='snapshot' AND (json_extract(metadata,'$.workspace')=?1 OR (json_extract(metadata,'$.state')='pending' AND physical IN (SELECT json_extract(request,'$.request.name') FROM operations WHERE op='snapshot' AND json_extract(request,'$.request.id')=?1)))";
+        const OF: &str = "kind='snapshot' AND (json_extract(metadata,'$.workspace')=?1 OR (json_extract(metadata,'$.state') IN ('pending','failed') AND physical IN (SELECT json_extract(request,'$.request.name') FROM operations WHERE op='snapshot' AND json_extract(request,'$.request.id')=?1)))";
         let tx = self.db.transaction()?;
         let grantees = tx
             .prepare("SELECT grantee FROM grants WHERE physical=?1")?
@@ -1303,10 +1353,9 @@ impl Catalog {
                 {
                     return Err(self.outcome_error(user, id));
                 }
-                ensure!(
-                    state != "failed",
-                    "operation previously rejected; use a new operation_key for deliberate retry"
-                );
+                if state == "failed" {
+                    return Err(self.outcome_error(user, id));
+                }
                 if state == "not_dispatched" {
                     self.admit(&node, &target, &op, &request, &metadata, &local_status)?;
                     self.db
@@ -1325,6 +1374,10 @@ impl Catalog {
                 &name
             };
             self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,?2,?3,'pending',?4,?5,?6)",params![user,op,resource,node,key,fingerprint])?;
+            if op == "snapshot" {
+                // A new capture supersedes a failed reservation, not a known sealed artifact.
+                self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','pending'),updated_at=CURRENT_TIMESTAMP WHERE owner=?1 AND kind='snapshot' AND physical=?2 AND json_extract(metadata,'$.state')='failed'",params![user,request["name"].as_str().context("snapshot ID")?])?;
+            }
             Ok((physical, node, target, self.db.last_insert_rowid(), None))
         })();
         let (physical, node, target, operation, cached) = match prepared {
@@ -1342,10 +1395,11 @@ impl Catalog {
         }
         let root = match nodes::route(&self.root, &node) {
             Ok(root) => root,
-            Err(_) => {
+            Err(error) => {
+                eprintln!("operation {operation} routing: {error:#}");
                 if self.db.execute(
-                    "UPDATE operations SET state='not_dispatched' WHERE id=?1 AND state='pending'",
-                    [operation],
+                    "UPDATE operations SET state='not_dispatched',response=?2 WHERE id=?1 AND state='pending'",
+                    params![operation, json!({"error":"node route unavailable before dispatch"}).to_string()],
                 )? == 1
                 {
                     self.db.execute("UPDATE resources SET reserved_mib=?1,reserved_cpus=?2 WHERE kind='machine' AND physical=?3",params![prior_reservation.0,prior_reservation.1,target])?;
@@ -1361,8 +1415,12 @@ impl Catalog {
             Ok(v) => v,
             Err(e) => {
                 self.db.execute(
-                    "UPDATE operations SET state='uncertain' WHERE id=?1",
-                    [operation],
+                    "UPDATE operations SET state='uncertain',response=?2 WHERE id=?1",
+                    params![
+                        operation,
+                        json!({"error":format!("transport lost after dispatch: {e:#}")})
+                            .to_string()
+                    ],
                 )?;
                 eprintln!("operation {operation} transport: {e:#}");
                 return Err(self.outcome_error(user, operation));
@@ -1371,36 +1429,21 @@ impl Catalog {
         let uncertain = envelope["uncertain"] == true;
         if envelope["ok"] != true {
             self.db.execute(
-                "UPDATE operations SET state=?1 WHERE id=?2",
-                params![if uncertain { "uncertain" } else { "failed" }, operation],
+                "UPDATE operations SET state=?1,response=?3,finished_at=CASE WHEN ?1='failed' THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id=?2",
+                params![if uncertain { "uncertain" } else { "failed" }, operation, envelope.to_string()],
             )?;
-            // A runtime error can follow partial effects. Reconcile positive inventory before
-            // releasing demand; the error itself is never proof the target stopped.
-            self.reconcile()?;
-            // Only fixed, known rejections may cross the host-diagnostic boundary.
-            let diagnostic = envelope["error"].as_str().unwrap_or("");
-            let hint = if uncertain {
-                None
-            } else {
-                match op.as_str() {
-                    "delete"
-                        if diagnostic == "workspace is running; stop or hibernate it first" =>
-                    {
-                        Some(
-                            "Box is running. Stop the box first with ow stop, then retry ow delete with a new operation key.",
-                        )
-                    }
-                    "ssh-info"
-                        if diagnostic.starts_with("SSH not enrolled; use ow ssh-authorize:") =>
-                    {
-                        Some(
-                            "SSH has no registered key. Run ow ssh-authorize BOX --key PATH_TO_PUBLIC_KEY, then retry ssh-info.",
-                        )
-                    }
-                    _ => None,
-                }
-            };
-            return Err(OperationFailure(self.operation_info(user, operation)?, hint).into());
+            // Keep raw worker diagnostics private, but never discard the cause.
+            eprintln!(
+                "operation {operation} ({op}) on node {node}: {}",
+                envelope["error"]
+                    .as_str()
+                    .unwrap_or("worker returned no error")
+            );
+            // A runtime error can follow partial effects; inventory decides resource state.
+            if let Err(error) = self.reconcile() {
+                eprintln!("operation {operation} reconciliation: {error:#}");
+            }
+            return Err(self.outcome_error(user, operation));
         }
         let mut value = envelope["result"].clone();
         let correlated = if matches!(
@@ -1419,9 +1462,16 @@ impl Catalog {
         };
         if !correlated {
             self.db.execute(
-                "UPDATE operations SET state='uncertain' WHERE id=?1",
-                [operation],
+                "UPDATE operations SET state='uncertain',response=?2 WHERE id=?1",
+                params![
+                    operation,
+                    json!({"error":"worker response did not match the requested resource"})
+                        .to_string()
+                ],
             )?;
+            eprintln!(
+                "operation {operation}: worker response did not match the requested resource"
+            );
             return Err(self.outcome_error(user, operation));
         }
         if matches!(

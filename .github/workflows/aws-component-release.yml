@@ -36,6 +36,11 @@ jobs:
       - name: Check tailnet previews before tagging
         working-directory: .
         run: cargo +1.97.0 test --locked -p ow --bin ow preview
+      - name: Check snapshot admission and failure recovery before tagging
+        working-directory: .
+        run: |
+          cargo +1.97.0 test --locked -p ow-core snapshot_
+          cargo +1.97.0 test --locked -p ow --bin ow failed_snapshot
       - name: Tag the release
         if: github.event_name == 'push'
         run: |
