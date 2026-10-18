@@ -25,6 +25,10 @@ What it creates:
 
 Every resource gets the `tags` input plus `Name`.
 
+During first boot, installing Tailscale waits up to five minutes for another
+OS package process to release the dpkg frontend lock. A failed package install
+still fails bootstrap; inspect `/var/log/open-workspaces-bootstrap.log`.
+
 Operate a host (SSM shell, readiness, SSH config, stop and start with
 hibernate and resume, images, backups, CI steps) with `bin/ow-aws`, and create
 its backup bucket with the `ArtifactStore` component: see
@@ -44,7 +48,7 @@ checks fail while they disagree. The same tag is the default `ref` the host
 builds, so set `ref` explicitly before the first release exists.
 
 ```bash
-pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.7.1
+pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.7.2
 ```
 
 ```typescript

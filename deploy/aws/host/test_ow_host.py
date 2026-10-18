@@ -300,6 +300,32 @@ class Setup(unittest.TestCase):
         self.assertFalse(h.p(h.DIRECT_NETWORK).exists())
         self.assertFalse(h.p(h.DIRECT_PORT).exists())
 
+    def test_tailscale_install_waits_for_the_package_lock_but_keeps_install_errors_fatal(self):
+        h.p("/etc").mkdir(parents=True, exist_ok=True)
+        h.p("/etc/os-release").write_text("VERSION_CODENAME=noble\n")
+        install_error = None
+
+        def fake(cmd, **kw):
+            self.calls.append(cmd)
+            if cmd == ["sh", "-c", "command -v tailscale"]:
+                raise RuntimeError("not installed")
+            if cmd[0] == "apt-get" and "install" in cmd:
+                if "DPkg::Lock::Timeout=300" not in cmd:
+                    raise RuntimeError("dpkg frontend lock held by another package process")
+                if install_error:
+                    raise RuntimeError(install_error)
+            if cmd[:2] == ["tailscale", "status"]:
+                return '{"BackendState": "Running"}'
+            return ""
+
+        h.run = fake
+        self.assertEqual(h.tailscale(config()), ("joined", False))
+        install_error = "package repository unavailable"
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, install_error):
+            h.tailscale(config())
+        self.assertFalse(any(c[0] == "tailscale" for c in self.calls))
+
     def test_tailscale_join_passes_the_key_by_file_and_deletes_it(self):
         key = h.ROOT / "key"
         outputs = {"status": '{"BackendState": "NeedsLogin"}', "mktemp": str(key), "aws": "tskey-secret\n"}
