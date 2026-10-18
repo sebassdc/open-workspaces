@@ -1,5 +1,5 @@
 //! Remote operator client: browser Access login, HTTPS API, and WSS native terminal.
-use crate::{Action, common};
+use crate::{Action, ImageAction, common};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -185,8 +185,13 @@ pub(crate) fn request(url: &str, token: &str, operation: Option<Value>) -> Resul
     } else {
         client.get(format!("{url}/api/state"))
     };
-    let mut response = request.header("cf-access-token", token).send()?;
+    let mut response = request.header("cf-access-token", token).send()
+        .context("server_unreachable: check the selected HTTPS server, network/tailnet connection and TLS trust; retry mutations only with their original operation key")?;
     let status = response.status();
+    ensure!(
+        !matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308 | 401 | 403),
+        "authentication_or_admission: run ow login {url} (use --tailnet for a tailnet server); ask the administrator to admit your own identity if access is denied"
+    );
     let mut data = Vec::new();
     response
         .by_ref()
@@ -197,7 +202,11 @@ pub(crate) fn request(url: &str, token: &str, operation: Option<Value>) -> Resul
         .context("expected workspace API response; check server and login")?;
     ensure!(
         status.is_success() && result["ok"] == true,
-        "remote operation failed: {} (operation {})",
+        "remote operation failed: {} {} (operation {})",
+        result["error_code"]
+            .as_str()
+            .or_else(|| result["operation"]["error_code"].as_str())
+            .unwrap_or(""),
         result["error"].as_str().unwrap_or("unknown error"),
         result["operation"]
     );
@@ -325,6 +334,10 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             Action::List
                 | Action::Stats
                 | Action::Status
+                | Action::Nodes
+                | Action::Image {
+                    command: ImageAction::List { runner: None }
+                }
                 | Action::Snapshots
                 | Action::Inspect { .. }
                 | Action::Shell { .. }
@@ -351,12 +364,12 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Unpublish { .. }
                 | Action::Delete { .. }
         ),
-        "this command is local-only; use --local for the local worker"
+        "unsupported_capability: this command is local-only; use --local for the local worker (remote image list does not take --runner)"
     );
     if let Action::SshProxy { id } = &action {
         return crate::ssh_client::remote_proxy(&url, id);
     }
-    let token = token(&url)?;
+    let token = token(&url).context("authentication_or_admission: sign in to the selected server as yourself before running remote commands")?;
     let key = retry.unwrap_or(common::nonce()?);
     common::identifier(&key)?;
     let mut operation = match action {
@@ -386,6 +399,10 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         Action::List
         | Action::Stats
         | Action::Status
+        | Action::Nodes
+        | Action::Image {
+            command: ImageAction::List { runner: None },
+        }
         | Action::Snapshots
         | Action::Inspect { .. } => {
             let state = request(&url, &token, None)?;
@@ -396,8 +413,8 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 Action::List => json!(machines),
                 Action::Snapshots => state["snapshots"].clone(),
                 Action::Stats => state["stats"].clone(),
-                Action::Status => {
-                    json!({"server":url,"connected":true,"machines":state["workspaces"].as_array().map(Vec::len)})
+                Action::Status | Action::Nodes | Action::Image { .. } => {
+                    discovery_output(&url, &state, &action)?
                 }
                 Action::Inspect { id } => machines
                     .iter()
@@ -524,6 +541,90 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
     Ok(0)
 }
 
+fn discovery_output(url: &str, state: &Value, action: &Action) -> Result<Value> {
+    let mut discovery = state["discovery"].clone();
+    // Newer controllers report provisioned owner quotas separately from runner headroom.
+    if let Some(images) = discovery.get_mut("images").and_then(Value::as_array_mut) {
+        for image in images {
+            let mac = image["name"] == "ubuntu-arm64";
+            if let Some(placements) = image.get_mut("nodes").and_then(Value::as_array_mut) {
+                for placement in placements.iter_mut() {
+                    if placement["availability"] == "available"
+                        && !owner_fits(
+                            &state["owner_limits"],
+                            if mac { 512 } else { 256 },
+                            1,
+                            if mac {
+                                0
+                            } else {
+                                common::DEFAULT_DISK_GIB as u64
+                            },
+                        )
+                    {
+                        placement["availability"] = json!("insufficient_capacity");
+                        placement["development_choice"] = json!(null);
+                    }
+                    let choice = &placement["development_choice"];
+                    if choice.is_object()
+                        && !owner_fits(
+                            &state["owner_limits"],
+                            choice["memory_mib"].as_u64().unwrap_or(0),
+                            choice["vcpu_count"].as_u64().unwrap_or(0),
+                            choice["disk_gib"].as_u64().unwrap_or(0),
+                        )
+                    {
+                        placement["development_choice"] = json!(null);
+                    }
+                }
+                image["available"] =
+                    json!(placements.iter().any(|p| p["availability"] == "available"));
+            }
+        }
+    }
+    let supported = discovery["schema"] == 1;
+    match action {
+        Action::Status => Ok(json!({"server":url,"connected":true,
+            "machines":state["workspaces"].as_array().map(Vec::len),
+            "client_version":env!("CARGO_PKG_VERSION"),"server_version":discovery["server_version"],
+            "compatibility":{"discovery_supported":supported,"schema":discovery["schema"],
+                "next_action":if supported {json!(null)} else {json!("unsupported_capability: upgrade the server/client together before using remote discovery")}},
+            "identity":discovery["identity"],"owner_limits":state["owner_limits"],"operations":state["operations"],"discovery":discovery})),
+        Action::Nodes | Action::Image { .. } => {
+            ensure!(
+                supported,
+                "unsupported_capability: selected server does not support discovery schema 1; upgrade the server/client together, then retry status"
+            );
+            let field = if matches!(action, Action::Nodes) {
+                "nodes"
+            } else {
+                "images"
+            };
+            ensure!(
+                discovery[field].is_array(),
+                "unsupported_capability: malformed discovery response; check server/client versions"
+            );
+            Ok(discovery[field].clone())
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn owner_fits(limits: &Value, memory: u64, cpus: u64, disk: u64) -> bool {
+    [
+        ("memory_mib", memory),
+        ("cpus", cpus),
+        ("disk_gib", disk),
+        ("boxes", 1),
+    ]
+    .iter()
+    .all(|(key, requested)| {
+        limits["caps"][key]
+            .as_u64()
+            .zip(limits["usage"][key].as_u64())
+            .is_none_or(|(cap, used)| cap.saturating_sub(used) >= *requested)
+    })
+}
+
 fn shell(url: &str, token: &str, id: &str) -> Result<i32> {
     common::address(id)?;
     ensure!(
@@ -641,6 +742,30 @@ fn shell(url: &str, token: &str, id: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_owner_quotas_bound_choices_without_defaulting_unknown_limits() {
+        let mut state = json!({"discovery":{"schema":1,"images":[{"name":"ubuntu","available":true,"nodes":[{"availability":"available","development_choice":{"memory_mib":2048,"vcpu_count":2,"disk_gib":32}}]}]}});
+        let action = Action::Image {
+            command: ImageAction::List { runner: None },
+        };
+        assert!(discovery_output("https://example.test",&state,&action).unwrap()[0]["nodes"][0]["development_choice"].is_object());
+        state["owner_limits"] = json!({"caps":{"memory_mib":2048,"cpus":2,"disk_gib":64,"boxes":2},"usage":{"memory_mib":1024,"cpus":0,"disk_gib":0,"boxes":0}});
+        let out = discovery_output("https://example.test", &state, &action).unwrap();
+        assert_eq!(out[0]["available"], true);
+        assert!(out[0]["nodes"][0]["development_choice"].is_null());
+        state["owner_limits"]["usage"]["boxes"] = json!(2);
+        let out = discovery_output("https://example.test", &state, &action).unwrap();
+        assert_eq!(out[0]["available"], false);
+        assert_eq!(out[0]["nodes"][0]["availability"], "insufficient_capacity");
+        state["discovery"] = json!([]);
+        assert!(discovery_output("https://example.test", &state, &action).is_err());
+        assert_eq!(
+            discovery_output("https://example.test", &state, &Action::Status).unwrap()["compatibility"]
+                ["discovery_supported"],
+            false
+        );
+    }
 
     #[test]
     fn only_a_saved_tailnet_server_skips_the_token() {

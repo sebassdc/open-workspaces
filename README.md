@@ -58,6 +58,10 @@ Owners can create larger sparse root disks with `ow create NAME --disk 64GiB` an
 grow a stopped box with `ow resize NAME --disk 128GiB`; new Linux boxes default to
 32 GiB. See [disk sizing, host admission and reporting](docs/DISKS.md).
 
+For an existing coding agent operating its own remote workspace, see the
+[remote CLI discovery guide](docs/AGENT_CLI.md) for target/identity, images,
+resource units, noninteractive output and safe retries.
+
 ## Read first
 
 1. [Agent handoff](docs/HANDOFF.md): context, first task, and acceptance criteria.
