@@ -25,7 +25,7 @@ pub trait SnapshotStore {
     fn list(&self) -> Result<Vec<String>>;
     /// Uploads one sealed snapshot directory under `name`, manifest last.
     fn push(&self, name: &str, directory: &Path) -> Result<()>;
-    /// The stored manifest of `name`, unchecked bytes.
+    /// The sealed manifest of `name`, without store transport metadata; unchecked bytes.
     fn manifest(&self, name: &str) -> Result<Vec<u8>>;
     /// Downloads `name` into `directory`, which must not exist yet. Every file is
     /// checked against the stored manifest; on any failure `directory` is removed.
@@ -37,6 +37,7 @@ pub trait SnapshotStore {
 pub struct S3Store {
     url: String,
     endpoint: Option<String>,
+    incremental: bool,
 }
 
 impl S3Store {
@@ -66,7 +67,70 @@ impl S3Store {
         Ok(Self {
             url: url.trim_end_matches('/').to_owned(),
             endpoint: endpoint.map(str::to_owned),
+            incremental: false,
         })
+    }
+
+    fn push_full(&self, name: &str, directory: &Path) -> Result<()> {
+        crate::common::identifier(name)?;
+        let manifest = read_manifest(&directory.join("manifest.json"), name)?;
+        for file in DATA_FILES {
+            let mut source = File::open(directory.join(file))?;
+            let size = source.metadata()?.len();
+            let mut child = self
+                .aws()
+                .args(["s3", "cp", "--only-show-errors", "-"])
+                .arg(self.key(name, &format!("{file}.zst")))
+                // Multipart part sizes for streams larger than 50 GB.
+                .args(["--expected-size", &size.to_string()])
+                .stdin(Stdio::piped())
+                .spawn()
+                .context("the AWS CLI (aws) is required for snapshot stores")?;
+            let mut hasher = Sha256::new();
+            let encoded = (|| -> Result<()> {
+                let mut encoder = zstd::Encoder::new(child.stdin.take().unwrap(), 3)?;
+                let mut buffer = vec![0; 1 << 20];
+                loop {
+                    let n = source.read(&mut buffer)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..n]);
+                    encoder.write_all(&buffer[..n])?;
+                }
+                encoder.finish()?;
+                Ok(())
+            })();
+            let uploaded = finished(child, &format!("uploading {file}"));
+            encoded?;
+            uploaded?;
+            // The bytes sent are the sealed bytes.
+            ensure!(
+                manifest["files"][file] == hex(&hasher.finalize()),
+                "snapshot {name}: {file} does not match its manifest"
+            );
+        }
+        let status = self
+            .aws()
+            .args(["s3", "cp", "--only-show-errors"])
+            .arg(directory.join("manifest.json"))
+            .arg(self.key(name, "manifest.json"))
+            .status()?;
+        ensure!(status.success(), "uploading manifest failed ({status})");
+        Ok(())
+    }
+
+    /// Opt-in chunk format for managed recovery. Existing manual backups keep
+    /// writing the original representation that older clients can restore.
+    pub fn incremental(mut self) -> Self {
+        self.incremental = true;
+        self
+    }
+
+    pub fn identity(&self) -> String {
+        hex(&Sha256::digest(
+            format!("{}\n{}", self.url, self.endpoint.as_deref().unwrap_or("")).as_bytes(),
+        ))
     }
 
     fn key(&self, name: &str, file: &str) -> String {
@@ -128,69 +192,21 @@ impl SnapshotStore for S3Store {
     }
 
     fn push(&self, name: &str, directory: &Path) -> Result<()> {
-        crate::common::identifier(name)?;
-        let manifest = read_manifest(&directory.join("manifest.json"), name)?;
-        for file in DATA_FILES {
-            let mut source = File::open(directory.join(file))?;
-            let size = source.metadata()?.len();
-            let mut child = self
-                .aws()
-                .args(["s3", "cp", "--only-show-errors", "-"])
-                .arg(self.key(name, &format!("{file}.zst")))
-                // Multipart part sizes for streams larger than 50 GB.
-                .args(["--expected-size", &size.to_string()])
-                .stdin(Stdio::piped())
-                .spawn()
-                .context("the AWS CLI (aws) is required for snapshot stores")?;
-            let mut hasher = Sha256::new();
-            let encoded = (|| -> Result<()> {
-                let mut encoder = zstd::Encoder::new(child.stdin.take().unwrap(), 3)?;
-                let mut buffer = vec![0; 1 << 20];
-                loop {
-                    let n = source.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..n]);
-                    encoder.write_all(&buffer[..n])?;
-                }
-                encoder.finish()?;
-                Ok(())
-            })();
-            let uploaded = finished(child, &format!("uploading {file}"));
-            encoded?;
-            uploaded?;
-            // The bytes sent are the sealed bytes.
-            ensure!(
-                manifest["files"][file] == hex(&hasher.finalize()),
-                "snapshot {name}: {file} does not match its manifest"
-            );
+        if self.incremental {
+            self.check_recovery_retention()?;
+            self.push_chunks(name, directory)
+        } else {
+            self.push_full(name, directory)
         }
-        let status = self
-            .aws()
-            .args(["s3", "cp", "--only-show-errors"])
-            .arg(directory.join("manifest.json"))
-            .arg(self.key(name, "manifest.json"))
-            .status()?;
-        ensure!(status.success(), "uploading manifest failed ({status})");
-        Ok(())
     }
 
     fn manifest(&self, name: &str) -> Result<Vec<u8>> {
-        crate::common::identifier(name)?;
-        let mut child = self.get(&self.key(name, "manifest.json"))?;
-        let mut bytes = Vec::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .take(1 << 20)
-            .read_to_end(&mut bytes)?;
-        finished(
-            child,
-            &format!("snapshot {name} not in the store: download"),
-        )?;
-        Ok(bytes)
+        let mut manifest = self.stored_manifest(name)?;
+        manifest
+            .as_object_mut()
+            .context("invalid manifest")?
+            .remove("ow_chunks_v2");
+        Ok(serde_json::to_vec(&manifest)?)
     }
 
     fn pull(&self, name: &str, directory: &Path) -> Result<()> {
@@ -198,22 +214,32 @@ impl SnapshotStore for S3Store {
         fs::create_dir(directory)?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         let result = (|| -> Result<()> {
-            let bytes = self.manifest(name)?;
+            let mut stored = self.stored_manifest(name)?;
+            let chunks = stored
+                .as_object_mut()
+                .context("invalid manifest")?
+                .remove("ow_chunks_v2");
+            let bytes = serde_json::to_vec(&stored)?;
             let manifest_path = directory.join("manifest.json");
             private_file(&manifest_path)?.write_all(&bytes)?;
             let manifest = read_manifest(&manifest_path, name)?;
-            for file in DATA_FILES {
-                let mut child = self.get(&self.key(name, &format!("{file}.zst")))?;
-                let decoded = (|| -> Result<String> {
-                    let mut output = private_file(&directory.join(file))?;
-                    let decoder = zstd::Decoder::new(child.stdout.take().unwrap())?;
-                    write_sparse(decoder, &mut output)
-                })();
-                finished(child, &format!("downloading {file}"))?;
-                ensure!(
-                    manifest["files"][file] == decoded?,
-                    "snapshot {name}: downloaded {file} does not match its manifest"
-                );
+            if let Some(chunks) = chunks {
+                self.pull_chunks(chunks, &manifest, directory)?;
+            } else {
+                // Original WRK-4 whole-file representation remains readable.
+                for file in DATA_FILES {
+                    let mut child = self.get(&self.key(name, &format!("{file}.zst")))?;
+                    let decoded = (|| -> Result<String> {
+                        let mut output = private_file(&directory.join(file))?;
+                        let decoder = zstd::Decoder::new(child.stdout.take().unwrap())?;
+                        write_sparse(decoder, &mut output)
+                    })();
+                    finished(child, &format!("downloading {file}"))?;
+                    ensure!(
+                        manifest["files"][file] == decoded?,
+                        "snapshot {name}: downloaded {file} does not match its manifest"
+                    );
+                }
             }
             for file in DATA_FILES.iter().chain(&["manifest.json"]) {
                 fs::set_permissions(directory.join(file), fs::Permissions::from_mode(0o400))?;
@@ -225,6 +251,16 @@ impl SnapshotStore for S3Store {
         }
         result
     }
+}
+
+#[path = "snapshot_chunks.rs"]
+mod chunks;
+
+fn valid_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn private_file(path: &Path) -> Result<File> {
@@ -246,7 +282,7 @@ pub fn read_manifest(path: &Path, name: &str) -> Result<Value> {
                 .is_some_and(|w| crate::common::identifier(w).is_ok())
             && DATA_FILES
                 .iter()
-                .all(|f| manifest["files"][f].as_str().is_some_and(|h| h.len() == 64)),
+                .all(|f| manifest["files"][f].as_str().is_some_and(|h| valid_hash(h))),
         "manifest {} is not a sealed snapshot named {name}",
         path.display()
     );

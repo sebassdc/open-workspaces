@@ -43,6 +43,19 @@ pub fn run(base: Option<PathBuf>, action: BackupAction) -> Result<i32> {
             println!("{}", json!({"store":to,"uploaded":pushed}));
             Ok(0)
         }
+        BackupAction::Recover {
+            to,
+            from,
+            endpoint_url,
+        } => {
+            let from = match from {
+                Some(dir) => dir,
+                None => selfhost::base(base)?.join("runner"),
+            };
+            let store = S3Store::new(&to, endpoint_url.as_deref())?.incremental();
+            recover(&store, &from, &store.identity())?;
+            Ok(0)
+        }
         BackupAction::Restore {
             snapshot,
             from,
@@ -89,6 +102,69 @@ pub fn run(base: Option<PathBuf>, action: BackupAction) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// The worker owns capture/journal changes; network transfer never holds its runtime lock.
+fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(runner.join("recovery-upload.lock"))?;
+    ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "a recovery upload is already running for this runner"
+    );
+    let status = wire::request(runner, json!({"op":"status"}))?;
+    ensure!(
+        status["recovery_points_v1"] == true,
+        "worker does not support recovery points; complete its normal class-2 upgrade first"
+    );
+    let machines = wire::request(runner, json!({"op":"list"}))?;
+    let mut machines = machines.as_array().context("invalid machine list")?.clone();
+    // An interrupted long transfer must not always leave later boxes at the back.
+    machines.sort_by_key(|m| {
+        (
+            m["durability"]["last_durable_at"].as_u64().unwrap_or(0),
+            m["durability"]["retry_at"].as_u64().unwrap_or(0),
+        )
+    });
+    let mut failed = Vec::new();
+    for machine in &machines {
+        let id = machine["id"].as_str().context("missing machine ID")?;
+        let result = (|| -> Result<()> {
+            let point = wire::request(
+                runner,
+                json!({"op":"recovery-prepare","id":id,"store":store_id}),
+            )?;
+            let Some(name) = point["snapshot"].as_str() else {
+                return Ok(());
+            };
+            let uploaded = store.push(name, &runner.join("snapshots").join(name));
+            wire::request(
+                runner,
+                json!({"op":"recovery-result","id":id,"snapshot":name,"uploaded":uploaded.is_ok(),"store":store_id}),
+            )?;
+            uploaded?;
+            println!(
+                "{}",
+                json!({"workspace":id,"snapshot":name,"last_durable_at":point["captured_at"]})
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("recovery {id}: {error:#}");
+            failed.push(id.to_owned());
+        }
+    }
+    ensure!(
+        failed.is_empty(),
+        "recovery failed for {}; retry on next scheduled run",
+        failed.join(", ")
+    );
+    Ok(())
 }
 
 /// One row per stored snapshot, oldest upload first: the box it captured
@@ -229,11 +305,14 @@ fn push_new(store: &dyn SnapshotStore, dir: &Path) -> Result<Vec<String>> {
         if name.starts_with('.') || !path.join("manifest.json").is_file() {
             continue;
         }
+        let local = ow_core::snapshot_store::read_manifest(&path.join("manifest.json"), &name)?;
+        if local["managed_recovery"] == true {
+            continue;
+        }
         if stored.contains(&name) {
             // Already stored only if it is this snapshot; never skip a different one.
             let remote: serde_json::Value = serde_json::from_slice(&store.manifest(&name)?)
                 .with_context(|| format!("invalid stored manifest for {name}"))?;
-            let local = ow_core::snapshot_store::read_manifest(&path.join("manifest.json"), &name)?;
             ensure!(
                 remote == local,
                 "the store already has a different snapshot named {name}; use a prefix per runner"
@@ -322,9 +401,18 @@ mod tests {
     #[test]
     fn a_runner_store_finds_its_controllers_catalog() {
         use super::catalog_root;
-        assert_eq!(catalog_root("s3://b/ow/snapshots"), Some(("s3://b/ow", false)));
-        assert_eq!(catalog_root("s3://b/ow/runners/big/snapshots"), Some(("s3://b/ow", true)));
-        assert_eq!(catalog_root("s3://b/ow/runners/a/b/snapshots"), Some(("s3://b/ow/runners/a/b", false)));
+        assert_eq!(
+            catalog_root("s3://b/ow/snapshots"),
+            Some(("s3://b/ow", false))
+        );
+        assert_eq!(
+            catalog_root("s3://b/ow/runners/big/snapshots"),
+            Some(("s3://b/ow", true))
+        );
+        assert_eq!(
+            catalog_root("s3://b/ow/runners/a/b/snapshots"),
+            Some(("s3://b/ow/runners/a/b", false))
+        );
         assert_eq!(catalog_root("s3://b/ow"), None);
         assert_eq!(catalog_root("s3:///snapshots"), None);
     }
@@ -400,6 +488,69 @@ mod tests {
                 fs::copy(self.0.join(name).join(f), directory.join(f))?;
             }
             Ok(())
+        }
+    }
+
+    #[test]
+    fn recovery_reports_failure_and_continues_other_boxes() {
+        use std::os::unix::net::UnixListener;
+        let (runner, remote) = (temp("recover"), temp("recover-store"));
+        fs::create_dir(runner.join("snapshots")).unwrap();
+        for name in ["a", "b"] {
+            let dir = runner.join("snapshots").join(name);
+            fs::create_dir(&dir).unwrap();
+            for file in ["state", "memory", "disk.ext4", "manifest.json"] {
+                fs::write(dir.join(file), "fixture").unwrap();
+            }
+        }
+        let listener = UnixListener::bind(runner.join("control.sock")).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = wire::line(&mut stream).unwrap();
+                let result = match request["op"].as_str().unwrap() {
+                    "status" => json!({"recovery_points_v1":true}),
+                    "list" => json!([{"id":"a"},{"id":"b"}]),
+                    "recovery-prepare" => json!({"snapshot":request["id"],"captured_at":1000}),
+                    "recovery-result" => json!({}),
+                    _ => panic!("unexpected recovery request"),
+                };
+                observed.lock().unwrap().push(request);
+                wire::send(&mut stream, &json!({"ok":true,"result":result})).unwrap();
+            }
+        });
+        struct Failing(Dir);
+        impl SnapshotStore for Failing {
+            fn list(&self) -> Result<Vec<String>> {
+                self.0.list()
+            }
+            fn manifest(&self, name: &str) -> Result<Vec<u8>> {
+                self.0.manifest(name)
+            }
+            fn pull(&self, name: &str, directory: &Path) -> Result<()> {
+                self.0.pull(name, directory)
+            }
+            fn push(&self, name: &str, directory: &Path) -> Result<()> {
+                ensure!(name != "a", "injected upload failure");
+                self.0.push(name, directory)
+            }
+        }
+        let error = recover(&Failing(Dir(remote.clone())), &runner, &"a".repeat(64)).unwrap_err();
+        worker.join().unwrap();
+        assert!(error.to_string().contains("failed for a"));
+        let seen = seen.lock().unwrap();
+        let results: Vec<_> = seen
+            .iter()
+            .filter(|v| v["op"] == "recovery-result")
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["uploaded"], false);
+        assert_eq!(results[1]["uploaded"], true);
+        assert!(remote.join("b/manifest.json").exists());
+        for dir in [runner, remote] {
+            fs::remove_dir_all(dir).unwrap();
         }
     }
 

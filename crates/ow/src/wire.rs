@@ -140,7 +140,7 @@ pub fn connect(root: &Path, request: &Value) -> Result<(UnixStream, Value)> {
 pub fn reply_wait(request: &Value) -> Duration {
     match request["op"].as_str() {
         Some("image-build" | "image-pull") => Duration::from_secs(7200),
-        Some("hibernate" | "snapshot" | "fork" | "export" | "seal-disk" | "import-prepare") => {
+        Some("hibernate" | "snapshot" | "fork" | "export" | "seal-disk" | "import-prepare" | "recovery-prepare") => {
             Duration::from_secs(1200)
         }
         _ => Duration::from_secs(120),
