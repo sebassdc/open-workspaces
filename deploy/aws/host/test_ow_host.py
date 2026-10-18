@@ -67,6 +67,9 @@ class Render(unittest.TestCase):
         prepare = self.files["/usr/local/lib/open-workspaces/dashboard-prepare"]
         self.assertIn("tailscale serve --bg http://127.0.0.1:8787", prepare)
         self.assertNotIn("funnel", prepare)
+        self.assertEqual(self.files["/etc/sudoers.d/ow-preview"], "ow ALL=(root) NOPASSWD: /usr/local/lib/open-workspaces/preview-serve *\n")
+        self.assertIn("/usr/bin/tailscale", self.files["/usr/local/lib/open-workspaces/preview-serve"])
+        self.assertEqual(h.units_changed(["/usr/local/lib/open-workspaces/preview-serve"]), {"dashboard"})
         self.assertEqual(self.files["/etc/open-workspaces/dashboard.env"], "OW_DASHBOARD_LOGINS=you@example.com\n")
 
     def test_optional_features_render_only_when_configured(self):

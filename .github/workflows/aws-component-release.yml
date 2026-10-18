@@ -33,6 +33,9 @@ jobs:
           cargo +1.97.0 test --locked -p ow --test ssh_proxy
           cargo +1.97.0 test --locked -p ow --bin ow node_stream_100_mib_each_way
           cargo +1.97.0 test --locked -p ow --bin ow known_rejections_give_safe_actions_without_worker_details
+      - name: Check tailnet previews before tagging
+        working-directory: .
+        run: cargo +1.97.0 test --locked -p ow --bin ow preview
       - name: Check snapshot admission and failure recovery before tagging
         working-directory: .
         run: |
