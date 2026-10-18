@@ -126,6 +126,7 @@ pub fn connect(root: &Path, request: &Value) -> Result<(UnixStream, Value)> {
 /// write guest RAM to disk (the VMM allows 900 s) and then hash it.
 pub fn reply_wait(request: &Value) -> Duration {
     match request["op"].as_str() {
+        Some("image-build" | "image-pull") => Duration::from_secs(7200),
         Some("hibernate" | "snapshot" | "fork") => Duration::from_secs(1200),
         _ => Duration::from_secs(120),
     }

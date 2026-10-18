@@ -54,6 +54,10 @@ Idle boxes hibernate and wake on the next connection, snapshots restore from S3
 onto another runner, and `ow image build` makes golden images from recipes; see
 [wake on connect, snapshot store and golden images](docs/DAILY_USE.md).
 
+The opt-in [write-once artifact store and shared images](docs/ARTIFACT_STORE.md)
+publish base/golden images once through S3, with catalog versions and digest-verified
+runner pulls. Live fleet rollout and controller GC remain separate gates.
+
 Owners can create larger sparse root disks with `ow create NAME --disk 64GiB` and
 grow a stopped box with `ow resize NAME --disk 128GiB`; new Linux boxes default to
 32 GiB. See [disk sizing, host admission and reporting](docs/DISKS.md).

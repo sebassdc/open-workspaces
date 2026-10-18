@@ -82,8 +82,11 @@ impl Fake {
                         }
                         m.clone()
                     }
+                    "image-pull" => {
+                        json!({"name":format!("{}@{}",request["image"]["name"].as_str().unwrap(),request["image"]["version"].as_i64().unwrap()),"image_digest":request["image"]["reference"]["digest"]})
+                    }
                     "create" => {
-                        let m = json!({"id":id,"memory_mib":request["memory_mib"].as_u64().unwrap_or(256),"vcpu_count":request["vcpu_count"].as_u64().unwrap_or(1),"image":request["image"].as_str().unwrap_or("alpine"),"state":"running","source":null,"disk_bytes":request["disk_gib"].as_u64().unwrap_or(8)*common::GIB});
+                        let m = json!({"id":id,"memory_mib":request["memory_mib"].as_u64().unwrap_or(256),"vcpu_count":request["vcpu_count"].as_u64().unwrap_or(1),"image":request["image"].as_str().unwrap_or("alpine"),"image_digest":request["image_digest"],"state":"running","source":null,"disk_bytes":request["disk_gib"].as_u64().unwrap_or(8)*common::GIB});
                         machines.insert(id.into(), m.clone());
                         m
                     }
@@ -1764,6 +1767,63 @@ fn owner_quota_unknown_native_disk_never_uses_linux_default() {
     assert!(error.to_string().contains("disk GiB limit exceeded"));
     assert_eq!(
         limits::state(&fake.root, &c.db, owner).unwrap()["usage"]["boxes"],
+        0
+    );
+}
+
+#[test]
+fn catalog_store_images_pin_retry_versions_and_keep_legacy_boxes() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let owner = c.user(&identity("alice")).unwrap();
+    c.operation(owner,json!({"op":"create","id":"legacy","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    c.db.execute("UPDATE nodes SET slots=8,memory_mib=4096,capabilities=json_set(capabilities,'$.slots',8,'$.memory_mib',4096,'$.vcpus',8,'$.image_store_v1',json('true')) WHERE id='alpha'",[]).unwrap();
+    for n in 1..=2 {
+        let artifact = format!("a-version-{n}");
+        let token = format!("{n:032x}");
+        let digest = format!("{n:064x}");
+        c.db.execute("INSERT INTO artifacts(id,kind,attempt,digest,local_name,state,store_url) VALUES(?1,'base',?2,?3,?4,'stored','s3://bucket/root')",params![artifact,token,digest,format!("alpine@{n}")]).unwrap();
+        c.db.execute("INSERT INTO leases(artifact,holder,purpose,token,expires) VALUES(?1,'local','push',?2,?3)",params![artifact,token,nodes_now()+7200]).unwrap();
+        c.db.execute(
+            "UPDATE images SET status='kept' WHERE name='alpine' AND status='current'",
+            [],
+        )
+        .unwrap();
+        c.db.execute("INSERT INTO images(name,version,artifact,base,base_digest,recipe_sha256,status) VALUES('alpine',?1,?2,'alpine',?3,?3,'current')",params![n,artifact,digest]).unwrap();
+        let created=c.operation(owner,json!({"op":"create","id":"pinned","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+        assert_eq!(
+            created["image"], "alpine@1",
+            "lost-response retry retains first version"
+        );
+    }
+    let legacy=c.operation(owner,json!({"op":"create","id":"legacy","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    assert_eq!(legacy["image"], "alpine");
+    let fresh=c.operation(owner,json!({"op":"create","id":"fresh","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    assert_eq!(fresh["image"], "alpine@2");
+    c.db.execute(
+        "UPDATE images SET status='retired' WHERE name='alpine' AND version=1",
+        [],
+    )
+    .unwrap();
+    assert!(c.operation(owner,json!({"op":"create","id":"retired","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine@1"})).is_err());
+    crate::image_store::prefetch(&fake.root, "alpha", &json!([])).unwrap();
+    assert_eq!(
+        c.db.query_row::<i64, _, _>(
+            "SELECT count(*) FROM artifact_copies WHERE node='alpha' AND state='present'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        c.db.query_row::<i64, _, _>(
+            "SELECT count(*) FROM leases WHERE purpose='pull'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
         0
     );
 }
