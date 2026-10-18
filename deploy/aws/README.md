@@ -25,6 +25,10 @@ What it creates:
 
 Every resource gets the `tags` input plus `Name`.
 
+Direct Tailscale setup waits for DHCP routing after networkd reconfiguration.
+Transient unreachable route probes retry for up to one minute; a timeout leaves
+setup pending for the next `ow-host apply`.
+
 During first boot, installing Tailscale waits up to five minutes for another
 OS package process to release the dpkg frontend lock. A failed package install
 still fails bootstrap; inspect `/var/log/open-workspaces-bootstrap.log`.
