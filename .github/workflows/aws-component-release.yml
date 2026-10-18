@@ -26,12 +26,23 @@ jobs:
       - uses: pulumi/actions@v5
       - run: npm ci --no-audit --no-fund
       - run: npm run check
+      - name: Check SSH throughput and actionable errors before tagging
+        working-directory: .
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --no-self-update
+          cargo +1.97.0 test --locked -p ow --test ssh_proxy
+          cargo +1.97.0 test --locked -p ow --bin ow node_stream_100_mib_each_way
+          cargo +1.97.0 test --locked -p ow --bin ow known_rejections_give_safe_actions_without_worker_details
       - name: Tag the release
         if: github.event_name == 'push'
         run: |
           tag="v$(node -p 'require("./package.json").version')"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            echo "$tag already exists"
+            if [ "$(git rev-parse "$tag^{commit}")" != "$GITHUB_SHA" ]; then
+              echo "::error::$tag already names a different commit; choose a fresh release version"
+              exit 1
+            fi
+            echo "$tag already names this commit"
           else
             git tag "$tag" "$GITHUB_SHA"
             git push origin "refs/tags/$tag"

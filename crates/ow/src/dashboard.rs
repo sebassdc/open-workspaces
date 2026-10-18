@@ -386,7 +386,13 @@ pub async fn handle(
         Err(error) => {
             eprintln!("Dashboard workspace operation failed: {error:#}");
             if let Some(failure) = error.downcast_ref::<crate::catalog::OperationFailure>() {
-                return secure((StatusCode::CONFLICT,Json(json!({"ok":false,"error":"Operation did not complete. Check its status before retrying; use the same retry key.","operation":failure.0}))).into_response());
+                return secure(
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({"ok":false,"error":failure.message(),"operation":failure.0})),
+                    )
+                        .into_response(),
+                );
             }
             (StatusCode::CONFLICT,Json(json!({"ok":false,"error":"Operation could not complete. Check machine state, capacity, snapshot ownership and names, then refresh before retrying."}))).into_response()
         }

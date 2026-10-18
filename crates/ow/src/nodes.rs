@@ -923,6 +923,7 @@ fn socket(
         }
     }
     let tcp = connected.context("node connect failed or timed out")?;
+    tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
     // Shutdown watchdog bounds a slow-drip TLS/HTTP handshake as well as an idle peer.
@@ -1377,27 +1378,50 @@ fn agent_job(
         );
         common::identifier(request["id"].as_str().context("SSH ID")?)?;
     }
-    let (mut unix, response) = wire::connect(root, &request)?;
+    let (unix, response) = wire::connect(root, &request)?;
     socket.send(tungstenite::Message::Binary(
         format!("{}\n", json!({"ok":true,"result":response}))
             .into_bytes()
             .into(),
     ))?;
-    unix.set_read_timeout(Some(Duration::from_millis(1)))?;
+    agent_stream(socket, unix)
+}
+
+fn agent_stream(
+    mut socket: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    mut unix: std::os::unix::net::UnixStream,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let socket_fd = match socket.get_ref() {
+        tungstenite::stream::MaybeTlsStream::Plain(s) => s.as_raw_fd(),
+        tungstenite::stream::MaybeTlsStream::Rustls(s) => s.sock.as_raw_fd(),
+        _ => anyhow::bail!("unsupported stream transport"),
+    };
+    unix.set_nonblocking(true)?;
     unix.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let mut buffer = [0; 4096];
+    let mut buffer = [0; 16384];
     let mut last = std::time::Instant::now();
     loop {
         ensure!(
             last.elapsed() < Duration::from_secs(90),
             "terminal transport idle"
         );
-        match socket.read() {
+        let mut progressed = false;
+        match wire::read_available(&mut socket) {
             Ok(tungstenite::Message::Binary(b)) => {
+                unix.set_nonblocking(false)?;
                 unix.write_all(&b)?;
+                unix.set_nonblocking(true)?;
                 last = std::time::Instant::now();
+                progressed = true;
             }
-            Ok(tungstenite::Message::Ping(v)) => socket.send(tungstenite::Message::Pong(v))?,
+            Ok(tungstenite::Message::Ping(v)) => {
+                socket.send(tungstenite::Message::Pong(v))?;
+                progressed = true;
+            }
+            Ok(tungstenite::Message::Pong(_)) => {
+                progressed = true;
+            }
             Err(e) if timed_out(&e) => {}
             _ => break,
         }
@@ -1406,6 +1430,7 @@ fn agent_job(
             Ok(n) => {
                 socket.send(tungstenite::Message::Binary(buffer[..n].to_vec().into()))?;
                 last = std::time::Instant::now();
+                progressed = true;
             }
             Err(e)
                 if matches!(
@@ -1413,6 +1438,9 @@ fn agent_job(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
             Err(e) => return Err(e.into()),
+        }
+        if !progressed {
+            wire::wait_readable([socket_fd, unix.as_raw_fd()])?;
         }
     }
     Ok(())
