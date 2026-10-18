@@ -142,10 +142,24 @@ impl Manifest {
     }
     pub fn bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        // Value maps are sorted (serde_json without preserve_order), including metadata.
-        let bytes = serde_json::to_vec(&serde_json::to_value(self)?)?;
+        let bytes = serde_json::to_vec(&canonical(serde_json::to_value(self)?))?;
         ensure!(bytes.len() as u64 <= MAX_MANIFEST, "manifest too large");
         Ok(bytes)
+    }
+}
+
+// Keep bytes stable even if another crate enables serde_json/preserve_order.
+fn canonical(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, canonical(value)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
+        value => value,
     }
 }
 
