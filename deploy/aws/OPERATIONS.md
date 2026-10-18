@@ -35,9 +35,11 @@ the stack's `instanceId` output. `OW_SSH_KEY` picks the private key (default
 | `join-tailnet --secret ARN` | joins the tailnet with the auth key in that Secrets Manager secret (the host role must be allowed to read it: `tailscaleAuthKeySecretArn`), restarts as above, starts the dashboard. The key goes to a root-only file under `/run` and is deleted; it is never printed |
 | `image RECIPE` | `ready --images`, then `ow image build RECIPE` on the host's runner. The file must be named `NAME.sh` |
 | `backups [--url S3URL] [OWNER/NAME \| ID]` | backed-up captures, oldest first: `uploaded  owner/machine  box  capture`. Default URL: the host's `backupUrl`. With a box, its newest capture is the last line. Restore one with `sudo ow backup restore` on a runner |
-| `apply`, `upgrade [ARGS]` | `ow-host apply` (the config parameter: class 0 now, the rest reported) or `ow-host upgrade [REF] [--plan] [--accept-cold] [--max-class N]` ([in place](README.md#upgrades-in-place)) on hosts that ship `ow-host` (0.5.0 and later); refused on others |
+| `apply`, `upgrade [ARGS]` | `ow-host apply` (the config parameter: class 0 now, the rest reported) or `ow-host upgrade [REF] [--plan] [--accept-cold] [--max-class N]` ([in place](README.md#upgrades-in-place)) on hosts that ship `ow-host` (0.5.0 and later); refused on others. On a [runner](README.md#runners) it first reads the release its controller's agent runs and passes `--controller-version` |
+| `runner-add RUNNER` | with `--host CONTROLLER`: waits until `RUNNER` is ready, then has the controller host mint a single-use join into `RUNNER`'s secret and `RUNNER` redeem it (`ow-host invite-runner`, then `ow-host enrol`), and waits until the controller lists it online. An enrolled runner is only checked |
+| `runner-remove RUNNER` | with `--host CONTROLLER`: revokes `RUNNER` on the controller; refused while it is online |
 | `ci-preflight --stack S` | before `pulumi up`: if `pulumi preview` replaces this host's instance, hibernates its boxes (`ow down --hibernate`, which keeps them running if one cannot be hibernated) and stops the service. Fails (so CI stops before `pulumi up`) when the preview cannot be read or the instance is neither running nor stopped |
-| `ci-post-up --stack S [--image RECIPE].. [--max-class N]` | after `pulumi up`: starts a stopped host, waits until ready (each step up to 50 minutes: a new host builds from source), resumes remembered boxes, runs `ow-host apply` and `ow-host upgrade` where the host has them, then builds each image (an unchanged recipe is a no-op) |
+| `ci-post-up --stack S [--image RECIPE].. [--max-class N]` | after `pulumi up`: starts a stopped host, waits until ready (each step up to 50 minutes: a new host builds from source), resumes remembered boxes, runs `ow-host apply` and `ow-host upgrade` where the host has them, then builds each image (an unchanged recipe is a no-op). On a runner, `runner-add` runs before `apply`, and `upgrade` gets the controller's release. Run it for the controller host first, then for each runner |
 
 Each SSM command has a local deadline, so an unreachable host ends the command
 instead of hanging. SSM keeps at most 24,000 characters of a command's output.
@@ -52,11 +54,13 @@ ow=open-workspaces/deploy/aws/bin/ow-aws
 "$ow" --host my-host ci-preflight --stack prod
 pulumi up --stack prod --yes
 "$ow" --host my-host ci-post-up --stack prod --image images/team.sh
+"$ow" --host my-host-2 ci-post-up --stack prod --image images/team.sh   # each Runner, after its controller
 ```
 
 The CI role needs `ec2:DescribeInstances`, `ec2:StartInstances`,
 `ssm:SendCommand` (scope it to the host's tags), `ssm:GetCommandInvocation`
-and `ssm:DescribeInstanceInformation`.
+and `ssm:DescribeInstanceInformation`; with runners, also `ssm:GetParameter` on
+`/open-workspaces/*/config` (the helper reads which controller a runner has).
 
 ## Backup bucket: `ArtifactStore`
 

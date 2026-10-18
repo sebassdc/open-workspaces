@@ -295,7 +295,7 @@ export class Host extends pulumi.ComponentResource {
         }
         // A runner's single-use join: the controller host writes it (`ow-aws runner-add`),
         // this host reads it once and overwrites it. No other host can read it.
-        let runner: pulumi.Output<RunnerConfig | undefined> = pulumi.output(undefined);
+        let runner = pulumi.output<RunnerConfig | undefined>(undefined);
         if (controller) {
             const join = new aws.secretsmanager.Secret(`${name}-join`, {
                 name: `open-workspaces/${nodeId(name)}/join`,
@@ -317,7 +317,7 @@ export class Host extends pulumi.ComponentResource {
                     Statement: [{ Effect: "Allow", Action: "secretsmanager:PutSecretValue", Resource: arn }],
                 })),
             }, parent);
-            runner = join.arn.apply((arn) => ({ node: name, controller: controller.hostName, joinSecretArn: arn }));
+            runner = join.arn.apply((arn): RunnerConfig | undefined => ({ node: name, controller: controller.hostName, joinSecretArn: arn }));
         }
         // Everything the host applies in place: user data only bootstraps (stage 0), so a
         // config or release change updates this parameter and never replaces the instance.

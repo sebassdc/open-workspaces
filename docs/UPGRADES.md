@@ -171,6 +171,29 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
 
 Old releases are pruned: every pinned release plus the two newest others stay.
 
+## Runners
+
+A [`Runner`](../deploy/aws/README.md#runners) host has the same layout, pins and
+journal, with `role: runner` in its config: its `open-workspaces.service` runs
+`ow node-agent` against the controller recorded at enrolment (no controller, no
+dashboard). `ow-host upgrade` works the same, with these differences:
+
+- **plan**: there is no catalog on a runner, so no catalog copy. When the agent
+  pin moves, the target's protocol must be inside the window of the release the
+  controller runs (`--controller-version`, which `ow-aws upgrade` reads from the
+  controller host); otherwise the upgrade is refused (upgrade the controller
+  first). A controller release missing from the target's manifest is refused too.
+- **verify**: the agent's own report, `/srv/ow/.ow/runner/agent.json`, written
+  after each heartbeat the controller kept the channel open for: online,
+  updated within 15 s, with the agent's and the worker's releases. An agent
+  that stops (SIGTERM) takes no new jobs, advertises `drain`, lets accepted jobs
+  finish and writes itself offline.
+- An unenrolled runner (no credential yet) has no agent to restart or check.
+
+Fleet order: the controller host first, then each runner, one at a time; a
+controller accepts the protocol it speaks and the one before, so a runner may
+run one protocol version behind its controller but never ahead.
+
 ## Sandbox EC2 check (2026-10-17)
 
 Observed on one m8i-flex.xlarge host (Ubuntu 24.04 AMI `ami-02a9cdd4e98bc3c78`,

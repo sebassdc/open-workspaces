@@ -2,7 +2,9 @@
 
 `open-workspaces-aws` is a Pulumi component package written in TypeScript. Its
 `Host` component creates one EC2 instance with nested virtualization that runs
-the Open Workspaces controller and runner together (single-host mode).
+the Open Workspaces controller and runner together (single-host mode). A
+[`Runner`](#runners) adds another such instance that runs only a runner and joins
+a Host's controller.
 
 What it creates:
 
@@ -197,6 +199,61 @@ Progress: `/var/log/open-workspaces-bootstrap.log`; state:
 `ok tailscale=...`). Building from source takes most of the boot time; see the
 [EC2 timings](../../docs/experiments/ec2-timings.md).
 
+## Runners
+
+A `Runner` is a second (usually bigger) machine for an existing Host's
+controller: its own nested-virtualization instance, Btrfs data volume (kept
+across replacement), role, config parameter and Tailscale identity, a worker and
+a node agent, and no controller or dashboard. The component name is its node ID
+(1 to 32 letters, digits, `-` or `_`).
+
+```typescript
+const host = new ow.Host("workspaces", { tailscaleAuthKeySecretArn: key, backupUrl: store.url });
+const big = new ow.Runner("workspaces-2", {
+    controller: host,
+    instanceType: "m8i.4xlarge",
+    tailscaleAuthKeySecretArn: key,      // required: the controller listens on the tailnet only
+    backupUrl: store.url,                // its snapshots go to backupUrl/runners/workspaces-2
+    developerImages: ["ubuntu"],
+});
+```
+
+It takes the Host inputs except `dashboardLogins`, plus `controller`. On top
+of what a Host creates, it adds a Secrets Manager secret
+`open-workspaces/NAME/join` (no value), lets its own role read and overwrite
+it, and lets the controller host's role write it. Nothing else of the
+controller host changes, and no other runner is touched.
+
+Enrol it once, after `pulumi up` (`ow-aws ci-post-up` on the runner does this
+by itself):
+
+```bash
+ow-aws --host workspaces runner-add workspaces-2
+```
+
+The controller host mints a single-use join file (it expires in 10 minutes)
+and writes it, with its CA, into the runner's secret; the runner reads it,
+stores the CA and the controller URL on its data volume, starts its node agent
+and overwrites the secret once it is online. The join never passes through
+the machine running `ow-aws`, and the controller gets no shell on the runner.
+A replaced runner keeps its data volume, so it keeps its node credential and
+comes back as the same node with its boxes; `runner-add` then only checks that
+it is online. A runner whose data volume is lost cannot take its old node ID
+again: `ow-aws --host workspaces runner-remove NAME` revokes it (refused while
+it is online), and the new one joins under another name.
+
+Placement, durable placement, forks on their source node and offline
+handling are the controller's ([multi-node](../../docs/MULTINODE.md)):
+`ow create` picks a node with room, `ow create --node workspaces-2` picks this
+one, and an offline runner keeps its boxes listed while new boxes go elsewhere.
+Golden images build per runner (`ow-aws --host workspaces-2 image RECIPE`).
+
+Upgrades are the same `ow-host upgrade` on each runner, one host at a time and
+the controller first: `ow-aws upgrade` on a runner passes the release its
+controller runs, and the runner refuses an agent that controller would not
+accept (the controller accepts its own protocol and the one before, so runners
+may lag one protocol version). See [docs/UPGRADES.md](../../docs/UPGRADES.md#runners).
+
 ## Upgrades in place
 
 Run on the host as root (`ow-aws upgrade` and `ow-aws ci-post-up` do it over SSM):
@@ -252,8 +309,8 @@ the run and the stack is still destroyed.
 
 ## Limits
 
-- Single host: controller and runner share the machine. A separate controller
-  is a later phase.
+- The controller always runs on a Host, next to that Host's own runner;
+  Runners only add runners. A controller-only host is a later phase.
 - The host builds each release from source (first boot and every upgrade,
   about 4 minutes incremental on 4 vCPUs); there are no prebuilt release
   binaries yet.

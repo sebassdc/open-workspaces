@@ -6,7 +6,7 @@ export interface ArtifactStoreArgs {
     bucketName?: pulumi.Input<string>;
     /** Prefix inside the bucket, for example the host name. `url` is `s3://BUCKET/PREFIX`. */
     prefix: pulumi.Input<string>;
-    /** Days before an object under `PREFIX/catalog/` or `PREFIX/snapshots/` expires. Default: 30. */
+    /** Days before an object under `PREFIX/catalog/`, `PREFIX/snapshots/` or `PREFIX/runners/` expires. Default: 30. */
     expireDays?: pulumi.Input<number>;
     /** Days an overwritten copy under those prefixes is kept. Default: 7. */
     noncurrentDays?: pulumi.Input<number>;

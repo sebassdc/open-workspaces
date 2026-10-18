@@ -58,7 +58,10 @@ Layout under the base directory (default `~/.ow`, mode 0700):
 
 ## Add a runner over SSH
 
-With `ow host up` running, on the same machine:
+On AWS, the [`Runner` component](../deploy/aws/README.md#runners) does this
+without SSH: the runner builds its own release, and `ow-aws runner-add` passes
+the join through a Secrets Manager secret. Elsewhere, with `ow host up`
+running, on the same machine:
 
 ```sh
 ow node add ssh://dev@build-box
