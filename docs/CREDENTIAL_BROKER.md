@@ -61,8 +61,17 @@ Each grant has a mandatory expiry and either or both of:
   inline session scope. The scope accepts explicit actions and exact resource
   ARNs only, with at most 16 statements, 32 actions/resources per statement and
   2048 bytes of generated JSON. Wildcards and policy variables are refused.
-- An exact, pre-created Secrets Manager ARN for writes. No secret names, guest
-  paths, wildcard destinations or create-secret behavior are accepted.
+- A complete, pre-created Secrets Manager ARN for writes (`secret_arn`), paired
+  with its expected `secret_name`. Both fields are required together. The resource
+  must equal `secret:<expected name>-<six alphanumeric characters>`. The name must
+  be 1–512 characters from AWS's allowed alphabet (`A–Z`, `a–z`, `0–9`, `/_+=.@-`).
+  Pinning the name matters: a partial ARN ending in `-output` already looks like
+  it has a six-character suffix. Name-only destinations, partial ARNs relative to
+  the expected name, wildcard destinations and create-secret behavior are refused
+  before provider dispatch. Populate the pair from the approved provisioner's
+  actual Name/ARN response; syntax validation alone cannot establish existence or
+  provenance. Policies with only `secret_arn` are now refused. See AWS's
+  [secret ARN format](https://docs.aws.amazon.com/secretsmanager/latest/userguide/whats-in-a-secret.html).
 
 This initial policy language deliberately omits conditions, managed policy ARNs,
 resource patterns and resource-less AWS actions. Extend it only for a concrete,

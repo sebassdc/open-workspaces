@@ -52,6 +52,8 @@ pub struct BoxGrant {
     pub aws_role: Option<AwsRoleGrant>,
     /// Exact pre-created AWS Secrets Manager ARN; write only, no secret read interface.
     pub secret_arn: Option<String>,
+    /// Required with secret_arn: a name ending in six characters can mimic an ARN suffix.
+    pub secret_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,15 +182,29 @@ impl Policy {
             }
             if let Some(secret) = &grant.secret_arn {
                 let parts = arn(secret)?;
+                let name = grant
+                    .secret_name
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("expected Secrets Manager name required"))?;
                 ensure!(
                     parts[2] == "secretsmanager"
                         && !parts[3].is_empty()
+                        && parts[3]
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
                         && account(parts[4])
+                        && (1..=512).contains(&name.len())
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"/_+=.@-".contains(&b))
                         && parts[5]
-                            .strip_prefix("secret:")
-                            .is_some_and(|s| !s.is_empty()),
-                    "exact Secrets Manager ARN required"
+                            .strip_prefix(&format!("secret:{name}-"))
+                            .is_some_and(|suffix| suffix.len() == 6
+                                && suffix.bytes().all(|b| b.is_ascii_alphanumeric())),
+                    "complete Secrets Manager ARN must match expected name and generated suffix"
                 );
+            } else {
+                ensure!(grant.secret_name.is_none(), "secret name requires an ARN");
             }
         }
         Ok(())

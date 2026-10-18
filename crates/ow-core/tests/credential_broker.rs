@@ -226,6 +226,7 @@ fn removal_expiration_and_separate_operation_grants_fail_closed() {
     );
     policy.grants[0].aws_role = Some(role);
     policy.grants[0].secret_arn = None;
+    policy.grants[0].secret_name = None;
     assert!(
         CredentialBroker::new(&policy, &host, &aws, &aws)
             .unwrap()
@@ -470,6 +471,7 @@ fn request_schema_has_no_guest_identity_role_policy_endpoint_or_read_overrides()
         "role_arn",
         "session_policy",
         "secret_arn",
+        "secret_name",
         "endpoint",
         "now",
     ] {
@@ -494,6 +496,65 @@ fn request_schema_has_no_guest_identity_role_policy_endpoint_or_read_overrides()
         );
     }
     assert!(Request::from_json(&vec![b' '; 512 * 1024 + 1]).is_err());
+}
+
+#[test]
+fn partial_secret_arns_are_rejected_before_write_for_json_and_rust_policies() {
+    let (host, aws) = (Host::live(), Aws::default());
+    for resource in [
+        "example-box-output".to_owned(),
+        "example-box-output-".into(),
+        "example-box-output-AbCdE".into(),
+        "example-box-output-AbCdEfG".into(),
+        "example-box-output-AbCdE_".into(),
+        "-AbCdEf".into(),
+        "invalid:name-AbCdEf".into(),
+        "invalid!name-AbCdEf".into(),
+        format!("{}-AbCdEf", "a".repeat(513)),
+    ] {
+        let destination =
+            format!("arn:aws:secretsmanager:us-east-1:000000000000:secret:{resource}");
+        let mut input: Value = serde_json::from_slice(FIXTURE).unwrap();
+        input["grants"][0]["secret_arn"] = json!(destination);
+        assert!(
+            parse(&input).is_err(),
+            "accepted partial or invalid ARN: {destination}"
+        );
+        let mut direct = policy();
+        direct.grants[0].secret_arn = Some(destination.clone());
+        let result = CredentialBroker::new(&direct, &host, &aws, &aws);
+        if let Ok(broker) = &result {
+            let _ = broker.handle("host-channel-a", write(CANARY), || NOW);
+        }
+        assert!(result.is_err(), "direct policy accepted {destination}");
+    }
+    assert!(
+        aws.writes.borrow().is_empty(),
+        "invalid targets reached writer"
+    );
+}
+
+#[test]
+fn complete_secret_arns_preserve_exact_destinations_including_hyphenated_names() {
+    let (host, aws) = (Host::live(), Aws::default());
+    for resource in [
+        "example-box-output-AbCdEf".to_owned(),
+        "name-AbCdEf-GhIj09".into(),
+        "path/to_name+=.@-AbCd09".into(),
+        format!("{}-aB0123", "a".repeat(512)),
+    ] {
+        let destination =
+            format!("arn:aws:secretsmanager:us-east-1:000000000000:secret:{resource}");
+        let mut input: Value = serde_json::from_slice(FIXTURE).unwrap();
+        input["grants"][0]["secret_arn"] = json!(destination);
+        input["grants"][0]["secret_name"] = json!(resource.rsplit_once('-').unwrap().0);
+        let policy = parse(&input).unwrap();
+        CredentialBroker::new(&policy, &host, &aws, &aws)
+            .unwrap()
+            .handle("host-channel-a", write(CANARY), || NOW)
+            .unwrap();
+        assert_eq!(aws.writes.borrow().last().unwrap().0, destination);
+    }
 }
 
 #[test]
@@ -543,6 +604,10 @@ fn policy_rejects_ambiguous_broad_or_malformed_authority() {
             "/grants/0/secret_arn",
             json!("arn:aws:ssm:us-east-1:000000000000:parameter/not-a-secret"),
         ),
+        ("/grants/0/secret_name", Value::Null),
+        ("/grants/0/secret_name", json!("different-name")),
+        ("/grants/0/secret_name", json!("example-box")),
+        ("/grants/0/secret_arn", Value::Null),
     ] {
         let mut value_copy = fixture.clone();
         *value_copy.pointer_mut(pointer).unwrap() = value;
