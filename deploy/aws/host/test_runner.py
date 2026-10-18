@@ -219,6 +219,32 @@ class Enrolment(unittest.TestCase):
         self.assertIn(["systemctl", "stop", h.UNITS["agent"]], self.fake.calls)
         self.assertIn("join", json.loads(self.fake.secrets[JOIN_ARN]), "the secret is cleared only after success")
 
+    def test_an_expired_join_from_an_interrupted_enrolment_does_not_block_a_retry(self):
+        h.write_json(h.CONFIG, runner())
+        status = json.dumps({"internet": True})
+        real = self.fake.__call__
+
+        def fake(cmd, **kw):
+            return status if cmd[:2] == ["/usr/local/bin/ow", "status"] else real(cmd, **kw)
+
+        h.run = fake
+        join = {"node": "ow-big", "secret": "s" * 64, "expires": int(time.time()) - 1,
+                "controller": "https://ow-host.tail1234.ts.net:8790"}
+        h.p(h.JOIN).write_text(json.dumps(join))
+        h.runner_ready(time.monotonic() + 5, 5)  # returns: ready for runner-add, not a timeout
+        self.assertFalse(h.p(h.JOIN).exists())
+        self.assertIn(["systemctl", "stop", h.UNITS["agent"]], self.fake.calls)
+        h.p(h.JOIN).write_text("not json")
+        h.runner_ready(time.monotonic() + 5, 5)
+        self.assertFalse(h.p(h.JOIN).exists(), "an unreadable join is dropped too")
+        # A join still in date is the agent's: readiness waits for it (here: times out).
+        h.p(h.JOIN).write_text(json.dumps({**join, "expires": int(time.time()) + 600}))
+        self.fake.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "not online"):
+            h.runner_ready(time.monotonic(), 0)
+        self.assertTrue(h.p(h.JOIN).exists())
+        self.assertNotIn(["systemctl", "stop", h.UNITS["agent"]], self.fake.calls)
+
     def test_online_means_a_fresh_accepted_heartbeat_with_the_expected_releases(self):
         h.write_json(h.CONFIG, runner())
         status = h.p(f"{h.RUNNER}/agent.json")

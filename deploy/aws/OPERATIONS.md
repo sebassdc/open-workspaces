@@ -16,8 +16,10 @@ deploy/aws/bin/ow-aws --host my-host ready
 ```
 
 `--host NAME` (or `OW_HOST`) is the component name: the instance is found by
-its tag `Name`. `OW_INSTANCE` skips the lookup; in CI the instance comes from
-the stack's `instanceId` output. `OW_SSH_KEY` picks the private key (default
+its tag `Name`. `OW_INSTANCE` skips the lookup. With `--stack`, the stack's
+`instanceId` output is used when that instance's tag `Name` is `NAME`; otherwise
+(for example a Runner in a stack whose `instanceId` is its controller's) the tag
+lookup decides, so a command never reaches another host. `OW_SSH_KEY` picks the private key (default
 `~/.ssh/id_ed25519`; its `.pub` is what gets pushed).
 
 ## Commands
@@ -52,6 +54,7 @@ that tag and check the commit):
 ```bash
 ow=open-workspaces/deploy/aws/bin/ow-aws
 "$ow" --host my-host ci-preflight --stack prod
+"$ow" --host my-host-2 ci-preflight --stack prod     # each Runner: hibernates only its own boxes
 pulumi up --stack prod --yes
 "$ow" --host my-host ci-post-up --stack prod --image images/team.sh
 "$ow" --host my-host-2 ci-post-up --stack prod --image images/team.sh   # each Runner, after its controller

@@ -148,8 +148,18 @@ print(s.get("node") or "-", int(b["memory"]), int(b["slots"]), int(b["cpus"]))' 
   on "$1" 180 node_online "$2" 120
 }
 
-stack_instance() { # with --stack S and no OW_INSTANCE: the stack's instanceId output
-  [[ -n $instance ]] || instance=$(pulumi stack output instanceId --stack "$1")
+# With --stack S and no OW_INSTANCE: the stack's instanceId output, but only when that
+# instance is this host's. A stack may hold a Host and its Runners while its one
+# instanceId names the controller; anything else falls back to the tag lookup.
+stack_instance() {
+  [[ -z $instance ]] || return 0
+  local id name
+  id=$(pulumi stack output instanceId --stack "$1" 2> /dev/null || true)
+  [[ $id =~ ^i-[0-9a-f]+$ ]] || return 0
+  # shellcheck disable=SC2016 # a JMESPath literal, not a shell expansion
+  name=$(aws ec2 describe-instances --instance-ids "$id" \
+    --query 'Reservations[0].Instances[0].Tags[?Key==`Name`]|[0].Value' --output text 2> /dev/null || true)
+  if [[ $name == "$host" ]]; then instance=$id; fi
 }
 
 stack_arg() { [[ ${1:-} == --stack && -n ${2:-} ]] || die "usage: ow-aws --host $host $command --stack STACK ..."; }

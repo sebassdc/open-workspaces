@@ -20,12 +20,13 @@ test("the helper and its host functions pass shellcheck", { skip: spawnSync("she
 // With `hostBin`, each script really runs in bash, with hostBin first on PATH,
 // and its exit status and output become the command's result.
 // `instances` maps tag names to instance IDs (default: every name is INSTANCE); `parameter`
-// is what `aws ssm get-parameter` prints (a host's config parameter).
-function fake({ state = "running", results = [], preview = { steps: [] }, hostBin = null, instances = null, parameter = "" } = {}) {
+// is what `aws ssm get-parameter` prints (a host's config parameter); `stackInstance` is the
+// stack's instanceId output (default INSTANCE).
+function fake({ state = "running", results = [], preview = { steps: [] }, hostBin = null, instances = null, parameter = "", stackInstance = INSTANCE } = {}) {
     const dir = mkdtempSync(join(tmpdir(), "ow-aws-"));
     mkdirSync(join(dir, "bin"));
     mkdirSync(join(dir, "scripts"));
-    writeFileSync(join(dir, "config.json"), JSON.stringify({ state, results, preview, hostBin, instances, parameter }));
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ state, results, preview, hostBin, instances, parameter, stackInstance }));
     writeFileSync(join(dir, "bin", "aws"), `#!/usr/bin/env node
 const fs = require("fs"), path = require("path");
 const dir = ${JSON.stringify(dir)}, args = process.argv.slice(2);
@@ -35,7 +36,9 @@ const arg = (name) => args[args.indexOf(name) + 1];
 const out = (text) => process.stdout.write(text + "\\n");
 const sent = () => fs.readdirSync(path.join(dir, "scripts")).length;
 const tag = (args.find((a) => a.startsWith("Name=tag:Name,Values=")) || "").split("=").pop();
-if (args[1] === "describe-instances") out(arg("--query").includes("State") ? config.state : (config.instances || {})[tag] || ${JSON.stringify(INSTANCE)});
+const nameOf = (id) => Object.entries(config.instances || {}).find(([, v]) => v === id)?.[0] ?? (id === ${JSON.stringify(INSTANCE)} ? "ow-test" : "other");
+if (args[1] === "describe-instances" && arg("--query").includes("Tags")) out(nameOf(arg("--instance-ids")));
+else if (args[1] === "describe-instances") out(arg("--query").includes("State") ? config.state : (config.instances || {})[tag] || ${JSON.stringify(INSTANCE)});
 else if (args[1] === "get-parameter") { if (config.parameter) out(config.parameter); else process.exit(254); }
 else if (args[1] === "describe-instance-information") out("Online");
 else if (args[1] === "send-command") {
@@ -63,7 +66,7 @@ if (args[0] === "preview" && process.env.PULUMI_ENABLE_STREAMING_JSON_PREVIEW) {
     for (const step of config.preview.steps || []) console.log(JSON.stringify({ resourcePreEvent: { metadata: step } }));
     console.log(JSON.stringify({ summaryEvent: {} }));
 } else if (args[0] === "preview") console.log(typeof config.preview === "string" ? config.preview : JSON.stringify(config.preview));
-else if (args[0] === "stack" && args[2] === "instanceId") console.log(${JSON.stringify(INSTANCE)});
+else if (args[0] === "stack" && args[2] === "instanceId") console.log(config.stackInstance);
 else process.exit(9);
 `, { mode: 0o755 });
     writeFileSync(join(dir, "bin", "sleep"), "#!/bin/sh\n", { mode: 0o755 });
@@ -434,5 +437,33 @@ test("a runner's backups are listed from its controller, under the runner's own 
     assert.equal(f.run(["backups", "ow-big-box"], { OW_HOST: "ow-big" }).status, 0);
     assert.deepEqual(f.scripts().map((s) => [s.instance, f.lastLine(s.script)]),
         [[CONTROLLER_ID, "backups s3://my-bucket/ow/runners/ow-big ow-big-box"]]);
+    f.done();
+});
+
+test("in a stack whose instanceId is the controller, runner CI commands act on the runner only", () => {
+    const instances = { "ow-test": CONTROLLER_ID, "ow-big": RUNNER_ID };
+    const status = JSON.stringify({ role: "runner", node: "ow-big", budget: { memory: 1024, slots: 2, cpus: 2 } });
+    let f = fake({ parameter: RUNNER_CONFIG, instances, stackInstance: CONTROLLER_ID,
+        results: [{}, {}, { stdout: status }, {}, {}, { stdout: JSON.stringify({ versions: { agent: "0.6.0" } }) }] });
+    let result = f.run(["ci-post-up", "--stack", "s"], { OW_HOST: "ow-big" });
+    assert.equal(result.status, 0, result.stderr);
+    const sent = f.scripts().map((s) => [s.instance, f.lastLine(s.script)]);
+    assert.deepEqual(sent.filter(([id]) => id === CONTROLLER_ID).map(([, call]) => call),
+        ["node_online ow-big 120", "ow_host status"], "the controller is only asked, never changed");
+    assert.deepEqual(sent.filter(([id]) => id === RUNNER_ID).map(([, call]) => call).filter((c) => !c.startsWith("ready") && c !== "ow_host status"),
+        ["after_start 3000", "ow_host apply", "ow_host upgrade --controller-version 0.6.0"]);
+    assert.ok(!f.calls().some((c) => c[1] === "start-instances" || c[1] === "stop-instances"));
+    f.done();
+    const urn = "urn:pulumi:s::p::open-workspaces-aws:index:Runner$aws:ec2/instance:Instance::ow-big-host";
+    f = fake({ instances, stackInstance: CONTROLLER_ID, preview: { steps: [{ op: "replace", urn }] } });
+    result = f.run(["ci-preflight", "--stack", "s"], { OW_HOST: "ow-big" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.scripts().map((s) => [s.instance, f.lastLine(s.script)]), [[RUNNER_ID, "hibernate_for_replacement"]]);
+    f.done();
+    // The Host itself still takes the stack's instance (its own), with no tag lookup.
+    f = fake({ instances, stackInstance: CONTROLLER_ID, preview: { steps: [{ op: "replace", urn: urn.replace("Runner", "Host").replace("ow-big", "ow-test") }] } });
+    assert.equal(f.run(["ci-preflight", "--stack", "s"]).status, 0);
+    assert.deepEqual(f.scripts().map((s) => s.instance), [CONTROLLER_ID]);
+    assert.ok(!f.calls().some((c) => c[1] === "describe-instances" && c.some((a) => a.startsWith("Name=tag:Name"))));
     f.done();
 });

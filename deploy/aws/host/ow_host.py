@@ -733,16 +733,34 @@ def runner_ready(deadline, wait):
             up = ow("status", timeout=30).get("internet") is True
         except (RuntimeError, ValueError, AttributeError, subprocess.TimeoutExpired):
             up = False
-        if up and not p(f"{RUNNER}/node.json").exists() and not p(JOIN).exists():
-            say(f"worker ready; not enrolled yet: ow-aws --host {config['runner']['controller']} "
-                f"runner-add {config['runner']['node']}")
-            return
+        if up and not p(f"{RUNNER}/node.json").exists():
+            drop_stale_join()
+            if not p(JOIN).exists():
+                say(f"worker ready; not enrolled yet: ow-aws --host {config['runner']['controller']} "
+                    f"runner-add {config['runner']['node']}")
+                return
         if up and node_online():
             break
         if time.monotonic() > deadline:
             raise RuntimeError(f"runner not online with its controller after {wait} s; see journalctl -u {UNITS['agent']}")
         time.sleep(2)
     say(f"runner {local_node()} online with controller {controller_url()}")
+
+
+def drop_stale_join():
+    """A join left by an interrupted enrolment that can no longer be redeemed (expired
+    or unreadable) is removed, and the agent waiting on it stopped, so `runner-add`
+    can mint a fresh one. A join still in date is left to the agent."""
+    try:
+        expires = json.loads(p(JOIN).read_text()).get("expires", 0)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, AttributeError):
+        expires = 0
+    if not isinstance(expires, (int, float)) or expires < time.time():
+        systemctl("stop", UNITS["agent"], check=False)
+        p(JOIN).unlink(missing_ok=True)
+        say("removed an expired join left by an interrupted enrolment")
 
 
 def controller_url():
