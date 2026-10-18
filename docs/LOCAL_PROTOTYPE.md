@@ -93,6 +93,13 @@ further restore hooks before handling arbitrary credentialed workloads.
 Hibernation retains a paired checkpoint and exits the VMM; `start` resumes that
 checkpoint. Host page cache can still retain snapshot data and is reclaimable.
 Restore requests advance the guest's KVM clock by the elapsed wall time.
+The worker also sets guest wall time from the host over the root
+management channel after every resume, including forks, hibernation wake,
+explicit restore and a parent continuing after capture. A failed clock update
+fails the operation. This corrects saved wall-clock drift without an image rebuild
+or guest Internet access; the host's own clock must be accurate. Restore/fork
+readiness waits for correction, but guest processes can run briefly between
+vCPU resume and the clock update. See [Firecracker's wall-clock guidance](https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/docs/snapshotting/snapshot-support.md#loading-snapshots).
 Cold stop/start preserves disk contents and starts fresh processes. `restore`
 replaces that workspace's current state with its named snapshot; subsequent guest
 changes are intentionally rewound. Backups should be made before rewinding work
