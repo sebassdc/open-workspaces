@@ -368,6 +368,8 @@ profile open-workspaces /srv/ow/{releases/*/bin,build/target/release}/ow flags=(
     )
     logins = config["dashboard"]["logins"]
     if logins:
+        files["/usr/local/lib/open-workspaces/preview-serve"] = ((HERE / "files/preview-serve").read_text(), 0o755)
+        files["/etc/sudoers.d/ow-preview"] = ("ow ALL=(root) NOPASSWD: /usr/local/lib/open-workspaces/preview-serve *\n", 0o440)
         files["/etc/open-workspaces/dashboard.env"] = (f"OW_DASHBOARD_LOGINS={','.join(logins)}\n", 0o644)
         files["/usr/local/lib/open-workspaces/dashboard-prepare"] = ((HERE / "files/dashboard-prepare").read_text(), 0o755)
         files["/etc/systemd/system/open-workspaces-dashboard.service"] = (
@@ -489,6 +491,8 @@ OWNED = (
     "/etc/systemd/system/ow-backup.timer",
     "/usr/local/lib/open-workspaces/wait-tailnet",
     "/usr/local/lib/open-workspaces/dashboard-prepare",
+    "/usr/local/lib/open-workspaces/preview-serve",
+    "/etc/sudoers.d/ow-preview",
     "/usr/local/lib/open-workspaces/developer-images",
     "/usr/local/bin/ow",
     "/usr/local/bin/ow-backup",
@@ -505,6 +509,7 @@ RESTARTS = {
     "/etc/open-workspaces/dashboard.env": "dashboard",
     "/etc/systemd/system/open-workspaces-dashboard.service": "dashboard",
     "/usr/local/lib/open-workspaces/dashboard-prepare": "dashboard",
+    "/usr/local/lib/open-workspaces/preview-serve": "dashboard",
 }
 
 
