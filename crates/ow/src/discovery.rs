@@ -62,6 +62,9 @@ pub fn node(inventory: &Value, reserved: Value, now: u64) -> Value {
                             "put",
                             "get",
                             "terminal",
+                            "tunnel",
+                            "ssh",
+                            "delete",
                             "hibernate",
                             "list",
                             "stats",
@@ -147,6 +150,53 @@ mod tests {
             100,
         )
     }
+    #[test]
+    fn discovery_preserves_supported_explicit_operations() {
+        let supported = json!([
+            "status",
+            "list",
+            "stats",
+            "snapshots",
+            "inspect",
+            "create",
+            "resize",
+            "start",
+            "stop",
+            "exec",
+            "put",
+            "get",
+            "snapshot",
+            "fork",
+            "restore",
+            "hibernate",
+            "terminal",
+            "tunnel",
+            "ssh",
+            "ssh-info",
+            "ssh-keys",
+            "delete"
+        ]);
+        for operations in [json!(["create", "exec", "delete"]), supported.clone()] {
+            let cap = json!({"type":"heartbeat","protocol":common::PROTOCOL,"backend":"firecracker","arch":"x86_64","runtime":common::RUNTIME,"memory_mib":4096,"slots":2,"vcpus":4,"images":["ubuntu"],"operations":operations});
+            common::node_capabilities(&cap).unwrap();
+            common::node_operation(&cap, "delete").unwrap();
+            let projected = node(
+                &json!({"id":"runner","online":true,"memory_mib":4096,"slots":2,"capabilities":cap}),
+                json!({"memory_mib":0,"vcpus":0,"slots":0}),
+                100,
+            );
+            for operation in supported.as_array().unwrap() {
+                let op = operation.as_str().unwrap();
+                assert_eq!(
+                    common::node_operation(&projected["capabilities"], op).is_ok(),
+                    common::node_operation(&cap, op).is_ok(),
+                    "operation: {op}"
+                );
+            }
+            assert_eq!(projected["capabilities"]["operations"], operations);
+        }
+    }
+
     #[test]
     fn discovery_create_choices_match_admission_for_operations() {
         for operations in [
