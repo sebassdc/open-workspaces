@@ -56,6 +56,9 @@ ENV={**os.environ,'OW_ASSET_DIR':str(ROOT/'assets'),'OW_MAX_MEMORY_MIB':'1024','
 helper=ROOT/'cloudflared';helper.write_text('#!/bin/sh\ncat '+shlex.quote(str(ROOT/'token'))+'\n');helper.chmod(0o700);ENV['OW_CLOUDFLARED']=str(helper)
 ORIGIN=(ROOT/'origin').read_text();CTX=ssl.create_default_context(cafile=str(ROOT/'ca.pem'))
 checks=[];children=[];worker=ROOT/'w';ctl=ROOT/'c';cleanup=False
+ctl.mkdir(mode=0o700,exist_ok=True)
+(ctl/'limits.json').write_text(json.dumps({'pool': {'default_type': 'test-self-hosted', 'hourly_cents': {'test-self-hosted': 0}}}))
+(ctl/'limits.json').chmod(0o600)
 log=(ROOT/'commands.log').open('w')
 def local(*args):
  log.write('local '+repr(args)+'\n');log.flush();return call([BIN,'--local','--data-dir',worker,*args],env=ENV)
