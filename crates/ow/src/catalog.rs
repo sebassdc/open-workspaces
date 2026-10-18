@@ -1364,6 +1364,10 @@ impl Catalog {
                 &name
             };
             self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,?2,?3,'pending',?4,?5,?6)",params![user,op,resource,node,key,fingerprint])?;
+            if op == "snapshot" {
+                // A new capture supersedes a failed reservation, not a known sealed artifact.
+                self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','pending'),updated_at=CURRENT_TIMESTAMP WHERE owner=?1 AND kind='snapshot' AND physical=?2 AND json_extract(metadata,'$.state')='failed'",params![user,request["name"].as_str().context("snapshot ID")?])?;
+            }
             Ok((physical, node, target, self.db.last_insert_rowid(), None))
         })();
         let (physical, node, target, operation, cached) = match prepared {

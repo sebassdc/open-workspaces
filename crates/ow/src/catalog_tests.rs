@@ -12,6 +12,7 @@ struct Fake {
     stopped: Arc<AtomicBool>,
     reject: Arc<Mutex<Option<String>>>,
     diagnostic: Arc<Mutex<String>>,
+    uncertain: Arc<AtomicBool>,
     _thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Fake {
@@ -27,6 +28,7 @@ impl Fake {
             stopped,
             reject: Arc::new(Mutex::new(None)),
             diagnostic: Arc::new(Mutex::new("simulated runtime rejection".into())),
+            uncertain: Arc::new(AtomicBool::new(false)),
             _thread: None,
         }
     }
@@ -39,6 +41,7 @@ impl Fake {
         let stop = self.stopped.clone();
         let reject = self.reject.clone();
         let diagnostic = self.diagnostic.clone();
+        let uncertain = self.uncertain.clone();
         self._thread = Some(std::thread::spawn(move || {
             let mut machines = BTreeMap::<String, Value>::new();
             let mut lost = BTreeMap::<String, Value>::new();
@@ -58,7 +61,7 @@ impl Fake {
                 if reject.lock().unwrap().as_deref() == Some(op) {
                     wire::send(
                         &mut stream,
-                        &json!({"ok":false,"error":*diagnostic.lock().unwrap()}),
+                        &json!({"ok":false,"error":*diagnostic.lock().unwrap(),"uncertain":uncertain.load(Ordering::SeqCst)}),
                     )
                     .unwrap();
                     continue;
@@ -302,6 +305,63 @@ fn failed_snapshots_keep_the_cause_reconcile_legacy_pending_and_retry() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn failed_snapshot_retry_with_uncertain_outcome_is_pending() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let owner = c.user(&identity("alice")).unwrap();
+    c.operation(owner, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    *fake.reject.lock().unwrap() = Some("snapshot".into());
+    *fake.diagnostic.lock().unwrap() =
+        "storage headroom exhausted: 72 bytes available, 73 bytes required".into();
+    let first = json!({"op":"snapshot","id":"demo","name":"saved","operation_key":"first"});
+    c.operation(owner, first.clone()).unwrap_err();
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "failed");
+    // Replaying a known rejection must not make its reservation pending again.
+    c.operation(owner, first.clone()).unwrap_err();
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "failed");
+
+    fake.uncertain.store(true, Ordering::SeqCst);
+    *fake.diagnostic.lock().unwrap() = "simulated lost reply".into();
+    let retry = json!({"op":"snapshot","id":"demo","name":"saved","operation_key":"retry"});
+    let error = c.operation(owner, retry.clone()).unwrap_err();
+    let failure = error.downcast_ref::<OperationFailure>().unwrap();
+    assert_eq!(failure.0["state"], "uncertain");
+    let operation = failure.0["id"].clone();
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "pending");
+    drop(c);
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "pending");
+    assert_eq!(
+        c.operation(owner, retry.clone())
+            .unwrap_err()
+            .downcast_ref::<OperationFailure>()
+            .unwrap()
+            .0["id"],
+        operation
+    );
+    // A replay of the older rejection cannot override the unresolved newer capture.
+    c.operation(owner, first).unwrap_err();
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "pending");
+
+    fake.uncertain.store(false, Ordering::SeqCst);
+    *fake.reject.lock().unwrap() = None;
+    let saved = c.operation(owner, retry).unwrap();
+    assert_eq!(saved["operation_id"], operation);
+    assert_eq!(saved["state"], "ready");
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "ready");
+    // Inventory of an existing seal wins even if another request loses its reply.
+    fake.uncertain.store(true, Ordering::SeqCst);
+    *fake.reject.lock().unwrap() = Some("snapshot".into());
+    c.operation(
+        owner,
+        json!({"op":"snapshot","id":"demo","name":"saved","operation_key":"sealed-retry"}),
+    )
+    .unwrap_err();
+    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "ready");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
