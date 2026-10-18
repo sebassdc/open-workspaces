@@ -95,8 +95,11 @@ disk capacity; it is never inferred from physical host totals.
   when offline/draining, or when the worker does not report it. Cached disk
   reservations and configured limits may remain visible with `fresh: false`.
 - `capabilities` lists backend, architecture, runtime, node transport protocol,
-  SSH/disk support and operation restrictions where advertised. Missing fields
-  remain null; no Linux-only capability is inferred for a Mac runner.
+  SSH/disk support and operation restrictions where advertised. An absent
+  `operations` key preserves legacy Linux admission behavior. Explicit null and
+  other non-array operation values project as an empty array and grant no
+  operations. Other missing fields remain null; no Linux-only capability is
+  inferred for a Mac runner.
 
 Memory uses MiB (2^20 bytes), disks GiB (2^30 bytes), CPU values are counts of
 virtual CPUs, slots are concurrent running reservations, and timestamps are Unix

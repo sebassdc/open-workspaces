@@ -47,37 +47,39 @@ pub fn node(inventory: &Value, reserved: Value, now: u64) -> Value {
     for key in ["guest_ssh_v1", "disk_resize_v1"] {
         capabilities[key] = json!(cap[key].as_bool());
     }
-    capabilities["operations"] = cap["operations"]
-        .as_array()
-        .map(|ops| {
-            json!(
-                ops.iter()
-                    .filter(|op| op.as_str().is_some_and(|op| [
-                        "create",
-                        "start",
-                        "stop",
-                        "inspect",
-                        "exec",
-                        "put",
-                        "get",
-                        "terminal",
-                        "hibernate",
-                        "list",
-                        "stats",
-                        "status",
-                        "snapshot",
-                        "snapshots",
-                        "restore",
-                        "fork",
-                        "resize",
-                        "ssh-info",
-                        "ssh-keys"
-                    ]
-                    .contains(&op)))
-                    .collect::<Vec<_>>()
-            )
-        })
-        .unwrap_or(json!(null));
+    if cap.get("operations").is_some() {
+        capabilities["operations"] = cap["operations"]
+            .as_array()
+            .map(|ops| {
+                json!(
+                    ops.iter()
+                        .filter(|op| op.as_str().is_some_and(|op| [
+                            "create",
+                            "start",
+                            "stop",
+                            "inspect",
+                            "exec",
+                            "put",
+                            "get",
+                            "terminal",
+                            "hibernate",
+                            "list",
+                            "stats",
+                            "status",
+                            "snapshot",
+                            "snapshots",
+                            "restore",
+                            "fork",
+                            "resize",
+                            "ssh-info",
+                            "ssh-keys"
+                        ]
+                        .contains(&op)))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .unwrap_or(json!([]));
+    }
     json!({"id":inventory["id"],"online":online,"draining":draining,
         "last_seen_unix_s":inventory["last_seen_unix_s"],
         "configured":{"memory_mib":inventory["owner_limits"]["memory"],"vcpus":inventory["owner_limits"]["cpus"],"slots":inventory["owner_limits"]["slots"]},"effective":limits,"reserved":reserved,"available":available,
@@ -118,8 +120,7 @@ pub fn images(nodes: &[Value]) -> Value {
             let prepared = node["images"].as_array().is_some_and(|a| a.contains(&json!(name)));
             let mac = node["capabilities"]["backend"] == "apple-virtualization";
             let disk_capable = mac || node["capabilities"]["disk_resize_v1"] == true;
-            let create_capable = node["capabilities"]["operations"].is_null()
-                || node["capabilities"]["operations"].as_array().is_some_and(|a| a.contains(&json!("create")));
+            let create_capable = common::node_operation(&node["capabilities"], "create").is_ok();
             let disk_fits = mac || node["disk"]["available_bytes"].as_u64().is_none_or(|n| n >= u64::from(common::DEFAULT_DISK_GIB)*common::GIB);
             let availability = if !prepared {"missing_image"} else if node["online"] != true {"offline"}
                 else if node["draining"] == true {"draining"} else if !disk_capable || !create_capable {"unsupported_capability"}
@@ -146,6 +147,58 @@ mod tests {
             100,
         )
     }
+    #[test]
+    fn discovery_create_choices_match_admission_for_operations() {
+        for operations in [
+            None,
+            Some(json!(null)),
+            Some(json!(false)),
+            Some(json!(42)),
+            Some(json!("create")),
+            Some(json!({"create":true})),
+            Some(json!([])),
+            Some(json!(["exec"])),
+            Some(json!(["create"])),
+            Some(json!(["create", 42])),
+        ] {
+            let mut cap = json!({"type":"heartbeat","protocol":common::PROTOCOL,"backend":"firecracker","arch":"x86_64","runtime":common::RUNTIME,"memory_mib":4096,"slots":2,"vcpus":4,"images":["ubuntu"],"disk_resize_v1":true,"available_disk_bytes":64*common::GIB,"disk_observed_unix_s":100});
+            if let Some(operations) = operations {
+                cap["operations"] = operations;
+            }
+            common::node_capabilities(&cap).unwrap();
+            let admitted = common::node_operation(&cap, "create").is_ok();
+            let projected = node(
+                &json!({"id":"runner","online":true,"memory_mib":4096,"slots":2,"capabilities":cap}),
+                json!({"memory_mib":0,"vcpus":0,"slots":0}),
+                100,
+            );
+            assert_eq!(
+                projected["capabilities"].get("operations").is_some(),
+                cap.get("operations").is_some()
+            );
+            let output = images(&[projected]);
+            let ubuntu = output
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["name"] == "ubuntu")
+                .unwrap();
+            assert_eq!(
+                ubuntu["available"],
+                admitted,
+                "operations: {:?}",
+                cap.get("operations")
+            );
+            assert_eq!(
+                ubuntu["nodes"][0]["development_choice"].is_object(),
+                admitted
+            );
+            if !admitted {
+                assert_eq!(ubuntu["nodes"][0]["availability"], "unsupported_capability");
+            }
+        }
+    }
+
     #[test]
     fn discovery_distinguishes_offline_full_missing_and_usable() {
         let online = runner(true, 1024);
