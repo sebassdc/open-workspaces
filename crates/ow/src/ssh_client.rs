@@ -257,6 +257,7 @@ pub fn remote_proxy(url: &str, id: &str) -> Result<i32> {
         }
     }
     let tcp = connection.context("SSH TCP connection deadline")?;
+    tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
     let watchdog = tcp.try_clone()?;
@@ -281,7 +282,7 @@ pub fn remote_proxy(url: &str, id: &str) -> Result<i32> {
         MaybeTlsStream::Rustls(s) => &s.sock,
         _ => bail!("unsupported TLS transport"),
     };
-    tcp.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let socket_fd = tcp.as_raw_fd();
     tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
     let _output = OutputFlags::new()?;
     let mut buf = [0; FRAME];
@@ -293,7 +294,8 @@ pub fn remote_proxy(url: &str, id: &str) -> Result<i32> {
                 && active.elapsed() < Duration::from_secs(90),
             "SSH proxy expired"
         );
-        if input_ready()? {
+        let input = input_ready()?;
+        if input {
             let n = std::io::stdin().read(&mut buf)?;
             if n == 0 {
                 let _ = socket.close(None);
@@ -302,7 +304,7 @@ pub fn remote_proxy(url: &str, id: &str) -> Result<i32> {
             socket.send(Message::Binary(buf[..n].to_vec().into()))?;
             active = Instant::now();
         }
-        match socket.read() {
+        match crate::wire::read_available(&mut socket) {
             Ok(Message::Binary(b)) => {
                 ensure!(!b.is_empty() && b.len() <= FRAME, "invalid SSH frame");
                 output(&b)?;
@@ -315,7 +317,12 @@ pub fn remote_proxy(url: &str, id: &str) -> Result<i32> {
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
+                ) =>
+            {
+                if !input {
+                    crate::wire::wait_readable([0, socket_fd])?;
+                }
+            }
             _ => bail!("SSH stream disconnected"),
         }
     }

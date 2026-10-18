@@ -7,6 +7,39 @@ use std::{
     time::Duration,
 };
 
+/// Drain TLS/WebSocket buffers without waiting for the opposite byte direction.
+/// Restore blocking writes so the existing socket write deadline remains authoritative.
+pub fn read_available(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) -> tungstenite::Result<tungstenite::Message> {
+    fn tcp(
+        stream: &tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+    ) -> std::io::Result<&std::net::TcpStream> {
+        match stream {
+            tungstenite::stream::MaybeTlsStream::Plain(s) => Ok(s),
+            tungstenite::stream::MaybeTlsStream::Rustls(s) => Ok(&s.sock),
+            _ => Err(std::io::Error::other("unsupported stream transport")),
+        }
+    }
+    tcp(socket.get_ref())?.set_nonblocking(true)?;
+    let result = socket.read();
+    tcp(socket.get_ref())?.set_nonblocking(false)?;
+    result
+}
+
+pub fn wait_readable<const N: usize>(fds: [std::os::fd::RawFd; N]) -> Result<()> {
+    let mut fds = fds.map(|fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
+    if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 thread_local! {
     /// The worker process this thread's requests must reach (set by a node agent job).
     static WORKER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };

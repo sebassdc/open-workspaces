@@ -11,6 +11,7 @@ struct Fake {
     calls: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
     reject: Arc<Mutex<Option<String>>>,
+    diagnostic: Arc<Mutex<String>>,
     _thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Fake {
@@ -25,6 +26,7 @@ impl Fake {
             calls,
             stopped,
             reject: Arc::new(Mutex::new(None)),
+            diagnostic: Arc::new(Mutex::new("simulated runtime rejection".into())),
             _thread: None,
         }
     }
@@ -36,6 +38,7 @@ impl Fake {
         let calls = self.calls.clone();
         let stop = self.stopped.clone();
         let reject = self.reject.clone();
+        let diagnostic = self.diagnostic.clone();
         self._thread = Some(std::thread::spawn(move || {
             let mut machines = BTreeMap::<String, Value>::new();
             let mut lost = BTreeMap::<String, Value>::new();
@@ -55,7 +58,7 @@ impl Fake {
                 if reject.lock().unwrap().as_deref() == Some(op) {
                     wire::send(
                         &mut stream,
-                        &json!({"ok":false,"error":"simulated runtime rejection"}),
+                        &json!({"ok":false,"error":*diagnostic.lock().unwrap()}),
                     )
                     .unwrap();
                     continue;
@@ -161,6 +164,51 @@ fn identity(name: &str) -> Identity {
         email: format!("{name}@example.test"),
     }
 }
+
+#[test]
+fn known_rejections_give_safe_actions_without_worker_details() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let owner = c.user(&identity("alice")).unwrap();
+    c.operation(owner, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.guest_ssh_v1',json('true')) WHERE id='alpha'", []).unwrap();
+    for (op, diagnostic, expected) in [
+        (
+            "delete",
+            "workspace is running; stop or hibernate it first",
+            "ow stop",
+        ),
+        (
+            "ssh-info",
+            "SSH not enrolled; use ow ssh-authorize: No such file or directory (os error 2)",
+            "ow ssh-authorize",
+        ),
+        (
+            "ssh-info",
+            "private host path /srv/private/data and secret diagnostic",
+            "Check its status",
+        ),
+        ("delete", "unrecognized worker failure", "Check its status"),
+    ] {
+        *fake.reject.lock().unwrap() = Some(op.into());
+        *fake.diagnostic.lock().unwrap() = diagnostic.into();
+        let error = c
+            .operation(owner, json!({"op":op,"id":"demo"}))
+            .unwrap_err();
+        let failure = error.downcast_ref::<OperationFailure>().unwrap();
+        assert!(
+            failure.message().contains(expected),
+            "{}",
+            failure.message()
+        );
+        assert_eq!(failure.0["state"], "failed");
+        assert!(!failure.message().contains("/srv/private"));
+        assert!(!failure.message().contains("os error"));
+    }
+    assert_eq!(c.state(owner).unwrap()["workspaces"][0]["state"], "running");
+}
+
 #[test]
 fn placement_ownership_snapshots_duplicate_and_offline_state() {
     let mut fake = Fake::new();
