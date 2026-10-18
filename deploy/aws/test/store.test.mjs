@@ -5,7 +5,7 @@ import { storeLifecycleRules, tlsOnlyPolicy } from "../store.ts";
 test("age expiry covers only the backup prefixes, never store/", () => {
     const rules = storeLifecycleRules("ow-host/", 30, 7);
     const expiring = rules.filter((rule) => rule.expiration || rule.noncurrentVersionExpiration);
-    assert.deepEqual(expiring.map((rule) => rule.filter.prefix), ["ow-host/catalog/", "ow-host/snapshots/"]);
+    assert.deepEqual(expiring.map((rule) => rule.filter.prefix), ["ow-host/catalog/", "ow-host/snapshots/", "ow-host/runners/"]);
     assert.ok(expiring.every((rule) => rule.expiration.days === 30 && rule.noncurrentVersionExpiration.noncurrentDays === 7));
     // The one bucket-wide rule only drops unfinished multipart uploads.
     const wide = rules.filter((rule) => !rule.filter.prefix);
@@ -61,5 +61,5 @@ test("the component creates a private, versioned, TLS-only bucket with prefix-sc
     assert.equal(byType["aws:s3/bucketVersioning:BucketVersioning"].versioningConfiguration.status, "Enabled");
     assert.deepEqual(JSON.parse(byType["aws:s3/bucketPolicy:BucketPolicy"].policy), JSON.parse(tlsOnlyPolicy("arn:aws:s3:::example-backups")));
     const rules = byType["aws:s3/bucketLifecycleConfiguration:BucketLifecycleConfiguration"].rules;
-    assert.deepEqual(rules.map((rule) => rule.filter.prefix ?? null), ["ow-host/catalog/", "ow-host/snapshots/", null]);
+    assert.deepEqual(rules.map((rule) => rule.filter.prefix ?? null), ["ow-host/catalog/", "ow-host/snapshots/", "ow-host/runners/", null]);
 });

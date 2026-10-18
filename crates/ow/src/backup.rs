@@ -146,17 +146,31 @@ fn ls(store: &S3Store, url: &str) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
+/// Where the catalog copies for a `…/snapshots` store live: beside it, or for a
+/// runner's own store (`PREFIX/runners/NAME/snapshots`) beside its controller's.
+fn catalog_root(url: &str) -> Option<(&str, bool)> {
+    let root = url
+        .strip_suffix("/snapshots")
+        .filter(|root| root.strip_prefix("s3://").is_some_and(|r| !r.is_empty()))?;
+    Some(match root.rsplit_once("/runners/") {
+        Some((parent, name)) if !name.is_empty() && !name.contains('/') => (parent, true),
+        _ => (root, false),
+    })
+}
+
 /// The newest `catalog-*.sqlite3` that `ow-backup` stored beside a `…/snapshots`
 /// store (in `…/catalog/`), as `s3://bucket/key`; none for any other store.
 fn newest_catalog(store: &S3Store, url: &str) -> Result<Option<String>> {
-    let Some(root) = url
-        .strip_suffix("/snapshots")
-        .filter(|root| root.strip_prefix("s3://").is_some_and(|r| !r.is_empty()))
-    else {
+    let Some((root, runner)) = catalog_root(url) else {
         return Ok(None);
     };
     let bucket = root["s3://".len()..].split('/').next().unwrap_or_default();
-    Ok(ls(store, &format!("{root}/catalog"))?
+    let found = match ls(store, &format!("{root}/catalog")) {
+        // A runner host may not read its controller's catalog: list without owners.
+        Err(_) if runner => return Ok(None),
+        other => other?,
+    };
+    Ok(found
         .into_iter()
         .map(|(_, key)| key)
         .filter(|key| key.ends_with(".sqlite3"))
@@ -305,6 +319,16 @@ fn catalog(source: &Path, output: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_runner_store_finds_its_controllers_catalog() {
+        use super::catalog_root;
+        assert_eq!(catalog_root("s3://b/ow/snapshots"), Some(("s3://b/ow", false)));
+        assert_eq!(catalog_root("s3://b/ow/runners/big/snapshots"), Some(("s3://b/ow", true)));
+        assert_eq!(catalog_root("s3://b/ow/runners/a/b/snapshots"), Some(("s3://b/ow/runners/a/b", false)));
+        assert_eq!(catalog_root("s3://b/ow"), None);
+        assert_eq!(catalog_root("s3:///snapshots"), None);
+    }
+
     use super::*;
 
     fn temp(name: &str) -> PathBuf {

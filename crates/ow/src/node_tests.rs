@@ -555,6 +555,14 @@ fn an_agent_whose_worker_leaves_its_protocol_window_drives_it_no_more() {
         }
     };
     until("a heartbeat", &|| fake.beats.load(Ordering::SeqCst) > 0);
+    // A runner host's upgrader reads agent.json: online with the releases it advertised.
+    let status = || -> Value {
+        serde_json::from_slice(&fs::read(worker.join("agent.json")).unwrap_or_default())
+            .unwrap_or(json!({}))
+    };
+    until("agent.json online", &|| status()["online"] == true);
+    assert_eq!(status()["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(status()["worker"]["version"], "0.5.0");
     fake.jobs.send("j1".into()).unwrap();
     until("the first reply", &|| {
         fake.replies.lock().unwrap().len() == 1
@@ -575,6 +583,7 @@ fn an_agent_whose_worker_leaves_its_protocol_window_drives_it_no_more() {
         beats,
         "no heartbeat once the worker is incompatible"
     );
+    assert_eq!(status()["online"], false, "the dropped channel reads offline");
     // ... and a job that still reaches it is answered with an error, not forwarded.
     for checked in [
         None,

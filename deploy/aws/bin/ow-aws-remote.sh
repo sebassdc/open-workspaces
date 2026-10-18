@@ -175,6 +175,27 @@ ow_host() {
   ow-host "$@"
 }
 
+# node_online NODE WAIT: on a controller host, until NODE is online (WAIT seconds at most).
+node_online() {
+  local deadline=$((SECONDS + $2))
+  until ow node list | python3 -c 'import json,sys; sys.exit(0 if any(n["id"] == sys.argv[1] and n["online"] for n in json.load(sys.stdin)) else 1)' "$1"; do
+    (( SECONDS < deadline )) || { echo "$1 is not online with this controller"; return 1; }
+    sleep 2
+  done
+  echo "$1 online with this controller"
+}
+
+# runner_remove NODE: revokes NODE on this controller, refused while it is online (its boxes
+# stay listed; restore them from its backups onto another runner).
+runner_remove() {
+  if ow node list | python3 -c 'import json,sys; sys.exit(0 if any(n["id"] == sys.argv[1] and n["online"] for n in json.load(sys.stdin)) else 1)' "$1"; then
+    echo "$1 is online: hibernate its boxes and destroy (or stop) the runner first"
+    return 1
+  fi
+  ow --data-dir /srv/ow/.ow/controller node-revoke "$1"
+  echo "revoked $1"
+}
+
 # authorize BOX PUBLIC_KEY: replaces BOX's SSH key list with that key.
 authorize() {
   local f

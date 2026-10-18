@@ -748,15 +748,38 @@ pub fn run(cli: Cli) -> Result<i32> {
             ca_cert,
             insecure_loopback_test,
         } => {
-            crate::nodes::agent(
-                &root,
-                &controller,
-                &credential,
-                join.as_deref(),
-                ca_cert.as_deref(),
-                insecure_loopback_test,
-            )?;
-            return Ok(0);
+            // SIGTERM (a runner host restarting its control plane): no new jobs, the
+            // accepted ones finish, then exit; the worker and its VMs keep running.
+            crate::selfhost::stop_on_signal()?;
+            let (done, finished) = std::sync::mpsc::channel();
+            let agent_root = root.clone();
+            std::thread::spawn(move || {
+                let _ = done.send(crate::nodes::agent(
+                    &agent_root,
+                    &controller,
+                    &credential,
+                    join.as_deref(),
+                    ca_cert.as_deref(),
+                    insecure_loopback_test,
+                ));
+            });
+            loop {
+                match finished.recv_timeout(Duration::from_millis(200)) {
+                    Ok(result) => {
+                        result?;
+                        return Ok(0);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if crate::nodes::STOPPING.load(std::sync::atomic::Ordering::SeqCst) =>
+                    {
+                        crate::selfhost::drain(Duration::from_secs(900));
+                        let _ = crate::nodes::agent_status(&root, false, &json!({}));
+                        return Ok(0);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
         }
         Action::Dashboard { config, listen } => {
             remote::run(&config, listen, Some(root))?;

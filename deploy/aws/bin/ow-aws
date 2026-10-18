@@ -22,13 +22,20 @@
 #   image RECIPE                 build the golden image RECIPE (NAME.sh) on the host's runner
 #   backups [--url S3URL] [OWNER/NAME | ID]
 #                                backed-up captures, oldest first, with the box's owner and name
-#                                (default URL: the host's backupUrl)
-#   apply | upgrade [ARGS]       ow-host apply | upgrade on the host (hosts with ow-host)
+#                                (default URL: the host's backupUrl; a runner's are listed
+#                                from its controller host)
+#   apply | upgrade [ARGS]       ow-host apply | upgrade on the host (hosts with ow-host); on a
+#                                runner, upgrade passes the release its controller runs
+#   runner-add RUNNER            enrol the Runner RUNNER with this host's controller: a
+#                                single-use join through RUNNER's secret (already enrolled:
+#                                only checks that it is online)
+#   runner-remove RUNNER         revoke RUNNER on this host's controller (refused while online)
 #   ci-preflight --stack S       before `pulumi up`: if the preview replaces the host, hibernate
 #                                its boxes and stop the service
 #   ci-post-up --stack S [--image RECIPE].. [--max-class N]
 #                                after `pulumi up`: start a stopped host, wait until ready,
-#                                apply and upgrade (hosts with ow-host), build each image
+#                                apply and upgrade (hosts with ow-host), build each image; a
+#                                runner is enrolled first. Controller first, then each runner
 #
 # NAME is the component name (tag Name). Environment: OW_HOST instead of --host,
 # OW_INSTANCE to skip the lookup, OW_SSH_KEY (default ~/.ssh/id_ed25519; its
@@ -51,12 +58,16 @@ instance=${OW_INSTANCE:-}
 
 box_name() { [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || die "bad box name: $1"; }
 
-find_instance() {
-  [[ -n $instance ]] || instance=$(aws ec2 describe-instances \
-    --filters "Name=tag:Name,Values=$host" Name=instance-state-name,Values=pending,running,stopping,stopped \
+instance_of() { # NAME: the one instance tagged Name=NAME
+  local id
+  id=$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=$1" Name=instance-state-name,Values=pending,running,stopping,stopped \
     --query 'Reservations[].Instances[].InstanceId' --output text)
-  [[ $instance =~ ^i-[0-9a-f]+$ ]] || die "expected one $host instance, found: '$instance'"
+  [[ $id =~ ^i-[0-9a-f]+$ ]] || die "expected one $1 instance, found: '$id'"
+  echo "$id"
 }
+
+find_instance() { [[ -n $instance ]] || instance=$(instance_of "$host"); }
 
 instance_state() { aws ec2 describe-instances --instance-ids "$instance" --query 'Reservations[0].Instances[0].State.Name' --output text; }
 
@@ -81,8 +92,74 @@ remote() {
   [[ $state == Success ]]
 }
 
-stack_instance() { # with --stack S and no OW_INSTANCE: the stack's instanceId output
-  [[ -n $instance ]] || instance=$(pulumi stack output instanceId --stack "$1")
+# on NAME TIMEOUT CALL [ARG..]: remote, on the host NAME instead of this one.
+on() {
+  local saved=$instance rc=0
+  instance=$(instance_of "$1")
+  shift
+  remote "$@" || rc=$?
+  instance=$saved
+  return "$rc"
+}
+
+# The controller NAME of a runner host (its config parameter's runner.controller); empty for a host.
+# Hosts older than 0.5.0 have no config parameter: they are hosts.
+controller_of() {
+  { aws ssm get-parameter --name "/open-workspaces/$1/config" --query Parameter.Value --output text 2> /dev/null || true; } | python3 -c '
+import json, re, sys
+c = json.loads(sys.stdin.read().strip() or "{}")
+name = (c.get("runner") or {}).get("controller", "") if c.get("role") == "runner" else ""
+if name and not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+    sys.exit("bad controller name in the config: " + name)
+print(name)'
+}
+
+# The release the agent of host NAME runs (its controller), for a runner's upgrade.
+agent_release() {
+  on "$1" 120 ow_host status | python3 -c '
+import json, re, sys
+v = (json.load(sys.stdin).get("versions") or {}).get("agent") or ""
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", v):
+    sys.exit("the controller reports no agent release")
+print(v)'
+}
+
+# runner_add CONTROLLER RUNNER: enrols RUNNER with CONTROLLER unless it is enrolled. The join
+# goes from CONTROLLER into RUNNER's secret and RUNNER reads it: never through this machine.
+runner_add() {
+  local status parsed node memory slots cpus
+  # A fresh runner builds its release first; its worker must answer before it can join.
+  on "$2" 9060 ready 3000 ""
+  status=$(on "$2" 120 ow_host status)
+  parsed=$(python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+if s.get("role") != "runner":
+    sys.exit(sys.argv[1] + " is not a runner host (role " + str(s.get("role")) + ")")
+b = s["budget"]
+print(s.get("node") or "-", int(b["memory"]), int(b["slots"]), int(b["cpus"]))' "$2" <<< "$status")
+  read -r node memory slots cpus <<< "$parsed"
+  if [[ $node == - ]]; then
+    on "$1" 300 ow_host invite-runner "$2" --memory "$memory" --slots "$slots" --cpus "$cpus"
+    on "$2" 600 ow_host enrol --wait 300
+  else
+    echo "$2 is enrolled as $node"
+  fi
+  on "$1" 180 node_online "$2" 120
+}
+
+# With --stack S and no OW_INSTANCE: the stack's instanceId output, but only when that
+# instance is this host's. A stack may hold a Host and its Runners while its one
+# instanceId names the controller; anything else falls back to the tag lookup.
+stack_instance() {
+  [[ -z $instance ]] || return 0
+  local id name
+  id=$(pulumi stack output instanceId --stack "$1" 2> /dev/null || true)
+  [[ $id =~ ^i-[0-9a-f]+$ ]] || return 0
+  # shellcheck disable=SC2016 # a JMESPath literal, not a shell expansion
+  name=$(aws ec2 describe-instances --instance-ids "$id" \
+    --query 'Reservations[0].Instances[0].Tags[?Key==`Name`]|[0].Value' --output text 2> /dev/null || true)
+  if [[ $name == "$host" ]]; then instance=$id; fi
 }
 
 stack_arg() { [[ ${1:-} == --stack && -n ${2:-} ]] || die "usage: ow-aws --host $host $command --stack STACK ..."; }
@@ -229,11 +306,31 @@ EOF
       esac
     done
     find_instance
-    remote 600 backups "$url" "$want" ;;
+    controller=$(controller_of "$host")
+    if [[ -n $controller && -z $url ]]; then
+      # A runner's own prefix, listed from its controller host, which can read the
+      # catalog copies that name each box's owner (the runner's role cannot).
+      url=$(aws ssm get-parameter --name "/open-workspaces/$host/config" --query Parameter.Value --output text \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["backup"]["url"])')
+      [[ -n $url ]] || die "$host has no backupUrl"
+      on "$controller" 600 backups "$url" "$want"
+    else
+      remote 600 backups "$url" "$want"
+    fi ;;
   apply | upgrade)
     for arg in "$@"; do [[ $arg =~ ^[A-Za-z0-9._=-]+$ ]] || die "bad argument: $arg"; done
     find_instance
-    remote 3600 ow_host "$command" "$@" ;;
+    extra=()
+    if [[ $command == upgrade ]]; then
+      controller=$(controller_of "$host")
+      # Controllers upgrade first: a runner moves only to an agent its controller accepts.
+      [[ -z $controller ]] || extra=(--controller-version "$(agent_release "$controller")")
+    fi
+    remote 3600 ow_host "$command" "$@" ${extra[@]+"${extra[@]}"} ;;
+  runner-add | runner-remove)
+    if (( $# != 1 )) || ! [[ $1 =~ ^[A-Za-z0-9_-]{1,32}$ && $1 != "$host" ]]; then die "usage: ow-aws --host CONTROLLER $command RUNNER"; fi
+    find_instance
+    if [[ $command == runner-add ]]; then runner_add "$host" "$1"; else remote 120 runner_remove "$1"; fi ;;
   ci-preflight)
     stack_arg "$@"
     stack=$2
@@ -287,8 +384,17 @@ sys.exit(0 if any(s.get("op") in ("replace", "create-replacement", "delete-repla
     # A host someone stopped is started (and left running) so no recipe is left unbuilt.
     if [[ $(instance_state) == stopped ]]; then echo "$host is stopped; starting it"; start_instance; fi
     wait_ssm
-    # A fresh host builds from source before it is ready.
-    remote 10800 post_up 3000 ${upgrade_args[@]+"${upgrade_args[@]}"}
+    controller=$(controller_of "$host")
+    if [[ -n $controller ]]; then
+      # A runner: ready (a fresh one builds first), enrolled with its controller, then as a host.
+      remote 10800 after_start 3000
+      runner_add "$controller" "$host"
+      remote 3600 ow_host apply
+      remote 3600 ow_host upgrade --controller-version "$(agent_release "$controller")" ${upgrade_args[@]+"${upgrade_args[@]}"}
+    else
+      # A fresh host builds from source before it is ready.
+      remote 10800 post_up 3000 ${upgrade_args[@]+"${upgrade_args[@]}"}
+    fi
     for recipe in ${recipes[@]+"${recipes[@]}"}; do image "$recipe"; done ;;
   *) usage ;;
 esac

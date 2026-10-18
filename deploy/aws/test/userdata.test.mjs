@@ -156,6 +156,8 @@ test("dashboard logins and developer images are validated", () => {
         execFileSync("bash", ["-n"], { input: file(name) });
     }
     assert.ok(!file("developer-images").includes("systemctl restart"), "a new image restarts nothing");
+    // Build VMs' sockets must fit Linux's limit: their roots stay out of the long release path.
+    assert.ok(file("developer-images").includes("ln -s /srv/ow/build/dev-images data/dev-images"));
 });
 
 test("backup URLs are checked and the host role can never delete a backup", () => {

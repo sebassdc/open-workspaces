@@ -17,7 +17,15 @@ for profile in "$@"; do
     # under the open-workspaces profile.
     aa-exec -p open-workspaces -- python3 experiments/runtime-spike/prepare-profiles.py "$profile"
   fi
-  mkdir -p data/dev-images
+  # Build roots live outside the release directory: a VM socket under
+  # /srv/ow/releases/VERSION-COMMIT/src/data/... is longer than Linux allows.
+  # build.py resolves the link, so its paths stay short.
+  install -d -m 700 /srv/ow/build/dev-images
+  if [[ ! -L data/dev-images ]]; then
+    # Failed builds kept for inspection move along.
+    [[ ! -d data/dev-images ]] || mv data/dev-images "/srv/ow/build/dev-images/from-release-$(date +%s)"
+    ln -s /srv/ow/build/dev-images data/dev-images
+  fi
   out=data/dev-images/out-$profile-$(date +%s)
   python3 experiments/guest-dev/build.py "$profile" --output-assets "$out"
   # Boxes clone the image when created, so replacing it leaves existing boxes alone.
