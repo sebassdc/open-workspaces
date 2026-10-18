@@ -1,3 +1,5 @@
+use crate::common::{DEFAULT_DISK_GIB, GIB};
+use crate::disk;
 use crate::vm::{self, Vm, shell_quote};
 use crate::{Capabilities, ComputeProvider};
 use anyhow::{Context, Result, bail, ensure};
@@ -59,12 +61,19 @@ fn minimum_free_gib() -> Result<u32> {
             );
             Ok(n)
         }
-        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(std::env::VarError::NotPresent) => Ok(5),
         Err(e) => Err(e.into()),
     }
 }
 fn minimum_free_bytes() -> Result<u64> {
     Ok((minimum_free_gib()? as u64 * 1024 * 1024 * 1024).max(128 * 1024 * 1024))
+}
+fn max_disk_gib() -> Result<u32> {
+    match std::env::var("OW_MAX_DISK_GIB") {
+        Ok(value) => parse_limit(&value, 1_048_576),
+        Err(std::env::VarError::NotPresent) => Ok(1024),
+        Err(e) => Err(e.into()),
+    }
 }
 const MAX_SNAPSHOTS: usize = 24;
 const MAX_WORKSPACES: usize = 32;
@@ -422,6 +431,7 @@ impl Runtime {
             }
         }
         minimum_free_gib()?;
+        max_disk_gib()?;
         for directory in ["machines", "snapshots"] {
             fs::create_dir_all(root.join(directory))?;
         }
@@ -578,6 +588,9 @@ impl Runtime {
             "the worker is shutting down; no machine can start"
         );
         self.capacity(workspace.memory_mib, workspace.vcpu_count)?;
+        if snapshot.is_none() {
+            disk::grow_filesystem(&self.machine_dir(&workspace.id).join("disk.ext4"))?;
+        }
         let mut machine = Vm::spawn(
             &self.binary(),
             &self.machine_dir(&workspace.id),
@@ -625,6 +638,30 @@ impl Runtime {
         Ok(())
     }
 
+    fn disk_reserved(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for entry in fs::read_dir(self.root.join("machines"))? {
+            let disk = entry?.path().join("disk.ext4");
+            if disk.exists() {
+                total = total
+                    .checked_add(disk.metadata()?.len())
+                    .context("disk reservation overflow")?;
+            }
+        }
+        Ok(total)
+    }
+
+    fn reserve_disk(&self, additional: u64) -> Result<()> {
+        ensure!(
+            self.disk_reserved()?
+                .checked_add(additional)
+                .context("disk reservation overflow")?
+                <= u64::from(max_disk_gib()?) * GIB,
+            "host disk cap exhausted (OW_MAX_DISK_GIB)"
+        );
+        self.storage_headroom(additional)
+    }
+
     fn storage_headroom(&self, extra: u64) -> Result<()> {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
@@ -635,11 +672,30 @@ impl Runtime {
             "storage capacity unavailable"
         );
         let stats = unsafe { stats.assume_init() };
+        // Reflink extents may be shared: reserve full logical sizes, not st_blocks.
+        let reserve = minimum_free_bytes()?;
+        let required = self
+            .disk_reserved()?
+            .checked_add(extra)
+            .and_then(|n| n.checked_add(reserve))
+            .context("disk reservation overflow")?;
         ensure!(
-            stats.f_bavail.saturating_mul(stats.f_frsize) >= minimum_free_bytes()? + extra,
-            "storage headroom exhausted"
+            stats.f_bavail.saturating_mul(stats.f_frsize) >= required,
+            "storage headroom exhausted (full disk reservations plus host reserve)"
         );
         Ok(())
+    }
+
+    fn workspace_summary(&self, id: &str) -> Result<Value> {
+        let mut summary = json!(self.workspace(id)?);
+        let usage = disk::summary(&self.machine_dir(id).join("disk.ext4")).unwrap_or_else(
+            |_| json!({"disk_bytes":null,"disk_used_bytes":null,"disk_allocated_bytes":null}),
+        );
+        summary
+            .as_object_mut()
+            .unwrap()
+            .extend(usage.as_object().unwrap().clone());
+        Ok(summary)
     }
     fn create(
         &mut self,
@@ -649,6 +705,7 @@ impl Runtime {
         image: &str,
         source: Option<String>,
         snapshot: Option<&str>,
+        disk_gib: Option<u32>,
     ) -> Result<Value> {
         identifier(id)?;
         image_profile(image)?;
@@ -658,10 +715,15 @@ impl Runtime {
                 existing.memory_mib == memory
                     && existing.vcpu_count == cpus
                     && existing.source == source
-                    && existing.image == image,
+                    && existing.image == image
+                    && disk_gib.is_none_or(|n| self
+                        .machine_dir(id)
+                        .join("disk.ext4")
+                        .metadata()
+                        .is_ok_and(|m| m.len() == u64::from(n) * GIB)),
                 "ID already exists with different parameters"
             );
-            return Ok(json!(existing));
+            return self.workspace_summary(id);
         }
         self.capacity(memory, cpus)?;
         self.storage_headroom(0)?;
@@ -698,8 +760,16 @@ impl Runtime {
             source_disk.is_file(),
             "image profile is not prepared; run prepare-profiles.py first"
         );
+        let source_bytes = source_disk.metadata()?.len();
+        let disk_bytes = disk_gib.map(|n| u64::from(n) * GIB).unwrap_or(source_bytes);
+        ensure!(
+            disk_bytes >= source_bytes,
+            "requested disk is smaller than the image or snapshot"
+        );
+        self.reserve_disk(disk_bytes)?;
         fs::create_dir(&directory)?;
         vm::reflink(&source_disk, &directory.join("disk.ext4"))?;
+        disk::extend(&directory.join("disk.ext4"), disk_bytes)?;
         let workspace = Workspace {
             id: id.into(),
             index: self.state.next_index,
@@ -719,7 +789,7 @@ impl Runtime {
             if result.is_ok() { "running" } else { "failed" }.into();
         self.save()?;
         result?;
-        Ok(json!(self.state.workspaces[id]))
+        self.workspace_summary(id)
     }
 
     fn stop(&mut self, id: &str) -> Result<Value> {
@@ -813,7 +883,7 @@ impl Runtime {
                 eprintln!("removing spent hibernation {name}: {e}");
             }
         }
-        Ok(json!(self.state.workspaces[id]))
+        self.workspace_summary(id)
     }
 
     /// Seals a RAM+disk snapshot. With `hibernate` the paused VM is dropped right after
@@ -936,16 +1006,14 @@ impl Runtime {
             self.state.next_index < 8192,
             "prototype network address allocation exhausted"
         );
-        self.storage_headroom(0)?;
+        self.reserve_disk(directory.join("disk.ext4").metadata()?.len())?;
         let machine = self.machine_dir(&id);
         ensure!(
             !machine.exists(),
             "unregistered workspace directory exists; preserve and inspect it"
         );
         fs::create_dir(&machine)?;
-        if cold {
-            vm::reflink(&directory.join("disk.ext4"), &machine.join("disk.ext4"))?;
-        }
+        vm::reflink(&directory.join("disk.ext4"), &machine.join("disk.ext4"))?;
         let workspace = Workspace {
             id: id.clone(),
             index: self.state.next_index,
@@ -1056,11 +1124,17 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"guest_ssh_v1":true,
+                "worker_pid":std::process::id(),"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
-            "list" => Ok(json!(self.state.workspaces.values().collect::<Vec<_>>())),
+            "list" => Ok(json!(
+                self.state
+                    .workspaces
+                    .keys()
+                    .map(|id| self.workspace_summary(id))
+                    .collect::<Result<Vec<_>>>()?
+            )),
             "quiesce" => {
                 // `"closing": false` lifts it again (a shutdown that was called off).
                 self.closing = request["closing"].as_bool().unwrap_or(true);
@@ -1100,7 +1174,7 @@ impl Runtime {
                     "limit_memory_mib":max_memory(),"note":"PSS is process memory; excludes additional host page cache and kernel overhead"}),
                 )
             }
-            "inspect" => Ok(json!(self.workspace(id)?)),
+            "inspect" => self.workspace_summary(id),
             "create" => self.create(
                 id,
                 u32::try_from(request["memory_mib"].as_u64().unwrap_or(256))?,
@@ -1108,26 +1182,46 @@ impl Runtime {
                 request["image"].as_str().unwrap_or("alpine"),
                 None,
                 None,
+                Some(crate::common::requested_disk(request)?.unwrap_or(DEFAULT_DISK_GIB)),
             ),
             "resize" => {
-                let memory =
-                    u32::try_from(request["memory_mib"].as_u64().context("missing memory")?)?;
-                let cpus = u32::try_from(
-                    request["vcpu_count"]
-                        .as_u64()
-                        .context("missing CPU count")?,
-                )?;
-                resources(memory, cpus)?;
                 let existing = self.workspace(id)?;
+                let mut shape = request.clone();
+                for (key, value) in [
+                    ("memory_mib", existing.memory_mib),
+                    ("vcpu_count", existing.vcpu_count),
+                ] {
+                    if shape.get(key).is_none() {
+                        shape[key] = json!(value);
+                    }
+                }
+                let (memory, cpus) = crate::common::requested_resources(&shape)?;
+                let size = crate::common::requested_disk(request)?;
+                ensure!(
+                    request.get("memory_mib").is_some()
+                        || request.get("vcpu_count").is_some()
+                        || size.is_some(),
+                    "specify memory_mib, vcpu_count or disk_gib"
+                );
                 ensure!(
                     !self.machines.contains_key(id) && existing.state == "stopped",
-                    "Stop the machine before resizing; RAM checkpoints cannot change CPU or RAM size"
+                    "stop the machine before resizing; hibernated checkpoints cannot be resized"
                 );
+                if let Some(size) = size {
+                    let path = self.machine_dir(id).join("disk.ext4");
+                    let current = path.metadata()?.len();
+                    let bytes = u64::from(size) * GIB;
+                    ensure!(bytes >= current, "disk shrinking is not supported");
+                    if bytes > current {
+                        self.reserve_disk(bytes - current)?;
+                        disk::extend(&path, bytes)?;
+                    }
+                }
                 let workspace = self.state.workspaces.get_mut(id).unwrap();
                 workspace.memory_mib = memory;
                 workspace.vcpu_count = cpus;
                 self.save()?;
-                Ok(json!(self.state.workspaces[id]))
+                self.workspace_summary(id)
             }
             "start" => self.start(id),
             "images" => Ok(json!(self.images()?)),
@@ -1270,6 +1364,7 @@ impl Runtime {
                     &snapshot.image,
                     Some(id.into()),
                     Some(name),
+                    None,
                 )
             }
             "hibernate" => {
@@ -1283,7 +1378,7 @@ impl Runtime {
                 workspace.state = "hibernated".into();
                 workspace.hibernation = Some(name);
                 self.save()?;
-                Ok(json!(self.state.workspaces[id]))
+                self.workspace_summary(id)
             }
             "restore" => {
                 let name = request["name"].as_str().context("missing snapshot name")?;
@@ -1295,7 +1390,9 @@ impl Runtime {
                     snapshot.workspace == id
                         && snapshot.memory_mib == workspace.memory_mib
                         && snapshot.vcpu_count == workspace.vcpu_count
-                        && snapshot.image == workspace.image,
+                        && snapshot.image == workspace.image
+                        && directory.join("disk.ext4").metadata()?.len()
+                            == self.machine_dir(id).join("disk.ext4").metadata()?.len(),
                     "snapshot belongs to another workspace"
                 );
                 self.stop(id)?;
@@ -1315,5 +1412,208 @@ impl Runtime {
             let _ = self.stop(&id);
         }
         self.machines.clear();
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    fn fixture() -> Runtime {
+        let root = std::env::temp_dir().join(format!("ow-disk-runtime-{}", vm::nonce().unwrap()));
+        fs::create_dir_all(root.join("machines/legacy")).unwrap();
+        fs::create_dir_all(root.join("snapshots")).unwrap();
+        File::create(root.join("machines/legacy/disk.ext4"))
+            .unwrap()
+            .set_len(8 * GIB)
+            .unwrap();
+        let workspace: Workspace = serde_json::from_value(json!({"id":"legacy","index":1,"state":"stopped","memory_mib":1024,"vcpu_count":2,"source":null,"hibernation":null})).unwrap();
+        let mut state = State::default();
+        state.workspaces.insert("legacy".into(), workspace);
+        Runtime {
+            root,
+            assets: PathBuf::new(),
+            state,
+            machines: BTreeMap::new(),
+            cpu: String::new(),
+            kernel_hash: String::new(),
+            verified: BTreeMap::new(),
+            idle: crate::idle::Idle::from_env().unwrap(),
+            closing: false,
+        }
+    }
+
+    #[test]
+    fn unavailable_disk_does_not_hide_other_workspaces() {
+        let mut runtime = fixture();
+        let mut missing = runtime.workspace("legacy").unwrap();
+        missing.id = "missing".into();
+        runtime.state.workspaces.insert(missing.id.clone(), missing);
+        let healthy = runtime
+            .request(&json!({"op":"inspect","id":"legacy"}))
+            .unwrap();
+        assert_eq!(healthy["disk_bytes"], 8 * GIB);
+        let listed = runtime.request(&json!({"op":"list"})).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+        assert_eq!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["id"] == "legacy")
+                .unwrap(),
+            &healthy
+        );
+        let missing = runtime
+            .request(&json!({"op":"inspect","id":"missing"}))
+            .unwrap();
+        assert_eq!(missing["state"], "stopped");
+        for key in ["disk_bytes", "disk_used_bytes", "disk_allocated_bytes"] {
+            assert_eq!(missing.get(key), Some(&Value::Null));
+        }
+        assert_eq!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["id"] == "missing")
+                .unwrap(),
+            &missing
+        );
+        assert!(
+            runtime
+                .request(&json!({"op":"inspect","id":"unknown"}))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .request(&json!({"op":"start","id":"missing"}))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .request(&json!({"op":"resize","id":"missing","disk_gib":2}))
+                .is_err()
+        );
+        assert_eq!(runtime.workspace("missing").unwrap().state, "stopped");
+        fs::create_dir(runtime.machine_dir("missing")).unwrap();
+        File::create(runtime.machine_dir("missing").join("disk.ext4"))
+            .unwrap()
+            .set_len(GIB)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .request(&json!({"op":"inspect","id":"missing"}))
+                .unwrap()["disk_bytes"],
+            GIB
+        );
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires 14 GiB free space for conservative full-disk reservation"]
+    fn legacy_disk_resize_is_stopped_grow_only_and_keeps_other_resources() {
+        let mut runtime = fixture();
+        let before = runtime
+            .request(&json!({"op":"inspect","id":"legacy"}))
+            .unwrap();
+        assert_eq!(before["disk_bytes"], 8 * GIB);
+        assert_eq!(runtime.disk_reserved().unwrap(), 8 * GIB);
+        for state in ["running", "hibernated", "failed"] {
+            runtime.state.workspaces.get_mut("legacy").unwrap().state = state.into();
+            assert!(
+                runtime
+                    .request(&json!({"op":"resize","id":"legacy","disk_gib":9}))
+                    .is_err()
+            );
+        }
+        runtime.state.workspaces.get_mut("legacy").unwrap().state = "stopped".into();
+        for size in [
+            json!(7),
+            json!(0),
+            json!(null),
+            json!("16"),
+            json!(1.5),
+            json!(16385),
+        ] {
+            assert!(
+                runtime
+                    .request(&json!({"op":"resize","id":"legacy","disk_gib":size}))
+                    .is_err()
+            );
+        }
+        let resized = runtime
+            .request(&json!({"op":"resize","id":"legacy","disk_gib":9}))
+            .unwrap();
+        assert_eq!(resized["disk_bytes"], 9 * GIB);
+        assert_eq!(resized["memory_mib"], 1024);
+        assert_eq!(resized["vcpu_count"], 2);
+        let repeated = runtime
+            .request(&json!({"op":"resize","id":"legacy","disk_gib":9}))
+            .unwrap();
+        assert_eq!(repeated["disk_bytes"], 9 * GIB);
+        assert!(
+            runtime
+                .request(&json!({"op":"resize","id":"legacy"}))
+                .is_err()
+        );
+        let state: State =
+            serde_json::from_slice(&fs::read(runtime.root.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state.workspaces["legacy"].memory_mib, 1024);
+        assert!(runtime.reserve_disk(1024 * GIB).is_err());
+        assert!(
+            runtime
+                .storage_headroom(1_048_576 * GIB)
+                .unwrap_err()
+                .to_string()
+                .contains("headroom")
+        );
+        assert!(runtime.storage_headroom(u64::MAX).is_err());
+        // Restoring a pre-growth capture must fail before stopping/replacing the box.
+        let saved = runtime.snapshot_dir("before-growth");
+        fs::create_dir(&saved).unwrap();
+        File::create(saved.join("disk.ext4"))
+            .unwrap()
+            .set_len(8 * GIB)
+            .unwrap();
+        fs::write(saved.join("state"), b"state").unwrap();
+        fs::write(saved.join("memory"), b"memory").unwrap();
+        let snapshot = Snapshot {
+            name: "before-growth".into(),
+            workspace: "legacy".into(),
+            memory_mib: 1024,
+            vcpu_count: 2,
+            image: "alpine".into(),
+            runtime: crate::common::RUNTIME.into(),
+            cpu: String::new(),
+            kernel_sha256: String::new(),
+            files: [
+                ("state".into(), String::new()),
+                ("memory".into(), String::new()),
+                ("disk.ext4".into(), String::new()),
+            ]
+            .into(),
+        };
+        atomic_json(&saved.join("manifest.json"), &snapshot).unwrap();
+        runtime
+            .verified
+            .insert(snapshot.name.clone(), fingerprints(&saved).unwrap());
+        runtime.state.workspaces.get_mut("legacy").unwrap().state = "running".into();
+        assert!(
+            runtime
+                .request(&json!({"op":"restore","id":"legacy","name":"before-growth"}))
+                .is_err()
+        );
+        assert_eq!(runtime.workspace("legacy").unwrap().state, "running");
+        assert_eq!(
+            runtime
+                .machine_dir("legacy")
+                .join("disk.ext4")
+                .metadata()
+                .unwrap()
+                .len(),
+            9 * GIB
+        );
+        fs::remove_dir_all(&runtime.root).unwrap();
     }
 }

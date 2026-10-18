@@ -34,7 +34,9 @@ its backup bucket with the `ArtifactStore` component: see
 
 Versions are this repository's git tags (`vX.Y.Z`). When a new
 `deploy/aws/package.json` version reaches `main`, the `aws-component-release`
-workflow runs the checks and creates that tag. Bump `version` in the root
+workflow runs the checks, creates that tag and publishes its GitHub Release.
+An existing published release is kept; an existing draft is published.
+Bump `version` in the root
 `Cargo.toml` and `Cargo.lock` with it (`cargo update --workspace`) so `ow --version`
 reports the release, and add the release's entry to
 [`release-impact.json`](../../docs/UPGRADES.md#release-impact-manifest); the

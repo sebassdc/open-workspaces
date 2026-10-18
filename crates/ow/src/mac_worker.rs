@@ -648,6 +648,10 @@ impl Worker {
             "native Unix endpoint path too long; use a shorter private data directory"
         );
         if op == "create" {
+            ensure!(
+                r.get("disk_gib").is_none(),
+                "disk sizing requires a Linux Firecracker runner"
+            );
             ensure!(id != "_mac_unknown_demand", "reserved demand ID");
             let (memory, cpus) = common::requested_resources(r)?;
             ensure!(
@@ -1078,9 +1082,14 @@ pub fn run(cli: Cli) -> Result<i32> {
             image,
             memory,
             cpus,
+            disk,
             node,
         } => {
             ensure!(node.is_none(), "local placement is this Mac");
+            ensure!(
+                disk.is_none(),
+                "--disk is only supported by Linux Firecracker runners"
+            );
             json!({"op":"create","id":id,"image":image,"memory_mib":memory,"vcpu_count":cpus})
         }
         Action::Start { id } => json!({"op":"start","id":id}),

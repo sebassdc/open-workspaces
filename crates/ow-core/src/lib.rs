@@ -11,6 +11,8 @@ pub mod capability;
 pub mod common;
 pub mod compute;
 pub mod connect;
+#[cfg(target_os = "linux")]
+pub mod disk;
 pub mod idle;
 #[cfg(target_os = "linux")]
 pub mod network;

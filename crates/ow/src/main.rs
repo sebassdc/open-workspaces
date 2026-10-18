@@ -195,6 +195,9 @@ enum Action {
         memory: u32,
         #[arg(long, default_value_t = 1)]
         cpus: u32,
+        /// Root disk size in whole GiB, e.g. 64GiB (Linux default: 32GiB).
+        #[arg(long, value_parser = common::parse_disk_size)]
+        disk: Option<u32>,
         /// Placement on a connected node (remote controller only).
         #[arg(long)]
         node: Option<String>,
@@ -203,9 +206,12 @@ enum Action {
     Resize {
         id: String,
         #[arg(long)]
-        memory: u32,
+        memory: Option<u32>,
         #[arg(long)]
-        cpus: u32,
+        cpus: Option<u32>,
+        /// Grow the root disk (whole GiB); never shrinks. Applied on next start.
+        #[arg(long, value_parser = common::parse_disk_size)]
+        disk: Option<u32>,
     },
     Start {
         id: String,
