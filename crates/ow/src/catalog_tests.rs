@@ -405,6 +405,7 @@ async fn failed_snapshot_dashboard_response_preserves_safe_cause() {
             identity("alice"),
             request,
             false,
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
