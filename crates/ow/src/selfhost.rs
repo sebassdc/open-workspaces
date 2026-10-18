@@ -154,7 +154,7 @@ fn wait_worker(runner: &Path, limit: Duration) -> Result<()> {
 }
 
 /// SIGTERM or SIGINT: stop taking jobs and let the ones in flight finish.
-fn stop_on_signal() -> Result<()> {
+pub(crate) fn stop_on_signal() -> Result<()> {
     extern "C" fn stopping(_: libc::c_int) {
         nodes::STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -171,7 +171,7 @@ fn stop_on_signal() -> Result<()> {
 
 /// After a stop signal: the controller already refuses new jobs; wait for the agent's
 /// accepted non-stream jobs (their replies are journaled) up to `limit`.
-fn drain(limit: Duration) {
+pub(crate) fn drain(limit: Duration) {
     use std::sync::atomic::Ordering;
     let started = Instant::now();
     // A job ID sent just before the signal may still be in flight to the agent.

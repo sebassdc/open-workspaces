@@ -25,7 +25,8 @@ export function storePrefix(prefix: string): string {
 }
 
 /**
- * Lifecycle rules. Age expiry covers only the backup prefixes (`catalog/`, `snapshots/`):
+ * Lifecycle rules. Age expiry covers only the backup prefixes (`catalog/`, `snapshots/`, and
+ * `runners/`, where each Runner keeps its own snapshots):
  * a content store under `PREFIX/store/` keeps objects as long as a catalog references
  * them, so an age rule there would delete live artifacts.
  */
@@ -35,7 +36,7 @@ export function storeLifecycleRules(prefix: string, expireDays = 30, noncurrentD
     }
     const root = storePrefix(prefix);
     return [
-        ...["catalog", "snapshots"].map((part) => ({
+        ...["catalog", "snapshots", "runners"].map((part) => ({
             id: `expire-${part}`,
             status: "Enabled",
             filter: { prefix: `${root}/${part}/` },

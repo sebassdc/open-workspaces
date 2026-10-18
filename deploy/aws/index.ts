@@ -64,6 +64,15 @@ export interface HostArgs {
     idleMinutes?: pulumi.Input<number>;
 }
 
+/** A runner host: everything a Host takes except the dashboard, plus the controller it joins. */
+export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins"> {
+    /**
+     * The Host whose controller this runner joins. Its role may write this runner's
+     * join secret; nothing of that host changes otherwise.
+     */
+    controller: Host;
+}
+
 /** Host layout of stage 0 (bootstrap.sh); bump it with any change to that script. */
 const STAGE0 = "2";
 const DEFAULT_REPOSITORY = "https://github.com/sebassdc/open-workspaces.git";
@@ -109,7 +118,16 @@ export function backupLocation(url: string): { bucket: string; prefix: string } 
     return { bucket: match[1], prefix: match[2] };
 }
 
+/** What a runner's config adds: its node ID, its controller's name and its join secret. */
+export interface RunnerConfig {
+    node: string;
+    controller: string;
+    joinSecretArn: string;
+}
+
 export interface HostConfigInputs {
+    /** Set for a runner host (role runner). */
+    runner?: RunnerConfig;
     repository: string;
     ref: string;
     tailscaleAuthKeySecretArn: string;
@@ -145,16 +163,32 @@ export function hostConfig(c: HostConfigInputs): object {
         throw new Error(`repository must be an https URL, not ${JSON.stringify(c.repository)}`);
     }
     const images = developerImageList(c.developerImages);
+    if (c.runner) {
+        nodeId(c.runner.node);
+        if (!c.tailscaleAuthKeySecretArn) {
+            throw new Error("a runner needs tailscaleAuthKeySecretArn: its controller listens on the tailnet only");
+        }
+        if (c.dashboardLogins.length > 0) throw new Error("a runner has no dashboard");
+    }
     return {
         schema: 1,
-        role: "host",
+        role: c.runner ? "runner" : "host",
         release: { repository: c.repository, ref: c.ref },
         tailscale: { secretArn: c.tailscaleAuthKeySecretArn, hostname: c.tailscaleHostname, ssh: c.tailscaleSsh },
         dashboard: { logins: c.dashboardLogins },
         developerImages: images ? images.split(" ") : [],
         backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule },
         idleMinutes: c.idleMinutes,
+        ...(c.runner ? { runner: c.runner } : {}),
     };
+}
+
+/** A runner's node ID is its component name: 1 to 32 letters, digits, `-` or `_`. */
+export function nodeId(name: string): string {
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(name) || name === "local") {
+        throw new Error(`a runner's name is its node ID (1 to 32 letters, digits, - or _), not ${JSON.stringify(name)}`);
+    }
+    return name;
 }
 
 /** Host role policy for backups: list under the prefix, read and write objects there, never delete. */
@@ -192,10 +226,19 @@ export class Host extends pulumi.ComponentResource {
     public readonly securityGroupId: pulumi.Output<string>;
     /** SSM parameter holding the host's config; apply a change with `ow-aws apply`. */
     public readonly configParameter: pulumi.Output<string>;
+    /** The component name: the tag Name `ow-aws --host` finds, and a runner's node ID. */
+    public readonly hostName: string;
 
-    constructor(name: string, args: HostArgs, opts?: pulumi.ComponentResourceOptions) {
-        super("open-workspaces-aws:index:Host", name, {}, opts);
+    /** `type` is for Runner only. */
+    constructor(name: string, args: HostArgs, opts?: pulumi.ComponentResourceOptions, type = "open-workspaces-aws:index:Host") {
+        super(type, name, {}, opts);
         const parent = { parent: this };
+        this.hostName = name;
+        const controller = (args as Partial<RunnerArgs>).controller;
+        // A runner keeps its snapshots under its own prefix of the shared store.
+        const backupUrl = args.backupUrl && controller
+            ? pulumi.output(args.backupUrl).apply((url) => `${url.replace(/\/+$/, "")}/runners/${nodeId(name)}`)
+            : args.backupUrl;
         const instanceType = pulumi.output(args.instanceType ?? "m8i-flex.xlarge");
         const tags = pulumi.output(args.tags ?? {});
         const named = tags.apply((t) => ({ ...t, Name: name }));
@@ -244,11 +287,37 @@ export class Host extends pulumi.ComponentResource {
                 })),
             }, parent);
         }
-        if (args.backupUrl) {
+        if (backupUrl) {
             new aws.iam.RolePolicy(`${name}-backup`, {
                 role: role.id,
-                policy: pulumi.all([partition, args.backupUrl]).apply(([p, url]) => backupPolicy(p, url)),
+                policy: pulumi.all([partition, backupUrl]).apply(([p, url]) => backupPolicy(p, url)),
             }, parent);
+        }
+        // A runner's single-use join: the controller host writes it (`ow-aws runner-add`),
+        // this host reads it once and overwrites it. No other host can read it.
+        let runner: pulumi.Output<RunnerConfig | undefined> = pulumi.output(undefined);
+        if (controller) {
+            const join = new aws.secretsmanager.Secret(`${name}-join`, {
+                name: `open-workspaces/${nodeId(name)}/join`,
+                description: `Open Workspaces: single-use join of runner ${name} to ${controller.hostName}`,
+                recoveryWindowInDays: 0,
+                tags,
+            }, parent);
+            new aws.iam.RolePolicy(`${name}-join`, {
+                role: role.id,
+                policy: join.arn.apply((arn) => JSON.stringify({
+                    Version: "2012-10-17",
+                    Statement: [{ Effect: "Allow", Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"], Resource: arn }],
+                })),
+            }, parent);
+            new aws.iam.RolePolicy(`${name}-invite`, {
+                role: controller.roleName,
+                policy: join.arn.apply((arn) => JSON.stringify({
+                    Version: "2012-10-17",
+                    Statement: [{ Effect: "Allow", Action: "secretsmanager:PutSecretValue", Resource: arn }],
+                })),
+            }, parent);
+            runner = join.arn.apply((arn) => ({ node: name, controller: controller.hostName, joinSecretArn: arn }));
         }
         // Everything the host applies in place: user data only bootstraps (stage 0), so a
         // config or release change updates this parameter and never replaces the instance.
@@ -261,12 +330,13 @@ export class Host extends pulumi.ComponentResource {
                     pulumi.all([args.repository ?? DEFAULT_REPOSITORY, args.ref ?? `v${require("./package.json").version}`]),
                     pulumi.all([args.tailscaleAuthKeySecretArn ?? "", args.tailscaleHostname ?? name, args.tailscaleSsh ?? false]),
                     pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? []]),
-                    pulumi.all([args.backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30]),
+                    pulumi.all([backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30]),
+                    runner,
                 ])
-                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images], [backupUrl, backupSchedule, idleMinutes]]) =>
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images], [backupUrl, backupSchedule, idleMinutes], runner]) =>
                     JSON.stringify(hostConfig({
                         repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
-                        dashboardLogins: logins, developerImages: images, backupUrl, backupSchedule, idleMinutes,
+                        dashboardLogins: logins, developerImages: images, backupUrl, backupSchedule, idleMinutes, runner,
                     })),
                 ),
             tags,
@@ -351,5 +421,21 @@ export class Host extends pulumi.ComponentResource {
             securityGroupId: this.securityGroupId,
             configParameter: this.configParameter,
         });
+    }
+}
+
+/**
+ * A runner host that joins another Host's controller: its own nested-virtualization
+ * instance, Btrfs volume kept across replacement, role, backup prefix
+ * (`backupUrl/runners/NAME`) and config parameter; a worker and a node agent, no
+ * controller or dashboard. The component name is its node ID. Enrol it with
+ * `ow-aws --host CONTROLLER runner-add NAME` (`ow-aws ci-post-up` on the runner does it).
+ * Creating or changing it touches no other host: the controller's role only gains the
+ * right to write this runner's join secret.
+ */
+export class Runner extends Host {
+    constructor(name: string, args: RunnerArgs, opts?: pulumi.ComponentResourceOptions) {
+        nodeId(name);
+        super(name, args, opts, "open-workspaces-aws:index:Runner");
     }
 }

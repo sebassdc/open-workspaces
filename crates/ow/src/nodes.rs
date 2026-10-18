@@ -31,7 +31,7 @@ use tokio::{
 
 const FRAME: usize = 65536;
 
-/// Set by `ow host up` on SIGTERM: the controller dispatches no new jobs and the
+/// Set on SIGTERM by `ow host up` and `ow node-agent`: no new jobs are dispatched or taken, and the
 /// process exits once BUSY (non-stream jobs the agent accepted) reaches zero.
 pub(crate) static STOPPING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -975,6 +975,18 @@ fn channel_status(
     fs::rename(&temporary, root.join("node-channel.json"))?;
     Ok(())
 }
+/// `agent.json`: whether the controller kept this runner's channel open after a
+/// heartbeat, with the releases it advertised. A runner host has no controller to
+/// ask, so its upgrader and readiness checks read this.
+pub(crate) fn agent_status(root: &Path, online: bool, beat: &Value) -> Result<()> {
+    let temporary = root.join(format!("agent-{}.tmp", common::nonce()?));
+    write_private(
+        &temporary,
+        &json!({"online":online,"updated":now(),"version":beat["version"],"worker":beat["worker"]}),
+    )?;
+    fs::rename(&temporary, root.join("agent.json"))?;
+    Ok(())
+}
 pub(crate) fn redeem(origin: &str, value: &Value, ca: Option<&Path>) -> Result<Value> {
     let mut builder = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -1155,7 +1167,15 @@ pub fn agent(
             let mut ws = socket(&origin, &format!("/node/{node}"), &credential, ca)?;
             timeout_socket(&ws)?;
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
+            let mut unconfirmed = None;
             loop {
+                // A refused heartbeat closes the channel at once; one still open a second
+                // later was accepted.
+                if heartbeat.elapsed() > Duration::from_secs(1)
+                    && let Some(beat) = unconfirmed.take()
+                {
+                    let _ = agent_status(root, true, &beat);
+                }
                 // Without a compatible worker the channel closes at once: the controller then
                 // sees this runner offline and dispatches nothing to it.
                 let status = latest
@@ -1178,7 +1198,11 @@ pub fn agent(
                     beat["version"] = json!(env!("CARGO_PKG_VERSION"));
                     beat["worker"] =
                         json!({"version":status["version"],"protocol":status["worker_protocol"]});
-                    beat["drain"] = json!(root.join("drain").exists());
+                    // A stopping agent takes no new jobs, so placement must skip it.
+                    beat["drain"] = json!(
+                        root.join("drain").exists()
+                            || STOPPING.load(std::sync::atomic::Ordering::SeqCst)
+                    );
                     if let Some(golden) = status["images"].as_array() {
                         beat["images"]
                             .as_array_mut()
@@ -1187,6 +1211,7 @@ pub fn agent(
                     }
                     ws.send(tungstenite::Message::Text(beat.to_string().into()))?;
                     heartbeat = std::time::Instant::now();
+                    unconfirmed = Some(beat);
                 }
                 match ws.read() {
                     Ok(tungstenite::Message::Text(id)) => {
@@ -1204,6 +1229,11 @@ pub fn agent(
                         }
                         common::identifier(&id)?;
                         use std::sync::atomic::Ordering;
+                        // Stopping: jobs in flight finish, new ones are left to time out
+                        // unattached (nothing ran), which the controller reports.
+                        if STOPPING.load(Ordering::SeqCst) {
+                            continue;
+                        }
                         if active
                             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                                 (n < 16).then_some(n + 1)
@@ -1250,6 +1280,7 @@ pub fn agent(
             if guided {
                 let _ = channel_status(root, "disconnected", &instance, None);
             }
+            let _ = agent_status(root, false, &json!({}));
             eprintln!("node channel disconnected ({e:#}); reconnecting");
         }
         std::thread::sleep(Duration::from_secs(2));

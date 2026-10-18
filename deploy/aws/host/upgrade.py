@@ -55,7 +55,7 @@ def gate(rule, captures):
 
 
 def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), captures=(), compat=None,
-         accept_cold=False, max_class=2):
+         accept_cold=False, max_class=2, controller=None):
     """The upgrade of one host from `pins` (pin -> release version) to version `target`.
 
     rendered: pins whose unit files the target release renders differently.
@@ -65,6 +65,8 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
               "kernel_sha256"}: hibernated boxes, named snapshots, and running boxes
               (which will be captured with the old worker's tuple).
     compat:   the running worker's tuple ({"cpu": ...}): the CPU string comes from the host.
+    controller: on a runner host, the release its controller runs: the new agent must speak
+              a protocol that controller accepts (controllers upgrade first).
     Returns the plan; raises Refused, naming what to do instead."""
     entries = {e["version"]: e for e in manifest["releases"]}
     if target not in entries:
@@ -92,8 +94,9 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
     plan_ = {"from": dict(pins), "to": target, "move": move, "catalog_backup": False, "rollback_auto": True,
              "cold": []}
     # Catalog: the controller and dashboard move together around a schema change, after a copy.
+    # A runner host has no catalog.
     schema = {name: entries[pins[name]]["catalog"]["schema"] for name in ("agent", "dashboard")}
-    if any(s != goal["catalog"]["schema"] for s in schema.values()):
+    if controller is None and any(s != goal["catalog"]["schema"] for s in schema.values()):
         plan_["catalog_backup"] = True
         plan_["rollback_auto"] = min(schema.values()) >= goal["catalog"]["min_reader"]
         move.update(agent=target, dashboard=target)
@@ -108,8 +111,17 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
         move["worker" if "agent" in move else "agent"] = target
         if not paired():
             raise Refused(f"the {target} agent cannot drive the {target} worker (worker protocol window)")
+    # A runner's new agent must be one its controller accepts; else it would sit offline.
+    if controller is not None and "agent" in move:
+        if controller not in entries:
+            raise Refused(f"the controller runs {controller}, which the target's release-impact.json does not "
+                          f"list: upgrade this runner to {controller} instead")
+        lo, hi = entries[controller]["protocol"]["accepts"]
+        if not lo <= goal["protocol"]["speaks"] <= hi:
+            raise Refused(f"the controller ({controller}) accepts protocol {lo}..{hi}, and {target} speaks "
+                          f"{goal['protocol']['speaks']}: upgrade the controller first")
     # Protocol: every other runner must speak what the new controller accepts.
-    if "agent" in move:
+    if controller is None and "agent" in move:
         lo, hi = goal["protocol"]["accepts"]
         low = sorted(r["id"] for r in runners if not lo <= r.get("protocol", 0) <= hi)
         if low:
@@ -432,6 +444,8 @@ class HostOps:
                 return f"runner not online with agent {expected['agent']} and worker {expected['worker']}"
         except (RuntimeError, ValueError):
             return "ow node list failed"
+        if h.role() == "runner":
+            return ""
         t = h.tailnet()
         if t not in ("none", "wait") and h.listening() != f"{t}:8790":
             return f"controller listens on {h.listening() or 'nothing'}, not {t}:8790"
@@ -647,7 +661,7 @@ def recover(ops=None, boot=False):
         finish(j, ops)
 
 
-def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None):
+def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None, controller=None):
     ops = ops or HostOps()
     with locked():
         recover(ops)
@@ -662,10 +676,19 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None)
             target["manifest"] = json.loads(git("show", f"{newest['commit']}:release-impact.json"))
         status = ops.worker_status() or {}
         compat = status.get("compat") or {"cpu": host_cpu()}
-        runners = [{"id": n["id"], "protocol": (n.get("capabilities") or {}).get("protocol", 0)}
-                   for n in h.ow("node", "list", timeout=30) if n["id"] != h.local_node() and not n.get("revoked")]
+        if config["role"] == "runner":
+            # Its controller is another host: ow-aws passes the release that runs there.
+            if controller is None:
+                raise Refused("a runner host needs --controller-version (the release its controller's agent runs; "
+                              "ow-aws upgrade passes it)")
+            version(controller)
+            runners = []
+        else:
+            controller = None
+            runners = [{"id": n["id"], "protocol": (n.get("capabilities") or {}).get("protocol", 0)}
+                       for n in h.ow("node", "list", timeout=30) if n["id"] != h.local_node() and not n.get("revoked")]
         common = dict(rendered=render_diff(target), pending=set(h.pending()), runners=runners,
-                      compat=compat, accept_cold=accept_cold, max_class=max_class)
+                      compat=compat, accept_cold=accept_cold, max_class=max_class, controller=controller)
         current = {name: version_of(frm[name]) for name in h.PINS}
         result = plan(target["manifest"], current, target["version"], captures=captures(compat), **common)
         say(json.dumps({"plan": result, "release": target["release"]}, indent=2))
