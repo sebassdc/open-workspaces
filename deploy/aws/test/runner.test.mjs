@@ -12,19 +12,19 @@ const created = [];
 pulumi.runtime.setMocks({
     newResource: (args) => {
         created.push(args);
-        return { id: `${args.name}-id`, state: { name: args.name, ...args.inputs, arn: `arn:aws:mock:::${args.name}` } };
+        return { id: `${args.name}-id`, state: { name: args.name, macAddress: "02:00:00:00:00:01", ...args.inputs, arn: `arn:aws:mock:::${args.name}` } };
     },
     call: (args) => ({
         "aws:ec2/getVpc:getVpc": { id: "vpc-1" },
         "aws:ec2/getInstanceTypeOfferings:getInstanceTypeOfferings": { locations: ["us-east-1a"] },
         "aws:ec2/getSubnets:getSubnets": { ids: ["subnet-1"] },
-        "aws:ec2/getSubnet:getSubnet": { id: "subnet-1", vpcId: "vpc-1", availabilityZone: "us-east-1a" },
+        "aws:ec2/getSubnet:getSubnet": { id: args.inputs.id ?? "subnet-1", vpcId: "vpc-1", availabilityZone: "us-east-1a" },
         "aws:index/getPartition:getPartition": { partition: "aws" },
         "aws:index/getRegion:getRegion": { region: "us-east-1", name: "us-east-1" },
         "aws:ssm/getParameter:getParameter": { value: "ami-1" },
     })[args.token] ?? {},
 }, "project", "stack", false);
-const { Host, Runner, hostConfig, nodeId } = await import("../index.ts");
+const { Host, Runner, hostConfig, nodeId, tailscaleDirectSubnet } = await import("../index.ts");
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 200));
 const secretArn = "arn:aws:secretsmanager:us-east-1:111122223333:secret:ow/ts-AbCdEf";
@@ -105,4 +105,43 @@ test("a runner's name is its node ID, and it needs the tailnet and no dashboard"
     assert.throws(() => hostConfig({ ...base, tailscaleAuthKeySecretArn: "" }), /needs tailscaleAuthKeySecretArn/);
     assert.throws(() => hostConfig({ ...base, dashboardLogins: ["you@example.com"] }), /no dashboard/);
     assert.equal(hostConfig({ ...base, runner: undefined }).runner, undefined);
+});
+
+
+test("direct Tailscale hot-attaches only UDP 41641; existing host inputs are identical", async () => {
+    created.length = 0;
+    new Host("ow-direct", { ...hostArgs, subnetId: "subnet-private", associatePublicIpAddress: false });
+    await settle();
+    const before = resources();
+    created.length = 0;
+    new Host("ow-direct", { ...hostArgs, subnetId: "subnet-private", associatePublicIpAddress: false,
+        tailscaleDirect: { subnetId: "subnet-public" } });
+    await settle();
+    const after = resources();
+    for (const [key, inputs] of before) {
+        if (key.includes("ssm/parameter:")) continue;
+        assert.deepEqual(after.get(key), inputs, key);
+    }
+    const added = [...after.keys()].filter((key) => !before.has(key));
+    assert.equal(added.length, 5, added.join(", "));
+    const sg = byName("ow-direct-tailscale-direct", "securityGroup:").inputs;
+    assert.deepEqual(sg.ingress, [{ protocol: "udp", fromPort: 41641, toPort: 41641, cidrBlocks: ["0.0.0.0/0"] }]);
+    assert.deepEqual(sg.egress, [{ protocol: "udp", fromPort: 0, toPort: 65535, cidrBlocks: ["0.0.0.0/0"] }]);
+    const eni = byName("ow-direct-tailscale-direct", "networkInterface:").inputs;
+    assert.equal(eni.subnetId, "subnet-public");
+    assert.deepEqual(eni.securityGroups, ["ow-direct-tailscale-direct-id"]);
+    assert.deepEqual(byName("ow-direct-tailscale-direct", "networkInterfaceAttachment:").inputs,
+        { instanceId: "ow-direct-host-id", networkInterfaceId: "ow-direct-tailscale-direct-id", deviceIndex: 1 });
+    assert.equal(byName("ow-direct-tailscale-direct", "eipAssociation:").inputs.networkInterfaceId, "ow-direct-tailscale-direct-id");
+    const config = JSON.parse(byName("ow-direct-config", "ssm/parameter:").inputs.insecureValue);
+    assert.deepEqual(config.tailscale.direct, { mac: "02:00:00:00:00:01" });
+});
+
+test("direct Tailscale refuses another VPC, AZ or the primary subnet", () => {
+    const host = { id: "private", vpcId: "vpc-1", availabilityZone: "us-east-1a" };
+    assert.equal(tailscaleDirectSubnet(host, { ...host, id: "public" }), "public");
+    for (const bad of [host, { ...host, id: "public", vpcId: "vpc-2" },
+        { ...host, id: "public", availabilityZone: "us-east-1b" }]) {
+        assert.throws(() => tailscaleDirectSubnet(host, bad), /separate public subnet/);
+    }
 });
