@@ -195,6 +195,16 @@ start). Each measurement is a single run (n = 1), so no p50/p95.
 | Tailnet | `tailscale ping ow-wrk13` answered from `100.76.57.76` after every step; the dashboard answered 401 over the tailnet to a login it does not list |
 | Disk | each release directory: 1.51 GiB, 453 MiB exclusive (`btrfs filesystem du`) |
 
+Re-run after the review fixes (2026-10-18, a fresh layout v2 host from this
+branch, same instance type and AMI, destroyed afterwards): an `idleMinutes`
+change applied by `ow-aws apply` was left pending and carried out by
+`ow-host upgrade` as a worker restart (the new worker runs
+`OW_IDLE_HIBERNATE_SECS=600`; box process kept, agent untouched); a class 2
+release then quiesced the worker over its control socket, passed the final
+capture gate (no cold capture), hibernated (1.8 s), swapped and resumed
+(0.4 s) the box with its process; verify 6.1 s; the dashboard answered over
+the tailnet.
+
 Found and fixed during the run: a replaced host keeps its runner's enrolled
 node ID but gets a new hostname, so readiness now reads the ID from the runner
 credential; the build log flooded SSM's output limit and now goes to a file;
