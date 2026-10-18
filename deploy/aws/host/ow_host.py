@@ -576,7 +576,7 @@ def setup(config):
             run(["networkctl", "reconfigure", interface])
         if direct:
             while True:
-                routes = json.loads(run(["ip", "-j", "route", "get", "1.1.1.1", "ipproto", "udp", "sport", "41641"]))
+                routes = json.loads(run(["ip", "-j", "route", "get", "1.1.1.1", "ipproto", "udp", "sport", "41641"], check=False) or "[]")
                 if routes and routes[0].get("dev") == interfaces[direct["mac"]]:
                     break
                 if time.monotonic() >= deadline:

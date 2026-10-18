@@ -261,6 +261,7 @@ class Setup(unittest.TestCase):
         h.setup(config())
         direct = config(tailscale__direct={"mac": "02:00:00:00:00:01"})
         failures = [True]
+        dhcp_pending = [True]
 
         def fake(cmd, **kw):
             self.calls.append(cmd)
@@ -277,6 +278,11 @@ class Setup(unittest.TestCase):
             if cmd == ["ip", "-j", "link", "show"]:
                 return '[{"address":"02:00:00:00:00:01","ifname":"ens6"},{"address":"02:00:00:00:00:02","ifname":"ens5"}]'
             if cmd[:4] == ["ip", "-j", "route", "get"]:
+                if dhcp_pending:
+                    if kw.get("check", True):
+                        raise RuntimeError("RTNETLINK answers: Network is unreachable")
+                    dhcp_pending.pop()
+                    return ""
                 return '[{"dev":"ens6"}]'
             return ""
 
@@ -286,6 +292,8 @@ class Setup(unittest.TestCase):
         self.assertTrue(h.p(h.SETUP_DUE).exists())
         self.calls.clear()
         h.setup(direct)
+        self.assertFalse(dhcp_pending)
+        self.assertEqual(sum(c[:4] == ["ip", "-j", "route", "get"] for c in self.calls), 2)
         self.assertIn(["networkctl", "reload"], self.calls)
         self.assertIn(["networkctl", "reconfigure", "ens6"], self.calls)
         self.assertNotIn(["networkctl", "reconfigure", "ens5"], self.calls)
