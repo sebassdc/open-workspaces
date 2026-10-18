@@ -41,6 +41,41 @@
       "notes": "Owner-requested sparse root disk sizing and stopped-box growth; ext4 expands before cold boot. Existing disks and paired warm snapshots keep their sizes. Class 2 runner upgrade, no host replacement."
     },
     {
+      "version": "0.6.3",
+      "class": 0,
+      "changes": [
+        "component"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "catalog": {
+        "schema": 3,
+        "min_reader": 3
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Operator helper: select role-aware readiness after first boot installs ow-host, so fresh runner-only hosts do not wait for a controller port. Existing host services and boxes are unchanged."
+    },
+    {
       "version": "0.6.2",
       "class": 1,
       "changes": ["controller", "agent", "dashboard"],

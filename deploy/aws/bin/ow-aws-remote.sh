@@ -132,11 +132,12 @@ resume_boxes() {
 
 # ready WAIT IMAGES: the readiness wait; IMAGES non-empty also waits for the developer image.
 ready() {
+  # A fresh bootstrap may install ow-host while we wait; select its role-aware path afterwards.
+  if ! command -v ow-host > /dev/null; then bootstrap_done "$1"; fi
   if command -v ow-host > /dev/null; then
     ow-host ready --wait "$1" ${2:+--images}
     return
   fi
-  bootstrap_done "$1"
   [[ -z $2 ]] || images_done "$1"
   wait_ready "$1"
 }
