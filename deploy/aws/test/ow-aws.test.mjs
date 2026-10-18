@@ -322,6 +322,41 @@ test("bootstrap_done needs cloud-init done and the bootstrap's ok status", () =>
     }
 });
 
+test("ready selects the role-aware helper installed during bootstrap", () => {
+    for (const images of ["", "images"]) {
+        const result = host(`
+bootstrap_done() {
+  printf '#!/bin/sh\\necho "ow-host $*"\\n' > "$(dirname "$resume_list")/bin/ow-host"
+  chmod +x "$(dirname "$resume_list")/bin/ow-host"
+}
+wait_ready() { echo 'legacy controller wait must not run on a runner' >&2; return 42; }
+images_done() { return 43; }
+ready 5 '${images}'`);
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.stdout, `ow-host ready --wait 5${images ? " --images" : ""}\n`);
+    }
+    const result = host("bootstrap_done() { return 44; }; ready 5 ''; echo after");
+    assert.equal(result.status, 44, "failed bootstrap stops before readiness");
+    assert.ok(!result.stdout.includes("after"));
+});
+
+test("ready preserves existing layout-v2 and legacy readiness paths", () => {
+    const existing = host(`
+printf '#!/bin/sh\\necho "ow-host $*"\\n' > "$(dirname "$resume_list")/bin/ow-host"
+chmod +x "$(dirname "$resume_list")/bin/ow-host"
+bootstrap_done() { return 44; }
+ready 5 ''`);
+    assert.equal(existing.status, 0, existing.stderr);
+    assert.equal(existing.stdout, "ow-host ready --wait 5\n", "ow-host owns layout-v2 bootstrap validation");
+    const legacy = host(`
+bootstrap_done() { echo bootstrap; }
+images_done() { echo images; }
+wait_ready() { echo controller; }
+ready 5 images`);
+    assert.equal(legacy.status, 0, legacy.stderr);
+    assert.equal(legacy.stdout, "bootstrap\nimages\ncontroller\n");
+});
+
 test("backups lists captures by owner and machine, oldest first, and filters by box", () => {
     const backups = JSON.stringify([
         { snapshot: "sleep-1", workspace: "m-gone", owner: null, machine: null, uploaded: "2026-10-15 01:00:00" },

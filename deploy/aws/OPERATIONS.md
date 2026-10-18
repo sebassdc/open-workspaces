@@ -43,6 +43,11 @@ lookup decides, so a command never reaches another host. `OW_SSH_KEY` picks the 
 | `ci-preflight --stack S` | before `pulumi up`: if `pulumi preview` replaces this host's instance, hibernates its boxes (`ow down --hibernate`, which keeps them running if one cannot be hibernated) and stops the service. Fails (so CI stops before `pulumi up`) when the preview cannot be read or the instance is neither running nor stopped |
 | `ci-post-up --stack S [--image RECIPE].. [--max-class N]` | after `pulumi up`: starts a stopped host, waits until ready (each step up to 50 minutes: a new host builds from source), resumes remembered boxes, runs `ow-host apply` and `ow-host upgrade` where the host has them, then builds each image (an unchanged recipe is a no-op). On a runner, `runner-add` runs before `apply`, and `upgrade` gets the controller's release. Run it for the controller host first, then for each runner |
 
+On a fresh host, readiness waits for bootstrap before selecting the role-aware
+`ow-host` handler it installs. Runner-only hosts never need a controller listener.
+Existing layout-v2 hosts retain `ow-host`'s own bootstrap validation; legacy hosts
+keep the controller readiness path.
+
 Each SSM command has a local deadline, so an unreachable host ends the command
 instead of hanging. SSM keeps at most 24,000 characters of a command's output.
 
