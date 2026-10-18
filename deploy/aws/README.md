@@ -44,7 +44,7 @@ checks fail while they disagree. The same tag is the default `ref` the host
 builds, so set `ref` explicitly before the first release exists.
 
 ```bash
-pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.6.1
+pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.7.0
 ```
 
 ```typescript
@@ -81,13 +81,13 @@ Outputs: `instanceId`, `privateIp`, `availabilityZone`, `dataVolumeId`,
 `roleName`, `securityGroupId`, `configParameter`.
 
 Every input except `instanceType`, `subnetId`, `associatePublicIpAddress`,
-`amiId`, `dataVolumeSizeGib` and `tags` lives in the config parameter. After
+`amiId`, `dataVolumeSizeGib`, `tailscaleDirect` and `tags` lives in the config parameter. After
 `pulumi up` changes it, apply it with `ow-aws apply` (or `ci-post-up`, which also
 upgrades); the host keeps the last applied copy on its data volume.
 
 ## Reach the host
 
-There are no inbound ports. Use SSM:
+By default there are no inbound ports. SSM also works with `tailscaleDirect`:
 
 ```bash
 aws ssm start-session --target "$(pulumi stack output instanceId)"
