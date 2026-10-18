@@ -154,6 +154,7 @@ pub async fn upgrade(
         return (StatusCode::BAD_REQUEST, "Invalid machine name").into_response();
     }
     let (mut parts, _) = request.into_parts();
+    let session = parts.extensions.remove::<crate::remote::TailnetSession>();
     let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
         Ok(ws) => ws,
         Err(e) => return e.into_response(),
@@ -193,7 +194,7 @@ pub async fn upgrade(
         .max_frame_size(4096)
         .write_buffer_size(0)
         .max_write_buffer_size(65536)
-        .on_upgrade(move |socket| relay(socket, stream, expires, permit, revoked))
+        .on_upgrade(move |socket| relay(socket, stream, expires, permit, revoked, session))
 }
 
 async fn send_frame(
@@ -211,7 +212,10 @@ async fn relay(
     expires: u64,
     _permit: OwnedSemaphorePermit,
     revoked: Arc<Notify>,
+    session: Option<crate::remote::TailnetSession>,
 ) {
+    let admission = crate::remote::TailnetSession::revoked(session);
+    tokio::pin!(admission);
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     // read_exact is isolated from select cancellation; otherwise partial frame headers can be lost.
@@ -253,6 +257,7 @@ async fn relay(
         tokio::select! {
             _=&mut deadline=>break,
             _=revoked.notified()=>break,
+            _=&mut admission=>break,
             _=heartbeat.tick()=>{
                 if seen.elapsed()>Duration::from_secs(90) {break;}
                 if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Ping(Vec::new().into()))).await,Ok(Ok(()))) {break;}

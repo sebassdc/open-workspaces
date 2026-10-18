@@ -96,12 +96,13 @@ tailscale serve --bg http://127.0.0.1:8787   # then open https://NAME.TAILNET.ts
   Origin, as with Access.
 - `tailscale serve` replaces client-sent `Tailscale-User-*` and
   `X-Forwarded-For` headers: it sets the login only for a tailnet user (never for
-  tagged devices) and `X-Forwarded-For` to the real peer address. The login must
-  be in `allowed_emails`, and `tailscale whois` for that peer must report the
-  same login. The catalog subject is the stable Tailscale user ID from whois, so
+  tagged devices) and `X-Forwarded-For` to the real peer address. Admission requires
+  an `allowed_emails` match or the configured `allowed_capability` in the peer's
+  whois `CapMap`. Whois must report the same login and an untagged device, even
+  when a capability is present. The catalog subject is the stable Tailscale user ID from whois, so
   a login name reassigned to someone else does not inherit machines. Catalog
   identities use the issuer `tailscale://TAILNET.ts.net`.
-- The dashboard runs `tailscale whois --json PEER` (cached for a minute), so the
+- The dashboard runs `tailscale whois --json PEER` for each request, so the
   `tailscale` CLI must be on its `PATH`; tailscaled answers this read-only query
   for any local user.
 - The CLI installer is not offered. Build `ow` from source (Linux or macOS:
@@ -113,12 +114,60 @@ tailscale serve --bg http://127.0.0.1:8787   # then open https://NAME.TAILNET.ts
 - Anyone who can open a TCP connection to the loopback port on this machine can
   claim an allowed login. Use it only where the machine's local users are
   operators; guests cannot reach host loopback.
-- Terminal and SSH streams close after eight hours; reconnect to continue.
-  Removing a login from `allowed_emails` takes effect on restart.
+- Terminal and SSH streams also recheck admission every 30 seconds and close on
+  denial, a changed user ID or a failed lookup (up to five seconds per lookup).
+  Their existing session deadlines still apply; reconnect to continue.
+  Removing a login from `allowed_emails` takes effect on dashboard restart.
 - `team_domain` and `audience` must be omitted; `upstream` is still required by
   the config format and unused by the dashboard.
-- The AWS component can run this for you: see `dashboardLogins` in
+- The AWS component can run this for you: see `dashboardLogins` and `dashboardCapability` in
   [deploy/aws](../deploy/aws/README.md).
+
+### Admission through a capability grant
+
+Choose a capability under a domain you control, and configure it once:
+
+```json
+{"auth": "tailscale", "hostname": "NAME.TAILNET.ts.net",
+ "allowed_capability": "example.com/cap/open-workspaces", "upstream": "http://127.0.0.1:9/"}
+```
+
+A tailnet administrator can then define the group, authorize the host tag, assign
+it to the dashboard host, and add a grant such as this to the existing policy:
+
+```json
+{"grants": [{
+  "src": ["group:ow-users"], "dst": ["tag:ow-host"],
+  "ip": ["tcp:443"],
+  "app": {"example.com/cap/open-workspaces": [{}]}
+}]}
+```
+
+The network permission permits HTTPS; the application permission admits the
+user. See [Tailscale application capabilities](https://tailscale.com/docs/features/access-control/grants/grants-app-capabilities).
+Only the top-level whois `CapMap` is used, not node attributes or a client-sent
+`Tailscale-App-Capabilities` header. The capability is a Boolean admission grant;
+its parameter objects do not grant catalog administration or other users' machines.
+
+At least one of `allowed_emails` and `allowed_capability` is required. If both
+are configured, either admits the user: removing their grant does **not** revoke
+an email-allowlisted user. For grant-only administration, omit the email list.
+The explicit email allowlist is still required for Cloudflare Access and for
+`bootstrap_owner_email` legacy ownership migration.
+
+After Tailscale propagates a policy removal to the host, the next request is
+denied and existing terminal/SSH streams close within 35 seconds. No dashboard
+restart or per-person application config update is needed. Work already
+dispatched to a guest is not cancelled by admission revocation; ownership and
+machine data are preserved. The existing AWS in-place config path already avoids
+host replacement; capability grants simplify administration rather than fixing
+host replacement downtime.
+
+Policy edits require the tailnet administrator's authorization. Before wider
+admission, verify on the actual host that a granted user can access only their
+machines, an ungranted user and tagged device are denied, a forged login/header
+is denied, and grant removal denies the next request and closes live streams.
+Local fake-daemon tests do not establish live tailnet propagation.
 
 ## Run and deployment
 

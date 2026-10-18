@@ -80,6 +80,7 @@ export const instanceId = host.instanceId;
 | `tailscaleDirect` | none | `{ subnetId: "subnet-public" }`: secondary interface and Elastic IP for UDP 41641 only. Public subnet must be in the same VPC/AZ, with an internet gateway route. Needs `tailscaleAuthKeySecretArn`; leaves the running host in its private subnet. |
 | `tailscaleSsh` | `false` | Tailscale SSH, authorized by your tailnet policy. |
 | `dashboardLogins` | none | Tailnet logins allowed into the web dashboard. Needs `tailscaleAuthKeySecretArn`; see below. |
+| `dashboardCapability` | none | Application capability (`example.com/cap/open-workspaces`) admitting tailnet users without a login list. Needs `tailscaleAuthKeySecretArn`. Either this or `dashboardLogins` enables the dashboard; if both are set, either admits. |
 | `developerImages` | none | `["ubuntu"]`: build the [developer image](../../docs/GUEST_IMAGES.md) (user `dev`, SSH server, toolchains) after boot. SSH into boxes and golden-image recipes need it. |
 | `backupUrl` | none | `s3://bucket/prefix`: install `ow-backup`, and let the host role list, read and add objects under the prefix (never delete). See below. |
 | `backupSchedule` | none | When `ow-backup` runs, as a systemd calendar expression (`*-*-* 01:00:00 UTC`); the host installs a timer. Needs `backupUrl`. |
@@ -163,7 +164,7 @@ a direct connection.
 
 ## Dashboard over the tailnet
 
-With `dashboardLogins`, the host also runs `open-workspaces-dashboard.service`:
+With `dashboardLogins` or `dashboardCapability`, the host also runs `open-workspaces-dashboard.service`:
 `ow dashboard` on `127.0.0.1:8787` with [tailnet sign-in](../../docs/DASHBOARD.md#tailnet-sign-in),
 published by `tailscale serve` to the tailnet only (never Funnel). Open
 `https://HOSTNAME.TAILNET.ts.net/` as one of the listed logins. The tailnet needs
@@ -171,6 +172,20 @@ HTTPS certificates enabled (admin console, DNS). The service waits, retrying
 every 30 s, until the host is on the tailnet, so a later `tailscale up` is
 enough. It uses the controller root, so machines created there are placed on
 the runners.
+
+For grant-based admission, set `dashboardCapability: "example.com/cap/open-workspaces"`
+and omit `dashboardLogins`. The component carries this through the in-place SSM
+config and generates `allowed_capability` in the dashboard config; it does not
+edit the tailnet policy. A tailnet administrator must define a user group and
+destination host tag, permit HTTPS and grant that capability; see the
+[policy example and revocation checks](../../docs/DASHBOARD.md#admission-through-a-capability-grant).
+After the initial configuration, group/grant additions and removals require no
+per-person application update, host redeploy or dashboard restart. The dashboard
+checks fresh whois answers per request; terminal/SSH streams recheck every 30
+seconds. Revocation takes effect after policy propagation (within 35 seconds for
+streams once the host sees it). An email-list fallback still admits listed users
+after grant removal, so omit it for grant-only administration. Capabilities admit
+users to their own catalog identity, never account-wide or host administration.
 
 ## Backups to S3
 
@@ -254,7 +269,7 @@ const big = new ow.Runner("workspaces-2", {
 });
 ```
 
-It takes the Host inputs except `dashboardLogins`, plus `controller`: the
+It takes the Host inputs except `dashboardLogins` and `dashboardCapability`, plus `controller`: the
 Host's component name and its `roleName` output (a component cannot be a
 package input; in TypeScript source the Host itself fits). On top
 of what a Host creates, it adds a Secrets Manager secret

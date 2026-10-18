@@ -44,7 +44,10 @@ struct Config {
     team_domain: String,
     #[serde(default)]
     audience: String,
+    #[serde(default)]
     allowed_emails: Vec<String>,
+    #[serde(default)]
+    allowed_capability: Option<String>,
     upstream: String,
     #[serde(default)]
     bootstrap_owner_email: Option<String>,
@@ -57,32 +60,22 @@ struct Config {
     whois: Whois,
 }
 
-/// Resolves a tailnet peer address to its stable user ID and login with
-/// `tailscale whois`, caching each answer briefly.
+/// Fresh local-daemon answers keep admission and revocation independent of restarts.
 #[derive(Clone)]
 struct Whois {
     cli: PathBuf,
-    cache:
-        Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (Instant, u64, String)>>>,
 }
 
 impl Default for Whois {
     fn default() -> Self {
         Self {
             cli: PathBuf::from("tailscale"),
-            cache: Arc::default(),
         }
     }
 }
 
 impl Whois {
-    async fn user(&self, peer: std::net::IpAddr) -> Option<(u64, String)> {
-        const FRESH: Duration = Duration::from_secs(60);
-        if let Some((at, id, login)) = self.cache.lock().ok()?.get(&peer)
-            && at.elapsed() < FRESH
-        {
-            return Some((*id, login.clone()));
-        }
+    async fn user(&self, peer: std::net::IpAddr) -> Option<WhoisUser> {
         let output = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::process::Command::new(&self.cli)
@@ -99,27 +92,35 @@ impl Whois {
         #[derive(Deserialize)]
         struct Answer {
             #[serde(rename = "UserProfile")]
-            user: Profile,
+            user: WhoisUser,
+            #[serde(rename = "Node")]
+            node: Node,
+            #[serde(rename = "CapMap", default)]
+            capabilities: Option<std::collections::HashMap<String, Option<Vec<serde_json::Value>>>>,
         }
         #[derive(Deserialize)]
-        struct Profile {
-            #[serde(rename = "ID")]
-            id: u64,
-            #[serde(rename = "LoginName")]
-            login: String,
+        struct Node {
+            #[serde(rename = "Tags", default)]
+            tags: Option<Vec<String>>,
         }
         let answer: Answer = serde_json::from_slice(&output.stdout).ok()?;
-        (answer.user.id != 0).then_some(())?;
-        let mut cache = self.cache.lock().ok()?;
-        if cache.len() > 4096 {
-            cache.clear();
-        }
-        cache.insert(
-            peer,
-            (Instant::now(), answer.user.id, answer.user.login.clone()),
-        );
-        Some((answer.user.id, answer.user.login))
+        (answer.user.id != 0 && answer.node.tags.as_ref().is_none_or(Vec::is_empty)).then_some(
+            WhoisUser {
+                capabilities: answer.capabilities.unwrap_or_default(),
+                ..answer.user
+            },
+        )
     }
+}
+
+#[derive(Deserialize)]
+struct WhoisUser {
+    #[serde(rename = "ID")]
+    id: u64,
+    #[serde(rename = "LoginName")]
+    login: String,
+    #[serde(skip)]
+    capabilities: std::collections::HashMap<String, Option<Vec<serde_json::Value>>>,
 }
 
 impl Config {
@@ -127,6 +128,10 @@ impl Config {
         ensure!(valid_hostname(&self.hostname), "invalid public hostname");
         match self.auth {
             Auth::Access => {
+                ensure!(
+                    self.allowed_capability.is_none(),
+                    "allowed_capability requires tailscale auth"
+                );
                 let suffix = ".cloudflareaccess.com";
                 ensure!(
                     self.team_domain.ends_with(suffix)
@@ -151,12 +156,20 @@ impl Config {
             }
         }
         ensure!(
-            !self.allowed_emails.is_empty()
-                && self
-                    .allowed_emails
-                    .iter()
-                    .all(|e| e.contains('@') && e.len() <= 254),
-            "an explicit email allowlist is required"
+            self.allowed_emails
+                .iter()
+                .all(|e| e.contains('@') && e.len() <= 254),
+            "invalid email allowlist"
+        );
+        if let Some(capability) = &self.allowed_capability {
+            ensure!(
+                valid_capability(capability),
+                "allowed_capability must be domain/path (at most 512 characters)"
+            );
+        }
+        ensure!(
+            !self.allowed_emails.is_empty() || self.allowed_capability.is_some(),
+            "an explicit email allowlist or tailnet capability is required"
         );
         if let Some(owner) = &self.bootstrap_owner_email {
             ensure!(
@@ -219,6 +232,17 @@ fn valid_hostname(host: &str) -> bool {
         })
 }
 
+fn valid_capability(capability: &str) -> bool {
+    capability.len() <= 512
+        && capability.split_once('/').is_some_and(|(domain, path)| {
+            valid_hostname(domain)
+                && !path.is_empty()
+                && path
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b))
+        })
+}
+
 struct Keys {
     set: JwkSet,
     fetched: Instant,
@@ -277,15 +301,19 @@ async fn tailnet_identity(
     };
     let login = single("tailscale-user-login")?;
     let peer: std::net::IpAddr = single("x-forwarded-for")?.parse().ok()?;
-    if !config
-        .allowed_emails
-        .iter()
-        .any(|email| email.eq_ignore_ascii_case(login))
-    {
+    let user = config.whois.user(peer).await?;
+    if !user.login.eq_ignore_ascii_case(login) {
         return None;
     }
-    let (id, whois_login) = config.whois.user(peer).await?;
-    if !whois_login.eq_ignore_ascii_case(login) {
+    let email_allowed = config
+        .allowed_emails
+        .iter()
+        .any(|email| email.eq_ignore_ascii_case(login));
+    let capability_allowed = config
+        .allowed_capability
+        .as_ref()
+        .is_some_and(|capability| user.capabilities.contains_key(capability));
+    if !email_allowed && !capability_allowed {
         return None;
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
@@ -293,10 +321,33 @@ async fn tailnet_identity(
         now + TAILNET_SESSION.as_secs(),
         crate::catalog::Identity {
             issuer: config.issuer(),
-            subject: id.to_string(),
+            subject: user.id.to_string(),
             email: login.to_owned(),
         },
     ))
+}
+
+/// Recheck long-lived connections too; a new owner of the same login is a new session.
+#[derive(Clone)]
+pub(crate) struct TailnetSession {
+    config: Config,
+    headers: HeaderMap,
+    subject: String,
+}
+
+impl TailnetSession {
+    pub(crate) async fn revoked(session: Option<Self>) {
+        let Some(session) = session else {
+            return std::future::pending().await;
+        };
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            match tailnet_identity(&session.config, &session.headers).await {
+                Some((_, identity)) if identity.subject == session.subject => {}
+                _ => return,
+            }
+        }
+    }
 }
 
 async fn authorized_until(
@@ -435,7 +486,7 @@ async fn proxy(State(app): State<App>, request: Request) -> Response {
     }
 }
 
-async fn handle(app: &App, request: Request) -> Response {
+async fn handle(app: &App, mut request: Request) -> Response {
     let host = request
         .headers()
         .get("host")
@@ -464,6 +515,14 @@ async fn handle(app: &App, request: Request) -> Response {
         };
         return (StatusCode::UNAUTHORIZED, login).into_response();
     };
+    if app.config.auth == Auth::Tailscale {
+        let session = TailnetSession {
+            config: app.config.clone(),
+            headers: request.headers().clone(),
+            subject: identity.subject.clone(),
+        };
+        request.extensions_mut().insert(session);
+    }
     if app.dashboard.is_some() && request.uri().path().starts_with("/api/ssh/") {
         if request
             .headers()
@@ -901,6 +960,7 @@ mod tests {
             team_domain: "test-team.cloudflareaccess.com".into(),
             audience: "test-audience".into(),
             allowed_emails: vec!["owner@example.test".into()],
+            allowed_capability: None,
             upstream,
             bootstrap_owner_email: None,
             node_owner_subject: None,
@@ -959,14 +1019,15 @@ mod tests {
 
     fn tailnet_config() -> Config {
         // Stand-in `tailscale whois --json ADDR`: two tailnet users, nothing else.
-        let dir = std::env::temp_dir().join(format!("ow-whois-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ow-whois-test-{}", crate::common::nonce().unwrap()));
         fs::create_dir_all(&dir).unwrap();
         let cli = dir.join("tailscale");
         fs::write(
             &cli,
             "#!/bin/sh\ncase \"$3\" in\n\
-             100.64.0.1) echo '{\"UserProfile\":{\"ID\":42,\"LoginName\":\"Owner@example.test\"}}' ;;\n\
-             100.64.0.2) echo '{\"UserProfile\":{\"ID\":43,\"LoginName\":\"stranger@example.test\"}}' ;;\n\
+             100.64.0.1) echo '{\"Node\":{},\"UserProfile\":{\"ID\":42,\"LoginName\":\"Owner@example.test\"}}' ;;\n\
+             100.64.0.2) echo '{\"Node\":{},\"UserProfile\":{\"ID\":43,\"LoginName\":\"stranger@example.test\"}}' ;;\n\
              *) exit 1 ;;\nesac\n",
         )
         .unwrap();
@@ -977,10 +1038,7 @@ mod tests {
             auth: Auth::Tailscale,
             team_domain: String::new(),
             audience: String::new(),
-            whois: Whois {
-                cli,
-                cache: Arc::default(),
-            },
+            whois: Whois { cli },
             ..config("http://127.0.0.1:1234".into())
         }
     }
@@ -1002,10 +1060,304 @@ mod tests {
         bad = tailnet_config();
         bad.allowed_emails.clear();
         assert!(bad.validate().is_err());
+        bad.allowed_capability = Some("example.test/cap/open-workspaces".into());
+        assert!(bad.validate().is_ok());
+        let parsed: Config = serde_json::from_value(json!({
+            "auth":"tailscale", "hostname":"box.example-net.ts.net",
+            "allowed_capability":"example.test/cap/open-workspaces", "upstream":"http://127.0.0.1:9/"
+        })).unwrap();
+        assert!(parsed.validate().is_ok());
+        for capability in [
+            "",
+            "cap",
+            "example.test/",
+            "https://example.test/cap",
+            "example.test/cap\nX=1",
+            "-bad.test/cap",
+        ] {
+            bad.allowed_capability = Some(capability.into());
+            assert!(bad.validate().is_err(), "{capability:?}");
+        }
+        bad.allowed_capability = Some("example.test/cap/open-workspaces".into());
+        bad.bootstrap_owner_email = Some("owner@example.test".into());
+        assert!(
+            bad.validate().is_err(),
+            "legacy migration still needs an explicitly allowed owner"
+        );
         // Access mode still needs its own settings.
         let mut access = config("http://127.0.0.1:1234".into());
+        access.allowed_capability = Some("example.test/cap/open-workspaces".into());
+        assert!(access.validate().is_err());
+        access.allowed_capability = None;
         access.audience.clear();
         assert!(access.validate().is_err());
+    }
+
+    fn capability_config() -> Config {
+        use std::os::unix::fs::PermissionsExt;
+        let mut cfg = tailnet_config();
+        cfg.allowed_emails.clear();
+        cfg.allowed_capability = Some("example.test/cap/open-workspaces".into());
+        fs::write(
+            &cfg.whois.cli,
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/$3.json\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cfg.whois.cli, fs::Permissions::from_mode(0o755)).unwrap();
+        cfg
+    }
+
+    fn whois_answer(cfg: &Config, answer: Value) {
+        fs::write(
+            cfg.whois.cli.parent().unwrap().join("100.64.0.1.json"),
+            answer.to_string(),
+        )
+        .unwrap();
+    }
+
+    fn capability_answer() -> Value {
+        json!({"Node":{"Tags":[]}, "UserProfile":{"ID":42,"LoginName":"owner@example.test"},
+            "CapMap":{"example.test/cap/open-workspaces":[{}]}})
+    }
+
+    fn tailnet_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "tailscale-user-login",
+            "owner@example.test".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-for", "100.64.0.1".parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn tailnet_capability_admission_denial_and_revocation() {
+        let cfg = capability_config();
+        let gateway = router(App {
+            dashboard: Some(PathBuf::from("/tmp/ow-no-worker-test")),
+            catalog: None,
+            config: cfg.clone(),
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set: JwkSet { keys: Vec::new() },
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        });
+        let request = || {
+            let mut req = Request::builder()
+                .uri("/")
+                .header("host", &cfg.hostname)
+                .body(Body::empty())
+                .unwrap();
+            req.headers_mut().extend(tailnet_headers());
+            // Capabilities in caller-supplied headers have no authority.
+            req.headers_mut().insert(
+                "tailscale-app-capabilities",
+                r#"{"example.test/cap/open-workspaces":[{}]}"#.parse().unwrap(),
+            );
+            req
+        };
+        whois_answer(&cfg, capability_answer());
+        assert_eq!(
+            gateway.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let (_, owner) = tailnet_identity(&cfg, &tailnet_headers()).await.unwrap();
+        assert_eq!(owner.subject, "42");
+        assert_eq!(owner.issuer, "tailscale://example-net.ts.net");
+        // Tailscale's PeerCapMap permits grants with no argument values (nil slices).
+        for values in [json!([]), Value::Null] {
+            let mut answer = capability_answer();
+            answer["CapMap"]["example.test/cap/open-workspaces"] = values;
+            whois_answer(&cfg, answer);
+            assert!(tailnet_identity(&cfg, &tailnet_headers()).await.is_some());
+        }
+        // Revocation affects the same running gateway and same headers, without a restart.
+        for answer in [
+            json!({"Node":{}, "UserProfile":{"ID":42,"LoginName":"owner@example.test"}}),
+            json!({"Node":{"CapMap":{"example.test/cap/open-workspaces":[{}]}}, "UserProfile":{"ID":42,"LoginName":"owner@example.test"}, "CapMap":{}}),
+            {
+                let mut a = capability_answer();
+                a["CapMap"] = json!({"other.test/cap/open-workspaces":[{}]});
+                a
+            },
+            {
+                let mut a = capability_answer();
+                a["Node"]["Tags"] = json!(["tag:device"]);
+                a
+            },
+            {
+                let mut a = capability_answer();
+                a["UserProfile"]["LoginName"] = json!("other@example.test");
+                a
+            },
+            {
+                let mut a = capability_answer();
+                a["UserProfile"]["ID"] = json!(0);
+                a
+            },
+            {
+                let mut a = capability_answer();
+                a["Node"] = Value::Null;
+                a
+            },
+            {
+                let mut a = capability_answer();
+                a["CapMap"] = json!("invalid");
+                a
+            },
+            {
+                let mut a = capability_answer();
+                a["CapMap"]["example.test/cap/open-workspaces"] = json!(true);
+                a
+            },
+        ] {
+            whois_answer(&cfg, answer);
+            assert_eq!(
+                gateway.clone().oneshot(request()).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        whois_answer(&cfg, capability_answer());
+        assert_eq!(
+            gateway.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let mut reassigned = capability_answer();
+        reassigned["UserProfile"]["ID"] = json!(99);
+        whois_answer(&cfg, reassigned);
+        let (_, replacement) = tailnet_identity(&cfg, &tailnet_headers()).await.unwrap();
+        assert_ne!(owner.subject, replacement.subject);
+        // Email admission remains an independent fallback, but never admits tagged devices.
+        let mut fallback = cfg.clone();
+        fallback.allowed_emails.push(owner.email);
+        let mut answer = capability_answer();
+        answer["CapMap"] = Value::Null;
+        whois_answer(&cfg, answer.clone());
+        assert!(
+            tailnet_identity(&fallback, &tailnet_headers())
+                .await
+                .is_some()
+        );
+        answer["Node"]["Tags"] = json!(["tag:device"]);
+        whois_answer(&cfg, answer);
+        assert!(
+            tailnet_identity(&fallback, &tailnet_headers())
+                .await
+                .is_none()
+        );
+        fs::remove_file(cfg.whois.cli.parent().unwrap().join("100.64.0.1.json")).unwrap();
+        assert!(tailnet_identity(&cfg, &tailnet_headers()).await.is_none());
+        fs::remove_dir_all(cfg.whois.cli.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tailnet_revocation_closes_an_owned_live_terminal() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut cfg = capability_config();
+        whois_answer(&cfg, capability_answer());
+        let root = cfg.whois.cli.parent().unwrap().join("data");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(root.join("control.sock")).unwrap();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = crate::wire::line(&mut stream).unwrap();
+                let result = match req["op"].as_str().unwrap() {
+                    "list" => {
+                        json!([{"id":"legacy","state":"running","memory_mib":256,"vcpu_count":1,"image":"alpine"}])
+                    }
+                    "snapshots" => json!([]),
+                    "terminal" => json!({}),
+                    other => panic!("unexpected worker call: {other}"),
+                };
+                crate::wire::send(&mut stream, &json!({"ok":true,"result":result})).unwrap();
+                if req["op"] == "terminal" {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(40)))
+                        .unwrap();
+                    let mut sink = [0; 4096];
+                    while std::io::Read::read(&mut stream, &mut sink).is_ok_and(|n| n > 0) {}
+                }
+            }
+        });
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("localhost:{}", tcp.local_addr().unwrap().port());
+        cfg.hostname = host.clone();
+        let mut catalog =
+            crate::catalog::Catalog::open(&root, &cfg.issuer(), Some("owner@example.test"))
+                .unwrap();
+        let (_, identity) = tailnet_identity(&cfg, &tailnet_headers()).await.unwrap();
+        let owner = catalog.user(&identity).unwrap();
+        assert!(catalog.terminal_id(owner, "legacy").is_ok());
+        // Another capability-bearing user cannot inherit the first user's resources.
+        let mut other = identity.clone();
+        other.subject = "43".into();
+        other.email = "other@example.test".into();
+        let other = catalog.user(&other).unwrap();
+        assert!(catalog.terminal_id(other, "legacy").is_err());
+        let gateway = router(App {
+            dashboard: Some(root.clone()),
+            catalog: Some(Arc::new(std::sync::Mutex::new(catalog))),
+            config: cfg.clone(),
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set: JwkSet { keys: Vec::new() },
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        });
+        let server = tokio::spawn(async move { axum::serve(tcp, gateway).await });
+        let socket = tokio::task::spawn_blocking(move || {
+            use tungstenite::client::IntoClientRequest;
+            let mut request = format!("ws://{host}/api/terminal/legacy")
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().extend(tailnet_headers());
+            request
+                .headers_mut()
+                .insert("origin", format!("https://{host}").parse().unwrap());
+            let (socket, _) = tungstenite::connect(request).unwrap();
+            socket
+        })
+        .await
+        .unwrap();
+        let mut revoked = capability_answer();
+        revoked["CapMap"] = json!({});
+        whois_answer(&cfg, revoked);
+        assert!(tailnet_identity(&cfg, &tailnet_headers()).await.is_none());
+        tokio::time::timeout(
+            Duration::from_secs(36),
+            tokio::task::spawn_blocking(move || {
+                let mut socket = socket;
+                if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(35)))
+                        .unwrap();
+                }
+                loop {
+                    match socket.read() {
+                        Ok(tungstenite::Message::Close(_)) => break,
+                        Ok(_) => {}
+                        Err(
+                            tungstenite::Error::ConnectionClosed
+                            | tungstenite::Error::AlreadyClosed,
+                        ) => break,
+                        Err(error) => {
+                            panic!("stream did not close cleanly after revocation: {error}")
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+        worker.join().unwrap();
+        fs::remove_dir_all(cfg.whois.cli.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]

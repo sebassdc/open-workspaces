@@ -67,7 +67,39 @@ class Render(unittest.TestCase):
         prepare = self.files["/usr/local/lib/open-workspaces/dashboard-prepare"]
         self.assertIn("tailscale serve --bg http://127.0.0.1:8787", prepare)
         self.assertNotIn("funnel", prepare)
-        self.assertEqual(self.files["/etc/open-workspaces/dashboard.env"], "OW_DASHBOARD_LOGINS=you@example.com\n")
+        self.assertEqual(self.files["/etc/open-workspaces/dashboard.env"], "OW_DASHBOARD_LOGINS=you@example.com\nOW_DASHBOARD_CAPABILITY=\n")
+
+    def test_capability_alone_enables_dashboard_and_changes_only_dashboard_config(self):
+        c = config(dashboard={"capability": "example.test/cap/open-workspaces"})
+        self.assertEqual(c["dashboard"], {"logins": [], "capability": "example.test/cap/open-workspaces"})
+        files = {k: v[0] for k, v in h.render(c, BUDGET).items()}
+        self.assertIn("OW_DASHBOARD_LOGINS=\nOW_DASHBOARD_CAPABILITY=example.test/cap/open-workspaces\n",
+                      files["/etc/open-workspaces/dashboard.env"])
+        changed = {path for path in files if files[path] != self.files[path]}
+        self.assertEqual(changed, {"/etc/open-workspaces/dashboard.env"})
+        self.assertEqual(h.units_changed(changed), {"dashboard"})
+
+    def test_dashboard_prepare_writes_capability_only_and_email_configs(self):
+        import json
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Run the real shell/Python generator with a private path and local tool stand-ins.
+            script = self.files["/usr/local/lib/open-workspaces/dashboard-prepare"].replace(
+                "/srv/ow/.ow/dashboard.json", str(root / "dashboard.json"))
+            (root / "tailscale").write_text('#!/bin/sh\n[ "$1" != status ] || echo \'{"BackendState":"Running","Self":{"DNSName":"host.example.ts.net."}}\'\n')
+            (root / "runuser").write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+            for tool in ("tailscale", "runuser"):
+                (root / tool).chmod(0o755)
+            for logins, capability in [("", "example.test/cap/open-workspaces"), ("you@example.com", ""),
+                                       ("you@example.com", "example.test/cap/open-workspaces")]:
+                subprocess.run(["bash", "-c", script], check=True, capture_output=True,
+                               env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}",
+                                    "OW_DASHBOARD_LOGINS": logins, "OW_DASHBOARD_CAPABILITY": capability})
+                output = json.loads((root / "dashboard.json").read_text())
+                self.assertEqual(output["allowed_emails"], logins.split(",") if logins else [])
+                self.assertEqual(output.get("allowed_capability", ""), capability)
+                self.assertEqual((root / "dashboard.json").stat().st_mode & 0o777, 0o600)
 
     def test_optional_features_render_only_when_configured(self):
         bare = h.render(config(dashboard={"logins": []}, developerImages=[], backup={"url": ""}), BUDGET)
@@ -113,6 +145,14 @@ class Render(unittest.TestCase):
 
 
 class Validate(unittest.TestCase):
+    def test_capability_is_validated_and_requires_tailnet(self):
+        for bad in ["no-domain", "example.test/", "https://example.test/cap", "example.test/cap\nX=1",
+                    "-bad.test/cap", "example.test/" + "a" * 512, 42]:
+            with self.assertRaisesRegex(Refused, "dashboard.capability"):
+                config(dashboard={"capability": bad})
+        with self.assertRaisesRegex(Refused, "need tailscale"):
+            config(dashboard={"capability": "example.test/cap/open-workspaces"}, tailscale__secretArn="")
+
     def test_bad_values_are_refused(self):
         for key, value in [("dashboard__logins", ["no-at-sign"]), ("dashboard__logins", ["$(id)@x"]),
                            ("developerImages", ["arch"]), ("backup__url", "s3://b/ow"),

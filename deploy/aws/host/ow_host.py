@@ -190,11 +190,21 @@ def validate(config):
                 or not tailscale["secretArn"]):
             raise Refused("config: tailscale.direct needs a MAC and tailscale.secretArn")
     logins = (config.get("dashboard") or {}).get("logins") or []
+    capability = (config.get("dashboard") or {}).get("capability", "")
+    if not isinstance(capability, str):
+        raise Refused("config: dashboard.capability must be domain/path")
+    if capability:
+        domain, _, path = capability.partition("/")
+        if (len(capability) > 512 or len(domain) > 253 or "." not in domain
+                or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part)
+                           for part in domain.split("."))
+                or not re.fullmatch(r"[A-Za-z0-9._/-]+", path)):
+            raise Refused("config: dashboard.capability must be domain/path (at most 512 characters)")
     for login in logins:
         if not isinstance(login, str) or not LOGIN.match(login) or len(login) > 254:
             raise Refused(f"config: invalid dashboard login {login!r}")
-    if logins and not tailscale["secretArn"]:
-        raise Refused("config: dashboard logins need tailscale.secretArn (the dashboard is served over the tailnet only)")
+    if (logins or capability) and not tailscale["secretArn"]:
+        raise Refused("config: dashboard logins/capability need tailscale.secretArn (the dashboard is served over the tailnet only)")
     images = config.get("developerImages") or []
     if any(image != "ubuntu" for image in images):
         raise Refused(f"config: developerImages takes ubuntu, not {images!r}")
@@ -217,15 +227,15 @@ def validate(config):
             raise Refused("config: runner.joinSecretArn is not a Secrets Manager secret ARN")
         if not tailscale["secretArn"]:
             raise Refused("config: a runner reaches its controller over the tailnet: tailscale.secretArn is required")
-        if logins:
-            raise Refused("config: a runner has no dashboard (it runs no controller): drop dashboard.logins")
+        if logins or capability:
+            raise Refused("config: a runner has no dashboard (it runs no controller): drop dashboard.logins/capability")
         extra["runner"] = {key: runner[key] for key in ("node", "controller", "joinSecretArn")}
     return {
         "schema": 1,
         "role": role,
         "release": {"repository": release["repository"], "ref": release["ref"]},
         "tailscale": tailscale,
-        "dashboard": {"logins": list(logins)},
+        "dashboard": {"logins": list(logins), **({"capability": capability} if capability else {})},
         "developerImages": sorted(set(images)),
         "backup": backup,
         "idleMinutes": idle,
@@ -367,8 +377,10 @@ profile open-workspaces /srv/ow/{releases/*/bin,build/target/release}/ow flags=(
         0o644,
     )
     logins = config["dashboard"]["logins"]
-    if logins:
-        files["/etc/open-workspaces/dashboard.env"] = (f"OW_DASHBOARD_LOGINS={','.join(logins)}\n", 0o644)
+    capability = config["dashboard"].get("capability", "")
+    if logins or capability:
+        files["/etc/open-workspaces/dashboard.env"] = (
+            f"OW_DASHBOARD_LOGINS={','.join(logins)}\nOW_DASHBOARD_CAPABILITY={capability}\n", 0o644)
         files["/usr/local/lib/open-workspaces/dashboard-prepare"] = ((HERE / "files/dashboard-prepare").read_text(), 0o755)
         files["/etc/systemd/system/open-workspaces-dashboard.service"] = (
             f"""[Unit]

@@ -104,6 +104,7 @@ test("a runner's name is its node ID, and it needs the tailnet and no dashboard"
     assert.equal(hostConfig(base).role, "runner");
     assert.throws(() => hostConfig({ ...base, tailscaleAuthKeySecretArn: "" }), /needs tailscaleAuthKeySecretArn/);
     assert.throws(() => hostConfig({ ...base, dashboardLogins: ["you@example.com"] }), /no dashboard/);
+    assert.throws(() => hostConfig({ ...base, dashboardCapability: "example.test/cap/open-workspaces" }), /no dashboard/);
     assert.equal(hostConfig({ ...base, runner: undefined }).runner, undefined);
 });
 

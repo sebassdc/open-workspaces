@@ -31,6 +31,7 @@ pub async fn upgrade(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let (mut parts, _) = request.into_parts();
+    let session = parts.extensions.remove::<crate::remote::TailnetSession>();
     let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
         Ok(w) => w,
         Err(e) => return e.into_response(),
@@ -69,7 +70,7 @@ pub async fn upgrade(
         .max_frame_size(16384)
         .write_buffer_size(0)
         .max_write_buffer_size(65536)
-        .on_upgrade(move |socket| relay(socket, stream, expires, permit, revoked))
+        .on_upgrade(move |socket| relay(socket, stream, expires, permit, revoked, session))
 }
 async fn relay(
     mut socket: WebSocket,
@@ -77,7 +78,10 @@ async fn relay(
     expires: u64,
     _permit: OwnedSemaphorePermit,
     revoked: Arc<Notify>,
+    session: Option<crate::remote::TailnetSession>,
 ) {
+    let admission = crate::remote::TailnetSession::revoked(session);
+    tokio::pin!(admission);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -91,6 +95,7 @@ async fn relay(
         tokio::select! {
             _=&mut deadline=>break,
             _=revoked.notified()=>break,
+            _=&mut admission=>break,
             _=tick.tick()=>{if active.elapsed()>Duration::from_secs(90){break;}if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Ping(Vec::new().into()))).await,Ok(Ok(()))){break;}}
             message=socket.recv()=>{
                 match message {
