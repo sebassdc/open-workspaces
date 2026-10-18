@@ -9,7 +9,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub use crate::common::{nonce, shell_quote};
@@ -305,8 +305,15 @@ impl Vm {
             "mem_backend":{"backend_path":snapshot.join("memory"),"backend_type":"File"},
             "network_overrides":[{"iface_id":"net1","host_dev_name":self.tap}],"resume_vm":false,"clock_realtime":true}),
         )?;
+        self.resume()
+    }
+
+    fn resume(&mut self) -> Result<()> {
         self.api("PATCH", "/vm", json!({"state":"Resumed"}))?;
-        self.checked("true")?;
+        // A restored guest may retain snapshot wall time despite clock_realtime.
+        let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        self.checked(&format!("date -u -s '@{seconds}' >/dev/null"))
+            .context("synchronizing guest clock after resume")?;
         Ok(())
     }
 
@@ -339,7 +346,7 @@ impl Vm {
         if captured.is_ok() && !resume {
             return Ok(());
         }
-        let resumed = self.api("PATCH", "/vm", json!({"state":"Resumed"}));
+        let resumed = self.resume();
         captured?;
         resumed
     }
@@ -361,5 +368,168 @@ impl Drop for Vm {
         if let Ok(index) = self.tap.trim_start_matches("ow").parse() {
             crate::network::unregister(index);
         }
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::net::{UnixListener, UnixStream},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    // Exercise the real API + management-serial path without changing the test host's clock.
+    fn clock_after_resume(capture_failure: bool, date_exit: i32) {
+        let root = std::env::temp_dir().join(format!("ow-clock-{}", nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let socket = root.join("api.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let api = std::thread::spawn(move || {
+            let endpoints = if capture_failure {
+                vec!["/vm", "/snapshot/create", "/vm"]
+            } else {
+                vec!["/snapshot/load", "/vm"]
+            };
+            for endpoint in endpoints {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.split_whitespace().nth(1), Some(endpoint));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                if endpoint == "/snapshot/load" {
+                    assert_eq!(body["clock_realtime"], true);
+                    assert_eq!(body["resume_vm"], false);
+                }
+                let status = if endpoint == "/snapshot/create" {
+                    "500 Failed"
+                } else {
+                    "204 No Content"
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        let initial = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 17 * 60;
+        let clock = Arc::new(AtomicU64::new(initial));
+        let guest_clock = clock.clone();
+        let (master, guest) = UnixStream::pair().unwrap();
+        guest
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let guest = std::thread::spawn(move || {
+            let mut serial = BufReader::new(guest);
+            for _ in 0..if capture_failure { 2 } else { 1 } {
+                let mut line = String::new();
+                serial.read_line(&mut line).unwrap();
+                let command = line.split_once("; ow_rc=").unwrap().0;
+                let code = if let Some(time) = command.strip_prefix("date -u -s '@") {
+                    let seconds = time.split_once('\'').unwrap().0.parse::<u64>().unwrap();
+                    if date_exit == 0 {
+                        guest_clock.store(seconds, Ordering::SeqCst);
+                    }
+                    date_exit
+                } else {
+                    assert!(command == "sync" || command == "true");
+                    0
+                };
+                let suffix = line
+                    .split_once("OW_DONE_")
+                    .unwrap()
+                    .1
+                    .split(':')
+                    .next()
+                    .unwrap();
+                let marker = format!("OW_DONE_{suffix}");
+                write!(serial.get_mut(), "\n{marker}:{code}:{marker}\n").unwrap();
+            }
+        });
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut vm = Vm {
+            child,
+            master: std::os::fd::OwnedFd::from(master).into(),
+            log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
+            diagnostics: None,
+            buffer: Vec::new(),
+            socket,
+            tap: "clock-fixture-no-host-interface".into(),
+            address: String::new(),
+        };
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let result = if capture_failure {
+            vm.capture(&root, &root.join("disk.ext4"), true)
+        } else {
+            vm.restore(&root)
+        };
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if capture_failure {
+            assert!(result.unwrap_err().to_string().contains("/snapshot/create"));
+        } else if date_exit != 0 {
+            assert!(format!("{:#}", result.unwrap_err()).contains("synchronizing guest clock"));
+        } else {
+            result.unwrap();
+        }
+        let current = clock.load(Ordering::SeqCst);
+        if date_exit == 0 {
+            assert!(
+                (before..=after).contains(&current),
+                "stale guest clock {current}"
+            );
+        } else {
+            assert_eq!(current, initial);
+        }
+        drop(vm);
+        guest.join().unwrap();
+        api.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_resyncs_a_guest_seventeen_minutes_behind() {
+        clock_after_resume(false, 0);
+    }
+
+    #[test]
+    fn restore_rejects_a_failed_guest_clock_update() {
+        clock_after_resume(false, 1);
+    }
+
+    #[test]
+    fn failed_capture_still_resyncs_the_resumed_parent() {
+        clock_after_resume(true, 0);
     }
 }
