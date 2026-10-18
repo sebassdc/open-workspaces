@@ -618,7 +618,7 @@ def tailscale(config, old=None):
         run(["curl", "-fsSL", f"https://pkgs.tailscale.com/stable/ubuntu/{codename}.tailscale-keyring.list",
              "-o", "/etc/apt/sources.list.d/tailscale.list"])
         run(["apt-get", "update", "-q"])
-        run(["apt-get", "install", "-y", "-q", "tailscale"])
+        run(["apt-get", "-o", "DPkg::Lock::Timeout=300", "install", "-y", "-q", "tailscale"])
     ssh = "true" if ts["ssh"] else "false"
     state = tailscale_status().get("BackendState", "")
     for _ in range(30):
