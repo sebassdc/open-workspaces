@@ -17,6 +17,9 @@ fi
 "$CARGO_HOME/bin/rustup" toolchain install 1.97.0 --profile minimal
 "$CARGO_HOME/bin/rustup" target add --toolchain 1.97.0 x86_64-unknown-linux-musl
 bash experiments/runtime-spike/fetch-firecracker.sh
+# The pinned guest kernel, also when a base image already exists (an upgrade's
+# asset set starts as a copy of the previous release's).
+python3 experiments/runtime-spike/prepare-guest.py --downloads-only
 if [[ ! -f data/runtime-spike/guest/base.ext4 ]]; then
   python3 experiments/runtime-spike/prepare-guest.py
 fi

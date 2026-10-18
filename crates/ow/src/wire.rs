@@ -7,6 +7,43 @@ use std::{
     time::Duration,
 };
 
+thread_local! {
+    /// The worker process this thread's requests must reach (set by a node agent job).
+    static WORKER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Binds this thread's worker connections to process `pid` (the worker whose status
+/// the agent checked), so a worker that replaced it in between is never driven.
+pub fn expect_worker(pid: Option<u32>) {
+    WORKER.with(|w| w.set(pid));
+}
+
+fn open(root: &Path) -> Result<UnixStream> {
+    let stream = UnixStream::connect(root.join("control.sock"))?;
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = WORKER.with(|w| w.get()) {
+        use std::os::fd::AsRawFd;
+        let mut peer = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                peer.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        ensure!(rc == 0, "worker peer credentials unavailable");
+        let peer = unsafe { peer.assume_init() }.pid as u32;
+        ensure!(
+            peer == pid,
+            "the worker changed (process {peer}, checked {pid}); retry"
+        );
+    }
+    Ok(stream)
+}
+
 pub fn line(stream: &mut UnixStream) -> Result<Value> {
     let mut bytes = Vec::new();
     use std::os::fd::AsRawFd;
@@ -67,7 +104,7 @@ pub fn connect_waiting(
     request: &Value,
     wait: Duration,
 ) -> Result<(UnixStream, Value)> {
-    let mut stream = UnixStream::connect(root.join("control.sock"))?;
+    let mut stream = open(root)?;
     stream.set_read_timeout(Some(wait))?;
     stream.set_write_timeout(Some(Duration::from_secs(120)))?;
     send(&mut stream, request)?;
@@ -103,7 +140,7 @@ pub fn response(result: anyhow::Result<Value>) -> Value {
 
 /// Preserve the worker error envelope so callers can distinguish a rejection from transport loss.
 pub fn request_envelope(root: &Path, request: &Value) -> Result<Value> {
-    let mut stream = UnixStream::connect(root.join("control.sock"))?;
+    let mut stream = open(root)?;
     stream.set_read_timeout(Some(reply_wait(request)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     send(&mut stream, request)?;
@@ -113,6 +150,40 @@ pub fn request_envelope(root: &Path, request: &Value) -> Result<Value> {
 #[cfg(test)]
 mod framing_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_job_reaches_only_the_worker_process_it_checked() {
+        let root = std::env::temp_dir().join(format!("ow-w-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(root.join("control.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = 0;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                if line(&mut stream).is_ok() {
+                    requests += 1;
+                    send(&mut stream, &json!({"ok":true,"result":"reached"})).unwrap();
+                }
+            }
+            requests
+        });
+        // Another process: refused before anything is sent.
+        expect_worker(Some(std::process::id() + 1));
+        let error = request(&root, json!({"op":"exec"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("the worker changed"), "{error}");
+        // The process that listens (this one): reached.
+        expect_worker(Some(std::process::id()));
+        assert_eq!(request(&root, json!({"op":"exec"})).unwrap(), "reached");
+        expect_worker(None);
+        assert_eq!(
+            server.join().unwrap(),
+            1,
+            "the refused connection sent nothing"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn captures_wait_longer_than_other_operations() {
         for op in ["hibernate", "snapshot", "fork"] {

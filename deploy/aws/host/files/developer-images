@@ -1,0 +1,29 @@
+#!/bin/bash
+# Builds each missing developer image (the dev user, SSH server, toolchains) in a
+# disposable microVM, then publishes it into the worker's live asset set. The
+# runner advertises it on its next heartbeat; nothing restarts.
+set -euo pipefail
+# The worker's release: its scripts match the asset set they write into.
+cd /srv/ow/run/worker/src
+guest=data/runtime-spike/guest
+for profile in "$@"; do
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("developer_user") else 1)' "$guest/$profile.json" 2>/dev/null; then
+    echo "$profile: developer image present"
+    continue
+  fi
+  if [[ ! -f $guest/$profile.ext4 ]]; then
+    rm -rf "$guest/$profile.tmp" "$guest"/build-"$profile"-*
+    # Its mkfs runs in a user namespace, which Ubuntu's AppArmor policy allows only
+    # under the open-workspaces profile.
+    aa-exec -p open-workspaces -- python3 experiments/runtime-spike/prepare-profiles.py "$profile"
+  fi
+  mkdir -p data/dev-images
+  out=data/dev-images/out-$profile-$(date +%s)
+  python3 experiments/guest-dev/build.py "$profile" --output-assets "$out"
+  # Boxes clone the image when created, so replacing it leaves existing boxes alone.
+  mv "$out/guest/$profile.ext4" "$guest/$profile.ext4"
+  mv "$out/guest/$profile.json" "$guest/$profile.json"
+  rm -rf "$out"
+  for build in data/dev-images/build-*; do [[ -f $build/result.json ]] && rm -rf "$build"; done
+  echo "$profile: developer image built"
+done

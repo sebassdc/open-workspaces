@@ -30,6 +30,25 @@ use tokio::{
 };
 
 const FRAME: usize = 65536;
+
+/// Set by `ow host up` on SIGTERM: the controller dispatches no new jobs and the
+/// process exits once BUSY (non-stream jobs the agent accepted) reaches zero.
+pub(crate) static STOPPING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub(crate) static BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// One accepted job, counted from its ID until its reply is sent (streams drop it early).
+struct Busy;
+impl Busy {
+    fn new() -> Self {
+        BUSY.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Busy
+    }
+}
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 const OFFLINE: i64 = 15;
 fn now() -> i64 {
     SystemTime::now()
@@ -58,8 +77,7 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     private(&path)?;
     let db = Connection::open(path)?;
     db.busy_timeout(Duration::from_secs(5))?;
-    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    ensure!(version <= 3, "catalog schema is newer than this binary");
+    readable(&db)?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY, credential_hash TEXT, revoked INTEGER NOT NULL DEFAULT 0, heartbeat INTEGER NOT NULL DEFAULT 0, memory_mib INTEGER NOT NULL, slots INTEGER NOT NULL, capabilities TEXT NOT NULL DEFAULT '{}', session TEXT);
       CREATE TABLE IF NOT EXISTS node_joins(secret_hash TEXT PRIMARY KEY, node TEXT NOT NULL REFERENCES nodes(id), expires INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);")?;
@@ -68,6 +86,33 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS node_capacity_limits(node TEXT PRIMARY KEY REFERENCES nodes(id), vcpu_cap INTEGER NOT NULL CHECK(vcpu_cap BETWEEN 1 AND 64));")?;
     Ok(db)
 }
+/// Catalog schema this binary writes (`PRAGMA user_version`).
+pub(crate) const SCHEMA: i64 = 3;
+
+/// A binary opens a catalog it can use safely: not newer than SCHEMA, or newer but
+/// declared readable by SCHEMA through `settings.min_reader_schema`, which every
+/// migration sets to the oldest schema whose binaries may still read and write it.
+pub(crate) fn readable(db: &Connection) -> Result<()> {
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version <= SCHEMA {
+        return Ok(());
+    }
+    let floor: Option<i64> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key='min_reader_schema'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .and_then(|v| v.parse().ok());
+    ensure!(
+        floor.is_some_and(|f| f <= SCHEMA),
+        "catalog schema {version} needs a newer binary (this one reads up to {SCHEMA})"
+    );
+    Ok(())
+}
+
 pub(crate) fn private(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
     ensure!(
@@ -472,7 +517,12 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             msg=socket.recv()=>{
                 match msg {Some(Ok(Message::Text(text)))=>{
                     let Ok(v)=serde_json::from_str::<Value>(&text) else {break;};
-                    if common::node_capabilities(&v).is_err() {break;}
+                    if let Err(e)=common::node_capabilities(&v) {
+                        // Say why, so a runner newer than this controller logs it instead of retrying blind.
+                        let reason:String=format!("{e:#}").chars().take(120).collect();
+                        let _=tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code:4001,reason:reason.into()})))).await;
+                        break;
+                    }
                     last=tokio::time::Instant::now();
                     if !c.root.join("nodes").join(&node).join("control.sock").exists(){continue;}
                     if let Ok(db)=db(&c.root)
@@ -527,6 +577,10 @@ async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) 
         "unauthorized proxy peer"
     );
     online(&c.root, &node)?;
+    ensure!(
+        !STOPPING.load(std::sync::atomic::Ordering::SeqCst),
+        "runner restarting; retry"
+    );
     let id = common::nonce()?;
     let (tx, rx) = oneshot::channel();
     let generation;
@@ -1024,11 +1078,12 @@ pub fn agent(
         .to_owned();
     ensure!(credential.len() == 64, "invalid credential file");
     let status = wire::request(root, json!({"op":"status"}))?;
+    // A worker outside this agent's protocol window is never driven or advertised.
+    common::worker_compatible(&status)?;
     let guided = root.join("host.json").exists();
-    let images = if guided {
-        crate::onboarding::verified_images(root)?
-    } else {
-        // Legacy unmanaged nodes retain their separately configured asset contract.
+    // Legacy unmanaged nodes retain their separately configured asset contract. Checked
+    // on every heartbeat, so a developer image built later shows without a restart.
+    let base_images = || {
         ["alpine", "arch", "ubuntu"]
             .into_iter()
             .filter(|image| {
@@ -1042,20 +1097,28 @@ pub fn agent(
             })
             .collect::<Vec<_>>()
     };
+    let images = if guided {
+        crate::onboarding::verified_images(root)?
+    } else {
+        base_images()
+    };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
     #[cfg(target_os = "linux")]
-    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":"firecracker-v1.17.0","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true});
+    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true});
     #[cfg(target_os = "macos")]
-    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":1,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
+    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Worker status for the heartbeats, fetched on its own thread: the worker answers
     // one request at a time, so a long capture must not stall or end the heartbeats.
-    // None once the worker stops answering.
+    // None while the worker does not answer: the agent then sends no heartbeats (the
+    // runner shows offline) and waits for a worker to answer again, so the worker can
+    // restart (a runner upgrade) without the agent.
     let latest = Arc::new(std::sync::Mutex::new(Some(status.clone())));
     {
         let (latest, root) = (latest.clone(), root.to_owned());
         std::thread::spawn(move || {
+            let mut refused = false;
             loop {
                 let status = wire::connect_waiting(
                     &root,
@@ -1064,20 +1127,27 @@ pub fn agent(
                 )
                 .map(|(_, v)| v)
                 .ok();
-                let stopped = status.is_none();
+                let status = match status.map(|s| common::worker_compatible(&s).map(|()| s)) {
+                    Some(Err(e)) => {
+                        if !refused {
+                            eprintln!(
+                                "{e:#}; this runner stays offline until a compatible worker runs"
+                            );
+                        }
+                        refused = true;
+                        None
+                    }
+                    other => {
+                        refused = false;
+                        other.and_then(Result::ok)
+                    }
+                };
                 *latest.lock().unwrap() = status;
-                if stopped {
-                    break;
-                }
                 std::thread::sleep(Duration::from_secs(3));
             }
         });
     }
     loop {
-        ensure!(
-            latest.lock().unwrap().is_some(),
-            "local worker stopped; host participation ended"
-        );
         let result = (|| -> Result<()> {
             if guided {
                 channel_status(root, "connecting", &instance, None)?;
@@ -1086,14 +1156,29 @@ pub fn agent(
             timeout_socket(&ws)?;
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
             loop {
+                // Without a compatible worker the channel closes at once: the controller then
+                // sees this runner offline and dispatches nothing to it.
+                let status = latest
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .context("no compatible worker answers")?;
                 if heartbeat.elapsed() > Duration::from_secs(3) {
-                    let status = latest
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .context("local worker stopped")?;
                     // Golden images built since the agent started are advertised too.
                     let mut beat = hello.clone();
+                    if !guided && cfg!(target_os = "linux") {
+                        beat["images"] = json!(base_images());
+                        // A restarted worker may run with new limits.
+                        beat["memory_mib"] = status["max_memory_mib"].clone();
+                        beat["slots"] = status["max_running"].clone();
+                        beat["vcpus"] = status["max_vcpus"].clone();
+                    }
+                    // Optional fields (older controllers ignore them): releases for upgrade
+                    // health checks, and a drain the host upgrader declares.
+                    beat["version"] = json!(env!("CARGO_PKG_VERSION"));
+                    beat["worker"] =
+                        json!({"version":status["version"],"protocol":status["worker_protocol"]});
+                    beat["drain"] = json!(root.join("drain").exists());
                     if let Some(golden) = status["images"].as_array() {
                         beat["images"]
                             .as_array_mut()
@@ -1127,32 +1212,45 @@ pub fn agent(
                         {
                             continue;
                         }
-                        let (root, origin, node, credential, ca, active) = (
+                        let (root, origin, node, credential, ca, active, worker) = (
                             root.to_owned(),
                             origin.clone(),
                             node.clone(),
                             credential.clone(),
                             ca.map(Path::to_owned),
                             active.clone(),
+                            latest.clone(),
                         );
+                        let busy = Busy::new();
                         std::thread::spawn(move || {
-                            let _ =
-                                agent_job(&root, &origin, &node, &id, &credential, ca.as_deref());
+                            let _ = agent_job(
+                                &root,
+                                &origin,
+                                &node,
+                                &id,
+                                &credential,
+                                ca.as_deref(),
+                                busy,
+                                &worker,
+                            );
                             active.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
                     Ok(tungstenite::Message::Ping(v)) => ws.send(tungstenite::Message::Pong(v))?,
                     Ok(tungstenite::Message::Pong(_)) => {}
                     Err(e) if timed_out(&e) => {}
+                    Ok(tungstenite::Message::Close(Some(frame))) => {
+                        anyhow::bail!("controller closed the channel: {}", frame.reason)
+                    }
                     _ => anyhow::bail!("node channel closed"),
                 }
             }
         })();
-        if result.is_err() {
+        if let Err(e) = result {
             if guided {
                 let _ = channel_status(root, "disconnected", &instance, None);
             }
-            eprintln!("node channel disconnected; reconnecting");
+            eprintln!("node channel disconnected ({e:#}); reconnecting");
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -1164,6 +1262,8 @@ fn agent_job(
     id: &str,
     credential: &str,
     ca: Option<&Path>,
+    busy: Busy,
+    worker: &std::sync::Mutex<Option<Value>>,
 ) -> Result<()> {
     let mut socket = socket(origin, &format!("/job/{node}/{id}"), credential, ca)?;
     timeout_socket(&socket)?;
@@ -1212,6 +1312,18 @@ fn agent_job(
         .contains(&op),
         "unsupported node operation"
     );
+    // Only the worker process whose status passed the protocol check is driven; a job
+    // that finds none (or another process on the socket) is answered with an error.
+    let checked = worker.lock().unwrap().clone();
+    let Some(checked) = checked.filter(|s| common::worker_compatible(s).is_ok()) else {
+        let refusal = json!({"ok":false,"error":"no compatible worker on this runner; retry"});
+        socket.send(tungstenite::Message::Binary(
+            format!("{refusal}\n").into_bytes().into(),
+        ))?;
+        let _ = socket.close(None);
+        return Ok(());
+    };
+    wire::expect_worker(checked["worker_pid"].as_u64().map(|pid| pid as u32));
     if op != "terminal" && op != "ssh" {
         let response = journal_request(root, &request)?;
         let data = serde_json::to_vec(&response)?;
@@ -1223,6 +1335,8 @@ fn agent_job(
         let _ = socket.close(None);
         return Ok(());
     }
+    // Streams (terminal, SSH) end with the process; a graceful stop does not wait for them.
+    drop(busy);
     if op == "ssh" {
         ensure!(
             request

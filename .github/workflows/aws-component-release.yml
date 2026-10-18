@@ -4,9 +4,9 @@ name: aws-component-release
 on:
   push:
     branches: [main]
-    paths: [deploy/aws/**, Cargo.toml, Cargo.lock, crates/*/Cargo.toml]
+    paths: [deploy/aws/**, Cargo.toml, Cargo.lock, crates/**, release-impact.json, experiments/runtime-spike/**]
   pull_request:
-    paths: [deploy/aws/**, Cargo.toml, Cargo.lock, crates/*/Cargo.toml]
+    paths: [deploy/aws/**, Cargo.toml, Cargo.lock, crates/**, release-impact.json, experiments/runtime-spike/**]
 permissions:
   contents: write
 jobs:

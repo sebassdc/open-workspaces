@@ -10,11 +10,16 @@ What it creates:
   `cpuOptions.nestedVirtualization = enabled`, IMDSv2 required, hop limit 1,
   and an encrypted gp3 root disk;
 - a security group with **no inbound rules** (egress only);
-- an IAM role and instance profile with `AmazonSSMManagedInstanceCore` only,
-  plus `secretsmanager:GetSecretValue` on the one Tailscale secret when given;
+- an IAM role and instance profile with `AmazonSSMManagedInstanceCore`,
+  `ssm:GetParameter` on the host's own config parameter, and
+  `secretsmanager:GetSecretValue` on the one Tailscale secret when given;
+- an SSM String parameter `/open-workspaces/NAME/config` with everything the
+  host applies in place (release, Tailscale, dashboard logins, images, backups,
+  idle minutes). User data only bootstraps, so changing any of these updates the
+  parameter and never replaces the instance;
 - a separate encrypted gp3 volume formatted Btrfs and mounted at `/srv/ow`.
-  It holds the sources, runtime assets and workspaces, and survives host
-  replacement (a new AMI or `ref` replaces the instance, not the volume).
+  It holds the sources, releases, runtime assets and workspaces, and survives
+  host replacement (a new AMI or stage 0 replaces the instance, not the volume).
 
 Every resource gets the `tags` input plus `Name`.
 
@@ -29,11 +34,13 @@ Versions are this repository's git tags (`vX.Y.Z`). When a new
 `deploy/aws/package.json` version reaches `main`, the `aws-component-release`
 workflow runs the checks and creates that tag. Bump `version` in the root
 `Cargo.toml` and `Cargo.lock` with it (`cargo update --workspace`) so `ow --version`
-reports the release; the checks fail while they disagree. The same tag is the default
-`ref` the host builds, so set `ref` explicitly before the first release exists.
+reports the release, and add the release's entry to
+[`release-impact.json`](../../docs/UPGRADES.md#release-impact-manifest); the
+checks fail while they disagree. The same tag is the default `ref` the host
+builds, so set `ref` explicitly before the first release exists.
 
 ```bash
-pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.4.1
+pulumi package add https://github.com/sebassdc/open-workspaces/deploy/aws@v0.5.0
 ```
 
 ```typescript
@@ -54,17 +61,24 @@ export const instanceId = host.instanceId;
 | `associatePublicIpAddress` | `true` | Egress without a NAT gateway; still no inbound rules. Use `false` with a private subnet that has NAT. |
 | `amiId` | Canonical Ubuntu 24.04 x86-64 from SSM | Pin it to avoid host replacement when Canonical publishes a new image. |
 | `dataVolumeSizeGib` | `100` | Btrfs volume at `/srv/ow`. |
-| `repository` / `ref` | upstream repo / this package's tag | The host builds this ref from source on first boot. |
+| `repository` / `ref` | upstream repo / this package's tag | The release the host builds and runs; a change is applied in place by `ow-host upgrade` (see below). |
 | `tags` | `{}` | Applied to every resource. |
 | `tailscaleAuthKeySecretArn` | none | Full secret ARN; the secret string is the raw auth key. |
 | `tailscaleHostname` | component name | |
 | `tailscaleSsh` | `false` | Tailscale SSH, authorized by your tailnet policy. |
 | `dashboardLogins` | none | Tailnet logins allowed into the web dashboard. Needs `tailscaleAuthKeySecretArn`; see below. |
 | `developerImages` | none | `["ubuntu"]`: build the [developer image](../../docs/GUEST_IMAGES.md) (user `dev`, SSH server, toolchains) after boot. SSH into boxes and golden-image recipes need it. |
-| `backupUrl` | none | `s3://bucket/prefix`: install the AWS CLI and `ow-backup`, and let the host role list, read and add objects under the prefix (never delete). See below. |
+| `backupUrl` | none | `s3://bucket/prefix`: install `ow-backup`, and let the host role list, read and add objects under the prefix (never delete). See below. |
+| `backupSchedule` | none | When `ow-backup` runs, as a systemd calendar expression (`*-*-* 01:00:00 UTC`); the host installs a timer. Needs `backupUrl`. |
+| `idleMinutes` | `30` | A box idle this long hibernates and wakes on its next connection; `0` turns it off. |
 
 Outputs: `instanceId`, `privateIp`, `availabilityZone`, `dataVolumeId`,
-`roleName`, `securityGroupId`.
+`roleName`, `securityGroupId`, `configParameter`.
+
+Every input except `instanceType`, `subnetId`, `associatePublicIpAddress`,
+`amiId`, `dataVolumeSizeGib` and `tags` lives in the config parameter. After
+`pulumi up` changes it, apply it with `ow-aws apply` (or `ci-post-up`, which also
+upgrades); the host keeps the last applied copy on its data volume.
 
 ## Reach the host
 
@@ -78,16 +92,19 @@ sudo ow create my-box && sudo ow shell my-box
 sudo ow node add ssh://dev@build-box   # another KVM machine as a runner
 ```
 
-The service runs [`ow host up`](../../docs/SINGLE_HOST.md): the controller plus
-a local runner whose budget is three quarters of the instance RAM, all vCPUs
-and 8 running machines. Controller state lives in `/srv/ow/.ow`. The controller
+Two units run [single-host mode](../../docs/SINGLE_HOST.md):
+`open-workspaces-worker.service` (`ow supervisor`: the worker and its VMs) and
+`open-workspaces.service` (`ow host up --external-worker`: the controller and
+the local runner's agent). Restarting the second leaves the VMs running. The
+runner's budget is three quarters of the instance RAM, all vCPUs and 8 running
+machines. Controller state lives in `/srv/ow/.ow`. The controller
 listens on the host's Tailscale address (port 8790) when Tailscale is up, and on
 loopback only otherwise. It picks the address at start, so the service waits up
 to 60 s for Tailscale to connect first (after a reboot, for example). Workspace commands through the wrapper go to the local
 runner (`/srv/ow/.ow/runner`); `node add` needs SSH access from the `ow` user.
-Boxes idle for 30 minutes hibernate and wake on the next connection; see
-[wake on connect](../../docs/DAILY_USE.md). Stopping the service (a restart, a
-reboot, an instance stop or a host replacement) runs `ow down --hibernate`:
+Boxes idle for `idleMinutes` (30) hibernate and wake on the next connection; see
+[wake on connect](../../docs/DAILY_USE.md). Stopping the worker unit (a worker
+restart, a reboot, an instance stop or a host replacement) runs `ow down --hibernate`:
 the worker refuses new starts and wakes, hibernates the running boxes, then
 stops, so their processes carry on when they next wake. If a box stays running
 (its capture failed), `ow down --hibernate` allows starts again, leaves the
@@ -95,16 +112,16 @@ worker running and exits non-zero; systemd then still stops the service, so on
 this path that box is cold-stopped and the failure is in the journal. EC2 does not promise an instance stop that long a
 shutdown window (captures run one at a time, about 25 s per 1 GiB box), so for
 planned stops and replacements stop the service first and wait for it
-(`sudo systemctl stop open-workspaces`, for example from an SSM Automation
-before `StopInstances`); the hook on the way down is the fallback. A box hibernated on a host with another kernel or
+(`ow-aws stop`, or `sudo systemctl stop open-workspaces-worker` before
+`StopInstances`); the hook on the way down is the fallback. A box hibernated on a host with another kernel or
 CPU (after a new AMI, say) boots its hibernated disk cold when it next starts.
 
 With Tailscale, the host joins your tailnet under `tailscaleHostname`. The
 auth key is read once at boot into a root-only file under `/run`, passed to
 `tailscale up` by file reference and deleted. A failed join does not fail the
 bootstrap; SSM keeps working. The Tailscale state (`/var/lib/tailscale`) is kept
-on the data volume, so a replaced host (new AMI or `ref`) comes back as the same
-tailnet device, with the same name and address.
+on the data volume, so a replaced host (new AMI or stage 0) comes back as the
+same tailnet device, with the same name and address.
 
 ## Dashboard over the tailnet
 
@@ -119,15 +136,15 @@ the runners.
 
 ## Backups to S3
 
-With `backupUrl`, the host gets the AWS CLI v2 and `/usr/local/bin/ow-backup`
-(run it as root). It copies the controller catalog (`ow backup catalog`) to
+With `backupUrl`, the host gets `/usr/local/bin/ow-backup` (run it as root;
+with `backupSchedule` a timer runs it). It copies the controller catalog (`ow backup catalog`) to
 `PREFIX/catalog/catalog-UTCSTAMP.sqlite3`, then uploads every sealed snapshot
 the store lacks (`ow backup snapshots`) to `PREFIX/snapshots/`, hibernated
 boxes' captures included. It stops at the first failure and exits non-zero.
 
-Nothing runs it on its own: call it from your scheduler, best right after
-`ow down --hibernate` (for example before a nightly instance stop), when every
-running box is a sealed capture. A running box that was never snapshotted or
+Without `backupSchedule` nothing runs it on its own: call it from your
+scheduler, best right after `ow down --hibernate` (for example before a nightly
+instance stop), when every running box is a sealed capture. A running box that was never snapshotted or
 hibernated, and a stopped box, are not in the store.
 
 The host role may list the bucket under the prefix and get and put objects
@@ -155,27 +172,61 @@ captured it. A restored box is runner-local: reach it with
 
 ## Boot sequence
 
-User data (`bootstrap.sh`) runs once per instance:
+User data (`bootstrap.sh`, stage 0) runs once per instance:
 
-1. installs build and host packages;
+1. installs host packages and the AWS CLI v2;
 2. waits for the data volume, formats it Btrfs only if it is blank, mounts it,
-   and optionally joins Tailscale with its state on that volume;
-3. creates the `ow` system user (member of `kvm`) and an AppArmor profile that
-   lets only the `ow` binary create user namespaces (Ubuntu restricts them);
-4. clones `repository`, checks out `ref` and runs `scripts/setup-local.sh`
-   (pinned Rust, Firecracker and guest assets, then a release build);
-5. installs `/usr/local/bin/ow`, starts `open-workspaces.service`
-   (`ow host up`) and waits until the controller reports its runner online;
-6. with `developerImages`, starts `open-workspaces-images.service`, which builds
-   each missing developer image in a disposable microVM (10-20 minutes) and then
-   publishes it under the built-in name (`ow create --image ubuntu`). It runs
-   once per data volume and retries at the next boot if it failed;
-7. with `backupUrl`, installs the AWS CLI v2 and `ow-backup`.
+   and bind-mounts the Tailscale state from it;
+3. creates the `ow` system user (member of `kvm`);
+4. fetches the config parameter (keeping the last good copy on the volume),
+   clones `repository` into `/srv/ow/src` and checks out `ref`;
+5. runs that release's `deploy/aws/host/ow_host.py boot`, which stages the
+   release (`scripts/setup-local.sh`: pinned Rust, Firecracker and guest assets,
+   then a release build) into `/srv/ow/releases/`, pins every unit to it,
+   renders the units and files (an AppArmor profile lets only release binaries
+   create user namespaces), joins Tailscale, starts the worker, the control
+   plane and the dashboard, then the developer-image build and the backup
+   timer, and waits until the runner is online.
+
+A data volume from a 0.4.x host is taken over: its build output moves to the
+shared build directory and its assets (developer images included) seed the
+first release, so nothing is downloaded or rebuilt from scratch.
 
 Progress: `/var/log/open-workspaces-bootstrap.log`; state:
 `/var/lib/open-workspaces/bootstrap-status` (`running`, `failed` or
 `ok tailscale=...`). Building from source takes most of the boot time; see the
 [EC2 timings](../../docs/experiments/ec2-timings.md).
+
+## Upgrades in place
+
+Run on the host as root (`ow-aws upgrade` and `ow-aws ci-post-up` do it over SSM):
+
+```bash
+sudo ow-host upgrade --plan          # what the configured release would do; changes nothing
+sudo ow-host upgrade                 # the config's release.ref
+sudo ow-host upgrade v0.5.1 --max-class 1
+sudo ow-host status                  # pins per unit, pending restarts, last journal
+```
+
+It fetches the ref, plans from its `release-impact.json`, builds it next to the
+running releases, and moves only the units the release changed:
+
+- a control-plane release restarts `open-workspaces.service` and the dashboard;
+  boxes keep running (open SSH and terminal streams reconnect);
+- a runner release drains the runner, hibernates its boxes, swaps the worker
+  and wakes them; their processes continue;
+- a release that changes stage 0 is refused in place: hibernate the boxes
+  (`ow-aws ci-preflight`), then `pulumi up` replaces the host.
+
+It refuses a release whose guest kernel or runtime, or this host's CPU, would
+boot a box's capture cold (pass `--accept-cold` to accept that, after a backup
+when `backupUrl` is set) and a class above `--max-class` (default 2). Any
+failure before the pins move aborts (old worker up, boxes resumed); a failure
+after rolls the pins back and verifies the old releases. A journal in
+`/srv/ow/.ow/upgrade.json` lets the next run, or the next boot, finish or undo
+an interrupted upgrade (`sudo ow-host recover`). To go back, upgrade to the
+older tag. Details, rules and the sandbox measurements:
+[docs/UPGRADES.md](../../docs/UPGRADES.md).
 
 ## Smoke test
 
@@ -203,7 +254,8 @@ the run and the stack is still destroyed.
 
 - Single host: controller and runner share the machine. A separate controller
   is a later phase.
-- The host builds from source on first boot; there are no prebuilt release
+- The host builds each release from source (first boot and every upgrade,
+  about 4 minutes incremental on 4 vCPUs); there are no prebuilt release
   binaries yet.
 - RAM checkpoints only restore on the same host kernel and CPU. Replacing the
   instance with a new AMI keeps disks; hibernated machines then boot their disk
@@ -211,4 +263,4 @@ the run and the stack is still destroyed.
 - Pulumi `destroy` deletes the data volume and every workspace on it. Protect
   the volume (`protect` resource option on the component) for long-lived hosts.
 
-Check: `npm run check` (type check, user-data, `ArtifactStore` and `ow-aws` tests, shellcheck when installed; Node 22.18+).
+Check: `npm run check` (type check, user-data, release manifest, `ArtifactStore` and `ow-aws` tests, shellcheck when installed, then the `ow-host` Python tests; Node 22.18+, Python 3.12+).

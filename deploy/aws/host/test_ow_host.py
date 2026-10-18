@@ -1,0 +1,265 @@
+"""Rendered units, config validation and setup, in a temporary root.
+
+Run: python3 -m unittest discover -s deploy/aws/host
+"""
+import copy
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ow_host as h  # noqa: E402
+from ow_host import Refused  # noqa: E402
+
+CONFIG = {
+    "schema": 1,
+    "role": "host",
+    "release": {"repository": "https://github.com/example/open-workspaces.git", "ref": "v0.5.0"},
+    "tailscale": {"secretArn": "arn:aws:secretsmanager:us-east-1:111122223333:secret:ow/ts-AbCdEf",
+                  "hostname": "ow-host", "ssh": False},
+    "dashboard": {"logins": ["you@example.com"]},
+    "developerImages": ["ubuntu"],
+    "backup": {"url": "s3://my-bucket/ow/host-1", "schedule": "*-*-* 01:00:00 UTC"},
+    "idleMinutes": 30,
+}
+BUDGET = {"memory": 11776, "cpus": 4, "slots": 8}
+
+
+def config(**changes):
+    c = copy.deepcopy(CONFIG)
+    for key, value in changes.items():
+        section, _, field = key.partition("__")
+        if field:
+            c[section][field] = value
+        else:
+            c[section] = value
+    return h.validate(c)
+
+
+class Render(unittest.TestCase):
+    def setUp(self):
+        self.files = {k: v[0] for k, v in h.render(config(), BUDGET).items()}
+
+    def test_worker_unit_hibernates_and_control_plane_never_takes_it_down(self):
+        worker = self.files["/etc/systemd/system/open-workspaces-worker.service"]
+        self.assertIn("ExecStart=/srv/ow/run/worker/bin/ow --data-dir /srv/ow/.ow/runner supervisor", worker)
+        self.assertIn("ExecStop=/srv/ow/run/worker/bin/ow --data-dir /srv/ow/.ow/runner down --hibernate", worker)
+        self.assertIn("TimeoutStopSec=900", worker)
+        cp = self.files["/etc/systemd/system/open-workspaces.service"]
+        self.assertIn("ExecStart=/srv/ow/run/agent/bin/ow host up --external-worker --memory 11776 --slots 8 --cpus 4", cp)
+        self.assertNotIn("ExecStop", cp)
+        self.assertIn("Wants=open-workspaces-worker.service", cp)
+        self.assertIn("After=open-workspaces-worker.service", cp)
+        for word in ("Requires=", "BindsTo=", "PartOf="):
+            self.assertNotIn(word, cp + worker, "a restart of one unit must not propagate to the other")
+        self.assertIn("ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet", cp)
+        env = self.files["/etc/open-workspaces/worker.env"]
+        self.assertIn("OW_ASSET_DIR=/srv/ow/run/worker/assets\n", env)
+        self.assertIn("OW_IDLE_HIBERNATE_SECS=1800\n", env)
+        self.assertIn("OW_MAX_MEMORY_MIB=11776\n", env)
+
+    def test_dashboard_stays_on_loopback_and_is_served_to_the_tailnet_only(self):
+        unit = self.files["/etc/systemd/system/open-workspaces-dashboard.service"]
+        self.assertIn("--listen 127.0.0.1:8787", unit)
+        self.assertIn("ExecStart=/srv/ow/run/dashboard/bin/ow", unit)
+        prepare = self.files["/usr/local/lib/open-workspaces/dashboard-prepare"]
+        self.assertIn("tailscale serve --bg http://127.0.0.1:8787", prepare)
+        self.assertNotIn("funnel", prepare)
+        self.assertEqual(self.files["/etc/open-workspaces/dashboard.env"], "OW_DASHBOARD_LOGINS=you@example.com\n")
+
+    def test_optional_features_render_only_when_configured(self):
+        bare = h.render(config(dashboard={"logins": []}, developerImages=[], backup={"url": ""}), BUDGET)
+        for path in ("/etc/systemd/system/open-workspaces-dashboard.service",
+                     "/etc/systemd/system/open-workspaces-images.service", "/usr/local/bin/ow-backup",
+                     "/etc/systemd/system/ow-backup.timer"):
+            self.assertIn(path, self.files)
+            self.assertNotIn(path, bare)
+        self.assertIn("OnCalendar=*-*-* 01:00:00 UTC", self.files["/etc/systemd/system/ow-backup.timer"])
+        self.assertNotIn("/etc/systemd/system/ow-backup.timer", h.render(config(backup__schedule=""), BUDGET))
+        images = self.files["/etc/systemd/system/open-workspaces-images.service"]
+        self.assertNotIn("ExecStartPost", images, "a new developer image no longer restarts anything")
+
+    def test_scripts_are_valid_shell_and_the_wrapper_runs_the_current_release(self):
+        for path, text in self.files.items():
+            if text.startswith("#!/bin/"):
+                subprocess.run(["bash", "-n"], input=text, text=True, check=True)
+        self.assertIn("exec /srv/ow/current/bin/ow", self.files["/usr/local/bin/ow"])
+        self.assertIn("/srv/ow/current/src/deploy/aws/host/ow_host.py", self.files["/usr/local/sbin/ow-host"])
+        self.assertIn("/srv/ow/{releases/*/bin,build/target/release}/ow", self.files["/etc/apparmor.d/open-workspaces"])
+        self.assertIn("cd /srv/ow/run/worker/src", self.files["/usr/local/lib/open-workspaces/developer-images"])
+
+    def test_every_rendered_path_is_owned_and_restarts_map_to_pins(self):
+        self.assertLessEqual(set(self.files), set(h.OWNED))
+        self.assertLessEqual(set(h.RESTARTS.values()), set(h.PINS))
+
+
+class Validate(unittest.TestCase):
+    def test_bad_values_are_refused(self):
+        for key, value in [("dashboard__logins", ["no-at-sign"]), ("dashboard__logins", ["$(id)@x"]),
+                           ("developerImages", ["arch"]), ("backup__url", "s3://b/ow"),
+                           ("backup__url", "s3://my-bucket/a/../b"), ("backup__schedule", "daily; id"),
+                           ("idleMinutes", -1), ("idleMinutes", True), ("release__ref", "v1\nx"),
+                           ("release__ref", "a..b"), ("release__repository", "http://plain.example/x"),
+                           ("tailscale__hostname", "bad name"), ("tailscale__ssh", "yes"),
+                           ("tailscale__secretArn", "arn:aws:iam::1:role/x")]:
+            with self.assertRaises(Refused, msg=key):
+                config(**{key: value})
+        with self.assertRaisesRegex(Refused, "need tailscale"):
+            config(tailscale__secretArn="")
+        with self.assertRaisesRegex(Refused, "schema"):
+            h.validate({"schema": 2})
+
+    def test_defaults(self):
+        c = h.validate({"schema": 1, "release": {"repository": "/srv/seed.bundle", "ref": "main"}})
+        self.assertEqual((c["idleMinutes"], c["dashboard"]["logins"], c["backup"]["url"]), (30, [], ""))
+
+
+class Setup(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        h.ROOT = Path(self.tmp.name)
+        (h.ROOT / "proc").mkdir()
+        (h.ROOT / "proc/meminfo").write_text("MemTotal:       16000000 kB\n")
+        self.calls = []
+        self.real_run = h.run
+        self.real_fetch = h.fetch_config
+        h.run = lambda cmd, **kw: self.calls.append(cmd) or ""
+
+    def tearDown(self):
+        h.run = self.real_run
+        h.fetch_config = self.real_fetch
+        self.tmp.cleanup()
+
+    def test_setup_writes_only_differences_and_removes_turned_off_features(self):
+        first = h.setup(config())
+        self.assertIn("/etc/systemd/system/open-workspaces-dashboard.service", first)
+        self.assertIn(["systemctl", "daemon-reload"], self.calls)
+        self.assertIn(["apparmor_parser", "-r", "/etc/apparmor.d/open-workspaces"], self.calls)
+        self.calls.clear()
+        self.assertEqual(h.setup(config()), set(), "a second setup with the same config changes nothing")
+        self.assertEqual(self.calls, [])
+        changed = h.setup(config(dashboard={"logins": ["other@example.com"]}))
+        self.assertEqual(h.units_changed(changed), {"dashboard"})
+        changed = h.setup(config(dashboard={"logins": []}, idleMinutes=10))
+        self.assertFalse(h.p("/etc/systemd/system/open-workspaces-dashboard.service").exists())
+        self.assertIn(["systemctl", "disable", "--now", "open-workspaces-dashboard.service"], self.calls)
+        self.assertEqual(h.units_changed(changed), {"dashboard", "worker"})
+        self.assertEqual(h.diff(h.render(config(dashboard={"logins": []}, idleMinutes=10), h.budgets())), set())
+
+    def test_a_failed_apply_keeps_its_restarts_for_the_retry(self):
+        import upgrade as u
+        h.setup(config())
+        h.write_json(h.CONFIG, config())
+        h.fetch_config = lambda: {**copy.deepcopy(CONFIG), "idleMinutes": 10,
+                                  "tailscale": {**CONFIG["tailscale"], "hostname": "renamed"}}
+        failures = ["tailscale set"]
+
+        def flaky(cmd, **kw):
+            self.calls.append(cmd)
+            if cmd[:2] == ["tailscale", "status"]:
+                return '{"BackendState": "Running"}'
+            if failures and " ".join(cmd).startswith(failures[0]):
+                failures.pop()
+                raise RuntimeError("transient tailscale failure")
+            return ""
+
+        h.run = flaky
+        with self.assertRaisesRegex(RuntimeError, "transient"):
+            h.apply_config()
+        self.assertEqual(h.read_json(h.CONFIG)["idleMinutes"], 30, "the stored config moves only after success")
+        self.assertEqual(h.apply_config(), 0)
+        self.assertEqual(set(h.pending()), {"worker", "agent"}, "the idle change and the tailnet rename survive")
+        self.assertEqual(h.read_json(h.CONFIG)["idleMinutes"], 10)
+        at = {"worker": "0.5.0", "agent": "0.5.0", "dashboard": "0.5.0"}
+        manifest = {"schema": 1, "releases": [{"version": "0.5.0", "changes": [], "class": 0,
+                    "catalog": {"schema": 3, "min_reader": 3}, "protocol": {"speaks": 1, "accepts": [1, 1]},
+                    "worker_protocol": {"speaks": 1, "accepts": [1, 1]}, "in_place_from": None}]}
+        plan = u.plan(manifest, at, "0.5.0", pending=set(h.pending()))
+        self.assertEqual((plan["class"], plan["restart"]), (2, ["agent", "worker"]))
+
+    def test_a_failure_inside_setup_keeps_the_reload_and_restarts_for_the_retry(self):
+        import upgrade as u
+        h.setup(config(dashboard={"logins": []}))
+        h.write_json(h.CONFIG, config(dashboard={"logins": []}))
+        h.fetch_config = lambda: {**copy.deepcopy(CONFIG), "idleMinutes": 10}
+        failures = ["systemctl daemon-reload"]
+
+        def flaky(cmd, **kw):
+            self.calls.append(cmd)
+            if cmd[:2] == ["tailscale", "status"]:
+                return '{"BackendState": "Running"}'
+            if failures and " ".join(cmd) == failures[0]:
+                failures.pop()
+                raise RuntimeError("transient daemon-reload failure")
+            return ""
+
+        h.run = flaky
+        with self.assertRaisesRegex(RuntimeError, "daemon-reload"):
+            h.apply_config()
+        self.assertEqual(set(h.pending()), {"worker", "dashboard"}, "recorded before setup wrote anything")
+        self.calls.clear()
+        self.assertEqual(h.apply_config(), 0)
+        self.assertIn(["systemctl", "daemon-reload"], self.calls, "the reload the first try missed")
+        self.assertIn(["systemctl", "restart", "--no-block", "open-workspaces-dashboard.service"], self.calls)
+        self.assertEqual(set(h.pending()), {"worker"})
+        self.assertFalse(h.p(h.SETUP_DUE).exists())
+        at = {"worker": "0.5.0", "agent": "0.5.0", "dashboard": "0.5.0"}
+        manifest = {"schema": 1, "releases": [{"version": "0.5.0", "changes": [], "class": 0,
+                    "catalog": {"schema": 3, "min_reader": 3}, "protocol": {"speaks": 1, "accepts": [1, 1]},
+                    "worker_protocol": {"speaks": 1, "accepts": [1, 1]}, "in_place_from": None}]}
+        self.assertEqual(u.plan(manifest, at, "0.5.0", pending=set(h.pending()))["restart"], ["worker"])
+
+    def test_a_login_change_restarts_the_dashboard_even_after_a_failed_try(self):
+        h.setup(config())
+        h.write_json(h.CONFIG, config())
+        h.fetch_config = lambda: {**copy.deepcopy(CONFIG), "dashboard": {"logins": ["new@example.com"]}}
+
+        def failing(cmd, **kw):
+            self.calls.append(cmd)
+            if cmd[:2] == ["tailscale", "status"]:
+                return '{"BackendState": "Running"}'
+            if cmd[:2] == ["systemctl", "restart"]:
+                raise RuntimeError("transient systemd failure")
+            return ""
+
+        h.run = failing
+        with self.assertRaises(RuntimeError):
+            h.apply_config()
+        h.run = lambda cmd, **kw: self.calls.append(cmd) or ('{"BackendState": "Running"}' if cmd[:2] == ["tailscale", "status"] else "")
+        self.calls.clear()
+        h.apply_config()
+        self.assertIn(["systemctl", "restart", "--no-block", "open-workspaces-dashboard.service"], self.calls)
+        self.assertNotIn("dashboard", h.pending())
+
+    def test_tailscale_join_passes_the_key_by_file_and_deletes_it(self):
+        key = h.ROOT / "key"
+        outputs = {"status": '{"BackendState": "NeedsLogin"}', "mktemp": str(key), "aws": "tskey-secret\n"}
+
+        def fake(cmd, **kw):
+            self.calls.append(cmd)
+            if cmd[0] == "tailscale" and cmd[1] == "up":
+                self.assertEqual(key.read_text(), "tskey-secret")
+                self.assertIn(f"--auth-key=file:{key}", cmd)
+                self.assertIn("--ssh=false", cmd)
+            return outputs.get(Path(cmd[0]).name if cmd[0] != "tailscale" else cmd[1], "")
+
+        h.run = fake
+        self.assertEqual(h.tailscale(config()), ("joined", False))
+        self.assertFalse(key.exists())
+        self.assertFalse(any("tskey-secret" in " ".join(c) for c in self.calls), "the key never reaches a command line")
+        outputs["aws"] = ""
+        self.calls.clear()
+        self.assertEqual(h.tailscale(config()), ("failed", False))
+        self.assertFalse(any(c[:2] == ["tailscale", "up"] for c in self.calls), "an empty key never reaches tailscale up")
+
+    def test_a_joined_host_applies_hostname_and_ssh_and_flags_a_rename(self):
+        h.run = lambda cmd, **kw: self.calls.append(cmd) or ('{"BackendState": "Running"}' if cmd[:2] == ["tailscale", "status"] else "")
+        state = h.tailscale(config(tailscale__hostname="new-name", tailscale__ssh=True), old=config())
+        self.assertEqual(state, ("joined", True))
+        self.assertIn(["tailscale", "set", "--ssh=true", "--hostname=new-name"], self.calls)
+
+
+if __name__ == "__main__":
+    unittest.main()
