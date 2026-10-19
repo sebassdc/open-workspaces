@@ -1,6 +1,6 @@
 {
   "name": "open-workspaces-aws",
-  "version": "0.9.16",
+  "version": "0.9.17",
   "description": "One nested-virtualization EC2 host running the Open Workspaces controller and runner.",
   "license": "MIT",
   "main": "index.ts",
