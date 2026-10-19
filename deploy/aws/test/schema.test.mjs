@@ -18,6 +18,7 @@ test("pulumi package get-schema finds every component", (t) => {
         assert.ok(schema.resources?.[`open-workspaces-aws:index:${name}`]?.isComponent, `${name} in the schema`);
     }
     for (const name of ["Host", "Runner"]) {
+        assert.equal(schema.resources[`open-workspaces-aws:index:${name}`].inputProperties.vcpuOvercommit.type, "number");
         assert.equal(schema.resources[`open-workspaces-aws:index:${name}`].inputProperties.tailscaleDirect.$ref,
             "#/types/open-workspaces-aws:index:TailscaleDirectArgs");
     }

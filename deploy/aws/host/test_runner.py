@@ -58,6 +58,12 @@ class Render(unittest.TestCase):
     def setUp(self):
         self.files = {k: v[0] for k, v in h.render(runner(), BUDGET).items()}
 
+    def test_runner_overcommit_uses_effective_budget_for_invitation(self):
+        files = {k: v[0] for k, v in h.render(runner(vcpuOvercommit=2), BUDGET).items()}
+        self.assertIn("OW_MAX_VCPUS=8\n", files["/etc/open-workspaces/worker.env"])
+        # Controller enrollment uses the runner's reported worker budget.
+        self.assertNotIn("--cpus 4", files["/etc/systemd/system/open-workspaces.service"])
+
     def test_the_agent_dials_the_recorded_controller_and_waits_for_an_identity(self):
         agent = self.files["/etc/systemd/system/open-workspaces.service"]
         self.assertIn("ExecStart=/srv/ow/run/agent/bin/ow --data-dir /srv/ow/.ow/runner node-agent "
