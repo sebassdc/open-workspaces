@@ -179,10 +179,11 @@ remain immutable.
 
 ## Limits and acceptance
 
-There is no store delete/list API, live controller GC, image cache eviction,
-controller placement moves, chunk deduplication or scaling in this foundation. Unreferenced
-uploads and old local build results consume storage until controller GC/cache work
-ships. Prefetch currently covers all current images, within the existing
+The runner object interface has no listing or deletion. The opt-in
+[controller collector](STORE_GC.md) adds exact dry-run candidates, terminal tombstones,
+verification and version-based undo evidence through a separate local operator interface.
+Live activation requires complete authority, effective policy and undo proof. Chunk
+deduplication and scaling remain deferred. Prefetch currently covers all current images, within the existing
 32-image runner ceiling. There is no age-based eviction of working templates.
 
 Local checks cover directory-store round trips, conditional single/multipart

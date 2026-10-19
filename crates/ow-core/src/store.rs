@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod gc;
 mod s3;
 pub use s3::S3Objects;
 const MAX_MANIFEST: u64 = 1024 * 1024;
