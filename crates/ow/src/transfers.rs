@@ -63,7 +63,7 @@ impl Step {
     }
     pub fn permits(self, kind: Kind, next: Self) -> bool {
         match (self, next) {
-            (Self::Preparing, Self::Exported) => kind.needs_fence(),
+            (Self::Preparing, Self::Exported) => kind.needs_fence() || kind == Kind::Wake,
             (Self::Preparing, Self::Importing) => !kind.needs_fence(),
             (Self::Exported, Self::Prepared) => kind == Kind::Park,
             (Self::Exported, Self::Importing) => kind != Kind::Park,
@@ -96,7 +96,13 @@ pub(crate) struct Intent {
     pub cpus: u32,
     pub disk_bytes: u64,
     pub accept_cold: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub explicit_start: bool,
 }
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Default)]
 pub(crate) struct Evidence {
     pub capture: Option<String>,
@@ -193,8 +199,8 @@ fn authorized(c: &Catalog, t: &Transfer) -> Result<()> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     ensure!(
-        c.machine(user, &address, "restore")? == t.source,
-        "restore authorization changed"
+        c.machine(user, &address, t.kind.permission())? == t.source,
+        "transfer authorization changed"
     );
     ensure!(c.db.query_row("SELECT r.ssh_policy_generation=t.source_policy_generation FROM transfers t JOIN resources r ON r.kind='machine' AND r.physical=t.source WHERE t.id=?1",[t.id],|r|r.get::<_,bool>(0))?, "source authority or SSH policy changed");
     Ok(())
@@ -231,7 +237,14 @@ fn rpc(root: &Path, node: &str, request: Value) -> Result<Value> {
     if node == "local" {
         return if matches!(
             request["op"].as_str(),
-            Some("capture-cache" | "capture-pull" | "restore-policy")
+            Some(
+                "capture-cache"
+                    | "capture-pull"
+                    | "restore-policy"
+                    | "capture-push"
+                    | "capture-published"
+                    | "capture-progress"
+            )
         ) {
             job(root, &request)
         } else {
@@ -281,6 +294,7 @@ pub(crate) fn restore(shared: Shared, identity: &Identity, request: &Value) -> R
                 .as_u64()
                 .context("unknown source disk size")?,
             accept_cold: request["accept_cold"].as_bool().unwrap_or(false),
+            explicit_start: false,
         };
         let joined:Option<i64> = c.db.query_row("SELECT t.id FROM transfers t JOIN operations o ON o.id=t.operation WHERE o.owner=?1 AND o.retry_key=?2",params![user,key],|r|r.get(0)).optional()?;
         (
@@ -361,11 +375,12 @@ pub(crate) fn recover(shared: &Shared) {
             let Some(shared) = weak.upgrade() else { break };
             let ids = (|| -> Result<Vec<i64>> {
                 let c = shared.lock().unwrap();
-                Ok(c.db.prepare("SELECT id FROM transfers WHERE kind='restore' AND step NOT IN ('succeeded','aborted','failed')")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?)
+                Ok(c.db.prepare("SELECT id FROM transfers WHERE kind IN ('restore','park','wake') AND step NOT IN ('succeeded','aborted','failed')")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?)
             })();
             if let Ok(ids) = ids {
                 for id in ids {
                     launch(shared.clone(), id);
+                    let _ = capture_upload::refresh_progress(&shared, id);
                 }
             }
             drop(shared);
@@ -422,7 +437,7 @@ fn launch(shared: Shared, id: i64) {
                         &Evidence::default(),
                     );
                 }
-                let _=c.db.execute("UPDATE operations SET state='uncertain',response=?1 WHERE id=?2 AND state<>'succeeded'",params![json!({"error":format!("{error:#}")}).to_string(),t.operation]);
+                let _=c.db.execute("UPDATE operations SET state='uncertain',response=json_set(COALESCE(response,'{}'),'$.error',?1) WHERE id=?2 AND state<>'succeeded'",params![format!("{error:#}"),t.operation]);
             }
         }
         RUNNING.lock().unwrap().remove(&key);
@@ -455,7 +470,7 @@ fn source_fence(
         .parse::<i64>()?;
     let previous = c.transfer(id)?;
     ensure!(
-        previous.kind == Kind::Restore
+        matches!(previous.kind, Kind::Restore | Kind::Park)
             && previous.source == t.source
             && previous.source_node == t.source_node
             && previous.source_epoch == t.source_epoch
@@ -474,6 +489,85 @@ fn source_fence(
     Ok(())
 }
 
+fn export_source(
+    shared: &Shared,
+    t: &Transfer,
+    input: &Intent,
+    policy: &Value,
+    source_authority: &common::Placement,
+    call: &impl Fn(&str, Value) -> Result<Value>,
+) -> Result<bool> {
+    let inspect = |node: &str| call(node, json!({"op":"inspect","id":t.machine}));
+    let step_request = |op: &str, auth: &common::Placement| json!({"op":op,"id":t.machine,"placement":auth,"operation_key":format!("{}-{op}",name(t))});
+    let advance = |next, proof| {
+        shared
+            .lock()
+            .unwrap()
+            .advance_transfer(t.id, t.epoch, t.step, next, &proof)
+            .map(|_| true)
+    };
+
+    let seen = inspect(&t.source_node)?;
+    ensure!(
+        seen["id"] == t.source
+            && seen["memory_mib"] == input.memory_mib
+            && seen["vcpu_count"] == input.cpus
+            && seen["disk_bytes"] == input.disk_bytes,
+        "source identity or disk shape differs from catalog intent"
+    );
+    ensure!(
+        matches!(
+            seen["state"].as_str(),
+            Some("stopped" | "hibernated" | "exported")
+        ) && seen["vmm_running"] != true,
+        "running or unknown source is ineligible for transfer"
+    );
+    if matches!(
+        seen["lifecycle"]["phase"].as_str(),
+        Some("exported" | "cleaned")
+    ) {
+        source_fence(&shared.lock().unwrap(), &t, &seen, &source_authority)?;
+        return advance(
+            Step::Exported,
+            Evidence {
+                source_fenced: true,
+                ..Default::default()
+            },
+        );
+    }
+    if seen.get("placement").is_none() {
+        ensure!(
+            t.source_epoch == 0 && seen["state"] == "stopped",
+            "unmanaged source must be stopped"
+        );
+        let mut register = step_request("placement-register", &source_authority);
+        register["committed"] = json!(true);
+        call(&t.source_node, register)?;
+    } else {
+        ensure!(
+            seen["placement"] == json!(source_authority),
+            "contradictory source placement"
+        );
+    }
+    let mut export = step_request("export", &source_authority);
+    export["transfer"] = json!(name(&t));
+    export["capture"] = json!(format!("{}-source", name(&t)));
+    let result = call(&t.source_node, export)?;
+    source_fence(&shared.lock().unwrap(), &t, &result, &source_authority)?;
+    let current = call(&t.source_node, json!({"op":"restore-policy","id":t.source}))?;
+    ensure!(
+        same_policy(&policy, &current),
+        "source SSH policy changed before export"
+    );
+    advance(
+        Step::Exported,
+        Evidence {
+            source_fenced: true,
+            ..Default::default()
+        },
+    )
+}
+
 /// One durable transition. A restart can occur on either side of every RPC or write.
 fn tick(
     shared: &Shared,
@@ -481,6 +575,13 @@ fn tick(
     at: i64,
     call: &impl Fn(&str, Value) -> Result<Value>,
 ) -> Result<bool> {
+    let initial = shared.lock().unwrap().transfer(id)?;
+    if initial.kind == Kind::Park {
+        return parking::tick(shared, &initial, at, call);
+    }
+    if initial.kind == Kind::Wake && initial.step == Step::Preparing {
+        return parking::reserve_wake(shared, &initial);
+    }
     let (t, a, input, policy, source_authority) = {
         let c = shared.lock().unwrap();
         let t = c.transfer(id)?;
@@ -523,64 +624,7 @@ fn tick(
     let inspect = |node: &str| call(node, json!({"op":"inspect","id":t.machine}));
     let step_request = |op: &str, auth: &common::Placement| json!({"op":op,"id":t.machine,"placement":auth,"operation_key":format!("{}-{op}",name(&t))});
     match t.step {
-        Step::Preparing => {
-            let seen = inspect(&t.source_node)?;
-            ensure!(
-                seen["id"] == t.source
-                    && seen["memory_mib"] == a.memory_mib
-                    && seen["vcpu_count"] == a.cpus
-                    && seen["disk_bytes"] == a.disk_bytes,
-                "source identity or disk shape differs from catalog intent"
-            );
-            ensure!(
-                seen["state"] != "running" && seen["vmm_running"] != true,
-                "running source is ineligible for restore"
-            );
-            if matches!(
-                seen["lifecycle"]["phase"].as_str(),
-                Some("exported" | "cleaned")
-            ) {
-                source_fence(&shared.lock().unwrap(), &t, &seen, &source_authority)?;
-                return advance(
-                    Step::Exported,
-                    Evidence {
-                        source_fenced: true,
-                        ..Default::default()
-                    },
-                );
-            }
-            if seen.get("placement").is_none() {
-                ensure!(
-                    t.source_epoch == 0 && seen["state"] == "stopped",
-                    "unmanaged source must be stopped"
-                );
-                let mut register = step_request("placement-register", &source_authority);
-                register["committed"] = json!(true);
-                call(&t.source_node, register)?;
-            } else {
-                ensure!(
-                    seen["placement"] == json!(source_authority),
-                    "contradictory source placement"
-                );
-            }
-            let mut export = step_request("export", &source_authority);
-            export["transfer"] = json!(name(&t));
-            export["capture"] = json!(format!("{}-source", name(&t)));
-            let result = call(&t.source_node, export)?;
-            source_fence(&shared.lock().unwrap(), &t, &result, &source_authority)?;
-            let current = call(&t.source_node, json!({"op":"restore-policy","id":t.source}))?;
-            ensure!(
-                same_policy(&policy, &current),
-                "source SSH policy changed before export"
-            );
-            advance(
-                Step::Exported,
-                Evidence {
-                    source_fenced: true,
-                    ..Default::default()
-                },
-            )
-        }
+        Step::Preparing => export_source(shared, &t, &input, &policy, &source_authority, call),
         Step::Exported => {
             // Cache inspection is read-only, digest-bearing proof; never blindly reissue a pull.
             let mut request = json!({"op":"capture-cache","artifact":a});
@@ -623,12 +667,15 @@ fn tick(
                 if status["compat"] != cached["compat"] {
                     let c = shared.lock().unwrap();
                     c.advance_transfer(t.id, t.epoch, t.step, Step::Failed, &Evidence::default())?;
-                    c.db.execute("UPDATE operations SET response=?1 WHERE id=?2",params![json!({"error":"incompatible stored RAM; retry with a new operation key and explicit --accept-cold consent"}).to_string(),t.operation])?;
+                    c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.error',?1) WHERE id=?2",params!["incompatible stored RAM; retry with a new operation key and explicit --accept-cold consent",t.operation])?;
                     return Ok(false);
                 }
             }
             let c = shared.lock().unwrap();
             authorized(&c, &t)?;
+            if let Some(bytes) = cached["bytes_total"].as_u64() {
+                c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.progress',json(?1)) WHERE id=?2",params![json!({"bytes_completed":bytes,"bytes_total":bytes,"unit":"logical bytes in completed file objects"}).to_string(),t.operation])?;
+            }
             c.db.execute("INSERT INTO artifact_copies(artifact,node,state,last_used) VALUES(?1,?2,'present',?3) ON CONFLICT(artifact,node) DO UPDATE SET state='present',last_used=excluded.last_used",params![a.id,target,at])?;
             drop(c);
             advance(Step::Importing, Evidence::default())
@@ -644,7 +691,26 @@ fn tick(
             request["manifest_sha256"] = cache["manifest_sha256"].clone();
             request["cold"] = json!(input.accept_cold);
             // T2 journal replays only the same immutable key/fingerprint and reconciles partial imports.
-            let inventory = call(target, json!({"op":"list"}))?;
+            let mut inventory = call(target, json!({"op":"list"}))?;
+            if t.kind == Kind::Wake {
+                if let Some(seen) = inventory
+                    .as_array()
+                    .context("invalid target inventory")?
+                    .iter()
+                    .find(|v| v["id"] == t.machine)
+                {
+                    if matches!(
+                        seen["lifecycle"]["phase"].as_str(),
+                        Some("exported" | "cleaned")
+                    ) {
+                        parking::clean_cached_source(shared, &t, target, seen, call)?;
+                        inventory
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|v| v["id"] != t.machine);
+                    }
+                }
+            }
             let existing = inventory
                 .as_array()
                 .context("invalid target inventory")?
@@ -690,7 +756,9 @@ fn tick(
             )
         }
         Step::Prepared => {
-            if let Ok(source) = inspect(&t.source_node) {
+            if t.kind.needs_fence()
+                && let Ok(source) = inspect(&t.source_node)
+            {
                 source_fence(&shared.lock().unwrap(), &t, &source, &source_authority)?;
             }
             let result = inspect(target)?;
@@ -708,7 +776,9 @@ fn tick(
         }
         Step::Committed => advance(Step::StartUncertain, Evidence::default()),
         Step::StartUncertain => {
-            if let Ok(source) = inspect(&t.source_node) {
+            if t.kind.needs_fence()
+                && let Ok(source) = inspect(&t.source_node)
+            {
                 source_fence(&shared.lock().unwrap(), &t, &source, &source_authority)?;
             }
             let seen = inspect(target)?;
@@ -756,6 +826,7 @@ fn tick(
 }
 
 fn native(manifest: &store::Manifest, a: &Artifact) -> Result<(String, Value)> {
+    manifest.validate()?;
     ensure!(
         matches!(manifest.kind.as_str(), "capture" | "snapshot"),
         "not a workspace capture"
@@ -840,7 +911,7 @@ fn cache(root: &Path, a: &Artifact) -> Result<Value> {
         );
     }
     Ok(
-        json!({"present":true,"digest":a.reference.digest,"manifest_sha256":store::sha256(raw.as_bytes()),"ram":manifest.files.len()==3,"compat":{"runtime":native["runtime"],"cpu":native["cpu"],"kernel_sha256":native["kernel_sha256"]}}),
+        json!({"present":true,"digest":a.reference.digest,"manifest_sha256":store::sha256(raw.as_bytes()),"bytes_total":manifest.files.values().map(|file|file.size).sum::<u64>(),"ram":manifest.files.len()==3,"compat":{"runtime":native["runtime"],"cpu":native["cpu"],"kernel_sha256":native["kernel_sha256"]}}),
     )
 }
 fn pull(objects: &dyn Objects, root: &Path, a: &Artifact, attempt: &str) -> Result<Value> {
@@ -863,7 +934,7 @@ fn pull(objects: &dyn Objects, root: &Path, a: &Artifact, attempt: &str) -> Resu
     }
     let stage = snapshots.join(format!(".pull-{attempt}"));
     // Each agent attempt owns one staging path. Expired attempts are never replayed.
-    let manifest = store::pull(objects, &a.reference, &stage)?;
+    let manifest = capture_upload::pull(objects, root, a, attempt, &stage)?;
     let result = (|| -> Result<Value> {
         let (raw, _) = native(&manifest, a)?;
         fs::rename(stage.join("manifest.json"), stage.join(".artifact.json"))?;
@@ -891,6 +962,12 @@ fn pull(objects: &dyn Objects, root: &Path, a: &Artifact, attempt: &str) -> Resu
 }
 /// Private agent jobs; transfer/hash work stays outside the serial worker.
 pub(crate) fn job(root: &Path, request: &Value) -> Result<Value> {
+    if matches!(
+        request["op"].as_str(),
+        Some("capture-push" | "capture-published" | "capture-progress")
+    ) {
+        return capture_upload::job(root, request);
+    }
     if request["op"] == "restore-policy" {
         let id = request["id"].as_str().context("machine required")?;
         common::identifier(id)?;
@@ -969,3 +1046,10 @@ mod tests;
 #[cfg(test)]
 #[path = "transfer_process_tests.rs"]
 pub(crate) mod process_tests;
+
+#[path = "parking.rs"]
+mod parking;
+pub(crate) use parking::{ensure_awake, park, wake};
+
+#[path = "capture_upload.rs"]
+mod capture_upload;

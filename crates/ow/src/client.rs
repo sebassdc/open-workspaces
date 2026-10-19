@@ -356,6 +356,8 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Create { .. }
                 | Action::Resize { .. }
                 | Action::Start { .. }
+                | Action::Park { .. }
+                | Action::Wake { .. }
                 | Action::Stop { .. }
                 | Action::Hibernate { .. }
                 | Action::Snapshot { .. }
@@ -500,6 +502,8 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         }
         Action::Share { id, with, role } => json!({"op":"share","id":id,"with":with,"role":role}),
         Action::Unshare { id, with } => json!({"op":"unshare","id":id,"with":with}),
+        Action::Park { id } => json!({"op":"park","id":id}),
+        Action::Wake { id, accept_cold } => json!({"op":"wake","id":id,"accept_cold":accept_cold}),
         Action::Start { id } => json!({"op":"start","id":id}),
         Action::Stop { id } => json!({"op":"stop","id":id}),
         Action::Delete { id } => json!({"op":"delete","id":id}),

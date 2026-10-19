@@ -127,6 +127,19 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             }
         }
         "start" | "stop" | "hibernate" | "ssh-info" | "delete" => {}
+        "park" | "wake" => {
+            ensure!(
+                request["operation_key"].is_string(),
+                "operation key required"
+            );
+            ensure!(
+                request.get("node").is_none(),
+                "park/wake chooses its placement"
+            );
+            if operation.op == "wake" {
+                request["accept_cold"] = json!(operation.accept_cold.unwrap_or(false));
+            }
+        }
         "publish" | "unpublish" => {
             if let Some(port) = operation.port {
                 ensure!(port > 0, "invalid port");
@@ -438,6 +451,20 @@ pub async fn handle(
             .and_then(|r| r),
             None => Err(anyhow::anyhow!("ownership catalog unavailable")),
         }
+    } else if matches!(operation["op"].as_str(), Some("park" | "wake")) {
+        match catalog {
+            Some(catalog) => tokio::task::spawn_blocking(move || {
+                if operation["op"] == "park" {
+                    crate::transfers::park(catalog, &identity, &operation)
+                } else {
+                    crate::transfers::wake(catalog, &identity, &operation)
+                }
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r),
+            None => Err(anyhow::anyhow!("ownership catalog unavailable")),
+        }
     } else if operation["op"] == "restore" && operation["artifact"].is_string() {
         match catalog {
             Some(catalog) => tokio::task::spawn_blocking(move || {
@@ -461,10 +488,31 @@ pub async fn handle(
             None => Err(anyhow::anyhow!("tailnet previews are not configured")),
         }
     } else {
-        with_catalog(catalog, identity, move |catalog, user| {
-            catalog.operation(user, operation)
-        })
-        .await
+        match catalog {
+            Some(catalog) => tokio::task::spawn_blocking(move || {
+                let op = operation["op"].as_str().unwrap_or("");
+                if matches!(op, "start" | "exec" | "put" | "get") {
+                    if let Some(info) = crate::transfers::ensure_awake(
+                        catalog.clone(),
+                        &identity,
+                        operation["id"].as_str().unwrap(),
+                        op,
+                        op == "start",
+                    )? {
+                        if op == "start" {
+                            return Ok(info);
+                        }
+                    }
+                }
+                let mut c = catalog.lock().unwrap();
+                let user = c.user(&identity)?;
+                c.operation(user, operation)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r),
+            None => Err(anyhow::anyhow!("ownership catalog unavailable")),
+        }
     };
     secure(match result {
         Ok(value) => Json(json!({"ok":true,"result":value})).into_response(),

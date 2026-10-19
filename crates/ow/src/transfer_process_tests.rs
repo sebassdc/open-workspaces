@@ -142,6 +142,30 @@ fn worker_request(root: &Path, request: &Value) -> Result<Value> {
                 state["workspace"]["placement"] == json!(placement),
                 "wrong export placement"
             );
+            if state["park_fixture"] == true {
+                let snapshot = request["capture"].as_str().context("capture")?;
+                let dir = root.join("snapshots").join(snapshot);
+                fs::create_dir_all(&dir)?;
+                let mut files = serde_json::Map::new();
+                for file in if state["ram"] == true {
+                    vec!["disk.ext4", "memory", "state"]
+                } else {
+                    vec!["disk.ext4"]
+                } {
+                    let bytes = if file == "disk.ext4" {
+                        b"disk".as_slice()
+                    } else {
+                        b"ram".as_slice()
+                    };
+                    fs::write(dir.join(file), bytes)?;
+                    fs::File::open(dir.join(file))?.sync_all()?;
+                    files.insert(file.into(), json!(store::sha256(bytes)));
+                }
+                ow_core::runtime::atomic_json(
+                    &dir.join("manifest.json"),
+                    &json!({"name":snapshot,"workspace":"physical","managed":true,"memory_mib":256,"vcpu_count":1,"runtime":common::RUNTIME,"cpu":"fixture","kernel_sha256":store::sha256(b"kernel"),"files":files}),
+                )?;
+            }
             state["workspace"]["state"] = json!("exported");
             state["workspace"]["lifecycle"] = json!({"phase":"exported","intent":{"transfer":request["transfer"],"capture":request["capture"]}});
         }
@@ -429,6 +453,7 @@ fn fixture() -> Processes {
             cpus: 1,
             disk_bytes: 4,
             accept_cold: false,
+            explicit_start: false,
         },
     )
     .unwrap();
@@ -584,3 +609,6 @@ fn sigkill_agent_before_and_after_real_jobs_and_journal_effects_recovers() {
         }
     }
 }
+
+#[path = "parking_process_tests.rs"]
+mod parking;

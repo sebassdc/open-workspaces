@@ -1480,3 +1480,13 @@ fn review_cached_unmanaged_delete_keeps_its_success_on_a_fencing_worker() {
     assert!(!root.join("machines/legacy").exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn subprocess_exit_interrupt_does_not_disconnect_the_control_channel() {
+    assert!(timed_out(&tungstenite::Error::Io(
+        std::io::Error::from_raw_os_error(libc::EINTR)
+    )));
+    assert!(!timed_out(&tungstenite::Error::Io(
+        std::io::Error::from_raw_os_error(libc::ECONNRESET)
+    )));
+}

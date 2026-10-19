@@ -2017,6 +2017,7 @@ fn transfer_fixture() -> (Fake, Catalog, i64, String, crate::transfers::Intent) 
         cpus: 1,
         disk_bytes: 8 * common::GIB,
         accept_cold: false,
+        explicit_start: false,
     };
     (fake, c, user, physical, intent)
 }

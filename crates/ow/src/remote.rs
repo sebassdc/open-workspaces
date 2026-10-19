@@ -537,6 +537,32 @@ async fn handle(app: &App, mut request: Request) -> Response {
         if !app.config.previews || app.config.auth != Auth::Tailscale || app.dashboard.is_none() {
             return StatusCode::FORBIDDEN.into_response();
         }
+        let wake = match app.catalog.clone() {
+            Some(catalog) => {
+                let identity = identity.clone();
+                tokio::task::spawn_blocking(move || {
+                    let name = {
+                        let mut c = catalog.lock().unwrap();
+                        let user = c.user(&identity)?;
+                        c.preview_name(user, port)?
+                    };
+                    crate::transfers::ensure_awake(catalog, &identity, &name, "preview", false)
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r)
+            }
+            None => Err(anyhow::anyhow!("ownership catalog unavailable")),
+        };
+        if let Err(error) = wake {
+            if error
+                .downcast_ref::<crate::catalog::OperationFailure>()
+                .is_some()
+            {
+                return wake_error(error);
+            }
+            return StatusCode::FORBIDDEN.into_response();
+        }
         let target = crate::dashboard::with_catalog(app.catalog.clone(), identity, move |c, u| {
             c.preview_target(u, port)
         })
@@ -563,6 +589,11 @@ async fn handle(app: &App, mut request: Request) -> Response {
             .to_owned();
         if request.uri().query().is_some() || crate::common::address(&name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid SSH target").into_response();
+        }
+        if let Err(error) =
+            wake_connection(app.catalog.clone(), identity.clone(), name.clone(), "ssh").await
+        {
+            return wake_error(error);
         }
         let target = crate::dashboard::with_catalog(
             app.catalog.clone(),
@@ -601,6 +632,16 @@ async fn handle(app: &App, mut request: Request) -> Response {
             .to_owned();
         if request.uri().query().is_some() || crate::common::address(&name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid terminal target").into_response();
+        }
+        if let Err(error) = wake_connection(
+            app.catalog.clone(),
+            identity.clone(),
+            name.clone(),
+            "terminal",
+        )
+        .await
+        {
+            return wake_error(error);
         }
         let id = crate::dashboard::with_catalog(
             app.catalog.clone(),
@@ -844,6 +885,35 @@ async fn host_admin(app: &App, identity: crate::catalog::Identity, request: Requ
 
 fn router(app: App) -> Router {
     Router::new().fallback(proxy).with_state(app)
+}
+
+async fn wake_connection(
+    catalog: Option<Arc<std::sync::Mutex<crate::catalog::Catalog>>>,
+    identity: crate::catalog::Identity,
+    name: String,
+    permission: &'static str,
+) -> Result<()> {
+    let catalog = catalog.context("ownership catalog unavailable")?;
+    tokio::task::spawn_blocking(move || {
+        crate::transfers::ensure_awake(catalog, &identity, &name, permission, false)
+    })
+    .await??;
+    Ok(())
+}
+fn wake_error(error: anyhow::Error) -> Response {
+    if let Some(operation) = error.downcast_ref::<crate::catalog::OperationFailure>() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"ok":false,"operation":operation.0})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "Workspace unavailable; stopped boxes require explicit start.",
+        )
+            .into_response()
+    }
 }
 
 pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Result<()> {

@@ -233,6 +233,14 @@ enum Action {
     },
     /// Start or wake an existing workspace.
     Start { id: String },
+    /// Publish a stopped/hibernated box and release its runner (remote only).
+    Park { id: String },
+    /// Place and start a parked box; cold RAM loss requires explicit consent (remote only).
+    Wake {
+        id: String,
+        #[arg(long)]
+        accept_cold: bool,
+    },
     /// Stop a workspace (disk persists; running processes end).
     Stop { id: String },
     /// Run a noninteractive command; raw combined output and guest exit status.
