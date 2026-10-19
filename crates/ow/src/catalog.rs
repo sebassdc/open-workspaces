@@ -75,6 +75,9 @@ fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
         (_, "node route unavailable before dispatch") => {
             "Node is unavailable; no operation was dispatched. Retry with the same operation key when it reconnects."
         }
+        (_, "image pull unavailable before create dispatch") => {
+            "Image download failed; no create was dispatched. Retry with the same operation key."
+        }
         _ => first_use_error(diagnostic).map(|(_,message)| message).unwrap_or(
             "Operation did not complete. Check its status before retrying; use the same retry key. The host journal records the cause under this operation ID."),
     }
@@ -1535,31 +1538,39 @@ impl Catalog {
         if let Some(cached) = cached {
             return Ok(cached);
         }
-        let root = match nodes::route(&self.root, &node) {
+        let mut diagnostic = "node route unavailable before dispatch";
+        let preparation = (|| -> Result<PathBuf> {
+            let root = nodes::route(&self.root, &node)?;
+            diagnostic = "image pull unavailable before create dispatch";
+            let pending_create = op=="create" && self.db.query_row("SELECT json_extract(metadata,'$.state')='pending' FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|r.get::<_,bool>(0))?;
+            if pending_create && request["image"].as_str().is_some_and(|s| s.contains('@')) {
+                let selector = request["image"].as_str().unwrap();
+                let image = crate::image_catalog::resolve_stored(&self.db, selector)?;
+                crate::image_store::dispatch(
+                    &self.root,
+                    &self.root,
+                    &node,
+                    json!({"op":"image-pull","image":image}),
+                )?;
+            }
+            Ok(root)
+        })();
+        let root = match preparation {
             Ok(root) => root,
             Err(error) => {
-                eprintln!("operation {operation} routing: {error:#}");
-                if self.db.execute(
+                eprintln!("operation {operation} preparation: {error:#}");
+                let tx = self.db.transaction()?;
+                if tx.execute(
                     "UPDATE operations SET state='not_dispatched',response=?2 WHERE id=?1 AND state='pending'",
-                    params![operation, json!({"error":"node route unavailable before dispatch"}).to_string()],
+                    params![operation, json!({"error":diagnostic}).to_string()],
                 )? == 1
                 {
-                    self.db.execute("UPDATE resources SET reserved_mib=?1,reserved_cpus=?2 WHERE kind='machine' AND physical=?3",params![prior_reservation.0,prior_reservation.1,target])?;
+                    tx.execute("UPDATE resources SET reserved_mib=?1,reserved_cpus=?2 WHERE kind='machine' AND physical=?3",params![prior_reservation.0,prior_reservation.1,target])?;
                 }
+                tx.commit()?;
                 return Err(self.outcome_error(user, operation));
             }
         };
-        let pending_create = op=="create" && self.db.query_row("SELECT json_extract(metadata,'$.state')='pending' FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|r.get::<_,bool>(0))?;
-        if pending_create && request["image"].as_str().is_some_and(|s| s.contains('@')) {
-            let selector = request["image"].as_str().unwrap();
-            let image = crate::image_catalog::resolve_stored(&self.db, selector)?;
-            crate::image_store::dispatch(
-                &self.root,
-                &self.root,
-                &node,
-                json!({"op":"image-pull","image":image}),
-            )?;
-        }
         if node != "local" {
             request["operation_key"] = json!(format!("op-{operation}"));
         }

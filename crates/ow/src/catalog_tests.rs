@@ -1772,6 +1772,88 @@ fn owner_quota_unknown_native_disk_never_uses_linux_default() {
 }
 
 #[test]
+fn image_pull_failure_releases_undispatched_capacity_and_retry_readmits() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let owner = c.user(&identity("alice")).unwrap();
+    c.db.execute("UPDATE nodes SET slots=1,memory_mib=512,capabilities=json_set(capabilities,'$.slots',1,'$.memory_mib',512,'$.vcpus',1,'$.image_store_v1',json('true')) WHERE id='alpha'",[]).unwrap();
+    let token = "a".repeat(32);
+    let digest = "b".repeat(64);
+    c.db.execute("INSERT INTO artifacts(id,kind,attempt,digest,local_name,state,store_url) VALUES('a-pull','image',?1,?2,'tools@1','stored','s3://bucket/root')",params![token,digest]).unwrap();
+    c.db.execute("INSERT INTO leases(artifact,holder,purpose,token,expires) VALUES('a-pull','local','push',?1,?2)",params![token,nodes_now()+7200]).unwrap();
+    c.db.execute("INSERT INTO images(name,version,artifact,base,base_digest,recipe_sha256,status) VALUES('tools',1,'a-pull','alpine',?1,?1,'current')",[digest]).unwrap();
+    let create = json!({"op":"create","id":"downloaded","node":"alpha","memory_mib":512,"vcpu_count":1,"image":"tools@1","operation_key":"create-download"});
+    for uncertain_create in [false, true] {
+        // A failed replay of an already-uncertain create must retain its reservation.
+        if uncertain_create {
+            *fake.reject.lock().unwrap() = Some("create".into());
+            fake.uncertain.store(true, Ordering::SeqCst);
+            assert!(c.operation(owner, create.clone()).is_err());
+            fake.uncertain.store(false, Ordering::SeqCst);
+        }
+        *fake.reject.lock().unwrap() = Some("image-pull".into());
+        assert!(c.operation(owner, create.clone()).is_err());
+        c.reconcile().unwrap();
+        let physical = c.physical(owner, "machine", "downloaded").unwrap();
+        let reserved: (i64, i64) =
+            c.db.query_row(
+                "SELECT reserved_mib,reserved_cpus FROM resources WHERE physical=?1",
+                [&physical],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let state: String =
+            c.db.query_row(
+                "SELECT state FROM operations WHERE retry_key='create-download'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if uncertain_create {
+            assert_eq!(reserved, (512, 1));
+            assert_eq!(state, "uncertain");
+            assert!(c.operation(owner,json!({"op":"create","id":"blocked","node":"alpha","memory_mib":512,"vcpu_count":1,"image":"alpine"})).unwrap_err().to_string().contains("node capacity exhausted"));
+            break;
+        }
+        assert_eq!(reserved, (0, 0), "image transfer did not dispatch a create");
+        assert_eq!(state, "not_dispatched");
+        drop(c);
+        c = Catalog::open(&fake.root, "test", None).unwrap();
+        assert_eq!(
+            limits::state(&fake.root, &c.db, owner).unwrap()["usage"]["boxes"],
+            0
+        );
+        // The old pull might finish independently; retain its own GC lease.
+        assert_eq!(
+            c.db.query_row::<i64, _, _>(
+                "SELECT count(*) FROM leases WHERE purpose='pull'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            1
+        );
+        let other = json!({"op":"create","id":"prepared","node":"alpha","memory_mib":512,"vcpu_count":1,"image":"alpine"});
+        c.operation(owner, other).unwrap();
+        *fake.reject.lock().unwrap() = None;
+        assert!(
+            c.operation(owner, create.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("node capacity exhausted"),
+            "same-key retry must reacquire capacity"
+        );
+        c.operation(owner, json!({"op":"stop","id":"prepared"}))
+            .unwrap();
+    }
+    // A successful worker replay resolves the uncertain pinned create.
+    *fake.reject.lock().unwrap() = None;
+    let result = c.operation(owner, create).unwrap();
+    assert_eq!(result["image"], "tools@1");
+}
+
+#[test]
 fn catalog_store_images_pin_retry_versions_and_keep_legacy_boxes() {
     let mut fake = Fake::new();
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();
