@@ -31,7 +31,7 @@ administration, database access, host filesystem access or hypervisor sockets.
 - Snapshot metadata, with its source workspace and resource shape.
 - Operation IDs, owner, operation/resource name, timestamps and pending/succeeded/failed status.
 
-The catalog uses schema version 2, foreign keys, uniqueness constraints, WAL and
+The catalog uses schema version 5 (minimum reader 5), foreign keys, uniqueness constraints, WAL and
 FULL synchronous writes. Its database must be an owned regular file with mode
 600; SQLite sidecars inherit private permissions. SQL parameters are bound,
 and request bodies cannot specify an owner. Ownership is committed before
@@ -57,6 +57,10 @@ remain open. The current gateway serializes catalog operations; it is not a
 multi-worker scheduler. Per-owner controller admission is described in [limits](LIMITS.md).
 PostgreSQL, fair scheduling, audit
 retention and full database/artifact backup recovery remain tracked follow-ups.
+
+Dormant placement authority, transfer reservations and the private pre-migration
+backup gate are described in [the lifecycle contract](LIFECYCLE.md). They do not
+activate movement for existing fixed-placement boxes.
 
 ## Existing machines and adding users
 

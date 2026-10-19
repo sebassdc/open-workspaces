@@ -188,7 +188,14 @@ fn shared_with(db: &Connection, physical: &str) -> Result<Value> {
 fn share_on(db: &mut Connection, user: i64, op: &str, request: &Value) -> Result<Value> {
     let name = request["id"].as_str().context("id")?;
     common::identifier(name)?;
-    let physical: String = db
+    let email = request["with"]
+        .as_str()
+        .context("teammate email required")?
+        .to_ascii_lowercase();
+    common::email(&email)?;
+    // Resolve ownership under the grant writer lock so deletion cannot leave a late grant.
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let physical: String = tx
         .query_row(
             "SELECT physical FROM resources WHERE owner=?1 AND kind='machine' AND name=?2",
             params![user, name],
@@ -196,12 +203,6 @@ fn share_on(db: &mut Connection, user: i64, op: &str, request: &Value) -> Result
         )
         .optional()?
         .context("resource not found")?;
-    let email = request["with"]
-        .as_str()
-        .context("teammate email required")?
-        .to_ascii_lowercase();
-    common::email(&email)?;
-    let tx = db.transaction()?;
     let issuer: String =
         tx.query_row("SELECT issuer FROM users WHERE id=?1", [user], |r| r.get(0))?;
     if op == "share" {
@@ -249,6 +250,7 @@ pub fn share_unlocked(root: &Path, identity: &Identity, request: &Value) -> Resu
     let mut db = Connection::open(path)?;
     db.busy_timeout(Duration::from_secs(5))?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+    nodes::readable(&db)?;
     let user = user_on(&mut db, identity)?;
     share_on(&mut db, user, op, request)
 }
@@ -310,6 +312,22 @@ impl Catalog {
         )?;
         crate::nodes::readable(&db)?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > 0 && version < 5 {
+            let backup = root.join(format!(
+                "catalog.pre-placement-{}.sqlite3",
+                common::nonce()?
+            ));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&backup)?;
+            db.execute(
+                "VACUUM main INTO ?1",
+                [backup.to_str().context("backup path")?],
+            )
+            .context("private pre-placement catalog backup failed; migration refused")?;
+        }
         db.execute_batch("BEGIN IMMEDIATE;
           CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, issuer TEXT NOT NULL, subject TEXT, email TEXT NOT NULL, UNIQUE(issuer,subject), UNIQUE(issuer,email));
           CREATE TABLE IF NOT EXISTS resources(owner INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL CHECK(kind IN ('machine','snapshot')), name TEXT NOT NULL, physical TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(owner,kind,name), UNIQUE(kind,physical));
@@ -341,8 +359,26 @@ impl Catalog {
             )?;
         }
         crate::image_catalog::initialize(&db)?;
+        if version < 5 {
+            db.execute_batch("ALTER TABLE resources ADD COLUMN placement_managed INTEGER NOT NULL DEFAULT 0 CHECK(placement_managed IN (0,1));
+              ALTER TABLE resources ADD COLUMN placement_epoch INTEGER NOT NULL DEFAULT 0 CHECK(placement_epoch>=0);
+              ALTER TABLE resources ADD COLUMN current_capture TEXT REFERENCES artifacts(id);
+              ALTER TABLE resources ADD COLUMN ssh_policy TEXT CHECK(ssh_policy IS NULL OR json_valid(ssh_policy));
+              ALTER TABLE resources ADD COLUMN ssh_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK(ssh_policy_generation>=0);
+              CREATE TABLE transfers(id INTEGER PRIMARY KEY,operation INTEGER NOT NULL UNIQUE REFERENCES operations(id),
+                kind TEXT NOT NULL CHECK(kind IN ('move','wake','park','fork','restore')),
+                source TEXT NOT NULL,machine TEXT NOT NULL,source_node TEXT NOT NULL,source_epoch INTEGER NOT NULL,
+                source_capture TEXT REFERENCES artifacts(id),source_policy_generation INTEGER NOT NULL,
+                target TEXT,epoch INTEGER NOT NULL UNIQUE CHECK(epoch>source_epoch),capture TEXT REFERENCES artifacts(id),
+                step TEXT NOT NULL CHECK(step IN ('preparing','exported','importing','import_uncertain','prepared','committed','start_uncertain','started','succeeded','aborted','failed')));
+              CREATE TABLE transfer_locks(machine TEXT PRIMARY KEY,transfer INTEGER NOT NULL REFERENCES transfers(id));
+              CREATE TABLE transfer_reservations(transfer INTEGER PRIMARY KEY REFERENCES transfers(id),node TEXT NOT NULL,epoch INTEGER NOT NULL UNIQUE,
+                memory_mib INTEGER NOT NULL CHECK(memory_mib>0),cpus INTEGER NOT NULL CHECK(cpus>0),disk_bytes INTEGER NOT NULL CHECK(disk_bytes>=0));
+              INSERT INTO settings(key,value) VALUES('min_reader_schema','5') ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),5);")?;
+        }
+
         // A newer catalog this binary may read (its floor allows it) keeps its version.
-        db.execute_batch(&format!("UPDATE resources SET reserved_mib=COALESCE(json_extract(metadata,'$.memory_mib'),0) WHERE kind='machine' AND reserved_mib=0 AND json_extract(metadata,'$.state')='running'; PRAGMA user_version={}; COMMIT;", version.max(nodes::SCHEMA)))?;
+        db.execute_batch(&format!("UPDATE resources SET reserved_mib=COALESCE(json_extract(metadata,'$.memory_mib'),0) WHERE kind='machine' AND placement_managed=0 AND reserved_mib=0 AND json_extract(metadata,'$.state')='running'; PRAGMA user_version={}; COMMIT;", version.max(nodes::SCHEMA)))?;
         nodes::db(root)?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS node_usage(node TEXT PRIMARY KEY,extra_mib INTEGER NOT NULL DEFAULT 0,extra_cpus INTEGER NOT NULL DEFAULT 0,extra_slots INTEGER NOT NULL DEFAULT 0);")?;
         // The exclusive gateway lock proves the previous catalog owner is gone.
@@ -418,7 +454,7 @@ impl Catalog {
             )?;
             tx.commit()?;
         }
-        catalog.db.execute("UPDATE resources SET reserved_mib=MAX(reserved_mib,COALESCE(json_extract(metadata,'$.memory_mib'),0)),reserved_cpus=MAX(reserved_cpus,COALESCE(json_extract(metadata,'$.vcpu_count'),1)) WHERE kind='machine' AND json_extract(metadata,'$.state')='running'",[])?;
+        catalog.db.execute("UPDATE resources SET reserved_mib=MAX(reserved_mib,COALESCE(json_extract(metadata,'$.memory_mib'),0)),reserved_cpus=MAX(reserved_cpus,COALESCE(json_extract(metadata,'$.vcpu_count'),1)) WHERE kind='machine' AND placement_managed=0 AND json_extract(metadata,'$.state')='running'",[])?;
         limits::initialize(&catalog.db)?;
         Ok(catalog)
     }
@@ -523,6 +559,242 @@ impl Catalog {
         Ok(value)
     }
 
+    /// Catalog policy only; the caller must reconcile the worker before enabling managed access.
+    #[allow(dead_code)]
+    pub(crate) fn set_transfer_ssh_policy(
+        &self,
+        user: i64,
+        name: &str,
+        generation: i64,
+        policy: &crate::transfers::PublicSshPolicy,
+    ) -> Result<()> {
+        if let crate::transfers::PublicSshPolicy::Enrolled(p) = policy {
+            common::identifier(&p.identity)?;
+            common::identifier(&p.generation)?;
+            ensure!(
+                ow_core::ssh_guest::key(&p.host_key)? == p.host_key,
+                "noncanonical SSH host key"
+            );
+            ensure!(
+                ow_core::ssh_guest::validate_keys(&json!(p.keys))? == p.keys,
+                "noncanonical SSH keys"
+            );
+        }
+        let text = serde_json::to_string(policy)?;
+        ensure!(text.len() <= 16384, "SSH policy too large");
+        self.transfer_write(|c| {
+            let physical = c.machine(user,name,"ssh-keys")?;
+            ensure!(c.db.execute("UPDATE resources SET ssh_policy=?1,ssh_policy_generation=ssh_policy_generation+1 WHERE kind='machine' AND physical=?2 AND ssh_policy_generation=?3",params![text,physical,generation])? == 1,"stale SSH policy");
+            Ok(())
+        })
+    }
+
+    // SQLite-only transitions: transport and artifact verification happen before entry.
+    #[allow(dead_code)] // Dormant until transfer orchestration is activated.
+    fn transfer_write<T>(&self, write: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let result = write(self)?;
+        tx.commit()?;
+        Ok(result)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn transfer(&self, id: i64) -> Result<crate::transfers::Transfer> {
+        use crate::transfers::*;
+        let row = self.db.query_row("SELECT id,operation,kind,source,machine,source_node,source_epoch,source_capture,target,epoch,capture,step FROM transfers WHERE id=?1", [id], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,i64>(9)?,r.get::<_,Option<String>>(10)?,r.get::<_,String>(11)?)))?;
+        Ok(Transfer {
+            id: row.0,
+            operation: row.1,
+            kind: serde_json::from_value(json!(row.2))?,
+            source: row.3,
+            machine: row.4,
+            source_node: row.5,
+            source_epoch: row.6,
+            source_capture: row.7,
+            target: row.8,
+            epoch: row.9,
+            capture: row.10,
+            step: serde_json::from_value(json!(row.11))?,
+        })
+    }
+    #[allow(dead_code)]
+    fn transfer_capture(&self, capture: &str, owner: i64, source: &str) -> Result<()> {
+        ensure!(self.db.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE id=?1 AND owner=?2 AND machine=?3 AND kind IN ('capture','snapshot') AND state='stored' AND digest IS NOT NULL)",params![capture,owner,source],|r|r.get::<_,bool>(0))?, "capture is not a committed artifact of this machine and owner");
+        Ok(())
+    }
+    #[allow(dead_code)]
+    pub(crate) fn begin_transfer(
+        &self,
+        user: i64,
+        key: &str,
+        intent: &crate::transfers::Intent,
+    ) -> Result<crate::transfers::Transfer> {
+        use crate::transfers::*;
+        common::identifier(key)?;
+        common::address(&intent.machine)?;
+        ensure!(
+            (intent.kind == Kind::Park) == intent.target.is_none(),
+            "only park has no target"
+        );
+        ensure!(
+            (intent.kind == Kind::Fork) == intent.child.is_some(),
+            "only fork reserves a child"
+        );
+        ensure!(
+            intent.memory_mib > 0 && intent.cpus > 0 && intent.disk_bytes <= i64::MAX as u64,
+            "invalid target shape"
+        );
+        let fingerprint = json!({"transfer":intent}).to_string();
+        self.transfer_write(|c| {
+            // Recheck current ownership/sharing even for a joined operation.
+            let source = c.machine(user, &intent.machine, intent.kind.permission())?;
+            let (owner, source_node, source_epoch, source_capture, policy_generation):(i64,String,i64,Option<String>,i64) = c.db.query_row("SELECT owner,node,placement_epoch,current_capture,ssh_policy_generation FROM resources WHERE kind='machine' AND physical=?1",[&source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+            ensure!(matches!(intent.kind, Kind::Fork | Kind::Wake) || owner == user, "placement changes require the owner");
+            if let Some((operation, previous)) = c.db.query_row("SELECT id,request FROM operations WHERE owner=?1 AND retry_key=?2",params![user,key],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).optional()? {
+                ensure!(previous == fingerprint, "operation key conflicts with original parameters");
+                let id = c.db.query_row("SELECT id FROM transfers WHERE operation=?1",[operation],|r|r.get(0))?;
+                return c.transfer(id);
+            }
+            ensure!(!c.db.query_row("SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1)",[&source],|r|r.get::<_,bool>(0))?, "machine already has an unfinished transfer");
+            ensure!(!c.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE (owner=?1 AND resource=(SELECT name FROM resources WHERE kind='machine' AND physical=?2) OR json_extract(request,'$.request.id')=?2 OR json_extract(request,'$.request.child')=?2) AND state IN ('pending','uncertain'))",params![owner,source],|r|r.get::<_,bool>(0))?, "machine has unresolved legacy effects");
+            ensure!(intent.kind == Kind::Fork || c.db.query_row("SELECT ssh_policy IS NOT NULL FROM resources WHERE kind='machine' AND physical=?1",[&source],|r|r.get::<_,bool>(0))?,"reconcile public SSH policy before managing placement");
+            ensure!(intent.kind != Kind::Move || intent.target.as_deref() != Some(&source_node),"move requires another node");
+            if intent.kind == Kind::Wake {
+                ensure!(source_node.is_empty(), "wake requires a parked placement");
+                let state:String = c.db.query_row("SELECT json_extract(metadata,'$.state') FROM resources WHERE kind='machine' AND physical=?1",[&source],|r|r.get(0))?;
+                ensure!(state == "hibernated", "connection wake requires hibernation; stopped needs explicit start");
+            }
+            if let Some(capture) = &intent.capture {
+                c.transfer_capture(capture, owner, &source)?;
+            }
+            ensure!(intent.kind.needs_fence() || intent.capture.is_some(), "stored capture required");
+            // Global high-watermark survives aborts, deleted children and controller restarts.
+            c.db.execute("INSERT INTO settings(key,value) VALUES('transfer_epoch','0') ON CONFLICT(key) DO NOTHING",[])?;
+            let high = c.db.query_row("SELECT value FROM settings WHERE key='transfer_epoch'",[],|r|r.get::<_,String>(0))?.parse::<i64>().context("invalid epoch high-watermark")?;
+            ensure!(high >= 0,"invalid epoch high-watermark");
+            let epoch = high.max(source_epoch).checked_add(1).context("placement epoch exhausted")?;
+            c.db.execute("UPDATE settings SET value=?1 WHERE key='transfer_epoch'",[epoch.to_string()])?;
+            let machine = if let Some(child) = &intent.child {
+                common::identifier(&child.id)?;
+                common::identifier(&child.name)?;
+                // INSERT, never reserve/reuse: an existing ID or logical name is a conflict.
+                c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'machine',?2,?3,'{\"state\":\"pending\"}','')",params![user,child.name,child.id])?;
+                c.db.execute("UPDATE resources SET ssh_policy='\"disabled\"' WHERE kind='machine' AND physical=?1",[&child.id])?;
+                child.id.clone()
+            } else { source.clone() };
+            c.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,?2,?3,'pending',?4,?5,?6)",params![user,intent.kind.operation(),intent.child.as_ref().map(|ch|ch.name.as_str()).unwrap_or(&intent.machine),intent.target.as_deref().unwrap_or(""),key,fingerprint])?;
+            let operation = c.db.last_insert_rowid();
+            c.db.execute("INSERT INTO transfers(operation,kind,source,machine,source_node,source_epoch,source_capture,source_policy_generation,target,epoch,capture,step) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'preparing')",params![operation,intent.kind.operation(),source,machine,source_node,source_epoch,source_capture,policy_generation,intent.target,epoch,intent.capture])?;
+            let id = c.db.last_insert_rowid();
+            for affected in if machine == source { vec![&source] } else { vec![&source,&machine] } {
+                c.db.execute("INSERT INTO transfer_locks(machine,transfer) VALUES(?1,?2)",params![affected,id])?;
+            }
+            if let Some(target) = &intent.target {
+                // Catalog capacity only; T3 additionally validates worker capability and disk headroom.
+                let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("target offline, draining or without a registered budget")?;
+                let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+                let (extra_mib,extra_cpus,extra_slots) = c.extra_usage(target)?;
+                ensure!(used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64 && used_cpus as u64 + extra_cpus + intent.cpus as u64 <= cpus as u64 && used_slots as u64 + extra_slots < slots as u64,"node capacity exhausted");
+                c.db.execute("INSERT INTO transfer_reservations(transfer,node,epoch,memory_mib,cpus,disk_bytes) VALUES(?1,?2,?3,?4,?5,?6)",params![id,target,epoch,intent.memory_mib,intent.cpus,intent.disk_bytes as i64])?;
+            }
+            c.transfer(id)
+        })
+    }
+    #[allow(dead_code)]
+    pub(crate) fn advance_transfer(
+        &self,
+        id: i64,
+        epoch: i64,
+        expected: crate::transfers::Step,
+        next: crate::transfers::Step,
+        proof: &crate::transfers::Evidence,
+    ) -> Result<crate::transfers::Transfer> {
+        use crate::transfers::*;
+        self.transfer_write(|c| {
+            let t = c.transfer(id)?;
+            ensure!(t.epoch == epoch && t.step == expected, "stale transfer result");
+            ensure!(expected.permits(t.kind,next), "invalid transfer transition");
+            if next == Step::Exported {
+                ensure!(proof.source_fenced,"positive source fence required; timeout is not a fence");
+                c.db.execute("UPDATE resources SET placement_managed=1 WHERE kind='machine' AND physical=?1",[&t.source])?;
+            }
+            if let Some(capture) = &proof.capture {
+                ensure!(matches!(expected,Step::Preparing | Step::Exported),"capture cannot change after import begins");
+                let owner = c.db.query_row("SELECT owner FROM resources WHERE kind='machine' AND physical=?1",[&t.source],|r|r.get(0))?;
+                c.transfer_capture(capture,owner,&t.source)?;
+                c.db.execute("UPDATE transfers SET capture=?1 WHERE id=?2",params![capture,id])?;
+            }
+            if matches!(next,Step::Importing | Step::Prepared) {
+                let prepared = c.transfer(id)?;
+                let capture = prepared.capture.as_deref().context("stored capture required")?;
+                let owner = c.db.query_row("SELECT owner FROM resources WHERE kind='machine' AND physical=?1",[&t.source],|r|r.get(0))?;
+                c.transfer_capture(capture,owner,&t.source)?;
+            }
+            if next == Step::Prepared {
+                ensure!(t.kind == Kind::Park || proof.target_prepared,"verified unstarted import required");
+            }
+            if matches!(next,Step::Aborted | Step::Failed) {
+                ensure!(matches!(expected,Step::Preparing | Step::Exported) || proof.target_excluded,"uncertain target retains capacity until positively excluded");
+                c.db.execute("DELETE FROM transfer_reservations WHERE transfer=?1 AND epoch=?2",params![id,epoch])?;
+                if t.kind == Kind::Fork {
+                    // Retire the child's identity and name together, as ordinary deletion does.
+                    c.db.execute("UPDATE operations SET resource='deleted:'||resource WHERE op<>'snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1)",[&t.machine])?;
+                    c.db.execute("UPDATE publications SET active=0 WHERE physical=?1",[&t.machine])?;
+                    c.db.execute("DELETE FROM grants WHERE physical=?1",[&t.machine])?;
+                    c.db.execute("DELETE FROM owner_allocations WHERE physical=?1",[&t.machine])?;
+                    ensure!(c.db.execute("DELETE FROM resources WHERE kind='machine' AND physical=?1 AND placement_epoch=0 AND node='' AND owner=(SELECT owner FROM operations WHERE id=?2) AND EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1 AND transfer=?3)",params![t.machine,t.operation,id])? == 1,"fork child authority changed");
+                }
+            }
+            let step = serde_json::to_value(next)?.as_str().unwrap().to_owned();
+            c.db.execute("UPDATE transfers SET step=?1 WHERE id=?2 AND epoch=?3",params![step,id,epoch])?;
+            if next.terminal() {
+                c.db.execute("DELETE FROM transfer_locks WHERE transfer=?1",[id])?;
+                c.db.execute("UPDATE operations SET state=?1,finished_at=CURRENT_TIMESTAMP WHERE id=?2",params![if next == Step::Succeeded {"succeeded"}else{"failed"},t.operation])?;
+            }
+            c.transfer(id)
+        })
+    }
+    #[allow(dead_code)]
+    pub(crate) fn commit_transfer(
+        &self,
+        id: i64,
+        epoch: i64,
+    ) -> Result<crate::transfers::Transfer> {
+        use crate::transfers::*;
+        self.transfer_write(|c| {
+            let t = c.transfer(id)?;
+            ensure!(t.epoch == epoch && t.step == Step::Prepared,"stale transfer commit");
+            let unchanged:bool = c.db.query_row("SELECT EXISTS(SELECT 1 FROM resources r JOIN transfers t ON t.source=r.physical WHERE r.kind='machine' AND t.id=?1 AND r.node=t.source_node AND r.placement_epoch=t.source_epoch AND r.current_capture IS t.source_capture AND r.ssh_policy_generation=t.source_policy_generation)",[id],|r|r.get(0))?;
+            ensure!(unchanged,"source authority or SSH policy changed");
+            let (actor,address):(i64,String) = c.db.query_row("SELECT owner,json_extract(request,'$.transfer.machine') FROM operations WHERE id=?1",[t.operation],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            ensure!(c.machine(actor,&address,t.kind.permission())? == t.source,"source authorization changed");
+            let capture = t.capture.as_deref().context("stored capture required")?;
+            let owner = c.db.query_row("SELECT owner FROM resources WHERE kind='machine' AND physical=?1",[&t.source],|r|r.get(0))?;
+            c.transfer_capture(capture,owner,&t.source)?;
+            let (memory,cpus):(i64,i64) = if let Some(target) = &t.target {
+                c.db.query_row("SELECT memory_mib,cpus FROM transfer_reservations WHERE transfer=?1 AND epoch=?2 AND node=?3",params![id,epoch,target],|r|Ok((r.get(0)?,r.get(1)?)))?
+            } else { (0,0) };
+            let changed = c.db.execute("UPDATE resources SET node=?1,placement_managed=1,placement_epoch=?2,current_capture=?3,reserved_mib=?4,reserved_cpus=?5,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND physical=?6 AND placement_epoch=?7 AND node=?8",params![t.target.as_deref().unwrap_or(""),epoch,capture,memory,cpus,t.machine,if t.kind == Kind::Fork {0}else{t.source_epoch},if t.kind == Kind::Fork {""}else{&t.source_node}])?;
+            ensure!(changed == 1,"target authority changed");
+            c.db.execute("DELETE FROM transfer_reservations WHERE transfer=?1 AND epoch=?2",params![id,epoch])?;
+            c.db.execute("UPDATE transfers SET step='committed' WHERE id=?1 AND epoch=?2 AND step='prepared'",params![id,epoch])?;
+            c.transfer(id)
+        })
+    }
+
+    // Legacy observations have no placement epoch and cannot mutate managed authority.
+    fn legacy_machine(&self, physical: &str) -> Result<bool> {
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND physical=?1 AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1))",[physical],|r|r.get(0))?)
+    }
+    fn legacy_access(&self, physical: &str) -> Result<()> {
+        ensure!(
+            self.legacy_machine(physical)?,
+            "managed placement requires transfer-aware routing"
+        );
+        Ok(())
+    }
     fn placement(&self, kind: &str, physical: &str) -> Result<String> {
         Ok(self.db.query_row(
             "SELECT node FROM resources WHERE kind=?1 AND physical=?2",
@@ -531,7 +803,7 @@ impl Catalog {
         )?)
     }
     fn save_node(&mut self, node: &str, kind: &str, physical: &str, value: &Value) -> Result<()> {
-        let updated = self.db.execute("UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE kind=?2 AND physical=?3 AND node=?4",params![value.to_string(),kind,physical,node])?;
+        let updated = self.db.execute("UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE kind=?2 AND physical=?3 AND node=?4 AND (kind<>'machine' OR (placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical)))",params![value.to_string(),kind,physical,node])?;
         if kind == "machine" && updated == 1 {
             limits::observe(&self.db, physical, value)?;
         }
@@ -604,6 +876,10 @@ impl Catalog {
                     extra_cpus += m["vcpu_count"].as_i64().unwrap_or(16);
                     extra_slots += 1;
                 }
+                if !self.legacy_machine(physical)? {
+                    all_machines.push(m.clone());
+                    continue;
+                }
                 self.save_node(&node, "machine", physical, m)?;
                 if matches!(
                     m["state"].as_str(),
@@ -626,7 +902,7 @@ impl Catalog {
                 .iter()
                 .filter_map(|m| m["id"].as_str())
                 .collect::<std::collections::BTreeSet<_>>();
-            let mut stmt=self.db.prepare("SELECT physical FROM resources WHERE kind='machine' AND node=?1 AND json_extract(metadata,'$.state')='pending' AND EXISTS(SELECT 1 FROM operations WHERE resource=resources.name AND owner=resources.owner AND state='failed') AND NOT EXISTS(SELECT 1 FROM operations WHERE resource=resources.name AND owner=resources.owner AND state IN ('pending','uncertain'))")?;
+            let mut stmt=self.db.prepare("SELECT physical FROM resources WHERE kind='machine' AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical) AND node=?1 AND json_extract(metadata,'$.state')='pending' AND EXISTS(SELECT 1 FROM operations WHERE resource=resources.name AND owner=resources.owner AND state='failed') AND NOT EXISTS(SELECT 1 FROM operations WHERE resource=resources.name AND owner=resources.owner AND state IN ('pending','uncertain'))")?;
             let absent = stmt
                 .query_map([&node], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -639,7 +915,7 @@ impl Catalog {
             // Missing inventory releases owner demand only after all effects are resolved.
             let mut stmt = self
                 .db
-                .prepare("SELECT physical FROM resources WHERE kind='machine' AND node=?1")?;
+                .prepare("SELECT physical FROM resources WHERE kind='machine' AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical) AND node=?1")?;
             let known = stmt
                 .query_map([&node], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -652,12 +928,12 @@ impl Catalog {
             // A machine this runner no longer lists is gone from it (deleted there, or the runner
             // lost its data): flag it so its owner can delete it here. Never-observed creates
             // stay pending; a machine listed again gets its metadata back on the next pass.
-            self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','missing'),reserved_mib=0,reserved_cpus=0,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND node=?1 AND json_extract(metadata,'$.state') NOT IN ('pending','missing') AND physical NOT IN (SELECT value FROM json_each(?2))",params![node,json!(observed).to_string()])?;
+            self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','missing'),reserved_mib=0,reserved_cpus=0,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical) AND node=?1 AND json_extract(metadata,'$.state') NOT IN ('pending','missing') AND physical NOT IN (SELECT value FROM json_each(?2))",params![node,json!(observed).to_string()])?;
             self.db.execute("INSERT INTO node_usage(node,extra_mib,extra_cpus,extra_slots) VALUES(?1,?2,?3,?4) ON CONFLICT(node) DO UPDATE SET extra_mib=?2,extra_cpus=?3,extra_slots=?4",params![node,extra_mib,extra_cpus,extra_slots])?;
             for snapshot in snapshots.as_array().context("invalid snapshots")? {
                 let physical = snapshot["name"].as_str().context("snapshot ID")?;
                 let parent = snapshot["workspace"].as_str().context("snapshot parent")?;
-                let owner:Option<i64>=self.db.query_row("SELECT owner FROM resources WHERE kind='machine' AND physical=?1 AND node=?2",params![parent,node],|r|r.get(0)).optional()?;
+                let owner:Option<i64>=self.db.query_row("SELECT owner FROM resources WHERE kind='machine' AND physical=?1 AND node=?2 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical)",params![parent,node],|r|r.get(0)).optional()?;
                 if let Some(owner) = owner {
                     let name=if self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND physical<>?2)",params![owner,physical],|r|r.get::<_,bool>(0))?{format!("auto-{}",&common::nonce()?[..24])}else{physical.to_owned()};
                     self.db.execute("INSERT OR IGNORE INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'snapshot',?2,?3,?4,?5)",params![owner,name,physical,snapshot.to_string(),node])?;
@@ -969,7 +1245,7 @@ impl Catalog {
         Ok(())
     }
     fn extra_usage(&self, node: &str) -> Result<(u64, u64, u64)> {
-        Ok(self
+        let extra = self
             .db
             .query_row(
                 "SELECT extra_mib,extra_cpus,extra_slots FROM node_usage WHERE node=?1",
@@ -983,7 +1259,13 @@ impl Catalog {
                 },
             )
             .optional()?
-            .unwrap_or((0, 0, 0)))
+            .unwrap_or((0, 0, 0));
+        let pending: (u64,u64,u64) = self.db.query_row("SELECT COALESCE(SUM(memory_mib),0),COALESCE(SUM(cpus),0),COUNT(*) FROM transfer_reservations WHERE node=?1",[node],|r|Ok((r.get::<_,i64>(0)? as u64,r.get::<_,i64>(1)? as u64,r.get::<_,i64>(2)? as u64)))?;
+        Ok((
+            extra.0 + pending.0,
+            extra.1 + pending.1,
+            extra.2 + pending.2,
+        ))
     }
     fn choose(
         &self,
@@ -1251,6 +1533,7 @@ impl Catalog {
         // Resolve authority before any worker contact, including inventory refresh.
         if op != "create" {
             let physical = self.machine(user, &name, &op)?;
+            self.legacy_access(&physical)?;
             // Confirmed gone from its runner: only the row is left. A runner that is online now
             // may have it back, so it must still not list it; an unreachable one refuses.
             if op == "delete" && self.missing(&physical)? {
@@ -1284,6 +1567,7 @@ impl Catalog {
         if op == "delete" {
             // The runner no longer has it: nothing to dispatch, only the row to drop.
             let physical = self.machine(user, &name, &op)?;
+            self.legacy_access(&physical)?;
             let node = self.placement("machine", &physical)?;
             if self.missing(&physical)? && !self.listed(&node, &physical)? {
                 return self.delete_missing(user, &name, &physical, &input);
@@ -1332,6 +1616,7 @@ impl Catalog {
             } else {
                 self.machine(user, &name, &op)?
             };
+            self.legacy_access(&physical)?;
             let metadata: String = self.db.query_row(
                 "SELECT metadata FROM resources WHERE kind='machine' AND physical=?1",
                 [&physical],
@@ -1461,6 +1746,7 @@ impl Catalog {
                     );
                 }
             }
+            self.legacy_access(&target)?;
             prior_reservation=self.db.query_row("SELECT reserved_mib,reserved_cpus FROM resources WHERE kind='machine' AND physical=?1",[&target],|r|Ok((r.get(0)?,r.get(1)?)))?;
             let key = if let Some(key) = input["operation_key"].as_str() {
                 common::identifier(key)?;
@@ -1741,13 +2027,14 @@ impl Catalog {
         let name = self
             .logical(user, "machine", &physical)?
             .context("not shared")?;
+        self.legacy_access(&physical)?;
         let node = self.placement("machine", &physical)?;
         nodes::operation_capable(&self.root, &node, "tunnel")?;
         let revoked = self.watched(user, &name, "preview", &physical)?;
         Ok(crate::preview::Target {
             root: nodes::route(&self.root, &node)?,
             id: physical,
-            placement: None, // T1 supplies committed authority before managed routing is enabled.
+            placement: None, // Managed placements stay blocked until transfer-aware routing lands.
             port,
             revoked,
             unpublished: session(user, &format!("preview:{https}")),
@@ -1777,6 +2064,7 @@ impl Catalog {
         name: &str,
     ) -> Result<(PathBuf, String, Arc<tokio::sync::Notify>)> {
         let physical = self.machine(user, name, "ssh")?;
+        self.legacy_access(&physical)?;
         let node = self.placement("machine", &physical)?;
         nodes::ssh_capable(&self.root, &node)?;
         let route = nodes::route(&self.root, &node)?;
@@ -1792,6 +2080,7 @@ impl Catalog {
         name: &str,
     ) -> Result<(PathBuf, String, Arc<tokio::sync::Notify>)> {
         let physical = self.machine(user, name, "terminal")?;
+        self.legacy_access(&physical)?;
         let node = self.placement("machine", &physical)?;
         nodes::operation_capable(&self.root, &node, "terminal")?;
         let route = nodes::route(&self.root, &node)?;
@@ -2208,7 +2497,7 @@ mod tests {
         let user = c.user(&owner).unwrap();
         let physical = c.reserve(user, "machine", "demo").unwrap();
         c.db.execute_batch(
-            "ALTER TABLE resources DROP COLUMN node; ALTER TABLE resources DROP COLUMN reserved_mib; ALTER TABLE resources DROP COLUMN reserved_cpus; DROP INDEX operation_retry; ALTER TABLE operations DROP COLUMN node; ALTER TABLE operations DROP COLUMN retry_key; ALTER TABLE operations DROP COLUMN request; ALTER TABLE operations DROP COLUMN response; CREATE UNIQUE INDEX legacy_physical ON resources(physical); PRAGMA user_version=1;",
+            "ALTER TABLE resources DROP COLUMN placement_managed; ALTER TABLE resources DROP COLUMN placement_epoch; ALTER TABLE resources DROP COLUMN current_capture; ALTER TABLE resources DROP COLUMN ssh_policy; ALTER TABLE resources DROP COLUMN ssh_policy_generation; DROP TABLE transfer_reservations; DROP TABLE transfer_locks; DROP TABLE transfers; ALTER TABLE resources DROP COLUMN node; ALTER TABLE resources DROP COLUMN reserved_mib; ALTER TABLE resources DROP COLUMN reserved_cpus; DROP INDEX operation_retry; ALTER TABLE operations DROP COLUMN node; ALTER TABLE operations DROP COLUMN retry_key; ALTER TABLE operations DROP COLUMN request; ALTER TABLE operations DROP COLUMN response; CREATE UNIQUE INDEX legacy_physical ON resources(physical); PRAGMA user_version=1;",
         )
         .unwrap();
         drop(c);

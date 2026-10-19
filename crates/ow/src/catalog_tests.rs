@@ -1909,3 +1909,1148 @@ fn catalog_store_images_pin_retry_versions_and_keep_legacy_boxes() {
         0
     );
 }
+
+// T1 contracts use only a private catalog and synthetic artifacts; no VM or store transport.
+fn transfer_fixture() -> (Fake, Catalog, i64, String, crate::transfers::Intent) {
+    use crate::transfers::*;
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let user = c.user(&identity("owner")).unwrap();
+    let physical = c.reserve(user, "machine", "box").unwrap();
+    c.db.execute("UPDATE resources SET node='alpha',reserved_mib=256,reserved_cpus=1,metadata=?1 WHERE physical=?2",params![json!({"id":physical,"state":"running","memory_mib":256,"vcpu_count":1,"disk_bytes":8*common::GIB}).to_string(),physical]).unwrap();
+    c.set_transfer_ssh_policy(user, "box", 0, &PublicSshPolicy::Disabled)
+        .unwrap();
+    c.db.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,digest,store_url) VALUES('capture','capture',?1,?2,'capture','stored',?3,'fixture://store')",params![user,physical,"a".repeat(64)]).unwrap();
+    for node in ["alpha", "beta"] {
+        c.db.execute("INSERT INTO nodes(id,memory_mib,slots,heartbeat,capabilities) VALUES(?1,512,2,?2,'{\"memory_mib\":512,\"slots\":2,\"vcpus\":2}')",params![node,nodes_now()]).unwrap();
+    }
+    let intent = Intent {
+        kind: Kind::Move,
+        machine: "box".into(),
+        target: Some("beta".into()),
+        capture: Some("capture".into()),
+        child: None,
+        memory_mib: 256,
+        cpus: 1,
+        disk_bytes: 8 * common::GIB,
+        accept_cold: false,
+    };
+    (fake, c, user, physical, intent)
+}
+fn prepare_transfer(c: &Catalog, t: &crate::transfers::Transfer) {
+    use crate::transfers::*;
+    let mut step = Step::Preparing;
+    if t.kind.needs_fence() {
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            step,
+            Step::Exported,
+            &Evidence {
+                source_fenced: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        step = Step::Exported;
+    }
+    if t.kind != Kind::Park {
+        c.advance_transfer(t.id, t.epoch, step, Step::Importing, &Evidence::default())
+            .unwrap();
+        step = Step::Importing;
+    }
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        step,
+        Step::Prepared,
+        &Evidence {
+            target_prepared: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+fn reservation(c: &Catalog, physical: &str) -> (String, i64, Option<String>, i64, i64) {
+    c.db.query_row("SELECT node,placement_epoch,current_capture,reserved_mib,reserved_cpus FROM resources WHERE kind='machine' AND physical=?1",[physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap()
+}
+#[test]
+fn transfer_schema_three_migration_preserves_private_catalog_and_reader_floor() {
+    let fake = Fake::new();
+    let path = fake.root.join("catalog.sqlite3");
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=ON;
+      CREATE TABLE users(id INTEGER PRIMARY KEY,issuer TEXT NOT NULL,subject TEXT,email TEXT NOT NULL,UNIQUE(issuer,subject),UNIQUE(issuer,email));
+      CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE resources(owner INTEGER NOT NULL REFERENCES users(id),kind TEXT NOT NULL,name TEXT NOT NULL,physical TEXT NOT NULL,metadata TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,node TEXT NOT NULL DEFAULT 'local',reserved_mib INTEGER NOT NULL DEFAULT 0,reserved_cpus INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(owner,kind,name),UNIQUE(kind,physical));
+      CREATE TABLE operations(id INTEGER PRIMARY KEY,owner INTEGER NOT NULL REFERENCES users(id),op TEXT NOT NULL,resource TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,finished_at TEXT,node TEXT NOT NULL DEFAULT 'local',retry_key TEXT,request TEXT,response TEXT);
+      CREATE UNIQUE INDEX operation_retry ON operations(owner,retry_key);
+      CREATE TABLE grants(physical TEXT NOT NULL,grantee INTEGER NOT NULL REFERENCES users(id),role TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(physical,grantee));
+      INSERT INTO users VALUES(1,'test','owner','owner@example.test'),(2,'test','guest','guest@example.test');
+      INSERT INTO resources(owner,kind,name,physical,metadata,node,reserved_mib,reserved_cpus) VALUES(1,'machine','box','m-fixture','{\"id\":\"m-fixture\",\"state\":\"hibernated\",\"keys\":[\"public-fixture\"]}','offline',256,1),(1,'snapshot','saved','s-fixture','{\"workspace\":\"m-fixture\"}','offline',0,0);
+      INSERT INTO grants(physical,grantee,role) VALUES('m-fixture',2,'use');
+      INSERT INTO settings VALUES('legacy_import','complete'),('fixture_public_keys','[\"fixture-key\"]');
+      INSERT INTO operations(id,owner,op,resource,state,retry_key,request,response) VALUES(91,1,'hibernate','box','succeeded','saved-key','{\"input\":1}','{\"ok\":true}');
+      PRAGMA user_version=3;").unwrap();
+    let rows = |db: &Connection, table: &str| -> Vec<String> {
+        db.prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+            .unwrap()
+            .query_map([], |r| {
+                let values = (0..r.as_ref().column_count())
+                    .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                    .collect::<Vec<_>>();
+                Ok(values.join("|"))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let users = rows(&db, "users");
+    let grants = rows(&db, "grants");
+    let operations = rows(&db, "operations");
+    drop(db);
+    let c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(rows(&c.db, "users"), users);
+    assert_eq!(rows(&c.db, "grants"), grants);
+    assert_eq!(rows(&c.db, "operations"), operations);
+    assert_eq!(
+        reservation(&c, "m-fixture"),
+        ("offline".into(), 0, None, 256, 1)
+    );
+    assert!(
+        c.db.query_row(
+            "SELECT metadata FROM resources WHERE physical='m-fixture'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap()
+        .contains("public-fixture")
+    );
+    assert_eq!(
+        c.db.query_row(
+            "SELECT value FROM settings WHERE key='fixture_public_keys'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "[\"fixture-key\"]"
+    );
+    assert_eq!(
+        c.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        c.db.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    assert!(
+        c.db.execute(
+            "UPDATE resources SET current_capture='missing' WHERE physical='m-fixture'",
+            []
+        )
+        .is_err()
+    );
+    for reader in [3, 4] {
+        assert!(nodes::readable_by(&c.db, reader).is_err());
+    }
+    assert!(nodes::readable_by(&c.db, 5).is_ok());
+    let backup = std::fs::read_dir(&fake.root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("catalog.pre-placement-")
+        })
+        .unwrap();
+    nodes::private(&backup).unwrap();
+    let db = Connection::open(backup).unwrap();
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(rows(&db, "operations"), operations);
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+        0
+    );
+}
+#[test]
+fn transfer_operation_join_conflict_and_atomic_competing_requests() {
+    let (_fake, c, user, physical, intent) = transfer_fixture();
+    let copies = (0..2)
+        .map(|_| Catalog {
+            db: nodes::db(&c.root).unwrap(),
+            root: c.root.clone(),
+            _lock: c._lock.try_clone().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let results = std::thread::scope(|scope| {
+        copies
+            .into_iter()
+            .enumerate()
+            .map(|(i, copy)| {
+                let b = barrier.clone();
+                let intent = intent.clone();
+                scope.spawn(move || {
+                    b.wait();
+                    copy.begin_transfer(user, &format!("move-{i}"), &intent)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    let t = results.into_iter().find_map(Result::ok).unwrap();
+    let key: String =
+        c.db.query_row(
+            "SELECT retry_key FROM operations WHERE id=?1",
+            [t.operation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(c.begin_transfer(user, &key, &intent).unwrap().id, t.id);
+    let mut changed = intent.clone();
+    changed.accept_cold = true;
+    assert!(
+        c.begin_transfer(user, &key, &changed)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts")
+    );
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM transfer_reservations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(c.extra_usage("beta").unwrap(), (256, 1, 1));
+    assert_eq!(
+        reservation(&c, &physical),
+        ("alpha".into(), 0, None, 256, 1)
+    );
+    assert!(c.db.is_autocommit());
+}
+#[test]
+fn transfer_uncertain_import_abort_and_epoch_never_reused_after_restart() {
+    use crate::transfers::*;
+    let (fake, c, user, physical, intent) = transfer_fixture();
+    let t = c.begin_transfer(user, "first", &intent).unwrap();
+    assert!(
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            Step::Preparing,
+            Step::Exported,
+            &Evidence::default()
+        )
+        .is_err()
+    );
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Preparing,
+        Step::Exported,
+        &Evidence {
+            source_fenced: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Exported,
+        Step::Importing,
+        &Evidence::default(),
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Importing,
+        Step::ImportUncertain,
+        &Evidence::default(),
+    )
+    .unwrap();
+    c.db.execute("UPDATE nodes SET heartbeat=0", []).unwrap();
+    drop(c);
+    let c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(c.transfer(t.id).unwrap().step, Step::ImportUncertain);
+    assert!(
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            Step::ImportUncertain,
+            Step::Aborted,
+            &Evidence::default()
+        )
+        .is_err()
+    );
+    assert!(
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            Step::ImportUncertain,
+            Step::Failed,
+            &Evidence::default()
+        )
+        .is_err()
+    );
+    assert_eq!(
+        reservation(&c, &physical),
+        ("alpha".into(), 0, None, 256, 1)
+    );
+    assert_eq!(c.extra_usage("beta").unwrap(), (256, 1, 1));
+    assert!(c.commit_transfer(t.id, t.epoch).is_err());
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::ImportUncertain,
+        Step::Aborted,
+        &Evidence {
+            target_excluded: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(c.extra_usage("beta").unwrap(), (0, 0, 0));
+    c.db.execute("UPDATE nodes SET heartbeat=?1", [nodes_now()])
+        .unwrap();
+    let next = c.begin_transfer(user, "second", &intent).unwrap();
+    assert!(next.epoch > t.epoch);
+    assert!(
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            Step::ImportUncertain,
+            Step::Aborted,
+            &Evidence {
+                target_excluded: true,
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        c.advance_transfer(
+            next.id,
+            t.epoch,
+            Step::Preparing,
+            Step::Failed,
+            &Evidence::default()
+        )
+        .is_err()
+    );
+    assert_eq!(c.extra_usage("beta").unwrap(), (256, 1, 1));
+    assert_eq!(
+        c.begin_transfer(user, "first", &intent).unwrap().step,
+        Step::Aborted
+    );
+}
+#[test]
+fn transfer_commit_is_atomic_and_terminal_transitions_are_forward_only() {
+    use crate::transfers::*;
+    let (_fake, mut c, user, physical, intent) = transfer_fixture();
+    let t = c.begin_transfer(user, "move", &intent).unwrap();
+    prepare_transfer(&c, &t);
+    assert_eq!(
+        reservation(&c, &physical),
+        ("alpha".into(), 0, None, 256, 1)
+    );
+    // Inject a transaction failure after the placement UPDATE: none of the tuple may escape.
+    c.db.execute_batch("CREATE TRIGGER fail_commit BEFORE DELETE ON transfer_reservations BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(c.commit_transfer(t.id, t.epoch).is_err());
+    assert_eq!(
+        reservation(&c, &physical),
+        ("alpha".into(), 0, None, 256, 1)
+    );
+    assert_eq!(c.transfer(t.id).unwrap().step, Step::Prepared);
+    assert_eq!(c.extra_usage("beta").unwrap(), (256, 1, 1));
+    c.db.execute_batch("DROP TRIGGER fail_commit").unwrap();
+    c.commit_transfer(t.id, t.epoch).unwrap();
+    assert_eq!(
+        reservation(&c, &physical),
+        ("beta".into(), t.epoch, Some("capture".into()), 256, 1)
+    );
+    assert_eq!(c.extra_usage("beta").unwrap(), (0, 0, 0));
+    c.save_node("alpha", "machine", &physical, &json!({"state":"stopped"}))
+        .unwrap();
+    c.save_node("beta", "machine", &physical, &json!({"state":"stopped"}))
+        .unwrap();
+    assert_eq!(
+        reservation(&c, &physical).3,
+        256,
+        "epochless observations cannot release managed capacity"
+    );
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Committed,
+        Step::StartUncertain,
+        &Evidence::default(),
+    )
+    .unwrap();
+    for terminal in [Step::Aborted, Step::Failed, Step::Succeeded] {
+        assert!(
+            c.advance_transfer(
+                t.id,
+                t.epoch,
+                Step::StartUncertain,
+                terminal,
+                &Evidence {
+                    target_excluded: true,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+    assert!(c.begin_transfer(user, "retarget", &intent).is_err());
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::StartUncertain,
+        Step::Started,
+        &Evidence::default(),
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Started,
+        Step::Succeeded,
+        &Evidence::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM transfer_locks", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(c.commit_transfer(t.id, t.epoch).is_err());
+    assert!(c.operation(user, json!({"op":"start","id":"box"})).is_err());
+    assert!(c.terminal_target(user, "box").is_err());
+    assert!(c.ssh_target(user, "box").is_err());
+}
+#[test]
+fn transfer_fork_reserves_child_identity_and_releases_only_its_attempt() {
+    use crate::transfers::*;
+    let (_fake, mut c, user, physical, mut intent) = transfer_fixture();
+    intent.kind = Kind::Fork;
+    intent.child = Some(Child {
+        id: "m-child".into(),
+        name: "child".into(),
+    });
+    let t = c.begin_transfer(user, "fork", &intent).unwrap();
+    assert_eq!(c.physical(user, "machine", "child").unwrap(), "m-child");
+    assert_eq!(reservation(&c, "m-child"), ("".into(), 0, None, 0, 0));
+    assert!(!c.legacy_machine("m-child").unwrap());
+    assert!(
+        c.begin_transfer(
+            user,
+            "other-source",
+            &Intent {
+                machine: "child".into(),
+                ..intent.clone()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        c.operation(user, json!({"op":"create","id":"child"}))
+            .is_err()
+    );
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Preparing,
+        Step::Failed,
+        &Evidence::default(),
+    )
+    .unwrap();
+    assert!(c.physical(user, "machine", "child").is_err());
+    assert_eq!(
+        c.begin_transfer(user, "fork", &intent).unwrap().step,
+        Step::Failed
+    );
+    let next = c.begin_transfer(user, "fork-next", &intent).unwrap();
+    assert!(next.epoch > t.epoch);
+    prepare_transfer(&c, &next);
+    c.commit_transfer(next.id, next.epoch).unwrap();
+    assert_eq!(
+        reservation(&c, &physical),
+        ("alpha".into(), 0, None, 256, 1)
+    );
+    assert_eq!(reservation(&c, "m-child").0, "beta");
+    assert_eq!(
+        c.db.query_row(
+            "SELECT ssh_policy FROM resources WHERE physical='m-child'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "\"disabled\""
+    );
+}
+#[test]
+fn transfer_permissions_capture_lineage_and_policy_generation_fail_closed() {
+    use crate::transfers::*;
+    let (_fake, mut c, user, physical, intent) = transfer_fixture();
+    let guest = c.user(&identity("guest")).unwrap();
+    c.db.execute(
+        "INSERT INTO grants(physical,grantee,role) VALUES(?1,?2,'admin')",
+        params![physical, guest],
+    )
+    .unwrap();
+    let mut shared = intent.clone();
+    shared.machine = "owner@example.test/box".into();
+    assert!(c.begin_transfer(guest, "not-owner", &shared).is_err());
+    shared.kind = Kind::Fork;
+    shared.child = Some(Child {
+        id: "m-shared-child".into(),
+        name: "copy".into(),
+    });
+    let fork = c.begin_transfer(guest, "fork", &shared).unwrap();
+    c.advance_transfer(
+        fork.id,
+        fork.epoch,
+        Step::Preparing,
+        Step::Aborted,
+        &Evidence::default(),
+    )
+    .unwrap();
+    let t = c.begin_transfer(user, "move", &intent).unwrap();
+    prepare_transfer(&c, &t);
+    c.set_transfer_ssh_policy(user, "box", 1, &PublicSshPolicy::Disabled)
+        .unwrap();
+    assert!(
+        c.set_transfer_ssh_policy(user, "box", 1, &PublicSshPolicy::Disabled)
+            .is_err()
+    );
+    assert!(
+        c.commit_transfer(t.id, t.epoch)
+            .unwrap_err()
+            .to_string()
+            .contains("policy changed")
+    );
+    assert_eq!(c.extra_usage("beta").unwrap(), (256, 1, 1));
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Prepared,
+        Step::Aborted,
+        &Evidence {
+            target_excluded: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    c.db.execute("UPDATE artifacts SET owner=?1 WHERE id='capture'", [guest])
+        .unwrap();
+    assert!(c.begin_transfer(user, "bad-capture", &intent).is_err());
+    c.db.execute(
+        "UPDATE artifacts SET owner=?1,machine='other-machine' WHERE id='capture'",
+        [user],
+    )
+    .unwrap();
+    assert!(c.begin_transfer(user, "wrong-lineage", &intent).is_err());
+}
+#[test]
+fn transfer_park_preserves_stopped_state_and_wake_requires_hibernation() {
+    use crate::transfers::*;
+    let (fake, c, user, physical, mut intent) = transfer_fixture();
+    c.db.execute(
+        "UPDATE resources SET metadata=json_set(metadata,'$.state','stopped') WHERE physical=?1",
+        [&physical],
+    )
+    .unwrap();
+    intent.kind = Kind::Park;
+    intent.target = None;
+    let t = c.begin_transfer(user, "park", &intent).unwrap();
+    prepare_transfer(&c, &t);
+    c.commit_transfer(t.id, t.epoch).unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Committed,
+        Step::Succeeded,
+        &Evidence::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        reservation(&c, &physical),
+        ("".into(), t.epoch, Some("capture".into()), 0, 0)
+    );
+    drop(c);
+    let c = Catalog::open(&fake.root, "test", None).unwrap();
+    intent.kind = Kind::Wake;
+    intent.target = Some("beta".into());
+    assert!(
+        c.begin_transfer(user, "wake", &intent)
+            .unwrap_err()
+            .to_string()
+            .contains("stopped")
+    );
+    c.db.execute(
+        "UPDATE resources SET metadata=json_set(metadata,'$.state','hibernated') WHERE physical=?1",
+        [&physical],
+    )
+    .unwrap();
+    let wake = c.begin_transfer(user, "wake", &intent).unwrap();
+    assert_eq!(c.begin_transfer(user, "wake", &intent).unwrap().id, wake.id);
+    assert!(c.begin_transfer(user, "competing-wake", &intent).is_err());
+    assert_eq!(reservation(&c, &physical).0, "");
+    prepare_transfer(&c, &wake);
+    c.commit_transfer(wake.id, wake.epoch).unwrap();
+    assert!(wake.epoch > t.epoch);
+}
+
+#[test]
+fn transfer_reservations_block_legacy_admission_and_heartbeat_cannot_release_source() {
+    use crate::transfers::*;
+    let (mut fake, mut c, user, physical, intent) = transfer_fixture();
+    // A synthetic source inventory reports stopped, then absent, while import is uncertain.
+    c.db.execute("DELETE FROM nodes WHERE id='alpha'", [])
+        .unwrap();
+    fake.worker("alpha");
+    wire::request(
+        &fake.root.join("nodes/alpha"),
+        json!({"op":"create","id":physical,"memory_mib":256}),
+    )
+    .unwrap();
+    c.db.execute(
+        "UPDATE nodes SET capabilities='{\"memory_mib\":512,\"slots\":2,\"vcpus\":1,\"images\":[\"alpine\"]}' WHERE id='beta'",
+        [],
+    )
+    .unwrap();
+    let t = c.begin_transfer(user, "move", &intent).unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Preparing,
+        Step::Exported,
+        &Evidence {
+            source_fenced: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Exported,
+        Step::Importing,
+        &Evidence::default(),
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Importing,
+        Step::ImportUncertain,
+        &Evidence::default(),
+    )
+    .unwrap();
+    let error = c
+        .capacity("beta", "another-id", 256, 1, "alpine", &json!({}))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("node capacity exhausted"),
+        "{error}"
+    );
+    wire::request(
+        &fake.root.join("nodes/alpha"),
+        json!({"op":"stop","id":physical}),
+    )
+    .unwrap();
+    c.reconcile().unwrap();
+    assert_eq!(
+        reservation(&c, &physical),
+        ("alpha".into(), 0, None, 256, 1)
+    );
+    wire::request(
+        &fake.root.join("nodes/alpha"),
+        json!({"op":"lose","id":physical}),
+    )
+    .unwrap();
+    c.reconcile().unwrap();
+    assert_eq!(reservation(&c, &physical).3, 256);
+    assert_eq!(c.extra_usage("beta").unwrap(), (256, 1, 1));
+    c.db.execute("UPDATE nodes SET heartbeat=0 WHERE id='alpha'", [])
+        .unwrap();
+    c.reconcile().unwrap();
+    assert_eq!(reservation(&c, &physical).3, 256);
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::ImportUncertain,
+        Step::Prepared,
+        &Evidence {
+            target_prepared: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    c.commit_transfer(t.id, t.epoch).unwrap();
+    wire::request(
+        &fake.root.join("nodes/alpha"),
+        json!({"op":"recover","id":physical}),
+    )
+    .unwrap();
+    c.db.execute(
+        "UPDATE nodes SET heartbeat=?1 WHERE id='alpha'",
+        [nodes_now()],
+    )
+    .unwrap();
+    c.reconcile().unwrap();
+    assert_eq!(
+        reservation(&c, &physical),
+        ("beta".into(), t.epoch, Some("capture".into()), 256, 1)
+    );
+}
+#[test]
+fn transfer_schema_four_keeps_store_roots_and_failed_preparation_rolls_back() {
+    use crate::transfers::*;
+    let (fake, c, user, physical, intent) = transfer_fixture();
+    c.db.execute("INSERT INTO artifact_copies(artifact,node,state,last_used) VALUES('capture','beta','present',1)",[]).unwrap();
+    c.db.execute("INSERT INTO leases(artifact,holder,purpose,expires) VALUES('capture','fixture','pull',9999999999)",[]).unwrap();
+    c.db.execute_batch("DROP TABLE transfer_reservations;DROP TABLE transfer_locks;DROP TABLE transfers;
+      ALTER TABLE resources DROP COLUMN placement_managed;ALTER TABLE resources DROP COLUMN placement_epoch;
+      ALTER TABLE resources DROP COLUMN current_capture;ALTER TABLE resources DROP COLUMN ssh_policy;
+      ALTER TABLE resources DROP COLUMN ssh_policy_generation;UPDATE settings SET value='3' WHERE key='min_reader_schema';PRAGMA user_version=4;").unwrap();
+    drop(c);
+    let c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM artifact_copies", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM leases", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    c.set_transfer_ssh_policy(user, "box", 0, &PublicSshPolicy::Disabled)
+        .unwrap();
+    c.db.execute("UPDATE nodes SET memory_mib=128 WHERE id='beta'", [])
+        .unwrap();
+    let mut fork = intent.clone();
+    fork.kind = Kind::Fork;
+    fork.child = Some(Child {
+        id: "m-rejected".into(),
+        name: "rejected".into(),
+    });
+    assert!(c.begin_transfer(user, "no-capacity", &fork).is_err());
+    assert!(c.physical(user, "machine", "rejected").is_err());
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM transfers", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        c.db.query_row(
+            "SELECT COUNT(*) FROM operations WHERE retry_key='no-capacity'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(c.db.is_autocommit());
+    assert_eq!(reservation(&c, &physical).0, "alpha");
+}
+
+#[test]
+fn transfer_import_pins_capture_and_commit_rechecks_authority_and_grants() {
+    use crate::transfers::*;
+    let (_fake, mut c, user, physical, mut intent) = transfer_fixture();
+    // Captures cannot be swapped after the import dispatch boundary.
+    let t = c.begin_transfer(user, "move", &intent).unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Preparing,
+        Step::Exported,
+        &Evidence {
+            source_fenced: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Exported,
+        Step::Importing,
+        &Evidence::default(),
+    )
+    .unwrap();
+    assert!(
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            Step::Importing,
+            Step::Prepared,
+            &Evidence {
+                capture: Some("capture".into()),
+                target_prepared: true,
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Importing,
+        Step::Prepared,
+        &Evidence {
+            target_prepared: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // A delayed commit cannot override a newer authority, even with a prepared target.
+    c.db.execute(
+        "UPDATE resources SET placement_epoch=?1 WHERE physical=?2",
+        params![t.epoch + 1, physical],
+    )
+    .unwrap();
+    assert!(c.commit_transfer(t.id, t.epoch).is_err());
+    assert_eq!(reservation(&c, &physical).1, t.epoch + 1);
+    assert_eq!(c.extra_usage("beta").unwrap(), (256, 1, 1));
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Prepared,
+        Step::Aborted,
+        &Evidence {
+            target_excluded: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let guest = c.user(&identity("guest")).unwrap();
+    c.db.execute(
+        "INSERT INTO grants(physical,grantee,role) VALUES(?1,?2,'use')",
+        params![physical, guest],
+    )
+    .unwrap();
+    intent.machine = "owner@example.test/box".into();
+    intent.kind = Kind::Fork;
+    intent.child = Some(Child {
+        id: "m-revoked-child".into(),
+        name: "revoked-child".into(),
+    });
+    let fork = c.begin_transfer(guest, "shared-fork", &intent).unwrap();
+    assert!(fork.epoch > t.epoch + 1);
+    prepare_transfer(&c, &fork);
+    c.db.execute("DELETE FROM grants WHERE grantee=?1", [guest])
+        .unwrap();
+    assert!(c.commit_transfer(fork.id, fork.epoch).is_err());
+    assert!(c.begin_transfer(guest, "shared-fork", &intent).is_err());
+    assert_eq!(reservation(&c, "m-revoked-child").0, "");
+    assert_eq!(c.extra_usage("beta").unwrap(), (256, 1, 1));
+}
+#[test]
+fn transfer_target_budget_clamps_operator_caps_and_rejects_stale_or_future_beats() {
+    use crate::transfers::*;
+    let (_fake, c, user, physical, intent) = transfer_fixture();
+    c.db.execute(
+        "UPDATE nodes SET capabilities=json_set(capabilities,'$.memory_mib',128) WHERE id='beta'",
+        [],
+    )
+    .unwrap();
+    assert!(c.begin_transfer(user, "small-worker", &intent).is_err());
+    c.db.execute(
+        "UPDATE nodes SET capabilities=json_set(capabilities,'$.memory_mib',512) WHERE id='beta'",
+        [],
+    )
+    .unwrap();
+    c.db.execute(
+        "INSERT INTO node_capacity_limits(node,vcpu_cap) VALUES('beta',1)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        c.begin_transfer(
+            user,
+            "operator-cap",
+            &Intent {
+                cpus: 2,
+                ..intent.clone()
+            }
+        )
+        .is_err()
+    );
+    for beat in [nodes_now() - 60, nodes_now() + 60] {
+        c.db.execute("UPDATE nodes SET heartbeat=?1 WHERE id='beta'", [beat])
+            .unwrap();
+        assert!(c.begin_transfer(user, "bad-heartbeat", &intent).is_err());
+    }
+    c.db.execute("UPDATE nodes SET heartbeat=?1,capabilities=json_set(capabilities,'$.drain',json('true')) WHERE id='beta'",[nodes_now()]).unwrap();
+    assert!(c.begin_transfer(user, "draining", &intent).is_err());
+    assert!(
+        c.begin_transfer(
+            user,
+            "implicit-local",
+            &Intent {
+                target: Some("local".into()),
+                ..intent
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(
+        reservation(&c, &physical),
+        ("alpha".into(), 0, None, 256, 1)
+    );
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM transfers", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn aborted_fork_does_not_leak_grants_to_reused_id() {
+    use crate::transfers::*;
+    for terminal in [Step::Aborted, Step::Failed] {
+        let (_fake, mut c, user, _physical, mut intent) = transfer_fixture();
+        let guest = c.user(&identity("guest")).unwrap();
+        let other_owner = c.user(&identity("other-owner")).unwrap();
+        c.operation(
+            user,
+            json!({"op":"share","id":"box","with":"other-owner@example.test","role":"use"}),
+        )
+        .unwrap();
+        intent.kind = Kind::Fork;
+        intent.child = Some(Child {
+            id: "m-reused".into(),
+            name: "first-child".into(),
+        });
+        let first = c.begin_transfer(user, "first-fork", &intent).unwrap();
+        c.operation(
+            user,
+            json!({"op":"share","id":"first-child","with":"guest@example.test","role":"use"}),
+        )
+        .unwrap();
+        c.advance_transfer(
+            first.id,
+            first.epoch,
+            Step::Preparing,
+            terminal,
+            &Evidence::default(),
+        )
+        .unwrap();
+        let grants: i64 =
+            c.db.query_row(
+                "SELECT COUNT(*) FROM grants WHERE physical='m-reused'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        println!(
+            "After aborted fork: child absent={}, dangling grants={grants}",
+            c.physical(user, "machine", "first-child").is_err()
+        );
+        intent.child = Some(Child {
+            id: "m-reused".into(),
+            name: "different-child".into(),
+        });
+        intent.machine = "owner@example.test/box".into();
+        let second = c
+            .begin_transfer(other_owner, "second-fork", &intent)
+            .unwrap();
+        prepare_transfer(&c, &second);
+        c.commit_transfer(second.id, second.epoch).unwrap();
+        let access = c.machine(guest, "other-owner@example.test/different-child", "fork");
+        println!(
+            "Guest authorized to another owner's new unshared child: {}",
+            access.is_ok()
+        );
+        c.advance_transfer(
+            second.id,
+            second.epoch,
+            Step::Committed,
+            Step::Started,
+            &Evidence::default(),
+        )
+        .unwrap();
+        c.advance_transfer(
+            second.id,
+            second.epoch,
+            Step::Started,
+            Step::Succeeded,
+            &Evidence::default(),
+        )
+        .unwrap();
+        c.db.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,digest,store_url) VALUES('replacement-capture','capture',?1,'m-reused','replacement','stored',?2,'fixture://store')",params![other_owner,"b".repeat(64)]).unwrap();
+        let illicit = c.begin_transfer(
+            guest,
+            "unshared-fork",
+            &Intent {
+                machine: "other-owner@example.test/different-child".into(),
+                capture: Some("replacement-capture".into()),
+                child: Some(Child {
+                    id: "m-unshared-copy".into(),
+                    name: "unshared-copy".into(),
+                }),
+                ..intent.clone()
+            },
+        );
+        println!(
+            "Uninvited guest admitted a fork of replacement owner's capture: {}",
+            illicit.is_ok()
+        );
+        assert!(
+            illicit.is_err(),
+            "aborted child's grant authorized a different owner's replacement"
+        );
+    }
+}
+
+#[test]
+fn aborted_fork_name_is_reusable_by_legacy_create() {
+    use crate::transfers::*;
+    for terminal in [Step::Aborted, Step::Failed] {
+        let (mut fake, mut c, user, _physical, mut intent) = transfer_fixture();
+        c.db.execute("DELETE FROM nodes WHERE id='alpha'", [])
+            .unwrap();
+        fake.worker("alpha");
+        intent.kind = Kind::Fork;
+        intent.child = Some(Child {
+            id: "m-aborted".into(),
+            name: "child".into(),
+        });
+        let t = c.begin_transfer(user, "fork-abort", &intent).unwrap();
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            Step::Preparing,
+            terminal,
+            &Evidence::default(),
+        )
+        .unwrap();
+        let result = c.operation(user,json!({"op":"create","id":"child","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"}));
+        println!("Legacy create using released child name: {result:?}");
+        let control = c.operation(user,json!({"op":"create","id":"fresh-name","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"}));
+        println!(
+            "Legacy create using fresh name: success={}",
+            control.is_ok()
+        );
+        assert!(control.is_ok());
+        assert!(
+            result.is_ok(),
+            "aborted fork left child name unusable to legacy create"
+        );
+    }
+}
+
+#[test]
+fn aborted_fork_cleanup_rolls_back_with_an_uncertain_target() {
+    use crate::transfers::*;
+    let (_fake, mut c, user, _physical, mut intent) = transfer_fixture();
+    let guest = c.user(&identity("guest")).unwrap();
+    intent.kind = Kind::Fork;
+    intent.child = Some(Child {
+        id: "m-cleanup".into(),
+        name: "child".into(),
+    });
+    let t = c.begin_transfer(user, "fork-cleanup", &intent).unwrap();
+    c.operation(
+        user,
+        json!({"op":"share","id":"child","with":"guest@example.test","role":"use"}),
+    )
+    .unwrap();
+    c.db.execute(
+        "INSERT INTO owner_allocations VALUES('m-cleanup',1,256,8)",
+        [],
+    )
+    .unwrap();
+    c.db.execute("INSERT INTO publications(https_port,physical,guest_port,active) VALUES(11000,'m-cleanup',80,1)",[]).unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Preparing,
+        Step::Importing,
+        &Evidence::default(),
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Importing,
+        Step::ImportUncertain,
+        &Evidence::default(),
+    )
+    .unwrap();
+    let metadata = || {
+        c.db.query_row("SELECT (SELECT COUNT(*) FROM grants WHERE physical='m-cleanup'),(SELECT COUNT(*) FROM owner_allocations WHERE physical='m-cleanup'),(SELECT active FROM publications WHERE physical='m-cleanup'),(SELECT resource FROM operations WHERE id=?1)",[t.operation],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).unwrap()
+    };
+    assert!(
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            Step::ImportUncertain,
+            Step::Failed,
+            &Evidence::default()
+        )
+        .is_err()
+    );
+    assert_eq!(metadata(), (1, 1, 1, "child".into()));
+    c.db.execute_batch("CREATE TRIGGER fail_child_delete BEFORE DELETE ON resources WHEN OLD.kind='machine' AND OLD.physical='m-cleanup' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    let proof = Evidence {
+        target_excluded: true,
+        ..Default::default()
+    };
+    assert!(
+        c.advance_transfer(t.id, t.epoch, Step::ImportUncertain, Step::Failed, &proof)
+            .is_err()
+    );
+    assert_eq!(metadata(), (1, 1, 1, "child".into()));
+    assert_eq!(c.physical(user, "machine", "child").unwrap(), "m-cleanup");
+    assert_eq!(c.transfer(t.id).unwrap().step, Step::ImportUncertain);
+    assert_eq!(c.extra_usage("beta").unwrap(), (256, 1, 1));
+    c.db.execute_batch("DROP TRIGGER fail_child_delete")
+        .unwrap();
+    c.advance_transfer(t.id, t.epoch, Step::ImportUncertain, Step::Failed, &proof)
+        .unwrap();
+    assert_eq!(metadata(), (0, 0, 0, "deleted:child".into()));
+    assert!(c.physical(user, "machine", "child").is_err());
+    assert_eq!(c.extra_usage("beta").unwrap(), (0, 0, 0));
+    assert_eq!(
+        c.begin_transfer(user, "fork-cleanup", &intent)
+            .unwrap()
+            .step,
+        Step::Failed
+    );
+    assert!(
+        c.machine(guest, "owner@example.test/child", "fork")
+            .is_err()
+    );
+}

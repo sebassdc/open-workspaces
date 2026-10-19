@@ -55,6 +55,9 @@ test("this release's entry matches the code", () => {
     assert.deepEqual(entry.runtime.resumes, [entry.runtime.vmm], "Snapshot::resumable compares common::RUNTIME only");
     assert.match(read("crates/ow-core/src/runtime.rs"), /self\.runtime == crate::common::RUNTIME/);
     assert.equal(entry.catalog.schema, Number(read("crates/ow/src/nodes.rs").match(/^pub\(crate\) const SCHEMA: i64 = (\d+);/m)[1]));
+    const floors = [...read("crates/ow/src/catalog.rs").matchAll(/VALUES\('min_reader_schema','(\d+)'\)/g)].map((m) => Number(m[1]));
+    assert.ok(floors.length, "catalog migrations declare their reader floor");
+    assert.equal(entry.catalog.min_reader, Math.max(...floors), "the catalog migration's reader floor");
     const kernel = read("experiments/runtime-spike/prepare-guest.py").match(/'vmlinux-[^']+': \(\s*'[^']+',\s*'([0-9a-f]{64})'/)[1];
     assert.equal(entry.runtime.guest_kernel_sha256, kernel, "the guest kernel pin in prepare-guest.py");
     const name = read("experiments/runtime-spike/prepare-guest.py").match(/'(vmlinux-[^']+)': \(/)[1];

@@ -87,14 +87,18 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     Ok(db)
 }
 /// Catalog schema this binary writes (`PRAGMA user_version`).
-pub(crate) const SCHEMA: i64 = 4;
+pub(crate) const SCHEMA: i64 = 5;
 
 /// A binary opens a catalog it can use safely: not newer than SCHEMA, or newer but
 /// declared readable by SCHEMA through `settings.min_reader_schema`, which every
 /// migration sets to the oldest schema whose binaries may still read and write it.
 pub(crate) fn readable(db: &Connection) -> Result<()> {
+    readable_by(db, SCHEMA)
+}
+
+pub(crate) fn readable_by(db: &Connection, reader: i64) -> Result<()> {
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version <= SCHEMA {
+    if version <= reader {
         return Ok(());
     }
     let floor: Option<i64> = db
@@ -107,8 +111,8 @@ pub(crate) fn readable(db: &Connection) -> Result<()> {
         .unwrap_or(None)
         .and_then(|v| v.parse().ok());
     ensure!(
-        floor.is_some_and(|f| f <= SCHEMA),
-        "catalog schema {version} needs a newer binary (this one reads up to {SCHEMA})"
+        floor.is_some_and(|f| f > 0 && f <= reader),
+        "catalog schema {version} needs a newer binary (this one reads up to {reader})"
     );
     Ok(())
 }
