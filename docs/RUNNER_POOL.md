@@ -214,7 +214,7 @@ no inbound rules, no secret in Pulumi, the exact rights, compare-and-set launch,
 duplicate and failed launches, join requests and retries, exact removal, retained
 instances, observations, preflight refusals and disk cleanup.
 
-On a dedicated disposable fixture (release 0.9.17 candidate, `@pulumi/aws` 7.48.0,
+On a dedicated disposable fixture (release 0.9.18 candidate, `@pulumi/aws` 7.48.0,
 Ubuntu 24.04 `m8i-flex.xlarge`, Firecracker v1.17.0) the following was observed:
 adding the component to an existing Host stack previewed only creations (no update,
 replacement or instance); a launch-template instance found its data volume, derived

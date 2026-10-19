@@ -33,6 +33,10 @@ export interface HostArgs {
     amiId?: pulumi.Input<string>;
     /** Size of the gp3 Btrfs volume holding sources, assets and workspaces. */
     dataVolumeSizeGib?: pulumi.Input<number>;
+    /** Provisioned IOPS of the data volume (gp3: 3000-16000). Default: gp3's 3000. Changes apply online. */
+    dataVolumeIops?: pulumi.Input<number>;
+    /** Provisioned throughput of the data volume in MiB/s (gp3: 125-1000). Default: gp3's 125. Changes apply online. */
+    dataVolumeThroughput?: pulumi.Input<number>;
     /** Git repository with the Open Workspaces sources. */
     repository?: pulumi.Input<string>;
     /**
@@ -101,6 +105,9 @@ export interface HostArgs {
 export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability" | "role" | "storeGc"> {
     // The package analyzer loses optional types inherited through Omit.
     vcpuOvercommit?: pulumi.Input<number>;
+    dataVolumeSizeGib?: pulumi.Input<number>;
+    dataVolumeIops?: pulumi.Input<number>;
+    dataVolumeThroughput?: pulumi.Input<number>;
     tailscaleDirect?: pulumi.Input<TailscaleDirectArgs>;
     storeUrl?: pulumi.Input<string>;
     imageArtifacts?: pulumi.Input<{ [profile: string]: pulumi.Input<ImageArtifact> }>;
@@ -541,6 +548,8 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
             availabilityZone: subnet.availabilityZone,
             type: "gp3",
             size: args.dataVolumeSizeGib ?? 100,
+            iops: args.dataVolumeIops,
+            throughput: args.dataVolumeThroughput,
             encrypted: true,
             tags: named.apply((t) => ({ ...t, Name: `${name}-data` })),
         }, { ...parent, retainOnDelete: true });

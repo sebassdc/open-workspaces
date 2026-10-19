@@ -21,6 +21,7 @@ test("pulumi package get-schema finds every component", (t) => {
         const inputs = schema.resources[`open-workspaces-aws:index:${name}`].inputProperties;
         assert.equal(inputs.vcpuOvercommit.type, "number");
         assert.equal(inputs.storeUrl.type, "string");
+        for (const input of ["dataVolumeSizeGib", "dataVolumeIops", "dataVolumeThroughput"]) assert.equal(inputs[input].type, "number");
         assert.equal(inputs.imageArtifacts.additionalProperties.$ref, "#/types/open-workspaces-aws:index:ImageArtifact");
         assert.equal(schema.resources[`open-workspaces-aws:index:${name}`].inputProperties.tailscaleDirect.$ref,
             "#/types/open-workspaces-aws:index:TailscaleDirectArgs");

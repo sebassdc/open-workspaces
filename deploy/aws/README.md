@@ -73,7 +73,8 @@ export const instanceId = host.instanceId;
 | `subnetId` | default VPC subnet in the first zone offering the type | |
 | `associatePublicIpAddress` | `true` | Egress without a NAT gateway; still no inbound rules. Use `false` with a private subnet that has NAT. |
 | `amiId` | Canonical Ubuntu 24.04 x86-64 from SSM | Pin it to avoid host replacement when Canonical publishes a new image. |
-| `dataVolumeSizeGib` | `100` | Btrfs volume at `/srv/ow`. |
+| `dataVolumeSizeGib` | `100` | Btrfs volume at `/srv/ow`. Grow it in place: EBS modifies the volume online and the next `ow-aws apply` (or `ci-post-up`) grows the filesystem. EBS refuses shrinking. |
+| `dataVolumeIops` / `dataVolumeThroughput` | gp3 defaults (`3000`, `125` MiB/s) | Data volume performance; gp3 allows 3000-16000 IOPS and 125-1000 MiB/s. Applied online, no restart. |
 | `repository` / `ref` | upstream repo / this package's tag | The release the host builds and runs; a change is applied in place by `ow-host upgrade` (see below). |
 | `tags` | `{}` | Applied to every resource. |
 | `tailscaleAuthKeySecretArn` | none | Full secret ARN; the secret string is the raw auth key. |
@@ -92,7 +93,7 @@ Outputs: `instanceId`, `privateIp`, `availabilityZone`, `dataVolumeId`,
 `roleName`, `securityGroupId`, `configParameter`.
 
 Every input except `instanceType`, `subnetId`, `associatePublicIpAddress`,
-`amiId`, `dataVolumeSizeGib`, `tailscaleDirect` and `tags` lives in the config parameter. After
+`amiId`, the `dataVolume*` inputs, `tailscaleDirect` and `tags` lives in the config parameter. After
 `pulumi up` changes it, apply it with `ow-aws apply` (or `ci-post-up`, which also
 upgrades); the host keeps the last applied copy on its data volume.
 

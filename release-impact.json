@@ -2,7 +2,7 @@
   "schema": 1,
   "releases": [
     {
-      "version": "0.9.17",
+      "version": "0.9.18",
       "class": 1,
       "changes": [
         "component",
@@ -37,6 +37,41 @@
       "host_layout": 2,
       "in_place_from": "0.5.0",
       "notes": "Opt-in RunnerPool component and controller-host adapter (ow-host pool). New infrastructure only: an unchanged consumer stack gets no new instance and no host replacement; bootstrap.sh, stage 0 and existing Host/Runner resources are unchanged. ow_host.py gains pool-runner identity (node from its data volume) and a join request through a per-instance secret; existing host and runner configs validate and render as before. The controller scaler accepts an opt-in live mode, refused unless a private recovery-drill attestation and a passing provider check for every pool exist; it then makes only newly recorded actions effectful for the adapter to execute and settle by receipt. Shadow configs behave as before. No agent, worker, catalog schema (7, reader floor 7), runtime or CPU ratio change."
+    },
+    {
+      "version": "0.9.17",
+      "class": 0,
+      "changes": [
+        "component"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Component inputs dataVolumeIops and dataVolumeThroughput set the data volume's gp3 performance; unset keeps the current volume unchanged. EBS applies a size or performance change online, and the host's existing apply step grows the Btrfs filesystem. Component only: runtime, worker and host protocols, catalog schema 7 and reader floor 7, guest kernel, host layout and stage 0 are unchanged; no restart, transfer or guest-state change is required."
     },
     {
       "version": "0.9.16",
