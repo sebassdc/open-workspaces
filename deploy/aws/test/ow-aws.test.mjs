@@ -502,3 +502,28 @@ test("in a stack whose instanceId is the controller, runner CI commands act on t
     assert.ok(!f.calls().some((c) => c[1] === "describe-instances" && c.some((a) => a.startsWith("Name=tag:Name"))));
     f.done();
 });
+
+test("recovery commands keep private catalogs on the host and never call a worker lifecycle", () => {
+    for (const [args, expected] of [
+        [["recovery-status"], "ow_host recovery-status"],
+        [["recovery-freeze"], "ow_host recovery-freeze"],
+        [["recovery-check", "/private/restored.sqlite3", "--against", "/private/final.sqlite3"],
+            "ow backup catalog-check /private/restored.sqlite3 --against /private/final.sqlite3"],
+        [["recovery-runner", "--config", "/private/runner.json", "--controller", "https://replacement:8790", "--ca", "/private/ca.pem"],
+            "ow_host recovery-runner --config /private/runner.json --controller https://replacement:8790 --ca /private/ca.pem"],
+    ]) {
+        const f = fake();
+        try {
+            const result = f.run(args);
+            assert.equal(result.status, 0, result.stderr);
+            assert.deepEqual(f.scripts().map((s) => f.lastLine(s.script)), [expected]);
+            assert.ok(!f.calls().some((c) => c.includes("secretsmanager") || c.includes("stop-instances") || c.includes("start-instances")));
+        } finally { f.done(); }
+    }
+    const f = fake();
+    try {
+        assert.notEqual(f.run(["recovery-check", "a", "bad-flag", "b"]).status, 0);
+        assert.notEqual(f.run(["recovery-freeze", "--worker"]).status, 0);
+        assert.equal(f.scripts().length, 0);
+    } finally { f.done(); }
+});

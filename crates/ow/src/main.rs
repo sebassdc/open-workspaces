@@ -537,6 +537,12 @@ enum StoreAction {
 
 #[derive(Subcommand)]
 enum BackupAction {
+    /// Read-only integrity/schema/root check; compare with a final private catalog.
+    CatalogCheck {
+        catalog: PathBuf,
+        #[arg(long)]
+        against: Option<PathBuf>,
+    },
     /// Consistent SQLite copy of the live catalog into a new private file.
     Catalog {
         #[arg(long)]
