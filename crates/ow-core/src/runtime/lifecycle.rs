@@ -794,7 +794,19 @@ mod tests {
                 .request(&json!({"op":"start","id":"child","placement":authority(8)}))
                 .is_err()
         );
-        fs::write(runtime.machine_dir("child/disk.ext4"), b"independent child").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let sealed = runtime.snapshot_dir("capture1/disk.ext4");
+        let child = runtime.machine_dir("child/disk.ext4");
+        assert_eq!(
+            fs::metadata(&sealed).unwrap().permissions().mode() & 0o222,
+            0
+        );
+        assert_ne!(
+            fs::metadata(&child).unwrap().permissions().mode() & 0o200,
+            0
+        );
+        fs::write(&child, b"independent child").unwrap();
+        assert_eq!(fs::read(&sealed).unwrap(), before);
         assert_eq!(
             fs::read(runtime.machine_dir("legacy/disk.ext4")).unwrap(),
             before
