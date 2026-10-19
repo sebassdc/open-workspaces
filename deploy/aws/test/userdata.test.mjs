@@ -288,3 +288,17 @@ test("recovery points require a store and remain opt in", () => {
     assert.equal(hostConfig(base).backup.recovery, undefined);
     assert.equal(hostConfig({...base, backupUrl: "s3://my-bucket/p", recoveryPoints: true}).backup.recovery, true);
 });
+
+
+test("recovery opt-in preserves dashboard capability and CPU admission", async () => {
+    const result = await deploy({
+        tailscaleAuthKeySecretArn: secretArn,
+        dashboardCapability: "example.test/cap/open-workspaces",
+        backupUrl: "s3://my-bucket/ow",
+        recoveryPoints: true,
+        vcpuOvercommit: 2,
+    });
+    assert.equal(result.config.vcpuOvercommit, 2);
+    assert.equal(result.config.dashboard.capability, "example.test/cap/open-workspaces");
+    assert.equal(result.config.backup.recovery, true);
+});
