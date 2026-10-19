@@ -396,10 +396,15 @@ fn launch(shared: Shared, id: i64) {
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Ok(());
             }
+            #[cfg(test)]
+            process_tests::controller_checkpoint(&root, id)?;
             loop {
-                if !tick(&shared, id, now(), &|node, request| {
+                let more = tick(&shared, id, now(), &|node, request| {
                     rpc(&root, node, request)
-                })? {
+                })?;
+                #[cfg(test)]
+                process_tests::controller_checkpoint(&root, id)?;
+                if !more {
                     break;
                 }
             }
@@ -960,3 +965,7 @@ pub(crate) fn job(root: &Path, request: &Value) -> Result<Value> {
 #[cfg(test)]
 #[path = "transfer_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transfer_process_tests.rs"]
+pub(crate) mod process_tests;

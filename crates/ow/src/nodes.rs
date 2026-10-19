@@ -1416,7 +1416,12 @@ fn agent_job(
             wire::response(crate::image_store::job(root, &request))
         } else if matches!(op, "capture-pull" | "capture-cache" | "restore-policy") {
             common::placement_capable(&checked)?;
-            wire::response(crate::transfers::job(root, &request))
+            #[cfg(test)]
+            crate::transfers::process_tests::agent_checkpoint(root, op, "before-effect")?;
+            let result = wire::response(crate::transfers::job(root, &request));
+            #[cfg(test)]
+            crate::transfers::process_tests::agent_checkpoint(root, op, "after-effect")?;
+            result
         } else {
             journal_request(root, &request, common::placement_capable(&checked).is_ok())?
         };
@@ -1598,10 +1603,22 @@ fn journal_request(root: &Path, request: &Value, fencing_worker: bool) -> Result
         params![key, request.to_string()],
     )?;
     tx.commit()?;
+    #[cfg(all(test, target_os = "linux"))]
+    crate::transfers::process_tests::agent_checkpoint(
+        root,
+        request["op"].as_str().unwrap_or(""),
+        "before-effect",
+    )?;
     let response = match wire::request_envelope(root, request) {
         Ok(v) => v,
         Err(e) => json!({"ok":false,"error":format!("{e:#}"),"uncertain":true}),
     };
+    #[cfg(all(test, target_os = "linux"))]
+    crate::transfers::process_tests::agent_checkpoint(
+        root,
+        request["op"].as_str().unwrap_or(""),
+        "after-effect",
+    )?;
     db.execute(
         "UPDATE effects SET response=?1 WHERE key=?2",
         params![response.to_string(), key],

@@ -811,14 +811,16 @@ impl Catalog {
         )?)
     }
     fn save_node(&mut self, node: &str, kind: &str, physical: &str, value: &Value) -> Result<()> {
-        let updated = self.db.execute("UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE kind=?2 AND physical=?3 AND node=?4 AND (kind<>'machine' OR (placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical)))",params![value.to_string(),kind,physical,node])?;
+        let mut updated = self.db.execute("UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE kind=?2 AND physical=?3 AND node=?4 AND (kind<>'machine' OR (placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical)))",params![value.to_string(),kind,physical,node])?;
         if kind == "machine" && updated == 0 {
             if let Some(placement) = self.managed_placement(physical)? {
                 ensure!(
-                    value["placement"] == json!(placement),
+                    node == placement.node
+                        && value["id"] == physical
+                        && value["placement"] == json!(placement),
                     "worker result has contradictory placement"
                 );
-                self.db.execute("UPDATE resources SET metadata=?1 WHERE kind='machine' AND physical=?2 AND node=?3 AND placement_epoch=?4",params![value.to_string(),physical,node,placement.epoch as i64])?;
+                updated = self.db.execute("UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND physical=?2 AND node=?3 AND placement_epoch=?4",params![value.to_string(),physical,node,placement.epoch as i64])?;
             }
         }
         if kind == "machine" && updated == 1 {
@@ -910,7 +912,12 @@ impl Catalog {
                     extra_cpus += m["vcpu_count"].as_i64().unwrap_or(16);
                     extra_slots += 1;
                 }
-                if !self.legacy_machine(physical)? {
+                let managed = self.managed_placement(physical)?;
+                if !self.legacy_machine(physical)?
+                    && !managed
+                        .as_ref()
+                        .is_some_and(|p| p.node == node && m["placement"] == json!(p))
+                {
                     all_machines.push(m.clone());
                     continue;
                 }
@@ -925,7 +932,8 @@ impl Catalog {
                 if matches!(
                     m["state"].as_str(),
                     Some("stopped" | "hibernated" | "failed")
-                ) {
+                ) && (managed.is_none() || m["vmm_running"] == false)
+                {
                     self.db.execute("UPDATE resources SET reserved_mib=0,reserved_cpus=0 WHERE kind='machine' AND physical=?1 AND node=?2 AND NOT EXISTS(SELECT 1 FROM operations WHERE resource=resources.name AND owner=resources.owner AND state IN ('pending','uncertain') AND op IN ('create','start','fork','restore'))",params![physical,node])?;
                 }
                 all_machines.push(m.clone());
@@ -1972,6 +1980,41 @@ impl Catalog {
                 "operation {operation}: worker response did not match the requested resource"
             );
             return Err(self.outcome_error(user, operation));
+        }
+        if request.get("placement").is_some()
+            && matches!(op.as_str(), "start" | "stop" | "hibernate")
+        {
+            // Lifecycle replies predate placement fields; observe the actual current copy.
+            let observed = (|| -> Result<Value> {
+                let observed = wire::request(
+                    &root,
+                    json!({"op":"inspect","id":physical,"placement":request["placement"]}),
+                )?;
+                ensure!(
+                    observed["id"] == physical && observed["placement"] == request["placement"],
+                    "post-effect inspect has contradictory placement"
+                );
+                Ok(observed)
+            })();
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    self.db.execute(
+                        "UPDATE operations SET state='uncertain',response=?1 WHERE id=?2",
+                        params![
+                            json!({"error":format!("post-effect observation failed: {error:#}")})
+                                .to_string(),
+                            operation
+                        ],
+                    )?;
+                    return Err(self.outcome_error(user, operation));
+                }
+            };
+            if op == "stop" {
+                value["workspace"] = observed;
+            } else {
+                value = observed;
+            }
         }
         if matches!(
             op.as_str(),

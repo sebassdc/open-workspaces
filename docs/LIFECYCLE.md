@@ -150,3 +150,27 @@ checked worker executable, and JSON additions remain optional for older controll
 No worker or VM is restarted by installing the controller. Retained source copies,
 cache cleanup, automatic recovery from unapproved source loss and legacy-backup
 catalog registration are outside this restore executor. See DAILY_USE for commands.
+
+## Observing an adopted workspace
+
+Worker lifecycle replies keep their existing shape: ordinary start, stop and
+hibernate responses need not contain placement. After a managed lifecycle effect,
+the controller inspects the worker and verifies physical ID and the exact requested
+placement before saving metadata and completing the operation. An unavailable or
+contradictory post-effect inspect records an uncertain operation, rather than
+leaving it pending or attaching a guessed epoch to an old reply.
+
+Completed restores refresh metadata from inventory only when the reporting node
+and epoch/node/transfer tuple all match the committed catalog placement. This
+includes failed VMMs and a stopped copy after worker restart. Source, stale/future
+epoch and transferring-copy reports cannot overwrite current metadata or release
+its capacity. Managed reservations release only on a matching positive nonrunning
+observation; offline or absent inventory is not proof of source loss.
+
+The x86 Linux unit-test binary includes process-crash acceptance tests:
+`cargo test --locked -p ow --bin ow transfers::process_tests -- --test-threads=1`.
+They SIGKILL real controller and node-agent subprocesses at persisted phases and
+before/after job effects, then invoke startup recovery against durable catalogs,
+verified byte caches and node journals. Their separate durable worker fixture
+emulates VMM execution; these tests prove controller/agent process recovery, not
+hardware isolation or RAM portability. All barriers compile out of release builds.
