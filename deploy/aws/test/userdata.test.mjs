@@ -113,6 +113,17 @@ test("capability admission, store pins and overcommit compose without user data 
     assert.equal(before.userData, after.userData);
 });
 
+test("data volume size and performance change the volume only, never the host", async () => {
+    const volume = () => created.find((r) => r.type === "aws:ebs/volume:Volume").inputs;
+    const before = await deploy({});
+    assert.equal(volume().size, 100);
+    assert.ok(!("iops" in volume()) && !("throughput" in volume()), "unset keeps the existing volume unchanged");
+    const after = await deploy({ dataVolumeSizeGib: 200, dataVolumeIops: 3000, dataVolumeThroughput: 500 });
+    assert.deepEqual([volume().size, volume().iops, volume().throughput], [200, 3000, 500]);
+    assert.equal(before.userData, after.userData);
+    assert.deepEqual(before.config, after.config);
+});
+
 test("user data keeps values literal and starts with the bootstrap shebang", () => {
     for (const value of [`it's $(touch /tmp/pwned) "quoted"`, "release-$&", "release-$$", "a-$'-$`-$1"]) {
         const script = renderUserData({ OW_CONFIG_PARAMETER: value }, bootstrap);
