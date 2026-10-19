@@ -52,6 +52,14 @@ an actual compatible worker. A newer agent with an old worker advertises false.
 Export returns `capture: {snapshot, metadata, manifest_sha256, files}`. Each file
 entry contains its private local `path` and lowercase uncompressed `sha256`.
 The native metadata includes subject, shape, image and runtime/CPU/kernel tuple.
+Exports and ordinary snapshots/hibernation of managed workspaces seal
+`managed: true` into that manifest. This provenance is not activation authority.
+Legacy import, restore and fork reject these captures before registration or disk
+replacement, including on a fresh worker with no local placement record. An
+unmanaged workspace cannot wake from a managed hibernation capture either.
+Consume a managed capture through `import-prepare` and post-commit activation.
+Older unmanaged manifests without the field keep their standalone behavior;
+legacy workers that cannot enforce this boundary remain ineligible for moves.
 A RAM capture has `state`, `memory` and `disk.ext4` together; a disk-only capture
 has `disk.ext4`. These are local worker results, not public API response fields.
 

@@ -432,6 +432,7 @@ impl Runtime {
             let snapshot = Snapshot {
                 name: intent.capture.clone(),
                 workspace: id.into(),
+                managed: true,
                 memory_mib: workspace.memory_mib,
                 vcpu_count: workspace.vcpu_count,
                 image: workspace.image,
@@ -475,6 +476,10 @@ impl Runtime {
         let snapshot: Snapshot =
             serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
         ensure!(snapshot.workspace == id, "capture belongs to another copy");
+        ensure!(
+            snapshot.managed,
+            "export capture is missing managed provenance"
+        );
         self.state.placements.get_mut(id).unwrap().phase = Phase::Exported;
         self.state.workspaces.get_mut(id).unwrap().state = "exported".into();
         self.save()?;
@@ -734,6 +739,7 @@ mod tests {
             restart(&mut runtime);
             assert_fenced(&mut runtime);
             let first = runtime.request(&export()).unwrap();
+            assert_eq!(first["capture"]["metadata"]["managed"], true);
             let bytes = fs::read(runtime.snapshot_dir("capture1").join("manifest.json")).unwrap();
             assert_eq!(first["state"], "exported");
             assert_eq!(runtime.request(&export()).unwrap(), first);
@@ -1005,6 +1011,200 @@ mod tests {
     }
 
     #[test]
+    fn review_managed_export_cannot_enter_through_legacy_import() {
+        for ram in [false, true] {
+            let mut source = fixture();
+            register(&mut source);
+            let server = ram.then(|| {
+                let (machine, server) = vm::capture_fixture(&source.machine_dir("legacy"), false);
+                source.machines.insert("legacy".into(), machine);
+                server
+            });
+            let exported = source.request(&export()).unwrap();
+            if let Some(server) = server {
+                server.join().unwrap();
+            }
+            for cold in [true, false].into_iter().filter(|cold| ram || *cold) {
+                let mut target = fixture();
+                forget_source_for_target_fixture(&mut target);
+                let directory = target.snapshot_dir("capture1");
+                fs::create_dir(&directory).unwrap();
+                for entry in fs::read_dir(source.snapshot_dir("capture1")).unwrap() {
+                    let entry = entry.unwrap();
+                    fs::copy(entry.path(), directory.join(entry.file_name())).unwrap();
+                }
+                let before = fs::read(target.root.join("state.json")).unwrap();
+                let index = target.state.next_index;
+                target.closing = true;
+                let error = target
+                    .request(&json!({"op":"import","snapshot":"capture1","cold":cold}))
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("managed capture requires import-prepare"),
+                    "legacy import reached registration or launch: {error:#}"
+                );
+                assert!(!target.machine_dir("legacy").exists());
+                assert!(!target.state.workspaces.contains_key("legacy"));
+                assert_eq!(target.state.next_index, index);
+                assert_eq!(fs::read(target.root.join("state.json")).unwrap(), before);
+                restart(&mut target);
+                assert!(
+                    target
+                        .request(&json!({"op":"start","id":"legacy"}))
+                        .is_err()
+                );
+                let mut prepare = import_request(&target);
+                prepare["cold"] = json!(cold);
+                assert_eq!(target.request(&prepare).unwrap()["state"], "prepared");
+                restart(&mut target);
+                assert!(
+                    target
+                        .request(&json!({"op":"start","id":"legacy"}))
+                        .is_err()
+                );
+                let mut start = request("start");
+                start["placement"] = authority(8);
+                assert!(
+                    target
+                        .request(&start)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("not activated")
+                );
+                let mut activate = request("activate");
+                activate["placement"] = authority(8);
+                activate["committed"] = json!(true);
+                target.request(&activate).unwrap();
+                assert!(target.authorize(&start, true).is_ok());
+                assert!(
+                    target
+                        .authorize(&json!({"op":"start","id":"legacy"}), true)
+                        .is_err()
+                );
+                assert!(target.machines.is_empty());
+                fs::remove_dir_all(target.root).unwrap();
+            }
+            assert_eq!(exported["capture"]["metadata"]["managed"], true);
+            fs::remove_dir_all(source.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn managed_snapshot_and_hibernation_provenance_survives_copy_to_a_fresh_worker() {
+        for managed in [false, true] {
+            for hibernate in [false, true] {
+                let mut source = fixture();
+                if managed {
+                    register(&mut source);
+                }
+                let (machine, server) =
+                    vm::capture_fixture(&source.machine_dir("legacy"), !hibernate);
+                source.machines.insert("legacy".into(), machine);
+                let mut capture = if managed {
+                    request(if hibernate { "hibernate" } else { "snapshot" })
+                } else {
+                    json!({"op":if hibernate {"hibernate"} else {"snapshot"},"id":"legacy"})
+                };
+                capture["name"] = json!("capture1");
+                let result = source.request(&capture).unwrap();
+                source.machines.clear();
+                server.join().unwrap();
+                let name = result[if hibernate { "hibernation" } else { "name" }]
+                    .as_str()
+                    .unwrap();
+                let mut target = fixture();
+                let directory = target.snapshot_dir(name);
+                fs::create_dir(&directory).unwrap();
+                for entry in fs::read_dir(source.snapshot_dir(name)).unwrap() {
+                    let entry = entry.unwrap();
+                    fs::copy(entry.path(), directory.join(entry.file_name())).unwrap();
+                }
+                let manifest = directory.join("manifest.json");
+                let mut metadata: Value =
+                    serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+                assert_eq!(metadata["managed"], managed);
+                if managed {
+                    let before = fs::read(target.machine_dir("legacy/disk.ext4")).unwrap();
+                    for req in [
+                        json!({"op":"restore","id":"legacy","name":name}),
+                        json!({"op":"fork","id":"legacy","child":"child","snapshot":name}),
+                    ] {
+                        let error = target.request(&req).unwrap_err();
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("managed capture requires import-prepare"),
+                            "{error:#}"
+                        );
+                    }
+                    assert_eq!(
+                        fs::read(target.machine_dir("legacy/disk.ext4")).unwrap(),
+                        before
+                    );
+                    assert!(!target.machine_dir("child").exists());
+                    let legacy = target.state.workspaces.get_mut("legacy").unwrap();
+                    legacy.hibernation = Some(name.into());
+                    legacy.state = "hibernated".into();
+                    target.save().unwrap();
+                    restart(&mut target);
+                    let error = target
+                        .request(&json!({"op":"start","id":"legacy"}))
+                        .unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("managed capture requires import-prepare"),
+                        "{error:#}"
+                    );
+                } else {
+                    // Pre-fencing unmanaged manifests have no provenance field.
+                    metadata.as_object_mut().unwrap().remove("managed");
+                    atomic_json(&manifest, &metadata).unwrap();
+                }
+                forget_source_for_target_fixture(&mut target);
+                for cold in [false, true] {
+                    target.closing = true;
+                    let error = target
+                        .request(&json!({"op":"import","snapshot":name,"cold":cold}))
+                        .unwrap_err();
+                    if managed {
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("managed capture requires import-prepare"),
+                            "{error:#}"
+                        );
+                        assert!(!target.state.workspaces.contains_key("legacy"));
+                        assert!(!target.machine_dir("legacy").exists());
+                    } else {
+                        assert!(
+                            error.to_string().contains("worker is shutting down"),
+                            "{error:#}"
+                        );
+                        assert_eq!(
+                            target
+                                .request(&json!({"op":"inspect","id":"legacy"}))
+                                .unwrap()["managed"],
+                            false
+                        );
+                        restart(&mut target);
+                        assert!(
+                            target
+                                .authorize(&json!({"op":"start","id":"legacy"}), true)
+                                .is_ok()
+                        );
+                        forget_source_for_target_fixture(&mut target);
+                    }
+                }
+                fs::remove_dir_all(target.root).unwrap();
+                fs::remove_dir_all(source.root).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn review_cached_unmanaged_delete_validation_survives_the_missing_record() {
         let mut runtime = fixture();
         let delete = json!({"op":"delete","id":"legacy"});
@@ -1062,13 +1262,14 @@ mod tests {
 
     #[test]
     fn review_cleaned_fences_release_capacity_without_losing_admission_or_epoch_guards() {
-        fn incoming(runtime: &Runtime, subject: &str, name: &str) -> Value {
+        fn incoming(runtime: &Runtime, subject: &str, name: &str, managed: bool) -> Value {
             let mut snapshot: Snapshot = serde_json::from_slice(
                 &fs::read(runtime.snapshot_dir("sealed0/manifest.json")).unwrap(),
             )
             .unwrap();
             snapshot.name = name.into();
             snapshot.workspace = subject.into();
+            snapshot.managed = managed;
             let directory = runtime.snapshot_dir(name);
             fs::create_dir(&directory).unwrap();
             fs::copy(
@@ -1108,7 +1309,7 @@ mod tests {
         );
         restart(&mut runtime);
         let count = runtime.request(&json!({"op":"status"})).unwrap()["workspace_count"].clone();
-        let import = incoming(&runtime, "target0", "incoming0");
+        let import = incoming(&runtime, "target0", "incoming0", true);
         let prepared = runtime.request(&import);
         assert!(
             prepared.is_ok(),
@@ -1116,7 +1317,7 @@ mod tests {
         );
         assert_eq!(count, 0);
         assert_eq!(runtime.state.placements.len(), MAX_WORKSPACES + 1);
-        let legacy = incoming(&runtime, "legacy-target", "legacy-import");
+        let legacy = incoming(&runtime, "legacy-target", "legacy-import", false);
         // Exercise legacy registration while quiesce prevents any guest boot.
         runtime.closing = true;
         let result = runtime
@@ -1151,7 +1352,12 @@ mod tests {
             "ordinary create still counts tombstones: {create:#}"
         );
         for i in 1..MAX_WORKSPACES {
-            let import = incoming(&runtime, &format!("target{i}"), &format!("incoming{i}"));
+            let import = incoming(
+                &runtime,
+                &format!("target{i}"),
+                &format!("incoming{i}"),
+                true,
+            );
             runtime.request(&import).unwrap();
         }
         assert_eq!(
@@ -1162,7 +1368,7 @@ mod tests {
             runtime.request(&import).is_ok(),
             "a prepared retry does not need another slot"
         );
-        let overflow = incoming(&runtime, "overflow", "incoming-overflow");
+        let overflow = incoming(&runtime, "overflow", "incoming-overflow", false);
         assert!(
             runtime
                 .request(&overflow)

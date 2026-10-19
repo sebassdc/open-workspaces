@@ -215,6 +215,8 @@ use lifecycle::Managed;
 struct Snapshot {
     name: String,
     workspace: String,
+    #[serde(default)]
+    managed: bool,
     memory_mib: u32,
     #[serde(default = "default_cpus")]
     vcpu_count: u32,
@@ -948,6 +950,10 @@ impl Runtime {
                 let manifest: Snapshot = serde_json::from_slice(&fs::read(
                     self.snapshot_dir(name).join("manifest.json"),
                 )?)?;
+                ensure!(
+                    workspace.managed || !manifest.managed,
+                    "managed capture requires import-prepare"
+                );
                 resume = manifest.resumable(&self.cpu, &self.kernel_hash);
                 ensure!(
                     resume || !workspace.managed,
@@ -1037,6 +1043,7 @@ impl Runtime {
             let snapshot = Snapshot {
                 name: name.into(),
                 workspace: id.into(),
+                managed: workspace.managed,
                 memory_mib: workspace.memory_mib,
                 vcpu_count: workspace.vcpu_count,
                 image: workspace.image,
@@ -1103,8 +1110,12 @@ impl Runtime {
         Ok(())
     }
 
-    fn validate_snapshot(&mut self, name: &str) -> Result<PathBuf> {
-        self.verify_snapshot(name, true)
+    fn validate_snapshot(&mut self, name: &str, resume: bool) -> Result<PathBuf> {
+        let directory = self.verify_snapshot(name, resume)?;
+        let snapshot: Snapshot =
+            serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+        ensure!(!snapshot.managed, "managed capture requires import-prepare");
+        Ok(directory)
     }
 
     /// Checks a snapshot's files against its manifest and, when its RAM state will be
@@ -1156,7 +1167,7 @@ impl Runtime {
     /// state resumed, or with `cold` its disk booted fresh (for a host whose CPU or
     /// kernel differs).
     fn import(&mut self, name: &str, cold: bool) -> Result<Value> {
-        let directory = self.verify_snapshot(name, !cold)?;
+        let directory = self.validate_snapshot(name, !cold)?;
         let snapshot: Snapshot =
             serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
         let id = snapshot.workspace.clone();
@@ -1541,7 +1552,7 @@ impl Runtime {
                 if supplied.is_none() {
                     self.capture(id, name, false)?;
                 }
-                let directory = self.validate_snapshot(name)?;
+                let directory = self.validate_snapshot(name, true)?;
                 let snapshot: Snapshot =
                     serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
                 ensure!(
@@ -1573,7 +1584,7 @@ impl Runtime {
             }
             "restore" => {
                 let name = request["name"].as_str().context("missing snapshot name")?;
-                let directory = self.validate_snapshot(name)?;
+                let directory = self.validate_snapshot(name, true)?;
                 let snapshot: Snapshot =
                     serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
                 let workspace = self.workspace(id)?;
@@ -1703,6 +1714,7 @@ mod disk_tests {
         let snapshot = Snapshot {
             name: "saved".into(),
             workspace: "legacy".into(),
+            managed: false,
             memory_mib: 1024,
             vcpu_count: 2,
             image: "alpine".into(),
@@ -1911,6 +1923,7 @@ mod disk_tests {
         let snapshot = Snapshot {
             name: "before-growth".into(),
             workspace: "legacy".into(),
+            managed: false,
             memory_mib: 1024,
             vcpu_count: 2,
             image: "alpine".into(),
