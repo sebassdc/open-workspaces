@@ -2,6 +2,47 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.10",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard",
+        "component",
+        "config"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 2,
+        "accepts": [
+          1,
+          2
+        ]
+      },
+      "catalog": {
+        "schema": 5,
+        "min_reader": 5
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Opt-in catalog-rooted artifact GC adds exact dry-run candidates, terminal tombstones, atomic root/grace revalidation, resumable versioned deletion receipts, live-object verification and a break-glass undo plan. Update the controller and dashboard for shared catalog validation; optional scoped GC IAM/config is class 0. Live deletion requires complete catalog authority, effective policy and undo evidence. Catalog schema/reader floor 5, host protocol 1, worker interface 2/readers 1-2, runtime, guest kernel, host layout 2 and stage 0 are unchanged from v0.9.8. Existing worker pins and running guests are preserved; no worker restart, automatic GC timer, bucket replacement or infrastructure activation.",
+      "waivers": {
+        "worker": "crates/ow/src/host.rs only adds Action::Store to the unreachable local-operator command arm. main.rs dispatches store commands before host::run; worker dispatch, runtime, placement enforcement and worker interfaces are unchanged. Keep the worker pin unchanged."
+      }
+    },
+    {
       "version": "0.9.8",
       "class": 1,
       "changes": [

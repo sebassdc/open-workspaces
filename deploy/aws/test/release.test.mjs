@@ -133,3 +133,19 @@ print(json.dumps(p))
     assert.deepEqual(result.cold, []);
     assert.equal(result.catalog_backup, false);
 });
+
+test("the GC release updates catalog owners without restarting the worker", () => {
+    const result = JSON.parse(execFileSync("python3", ["-c", `
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import upgrade
+m = json.load(open(sys.argv[2]))
+pins = dict.fromkeys(("agent", "dashboard", "worker"), "0.9.8")
+print(json.dumps(upgrade.plan(m, pins, "0.9.10", max_class=1)))
+`, new URL("../host/", import.meta.url).pathname, new URL("../../../release-impact.json", import.meta.url).pathname], { encoding: "utf8" }));
+    assert.equal(result.class, 1);
+    assert.deepEqual(result.move, { agent: "0.9.10", dashboard: "0.9.10" });
+    assert.deepEqual(result.restart, ["agent", "dashboard"]);
+    assert.ok(!("worker" in result.move));
+    assert.ok(!("gate" in result));
+});
