@@ -281,3 +281,215 @@ fn host_up_then_node_add() {
     assert!(nodes::online(&controller, "sshnode").is_ok());
     fs::remove_dir_all(tools).unwrap();
 }
+
+/// Real TLS listener and outbound agents, synthetic workers; run in a non-KVM Linux fixture.
+#[test]
+#[ignore = "requires x86-64 non-KVM Linux and OW_NODE_TEST_BINARY; boots no VM"]
+fn controller_only_boot_enroll_create_and_restart() {
+    use crate::catalog::{Catalog, Identity};
+    use std::{
+        collections::BTreeMap,
+        os::unix::net::UnixListener,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    assert!(!Path::new("/dev/kvm").exists(), "use a non-KVM fixture");
+    let binary =
+        PathBuf::from(std::env::var_os("OW_NODE_TEST_BINARY").expect("built CLI required"));
+    let base = private_dir("ctrl");
+    let controller = base.join("controller");
+    host::data_root(Some(controller.clone())).unwrap();
+    nodes::write_private(
+        &controller.join("limits.json"),
+        &json!({"pool":{"default_type":"self-hosted","hourly_cents":{"self-hosted":0}}}),
+    )
+    .unwrap();
+    let mut catalog = Catalog::open(&controller, "test", None).unwrap();
+    let owner = catalog
+        .user(&Identity {
+            issuer: "test".into(),
+            subject: "owner".into(),
+            email: "owner@example.test".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        catalog.state(owner).unwrap()["stats"]["limit_memory_mib"],
+        0
+    );
+    assert!(
+        catalog
+            .operation(
+                owner,
+                json!({"op":"create","id":"no-node","memory_mib":256})
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no online node")
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let start = || {
+        Command::new(&binary)
+            .arg("--data-dir")
+            .arg(&base)
+            .args([
+                "host",
+                "up",
+                "--controller-only",
+                "--listen",
+                &addr.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    struct Fixture {
+        children: Vec<std::process::Child>,
+        stop: Arc<AtomicBool>,
+        workers: Vec<std::thread::JoinHandle<()>>,
+        base: PathBuf,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            for child in &mut self.children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.stop.store(true, Ordering::SeqCst);
+            for worker in self.workers.drain(..) {
+                let _ = worker.join();
+            }
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+    let mut fixture = Fixture {
+        children: vec![start()],
+        stop: Arc::new(AtomicBool::new(false)),
+        workers: Vec::new(),
+        base: base.clone(),
+    };
+    let ready = || {
+        let since = Instant::now();
+        while TcpStream::connect(addr).is_err() {
+            assert!(since.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    ready();
+    assert!(!base.join("runner").exists());
+    assert!(!controller.join("control.sock").exists());
+    assert_eq!(nodes::inventory(&controller).unwrap(), json!([]));
+    let ca = fs::read(base.join("tls/ca.pem")).unwrap();
+    let assets = base.join("assets/guest");
+    fs::create_dir_all(&assets).unwrap();
+    fs::write(assets.join("base.ext4"), b"synthetic image marker").unwrap();
+    for node in ["alpha", "beta"] {
+        let worker = base.join(node);
+        host::data_root(Some(worker.clone())).unwrap();
+        let listener = UnixListener::bind(worker.join("control.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = fixture.stop.clone();
+        fixture.workers.push(std::thread::spawn(move || {
+            let mut machines=BTreeMap::<String,Value>::new();
+            while !stop.load(Ordering::SeqCst) {
+                let (mut stream,_)=match listener.accept() {Ok(s)=>s,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{std::thread::sleep(Duration::from_millis(2));continue;},Err(e)=>panic!("{e}")};
+                let request=crate::wire::line(&mut stream).unwrap();
+                let result=match request["op"].as_str().unwrap() {
+                    "status"=>json!({"internet":true,"max_memory_mib":512,"max_running":1,"max_vcpus":1,"max_guest_memory_mib":512,"max_guest_vcpus":1}),
+                    "list"=>json!(machines.values().collect::<Vec<_>>()),
+                    "snapshots"=>json!([]),
+                    "stats"=>json!({"running":{}}),
+                    "create"=>{let m=json!({"id":request["id"],"memory_mib":256,"vcpu_count":1,"image":"alpine","state":"running","disk_bytes":8*common::GIB});machines.insert(request["id"].as_str().unwrap().into(),m.clone());m},
+                    other=>panic!("unexpected worker call {other}"),
+                };
+                crate::wire::send(&mut stream,&json!({"ok":true,"result":result})).unwrap();
+            }
+        }));
+        let join = worker.join("join.json");
+        nodes::invitation(
+            &controller,
+            node,
+            600,
+            512,
+            1,
+            1,
+            Some(&format!("https://{addr}")),
+            |v| nodes::write_private(&join, v),
+        )
+        .unwrap();
+        fixture.children.push(
+            Command::new(&binary)
+                .arg("--data-dir")
+                .arg(&worker)
+                .args([
+                    "node-agent",
+                    "--controller",
+                    &format!("https://{addr}"),
+                    "--credential",
+                ])
+                .arg(worker.join("node.json"))
+                .arg("--join")
+                .arg(join)
+                .arg("--ca-cert")
+                .arg(base.join("tls/ca.pem"))
+                .env("OW_ASSET_DIR", base.join("assets"))
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        assert!(wait_online(&controller, node, 0, Duration::from_secs(15)));
+    }
+    let mut selected = Vec::new();
+    for name in ["one", "two"] {
+        let result = catalog
+            .operation(
+                owner,
+                json!({"op":"create","id":name,"memory_mib":256,"vcpu_count":1,"image":"alpine"}),
+            )
+            .unwrap();
+        selected.push(result["node"].as_str().unwrap().to_owned());
+    }
+    selected.sort();
+    assert_eq!(selected, vec!["alpha", "beta"]);
+    assert_eq!(
+        catalog.state(owner).unwrap()["stats"]["limit_memory_mib"],
+        1024
+    );
+    let agents = fixture.children[1..]
+        .iter()
+        .map(|p| p.id())
+        .collect::<Vec<_>>();
+    // Graceful controller stop returns without waiting on a nonexistent local worker.
+    unsafe {
+        libc::kill(fixture.children[0].id() as i32, libc::SIGTERM);
+    }
+    let since = Instant::now();
+    while fixture.children[0].try_wait().unwrap().is_none() {
+        assert!(since.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    fixture.children[0] = start();
+    ready();
+    assert_eq!(fs::read(base.join("tls/ca.pem")).unwrap(), ca);
+    for (i, node) in ["alpha", "beta"].iter().enumerate() {
+        assert_eq!(fixture.children[i + 1].id(), agents[i]);
+        assert!(fixture.children[i + 1].try_wait().unwrap().is_none());
+        assert!(wait_online(
+            &controller,
+            node,
+            unix_now(),
+            Duration::from_secs(20)
+        ));
+    }
+    assert_eq!(
+        catalog.state(owner).unwrap()["workspaces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(!base.join("runner").exists());
+}
