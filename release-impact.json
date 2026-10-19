@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.7",
+      "class": 2,
+      "changes": [
+        "controller",
+        "agent",
+        "dashboard",
+        "worker"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 2,
+        "accepts": [
+          1,
+          2
+        ]
+      },
+      "catalog": {
+        "schema": 5,
+        "min_reader": 5
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Verified bounded cache inventory, lease-excluded and replay-safe eviction, aggregate staging reservations and deterministic cache-aware placement. Update controller, dashboard and agents, then use the normal class-2 worker quiesce/hibernate/swap/resume action; a control-plane update alone cannot grant older workers cache enforcement. The acknowledged cache-inventory-v1 extension and worker cache_eviction_v1 capability gate the new shape and operations. Preserve full logical disk reservations, configured host/capture reserves, capture compatibility and explicit cold-memory-loss consent. Catalog schema/read floor 5, host protocol 1, worker interface 2/readers 1-2, runtime, guest kernel, host layout and stage0 remain unchanged from v0.9.4. No host replacement, automatic managed movement or store activation."
+    },
+    {
       "version": "0.9.4",
       "class": 1,
       "changes": [

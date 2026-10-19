@@ -117,8 +117,9 @@ to 24 KiB. Prior controllers receive the prior shape. Legacy runners remain
 accepted and never receive the new `cache-inventory` or `cache-evict` operations.
 Catalog schema/read floor remains 5: the claim table and guards are additive, and
 SQLite enforces their exclusions for older compatible writers. Runtime, guest
-kernel, host layout, stage 0 and package/release versions are unchanged. The
-coordinated release must declare class-2 worker semantics before deployment.
+kernel, host layout and stage 0 are unchanged from v0.9.4. Release v0.9.7
+declares the cache worker semantics as class 2; update the controller, dashboard
+and agents, then apply the normal worker upgrade action before using eviction.
 
 ## Reproducible checks and timing limits
 
