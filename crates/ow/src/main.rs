@@ -42,6 +42,8 @@ mod ssh_client;
 #[cfg(target_os = "linux")]
 mod ssh_gateway;
 #[cfg(target_os = "linux")]
+mod store_gc;
+#[cfg(target_os = "linux")]
 mod terminal;
 #[cfg(target_os = "linux")]
 mod transfers;
@@ -116,6 +118,11 @@ enum Action {
     Image {
         #[command(subcommand)]
         command: ImageAction,
+    },
+    /// Controller-only artifact collection and verification (Linux, local operator).
+    Store {
+        #[command(subcommand)]
+        command: StoreAction,
     },
     /// Back up the controller catalog or a runner's snapshots (Linux, this machine).
     Backup {
@@ -462,6 +469,32 @@ enum ImageAction {
 }
 
 #[derive(Subcommand)]
+enum StoreAction {
+    /// Enumerate exact keys/bytes, or explicitly opt in to versioned deletion.
+    Gc {
+        #[arg(long)]
+        to: String,
+        #[arg(long, conflicts_with = "live")]
+        dry_run: bool,
+        #[arg(long, requires = "activation")]
+        live: bool,
+        /// Private operator receipt for complete authority, effective policy and undo proof.
+        #[arg(long, requires = "live")]
+        activation: Option<PathBuf>,
+        /// Restart the remaining work of an existing live run, retaining its server cutoff.
+        #[arg(long, requires = "live")]
+        resume: Option<String>,
+    },
+    /// Verify every stored manifest and current object by its catalog digest.
+    Verify {
+        #[arg(long)]
+        to: String,
+    },
+    /// Print preserved object-version/delete-marker receipts for break-glass recovery.
+    UndoPlan { run: String },
+}
+
+#[derive(Subcommand)]
 enum BackupAction {
     /// Consistent SQLite copy of the live catalog into a new private file.
     Catalog {
@@ -665,6 +698,19 @@ fn main_result() -> anyhow::Result<i32> {
         {
             drop(command);
             anyhow::bail!("ow node runs on the Linux controller machine (ow host up)");
+        }
+    }
+    if let Action::Store { command } = cli.command {
+        anyhow::ensure!(
+            cli.server.is_none() && cli.operation_key.is_none(),
+            "store commands run only on the local controller"
+        );
+        #[cfg(target_os = "linux")]
+        return store_gc::run(cli.data_dir, command);
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop(command);
+            anyhow::bail!("ow store runs on the Linux controller");
         }
     }
     if let Action::Image { command } = cli.command {

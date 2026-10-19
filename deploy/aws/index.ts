@@ -3,8 +3,8 @@ import * as path from "path";
 import * as aws from "@pulumi/aws";
 import * as pulumi from "@pulumi/pulumi";
 
-import { storeRunnerPolicy } from "./store";
-export { ArtifactStore, storeLifecycleRules, tlsOnlyPolicy, storeBucketPolicy, storeRunnerPolicy } from "./store";
+import { storeRunnerPolicy, storeGcPolicy } from "./store";
+export { ArtifactStore, storeLifecycleRules, tlsOnlyPolicy, storeBucketPolicy, storeRunnerPolicy, storeGcPolicy } from "./store";
 export type { ArtifactStoreArgs } from "./store";
 
 export interface ImageArtifact {
@@ -73,6 +73,8 @@ export interface HostArgs {
     backupUrl?: pulumi.Input<string>;
     /** Opt-in write-once image store root, s3://bucket/prefix. No list/delete rights. */
     storeUrl?: pulumi.Input<string>;
+    /** Controller-only GC rights. Default false; never enables a timer or deletion. Needs storeUrl. */
+    storeGc?: boolean;
     /** Digest-pinned base images to pull instead of building developerImages locally. */
     imageArtifacts?: pulumi.Input<{ [profile: string]: pulumi.Input<ImageArtifact> }>;
     /**
@@ -92,7 +94,7 @@ export interface HostArgs {
 }
 
 /** A runner host: everything a Host takes except the dashboard, plus the controller it joins. */
-export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability"> {
+export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability" | "storeGc"> {
     // The package analyzer loses optional types inherited through Omit.
     vcpuOvercommit?: pulumi.Input<number>;
     tailscaleDirect?: pulumi.Input<TailscaleDirectArgs>;
@@ -395,6 +397,11 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                     Statement: [{ Effect: "Allow", Action: "secretsmanager:GetSecretValue", Resource: arn }],
                 })),
             }, parent);
+        }
+        if (args.storeGc) {
+            if (controller || !args.storeUrl) throw new Error("storeGc needs a controller host and storeUrl");
+            new aws.iam.RolePolicy(`${name}-store-gc`, { role: role.id,
+                policy: pulumi.all([partition, args.storeUrl]).apply(([p, url]) => storeGcPolicy(p, url)) }, parent);
         }
         if (args.storeUrl) {
             new aws.iam.RolePolicy(`${name}-store`, { role: role.id,

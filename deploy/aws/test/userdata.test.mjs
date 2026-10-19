@@ -311,3 +311,16 @@ test("recovery opt-in preserves dashboard, CPU and artifact store configuration"
     assert.equal(result.config.dashboard.capability, "example.test/cap/open-workspaces");
     assert.equal(result.config.backup.recovery, true);
 });
+
+test("GC IAM is opt in, preserves host inputs and creates no bucket or endpoint", async () => {
+    const plain = await deploy({ storeUrl: "s3://bucket/root" });
+    assert.ok(!created.some(r => r.name === "ow-test-store-gc"));
+    const enabled = await deploy({ storeUrl: "s3://bucket/root", storeGc: true });
+    assert.equal(enabled.userData, plain.userData);
+    assert.deepEqual(enabled.config, plain.config);
+    const policy = created.find(r => r.name === "ow-test-store-gc");
+    assert.equal(policy.type, "aws:iam/rolePolicy:RolePolicy");
+    assert.ok(JSON.parse(policy.inputs.policy).Statement.some(s => s.Effect === "Deny" && s.Action === "s3:DeleteObjectVersion"));
+    assert.ok(!created.some(r => /s3.*Bucket|vpcEndpoint/.test(r.type)));
+    assert.throws(() => new Host("no-store", { storeGc: true }), /needs a controller/);
+});

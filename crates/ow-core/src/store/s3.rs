@@ -69,7 +69,7 @@ impl S3Objects {
         command
     }
     /// Fail closed before publishing into a bucket that could expire live artifacts.
-    pub fn verify_configuration(&self) -> Result<()> {
+    pub fn configuration_snapshot(&self) -> Result<Value> {
         let read = |operation: &str| -> Result<Value> {
             let output = self
                 .aws()
@@ -88,10 +88,18 @@ impl S3Objects {
             );
             Ok(serde_json::from_slice(&output.stdout)?)
         };
-        let versioning = read("get-bucket-versioning")?;
-        let lifecycle = read("get-bucket-lifecycle-configuration")?;
-        check_configuration(&versioning, &lifecycle, &self.prefix)?;
-        let policy = read("get-bucket-policy")?;
+        Ok(
+            json!({"versioning":read("get-bucket-versioning")?,"lifecycle":read("get-bucket-lifecycle-configuration")?,"policy":read("get-bucket-policy")?}),
+        )
+    }
+    pub fn verify_configuration(&self) -> Result<()> {
+        let evidence = self.configuration_snapshot()?;
+        check_configuration(
+            &evidence["versioning"],
+            &evidence["lifecycle"],
+            &self.prefix,
+        )?;
+        let policy = &evidence["policy"];
         let policy: Value = serde_json::from_str(
             policy["Policy"]
                 .as_str()
@@ -176,6 +184,147 @@ impl S3Objects {
                 "COMPOSITE",
             ],
         )
+    }
+}
+impl gc::ControllerObjects for S3Objects {
+    fn configuration(&self) -> Result<()> {
+        self.verify_configuration()
+    }
+    fn marker(&self, run: &str) -> Result<i64> {
+        attempt_prefix(run)?;
+        let key = format!("gc/runs/{run}.json");
+        let scratch = Scratch::new()?;
+        let body = scratch.0.join("marker");
+        private_file(&body)?.write_all(b"{\"format\":1}")?;
+        let call = |op: &str, args: &[&str]| -> Result<Value> {
+            let output = self
+                .aws()
+                .args([
+                    "s3api",
+                    op,
+                    "--bucket",
+                    &self.bucket,
+                    "--key",
+                    &format!("{}{key}", self.prefix),
+                    "--output",
+                    "json",
+                ])
+                .args(args)
+                .output()?;
+            ensure!(output.status.success(), "S3 run marker failed");
+            Ok(serde_json::from_slice(&output.stdout)?)
+        };
+        call(
+            "put-object",
+            &[
+                "--body",
+                body.to_str().context("marker path")?,
+                "--if-none-match",
+                "*",
+            ],
+        )?;
+        let head = call("head-object", &[])?;
+        gc::timestamp(
+            head["LastModified"]
+                .as_str()
+                .context("run marker has no server timestamp")?,
+        )
+    }
+    fn list(&self) -> Result<Vec<gc::ListedObject>> {
+        let prefix = format!("{}u/", self.prefix);
+        let mut continuation: Option<String> = None;
+        let mut objects = Vec::new();
+        loop {
+            let mut command = self.aws();
+            command.args([
+                "s3api",
+                "list-objects-v2",
+                "--bucket",
+                &self.bucket,
+                "--prefix",
+                &prefix,
+                "--no-paginate",
+                "--output",
+                "json",
+            ]);
+            if let Some(token) = &continuation {
+                command.args(["--continuation-token", token]);
+            }
+            let output = command.output()?;
+            ensure!(output.status.success(), "S3 candidate enumeration failed");
+            let value: Value = serde_json::from_slice(&output.stdout)?;
+            if let Some(contents) = value.get("Contents") {
+                for object in contents.as_array().context("invalid listing")? {
+                    let key = object["Key"]
+                        .as_str()
+                        .context("listing key missing")?
+                        .strip_prefix(&self.prefix)
+                        .context("listing escaped store")?;
+                    key_path(key)?;
+                    objects.push(gc::ListedObject {
+                        key: key.into(),
+                        bytes: object["Size"].as_u64().context("listing size missing")?,
+                        modified: gc::timestamp(
+                            object["LastModified"]
+                                .as_str()
+                                .context("listing timestamp missing")?,
+                        )?,
+                    });
+                }
+            }
+            if value["IsTruncated"] == false {
+                break;
+            }
+            let next = value["NextContinuationToken"]
+                .as_str()
+                .context("incomplete listing")?
+                .to_owned();
+            ensure!(
+                continuation.as_ref() != Some(&next),
+                "listing did not advance"
+            );
+            continuation = Some(next);
+        }
+        Ok(objects)
+    }
+    fn head(&self, key: &str) -> Result<Option<gc::ObjectVersion>> {
+        let output = self.command("head-object", key)?.output()?;
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            if error.contains("(404)") || error.contains("(NoSuchKey)") {
+                return Ok(None);
+            }
+            anyhow::bail!("S3 verification HEAD failed");
+        }
+        let head: Value = serde_json::from_slice(&output.stdout)?;
+        let version = head["VersionId"]
+            .as_str()
+            .context("versioning proof missing")?;
+        ensure!(
+            !version.is_empty() && version != "null",
+            "unversioned artifact"
+        );
+        Ok(Some(gc::ObjectVersion {
+            bytes: head["ContentLength"]
+                .as_u64()
+                .context("HEAD size missing")?,
+            version: version.into(),
+        }))
+    }
+    fn delete(&self, key: &str) -> Result<String> {
+        let value = self.call("delete-object", key, &[])?;
+        ensure!(
+            value["DeleteMarker"] == true,
+            "delete did not return a versioned marker"
+        );
+        let version = value["VersionId"]
+            .as_str()
+            .context("delete marker version missing")?;
+        ensure!(
+            !version.is_empty() && version != "null",
+            "unversioned deletion"
+        );
+        Ok(version.into())
     }
 }
 struct Scratch(PathBuf);
@@ -556,4 +705,65 @@ fn s3_store_requires_write_once_policy_for_every_principal() {
     policy["Statement"][0]["Principal"] = json!({"AWS":"one-role"});
     assert!(check_bucket_policy(&policy, resource).is_err());
     assert!(check_bucket_policy(&json!({"Statement":[]}), resource).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn controller_gc_uses_server_marker_paged_listing_and_only_current_deletes() {
+    use gc::ControllerObjects;
+    let scratch = Scratch::new().unwrap();
+    let script = scratch.0.join("aws");
+    fs::write(&script,r#"#!/usr/bin/env python3
+import sys,json,pathlib
+root=pathlib.Path(__file__).parent
+a=sys.argv[1:]
+def arg(k):return a[a.index(k)+1]
+op=a[1]
+with (root/'gc-calls').open('a') as f:f.write(json.dumps(a)+'\n')
+assert '--version-id' not in a
+assert arg('--bucket')=='bucket'
+if op=='put-object':
+ assert arg('--if-none-match')=='*'
+ assert arg('--key').startswith('root/store/v1/gc/runs/')
+ assert pathlib.Path(arg('--body')).read_text()=='{"format":1}'
+ print('{}')
+elif op=='head-object':
+ key=arg('--key')
+ if key.endswith('memory.zst'):
+  print('An error occurred (404) when calling the HeadObject operation',file=sys.stderr);sys.exit(1)
+ if key.endswith('state.zst'):
+  print('An error occurred (403) when calling the HeadObject operation',file=sys.stderr);sys.exit(1)
+ print(json.dumps({'LastModified':'2026-10-19T12:34:56+00:00','ContentLength':9,'VersionId':'original'}))
+elif op=='list-objects-v2':
+ assert arg('--prefix')=='root/store/v1/u/' and '--no-paginate' in a
+ page=1 if '--continuation-token' not in a else 2
+ if page==2:assert arg('--continuation-token')=='page2'
+ print(json.dumps({'Contents':[{'Key':'root/store/v1/u/aa/'+'a'*32+('/manifest.json' if page==1 else '/disk.ext4.zst'),'Size':page*10,'LastModified':'2026-10-19T10:00:00Z'}], 'IsTruncated':page==1,**({'NextContinuationToken':'page2'} if page==1 else {})}))
+elif op=='delete-object':print(json.dumps({'DeleteMarker':True,'VersionId':'marker'}))
+else:raise Exception(op)
+"#).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut s3 = S3Objects::new("s3://bucket/root", None).unwrap();
+    s3.program = Some(script);
+    assert_eq!(s3.marker(&token().unwrap()).unwrap(), 1792413296);
+    let listed = s3.list().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed.iter().map(|o| o.bytes).sum::<u64>(), 30);
+    assert_eq!(
+        s3.head(&listed[0].key).unwrap().unwrap().version,
+        "original"
+    );
+    let prefix = attempt_prefix(&"a".repeat(32)).unwrap();
+    assert!(s3.head(&format!("{prefix}memory.zst")).unwrap().is_none());
+    assert!(s3.head(&format!("{prefix}state.zst")).is_err());
+    assert_eq!(s3.delete(&listed[0].key).unwrap(), "marker");
+    for bad in [
+        "../catalog/saved.json",
+        "u/aa/wrong/disk.ext4.zst",
+        "gc/runs/run.json",
+    ] {
+        assert!(s3.delete(bad).is_err());
+    }
+    let calls = fs::read_to_string(scratch.0.join("gc-calls")).unwrap();
+    assert!(!calls.contains("--version-id") && !calls.contains("delete-object-version"));
 }
