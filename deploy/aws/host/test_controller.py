@@ -172,6 +172,64 @@ class Controller(unittest.TestCase):
         with self.assertRaisesRegex(h.Refused, "no worker"):
             u.restart_worker()
 
+    def test_disabled_dashboard_follows_schema_upgrade_before_later_enable(self):
+        self.dashboard_upgrade(enable=True)
+
+    def test_disabled_dashboard_pin_rolls_back_without_starting_it(self):
+        self.dashboard_upgrade(fail=True)
+
+    def test_disabled_dashboard_pin_is_repaired_at_current_release_without_restart(self):
+        self.dashboard_upgrade(enable=True, dashboard_only=True)
+
+    def dashboard_upgrade(self, enable=False, fail=False, dashboard_only=False):
+        c = controller(dashboard={"logins": []})
+        h.write_json(h.CONFIG, c)
+        for name in ("agent", "dashboard", "current"):
+            h.set_pin(name, "0.5.0-old")
+        for release, version in (("0.5.0-old", "0.5.0"), ("0.5.1-new", "0.5.1")):
+            h.write_json(f"{h.SRV}/releases/{release}/STAGED", {"version": version, "ref": "v" + version})
+        if dashboard_only:
+            h.set_pin("agent", "0.5.1-new")
+            h.set_pin("current", "0.5.1-new")
+        target = {"version": "0.5.1", "release": "0.5.1-new", "manifest":
+                  manifest(entry("0.5.1", ["dashboard"] if dashboard_only else ["controller", "dashboard"],
+                                 1, schema=(3, 3) if dashboard_only else (4, 3 if fail else 4)))}
+        calls = []
+        with mock.patch.object(h, "run", side_effect=lambda cmd, **kw: calls.append(cmd) or ""), \
+             mock.patch.object(h, "chown"), mock.patch.object(h, "tailscale", return_value=("joined", False)):
+            h.setup(c)
+            ops = u.HostOps()
+            def switch(pins):
+                for name, release in pins.items():
+                    h.set_pin(name, release)
+                h.setup(h.validate(h.read_json(h.CONFIG)))
+            with mock.patch.object(u, "fetch", return_value=target), \
+                 mock.patch.object(u, "stage", return_value=target["release"]), \
+                 mock.patch.object(u, "render_diff", return_value=set()), mock.patch.object(u, "prune"), \
+                 mock.patch.object(h, "ow", return_value=[]), mock.patch.object(ops, "active", return_value=True), \
+                 mock.patch.object(ops, "backup_catalog", return_value="fixture-backup"), \
+                 mock.patch.object(ops, "verify", side_effect=[RuntimeError("fixture health failure"), None] if fail else None), \
+                 mock.patch.object(ops, "switch", side_effect=switch):
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, "fixture health failure"):
+                        u.upgrade(ops=ops)
+                else:
+                    self.assertEqual(u.upgrade(ops=ops, max_class=0 if dashboard_only else 2), 0)
+            if dashboard_only:
+                self.assertFalse(any(cmd[0] == "systemctl" and cmd[1] in ("start", "stop", "restart") for cmd in calls))
+            self.assertEqual(h.pin("dashboard"), "0.5.0-old" if fail else "0.5.1-new")
+            self.assertFalse(any(h.UNITS["dashboard"] in cmd for cmd in calls), "disabled unit never started/stopped")
+            self.assertFalse(any(h.UNITS["worker"] in cmd for cmd in calls))
+            self.assertIsNone(h.pin("worker"))
+            if enable:
+                enabled = copy.deepcopy(c)
+                enabled["dashboard"] = {"logins": ["owner@example.test"]}
+                with mock.patch.object(h, "fetch_config", return_value=enabled):
+                    h.apply_config()
+                self.assertIn(["systemctl", "restart", "--no-block", h.UNITS["dashboard"]], calls)
+                self.assertIn("/srv/ow/run/dashboard/bin/ow", h.p(f"/etc/systemd/system/{h.UNITS['dashboard']}").read_text())
+                self.assertEqual(h.pin("dashboard"), h.pin("agent"))
+
     def test_backup_runs_only_the_role_targets(self):
         script = (h.HERE / "files/ow-backup").read_text()
         for role, flags, catalog, snapshots in (

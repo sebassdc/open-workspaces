@@ -68,7 +68,9 @@ Rust toolchain but builds only `ow`, without Firecracker, guest builds, network
 assets or KVM preflight. Upgrades neither probe a local worker nor inspect
 captures, quiesce, drain or canary local boxes. Worker-only release changes do
 not move any controller host pin; catalog/protocol compatibility still applies.
-The optional dashboard moves with the controller for a catalog schema change.
+The optional dashboard pin moves with the controller for a catalog schema change,
+even while its unit is disabled. Pin-only moves do not restart absent units;
+enabling the dashboard later uses the migrated catalog's compatible release.
 Controller/dashboard restarts interrupt streams; remote worker pins are untouched.
 
 This role adds no catalog migration or protocol/worker interface change.

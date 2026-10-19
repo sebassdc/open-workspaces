@@ -107,9 +107,15 @@ OW_NODE_TEST_BINARY=$PWD/target/debug/ow cargo test --locked -p ow --bin ow \
   controller_only_boot_enroll_create_and_restart -- --ignored --nocapture
 ```
 
-No guest boots in that fixture. Real worker/VMM PID, guest counter and executable
-hash continuity across controller/dashboard restarts remain a separate
-disposable-hardware rollout gate.
+No guest boots in that fixture. A separate disposable KVM acceptance run used
+independent worker, agent, controller and dashboard processes on one x86-64 host.
+SIGTERM/restart of each control-plane process interrupted and reconnected terminal
+streams while worker/VMM and guest-process identities, guest boot ID and worker
+executable hash stayed fixed and a guest counter advanced. The worker used the
+prior supported release; its executable was not upgraded. The test used loopback
+listeners and a process-scoped fixture identity adapter. It establishes process
+continuity, without claiming cross-host cutover, live tailnet authentication or
+shared systemd-unit rollout.
 
 ## Add a runner over SSH
 

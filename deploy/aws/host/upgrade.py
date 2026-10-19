@@ -55,7 +55,7 @@ def gate(rule, captures):
 
 
 def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), captures=(), compat=None,
-         accept_cold=False, max_class=2, controller=None):
+         accept_cold=False, max_class=2, controller=None, installed=None):
     """The upgrade of one host from `pins` (pin -> release version) to version `target`.
 
     rendered: pins whose unit files the target release renders differently.
@@ -67,6 +67,7 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
     compat:   the running worker's tuple ({"cpu": ...}): the CPU string comes from the host.
     controller: on a runner host, the release its controller runs: the new agent must speak
               a protocol that controller accepts (controllers upgrade first).
+    installed: optional installed unit pins; dormant pins still move, but do not restart.
     Returns the plan; raises Refused, naming what to do instead."""
     entries = {e["version"]: e for e in manifest["releases"]}
     if target not in entries:
@@ -134,7 +135,8 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
             bridge = max(bridges, key=lambda e: version(e["version"]))["version"]
             raise Refused(f"upgrade runners {', '.join(low)} to {bridge} first: the target controller accepts "
                           f"protocol {lo}..{hi} only")
-    restart = sorted(set(move) | (set(pending) & set(pins)))
+    restart = set(move) | (set(pending) & set(pins))
+    restart = sorted(restart if installed is None else restart & set(installed))
     plan_["restart"] = restart
     plan_["class"] = max([PIN_CLASS[name] for name in restart], default=0)
     # Capture gate: a capture the target worker cannot resume boots cold and is deleted.
@@ -691,7 +693,8 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
         target = fetch(config, ref)
         frm = h.pins()
         if config["role"] == "controller":
-            frm = {name: value for name, value in frm.items() if name == "current" or name in ops.units()}
+            # The optional dashboard pin must remain readable after catalog migrations.
+            frm = {name: value for name, value in frm.items() if name in (*h.role_pins(config), "current")}
         pin_names = [name for name in frm if name != "current"]
         if None in frm.values():
             raise Refused("this host has no release pins (layout v1): replace it with this release first")
@@ -713,13 +716,14 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
             runners = [{"id": n["id"], "protocol": (n.get("capabilities") or {}).get("protocol", 0)}
                        for n in h.ow("node", "list", timeout=30) if n["id"] != h.local_node() and not n.get("revoked")]
         common = dict(rendered=render_diff(target), pending=set(h.pending()), runners=runners,
-                      compat=compat, accept_cold=accept_cold, max_class=max_class, controller=controller)
+                      compat=compat, accept_cold=accept_cold, max_class=max_class, controller=controller,
+                      installed=ops.units() if config["role"] == "controller" else None)
         current = {name: version_of(frm[name]) for name in pin_names}
         result = plan(target["manifest"], current, target["version"], captures=captures(compat) if "worker" in current else (), **common)
         say(json.dumps({"plan": result, "release": target["release"]}, indent=2))
         if plan_only:
             return 0
-        if not result["restart"] and frm["current"] == target["release"]:
+        if not result["move"] and not result["restart"] and frm["current"] == target["release"]:
             say("nothing to do")
             return 0
         release = stage(target)
