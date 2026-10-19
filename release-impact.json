@@ -36,6 +36,9 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
+      "waivers": {
+        "host-layout": "Only deploy/aws/host/test_upgrade.py adds a catalog-upgrade regression; host rendering, units and runtime host layout are unchanged."
+      },
       "notes": "Persisted placement authority, transfer intent and capacity reservations. Catalog schema 5 requires reader floor 5: take a private consistent backup and move controller, dashboard and agent catalog readers together. Worker interface 2, host protocol 1, runtime, guest kernel and host layout are unchanged from v0.9.2; retain running worker pins. Transfer execution remains dormant. Older catalog writers are refused; rollback after new writes requires a current compatible catalog. No automatic movement, source reactivation, cold-memory loss or recovery/store activation."
     },
     {
