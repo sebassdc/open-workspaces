@@ -2,8 +2,9 @@
 """One fresh <=256MiB Alpine regression; needs an exclusive planner host turn."""
 import os,sys,json,subprocess,hashlib,time
 from pathlib import Path
+protected=Path(os.environ['OW_SSH_PROTECTED_ROOT']).resolve(strict=True)
+assert protected.is_dir()
 root=Path(sys.argv[1]).resolve();assert not root.exists();root.mkdir(parents=True,mode=0o700)
-repo=Path(__file__).resolve().parents[2]
 binary=Path(os.environ['OW_SSH_TEST_BINARY']).resolve();source=Path(os.environ['OW_SSH_TEST_ASSETS']).resolve()
 def vmm():
  out={}
@@ -18,7 +19,7 @@ for name in ['official','downloads','bin']:(assets/name).symlink_to(source/name,
 subprocess.run(['cp','--reflink=always',str(source/'guest/base.ext4'),str(assets/'guest/base.ext4')],check=True)
 env={**os.environ,'OW_ASSET_DIR':str(assets),'OW_MAX_MEMORY_MIB':'1024','OW_MAX_RUNNING':'1','OW_MAX_VCPUS':'2','OW_MIN_FREE_GIB':'8'}
 worker=root/'w';checks=[];clean=False
-owner=repo/'data/prototype/machines/ubuntu-dev/disk.ext4';inode=owner.stat().st_ino
+owner=protected/'data/prototype/machines/ubuntu-dev/disk.ext4';inode=owner.stat().st_ino
 log=(root/'commands.log').open('w')
 def run(*args,ok=True):
  log.write(repr(args)+'\n');log.flush();r=subprocess.run([str(binary),'--local','--data-dir',str(worker),*args],env=env,capture_output=True,timeout=60)
