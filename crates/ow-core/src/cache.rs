@@ -350,9 +350,19 @@ pub fn evict(
 fn check_contents(dir: &Path) -> Result<()> {
     for e in fs::read_dir(dir)? {
         let e = e?;
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        // atomic_json can leave a partial stamp on interruption; discard it only under eviction exclusion.
+        let verification_temp = name.strip_prefix(".verified.tmp-").is_some_and(|nonce| {
+            nonce.len() == 24
+                && nonce
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
         ensure!(
-            ["manifest.json", "disk.ext4", ".verified.json", ".last-used"]
-                .contains(&e.file_name().to_string_lossy().as_ref())
+            (["manifest.json", "disk.ext4", ".verified.json", ".last-used"]
+                .contains(&name.as_ref())
+                || verification_temp)
                 && e.file_type()?.is_file(),
             "unmanaged cache contents; preserve them"
         );

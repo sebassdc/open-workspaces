@@ -294,3 +294,39 @@ fn cache_late_duplicate_claim_never_deletes_a_reinstalled_image() {
     assert!(dir.join("disk.ext4").exists());
     assert!(evict_claim(&f.root, &token, "other@1", &reference, &f.objects).is_err());
 }
+
+#[test]
+fn cache_eviction_preserves_near_match_and_non_regular_verification_temporaries() {
+    for case in 0..5 {
+        let f = Fixture::new();
+        let reference = f.image("tools@1", b"sealed");
+        let dir = f.root.join("images/tools@1");
+        let name = match case {
+            0 => ".verified.tmp-note".into(),
+            1 => format!(".verified.tmp-{}", "A".repeat(24)),
+            2 => format!(".verified.tmp-{}.keep", "a".repeat(24)),
+            _ => format!(".verified.tmp-{}", crate::common::nonce().unwrap()),
+        };
+        let path = dir.join(name);
+        match case {
+            3 => std::os::unix::fs::symlink(f.root.join("source"), &path).unwrap(),
+            4 => fs::create_dir(&path).unwrap(),
+            _ => fs::write(&path, b"unmanaged data").unwrap(),
+        }
+        let _lock = lock(&f.root, true).unwrap();
+        assert!(
+            evict_claim(
+                &f.root,
+                &store::token().unwrap(),
+                "tools@1",
+                &reference,
+                &f.objects
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unmanaged cache contents")
+        );
+        assert!(fs::symlink_metadata(path).is_ok());
+        assert!(dir.join("disk.ext4").exists());
+    }
+}

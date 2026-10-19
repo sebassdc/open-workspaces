@@ -235,3 +235,108 @@ fn cache_lru_stops_on_actual_space_and_fails_without_enough_reclaim() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interrupted_verification_reconciles_claim_and_unblocks_other_runner_pull() {
+    use std::{
+        collections::BTreeMap,
+        fs,
+        io::{BufRead, Write},
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+    };
+    let root = std::env::temp_dir().join(format!("ow-cache-stamp-{}", store::token().unwrap()));
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = root.join("catalog.sqlite3");
+    let mut db = database(&path);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let runner = root.join("runner");
+    let image = runner.join("images/tools@1");
+    fs::create_dir_all(&image).unwrap();
+    let disk = image.join("disk.ext4");
+    fs::write(&disk, b"sealed disk").unwrap();
+    let objects = store::DirectoryObjects(root.join("objects"));
+    let reference = store::push(
+        &objects,
+        &format!("{:032x}", 1),
+        "image",
+        json!({"name":"tools","version":1}),
+        &BTreeMap::from([(
+            "disk.ext4".into(),
+            store::Source {
+                path: disk.clone(),
+                sha256: store::hash_file(&disk).unwrap(),
+            },
+        )]),
+        1,
+    )
+    .unwrap();
+    fs::write(image.join("manifest.json"),json!({"name":"tools@1","image_digest":reference.digest,"disk_sha256":store::hash_file(&disk).unwrap(),"store":{"reference":reference}}).to_string()).unwrap();
+    // Exactly the path atomic_json leaves if interrupted before renaming its verification stamp.
+    let temporary = image
+        .join(".verified.json")
+        .with_extension(format!("tmp-{}", crate::common::nonce().unwrap()));
+    fs::write(&temporary, b"{partial stamp").unwrap();
+    let inventory = ow_core::cache::inventory(&runner).unwrap();
+    assert_eq!(inventory[0].digest, reference.digest);
+    assert!(image.join(".verified.json").exists());
+    assert!(temporary.exists());
+    artifact(&db, "a", 1);
+    db.execute("UPDATE artifacts SET digest=?1", [&reference.digest])
+        .unwrap();
+    db.execute("UPDATE artifact_copies SET node='local'", [])
+        .unwrap();
+    let c = claim(&mut db, "local", &reference.digest, 100).unwrap();
+    // A prior interrupted attempt retains the token and excludes new leases across runners.
+    fs::write(image.join(".pin"), b"pin").unwrap();
+    {
+        let _lock = ow_core::cache::lock(&runner, true).unwrap();
+        assert!(
+            ow_core::cache::evict_claim(&runner, &c.token, &c.name, &c.reference, &objects)
+                .unwrap_err()
+                .to_string()
+                .contains("local pin")
+        );
+    }
+    let lease = "INSERT INTO leases(artifact,holder,purpose,expires) VALUES('a','other-runner','pull',1000)";
+    assert!(
+        db.execute(lease, [])
+            .unwrap_err()
+            .to_string()
+            .contains("artifact copy eviction in progress")
+    );
+    fs::remove_file(image.join(".pin")).unwrap();
+    let socket = UnixListener::bind(runner.join("control.sock")).unwrap();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let (mut stream, _) = socket.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["claim"], c.token);
+            let _lock = ow_core::cache::lock(&runner, true).unwrap();
+            let result = ow_core::cache::evict_claim(
+                &runner,
+                request["claim"].as_str().unwrap(),
+                request["name"].as_str().unwrap(),
+                &serde_json::from_value(request["reference"].clone()).unwrap(),
+                &objects,
+            );
+            writeln!(stream, "{}", crate::wire::response(result)).unwrap();
+        });
+        let result = reconcile(&root, &runner, "local");
+        worker.join().unwrap();
+        result.unwrap();
+    });
+    assert!(!image.exists());
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT COUNT(*) FROM cache_evictions", [], |r| r.get(0))
+            .unwrap(),
+        0
+    );
+    db.execute(lease, []).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}

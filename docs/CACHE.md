@@ -45,7 +45,11 @@ base-template copies and runtime requests hold shared exclusion; runtime disk
 allocation and staging admission also share one space-admission lock. A busy
 local use rejects eviction. The worker fetches the committed remote manifest by
 the pinned digest immediately before unlink, checks selector and local file
-identity, and accepts only the known sealed-image filenames. It renames the copy
+identity, and accepts only the known sealed-image filenames, including regular
+`.verified.tmp-` files with the verifier's exact 24-character lowercase hexadecimal
+nonce. These interrupted verification stamps are discarded only under eviction
+exclusion; near-matching names, symlinks and directories remain protected.
+It renames the copy
 to private digest-named trash before removing it. An interrupted unlink can be
 reissued with the same claim. Completed worker claim tokens are durably recorded: a late duplicate cannot delete
 a copy reinstalled under a later lease. A lost reply keeps the catalog exclusion indefinitely;
