@@ -50,7 +50,7 @@ class Config(unittest.TestCase):
         with self.assertRaisesRegex(Refused, "node ID"):
             h.validate({**RUNNER, "runner": None})
         with self.assertRaisesRegex(Refused, "not supported"):
-            h.validate({**RUNNER, "role": "controller"})
+            h.validate({**RUNNER, "role": "unknown"})
         self.assertNotIn("runner", h.validate(CONFIG), "a host config carries no runner block")
 
 

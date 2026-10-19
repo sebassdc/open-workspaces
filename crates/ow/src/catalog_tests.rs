@@ -3137,3 +3137,126 @@ fn aborted_fork_cleanup_rolls_back_with_an_uncertain_target() {
             .is_err()
     );
 }
+
+#[test]
+fn controller_without_worker_has_no_local_fallback_or_capacity() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let owner = c.user(&identity("owner")).unwrap();
+    let before = c.state(owner).unwrap();
+    assert_eq!(before["stats"]["limit_memory_mib"], 0);
+    assert_eq!(before["discovery"]["nodes"], json!([]));
+    assert!(
+        c.choose(None, 256, "alpine", 1, &json!({}), false)
+            .unwrap_err()
+            .to_string()
+            .contains("no online node")
+    );
+    assert!(
+        c.operation(owner, json!({"op":"create","id":"empty","memory_mib":256}))
+            .unwrap_err()
+            .to_string()
+            .contains("no online node")
+    );
+    // Absence is not evidence that another node's machine belongs to this host.
+    let physical = c.reserve(owner, "machine", "remote").unwrap();
+    c.db.execute("UPDATE resources SET node='missing-runner',metadata='{\"state\":\"running\"}' WHERE physical=?1",[&physical]).unwrap();
+    let state = c.state(owner).unwrap();
+    assert_eq!(state["workspaces"][0]["node"], "missing-runner");
+    assert_eq!(state["workspaces"][0]["state"], "offline");
+    assert_eq!(c.placement("machine", &physical).unwrap(), "missing-runner");
+    assert!(!fake.root.join("control.sock").exists());
+}
+
+#[test]
+fn controller_private_backup_preserves_all_authority_and_artifact_roots() {
+    let (fake, mut c, user, physical, intent) = transfer_fixture();
+    let grantee = c.user(&identity("grantee")).unwrap();
+    c.share(
+        user,
+        "share",
+        &json!({"id":"box","with":"grantee@example.test","role":"use"}),
+    )
+    .unwrap();
+    c.db.execute("UPDATE nodes SET credential_hash='fixture-hash'", [])
+        .unwrap();
+    c.db.execute(
+        "UPDATE resources SET current_capture='capture' WHERE physical=?1",
+        [&physical],
+    )
+    .unwrap();
+    c.db.execute("INSERT INTO artifact_copies(artifact,node,state,last_used) VALUES('capture','beta','present',1)",[]).unwrap();
+    c.db.execute("INSERT INTO leases(artifact,holder,purpose,expires) VALUES('capture','fixture','pull',9999999999)",[]).unwrap();
+    let transfer = c.begin_transfer(user, "backup-transfer", &intent).unwrap();
+    let output = fake.root.join("backup.sqlite3");
+    crate::backup::run(
+        None,
+        crate::BackupAction::Catalog {
+            output: output.clone(),
+            from: Some(fake.root.clone()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let restored = Fake::new();
+    std::fs::copy(&output, restored.root.join("catalog.sqlite3")).unwrap();
+    let restored_db = Connection::open(restored.root.join("catalog.sqlite3")).unwrap();
+    assert_eq!(
+        restored_db
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(
+        restored_db
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
+    for table in [
+        "users",
+        "resources",
+        "grants",
+        "nodes",
+        "node_limits",
+        "transfers",
+        "transfer_locks",
+        "transfer_reservations",
+        "artifacts",
+        "artifact_copies",
+        "leases",
+        "settings",
+    ] {
+        let rows = |db: &Connection| {
+            let mut statement = db
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |r| {
+                    Ok((0..columns)
+                        .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                        .collect::<Vec<_>>())
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(rows(&c.db), rows(&restored_db), "lost {table}");
+    }
+    drop(restored_db);
+    let copy = Catalog::open(&restored.root, "test", None).unwrap();
+    assert_eq!(copy.transfer(transfer.id).unwrap().epoch, transfer.epoch);
+    assert!(
+        copy.machine(grantee, "owner@example.test/box", "exec")
+            .is_ok()
+    );
+    assert_eq!(copy.placement("machine", &physical).unwrap(), "alpha");
+    assert!(!restored.root.join("control.sock").exists());
+}

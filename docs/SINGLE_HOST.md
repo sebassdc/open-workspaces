@@ -15,10 +15,10 @@ outbound `node-agent`. Nothing new is exposed to guests.
 
 ## Requirements
 
-Every runner, including the controller machine, needs Linux x86-64, read/write
+Every runner, including a combined controller/runner machine, needs Linux x86-64, read/write
 `/dev/kvm` for the SSH user, a Btrfs data directory and the host tools that
 `ow host doctor` checks (`ip`, `nft`, `unshare`, `cp`, `curl`, `sha256sum` and
-unprivileged user namespaces). SSH runners also need `flock`. The controller machine also needs `openssl` and
+unprivileged user namespaces). SSH runners also need `flock`. The combined controller/runner also needs `openssl` and
 the runtime assets (`scripts/setup-local.sh`, or `OW_ASSET_DIR`).
 
 ## Start the controller
@@ -69,6 +69,47 @@ Layout under the base directory (default `~/.ow`, mode 0700):
 | `runner/` | local worker, guests, local node credential |
 | `tls/` | private CA and controller certificate (keys mode 0600) |
 | `host.json` | controller URL that `node add` hands to runners |
+
+## Controller without local compute
+
+```sh
+ow host up --controller-only
+```
+
+This opt-in Linux role uses the same private CA, saved controller URL and
+`node-controller` TLS listener. It skips the KVM/tool/storage doctor, worker,
+local enrollment and local agent. It needs `openssl`, a private writable base
+directory and the `ow` binary; it needs no guest images or runtime assets.
+The catalog persists in `BASE/controller`; there is no `BASE/runner`.
+`--controller-only` conflicts with local node, budget, idle and external-worker
+flags. Existing `host up` behavior is unchanged.
+
+Before enrollment, `ow node list` is empty, the dashboard reports zero capacity,
+and create returns `no online node available`. Enroll remote runners using the
+same `ow node add` or node invitation/agent flow below. Placement and resource
+ownership come from their catalog entries, never an assumed local runner.
+Configure the same explicit pool limits before authorizing any runner.
+
+Restarting the controller drops control/access streams. Remote workers and
+already running guests continue; their agents reconnect using the retained CA
+and catalog credentials. This is one controller, without automatic failover.
+A directory containing local runner data is refused: converting an existing
+combined host requires a separate, fenced cutover and is outside this role.
+
+The controller-only fixture runs the real TLS listener and agents with two
+synthetic workers in a Linux x86-64 container **without** `/dev/kvm`. It checks
+empty-pool refusal, placement on both nodes, no local capacity and retained CA /
+agent identity across controller restart. Run it after building the CLI:
+
+```sh
+cargo build --locked -p ow --bin ow
+OW_NODE_TEST_BINARY=$PWD/target/debug/ow cargo test --locked -p ow --bin ow \
+  controller_only_boot_enroll_create_and_restart -- --ignored --nocapture
+```
+
+No guest boots in that fixture. Real worker/VMM PID, guest counter and executable
+hash continuity across controller/dashboard restarts remain a separate
+disposable-hardware rollout gate.
 
 ## Add a runner over SSH
 

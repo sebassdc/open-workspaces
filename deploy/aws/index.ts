@@ -19,7 +19,9 @@ export interface TailscaleDirectArgs {
 }
 
 export interface HostArgs {
-    /** Nested-virtualization type: c8i, m8i, r8i or their flex variants. */
+    /** host (default): controller plus local runner; controller: remote capacity only, no KVM. New hosts only. */
+    role?: pulumi.Input<string>;
+    /** Combined host/runner: c8i, m8i, r8i or flex with nested virtualization; controller: any suitable x86-64 type. */
     instanceType?: pulumi.Input<string>;
     /** Subnet for the host. Default: the default VPC's default subnet in the first zone offering the type. */
     subnetId?: pulumi.Input<string>;
@@ -91,8 +93,8 @@ export interface HostArgs {
     vcpuOvercommit?: pulumi.Input<number>;
 }
 
-/** A runner host: everything a Host takes except the dashboard, plus the controller it joins. */
-export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability"> {
+/** A runner host: Host inputs except dashboard/role, plus the controller it joins. */
+export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability" | "role"> {
     // The package analyzer loses optional types inherited through Omit.
     vcpuOvercommit?: pulumi.Input<number>;
     tailscaleDirect?: pulumi.Input<TailscaleDirectArgs>;
@@ -167,6 +169,7 @@ export interface RunnerConfig {
 }
 
 export interface HostConfigInputs {
+    role?: string;
     /** Set for a runner host (role runner). */
     runner?: RunnerConfig;
     repository: string;
@@ -192,6 +195,13 @@ export interface HostConfigInputs {
  * applies in place. The host validates it again; see deploy/aws/host/ow_host.py.
  */
 export function hostConfig(c: HostConfigInputs): object {
+    const role = c.role ?? "host";
+    if (!["host", "controller"].includes(role) || (c.runner && role !== "host")) {
+        throw new Error("role must be host or controller; Runner determines its own role");
+    }
+    if (role === "controller" && (c.developerImages.length || c.recoveryPoints || Object.keys(c.imageArtifacts ?? {}).length)) {
+        throw new Error("controller role has no local images or recovery worker; configure images/recovery on runners");
+    }
     const capability = c.dashboardCapability ?? "";
     if (capability) {
         const [domain, ...parts] = capability.split("/");
@@ -243,7 +253,7 @@ export function hostConfig(c: HostConfigInputs): object {
     }
     return {
         schema: 1,
-        role: c.runner ? "runner" : "host",
+        role: c.runner ? "runner" : role,
         release: { repository: c.repository, ref: c.ref },
         tailscale: { secretArn: c.tailscaleAuthKeySecretArn, hostname: c.tailscaleHostname, ssh: c.tailscaleSsh,
             ...(c.directMac ? { direct: { mac: c.directMac } } : {}) },
@@ -348,7 +358,12 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
         const backupUrl = args.backupUrl && controller
             ? pulumi.output(args.backupUrl).apply((url) => `${url.replace(/\/+$/, "")}/runners/${nodeId(name)}`)
             : args.backupUrl;
-        const instanceType = pulumi.output(args.instanceType ?? "m8i-flex.xlarge");
+        const hostRole = pulumi.output(args.role ?? "host").apply((role) => {
+            if (!["host", "controller"].includes(role) || (controller && role !== "host")) throw new Error("invalid host role");
+            return role;
+        });
+        const instanceType = args.instanceType ? pulumi.output(args.instanceType)
+            : hostRole.apply((role) => role === "controller" ? "m7i.large" : "m8i-flex.xlarge");
         const tags = pulumi.output(args.tags ?? {});
         const named = tags.apply((t) => ({ ...t, Name: name }));
 
@@ -468,10 +483,11 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                     runner,
                     directInterface ? directInterface.macAddress : pulumi.output(""),
                     pulumi.all([args.storeUrl ?? "", args.imageArtifacts ?? {}]),
+                    hostRole,
                 ])
-                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints], runner, directMac, [storeUrl, imageArtifacts]]) =>
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints], runner, directMac, [storeUrl, imageArtifacts], role]) =>
                     JSON.stringify(hostConfig({
-                        repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
+                        role, repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
                         dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints, runner, directMac, storeUrl, imageArtifacts,
                     })),
                 ),
@@ -524,7 +540,7 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
             associatePublicIpAddress: args.associatePublicIpAddress ?? true,
             vpcSecurityGroupIds: [securityGroup.id],
             iamInstanceProfile: profile.name,
-            cpuOptions: { nestedVirtualization: "enabled" },
+            cpuOptions: hostRole.apply((role) => role === "controller" ? undefined : { nestedVirtualization: "enabled" }),
             metadataOptions: { httpEndpoint: "enabled", httpTokens: "required", httpPutResponseHopLimit: 1 },
             rootBlockDevice: { volumeType: "gp3", volumeSize: 30, encrypted: true },
             userData,
