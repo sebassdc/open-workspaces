@@ -103,8 +103,8 @@ is class **1**. Preserve per-unit pins, quiesce, compatibility checks and explic
 cold-loss consent. A supervisor may use worker inventory only to stop its own
 running copies during quiesce; controller start authority must come from catalog
 commit. Existing legacy runners remain fixed-placement and ineligible for moves.
-The coordinated release must declare interface 2 and these impacts before release;
-this slice does not change package versions or historical release entries.
+Release 0.8.6 declares interface 2 and these impacts; historical release entries
+remain unchanged.
 
 Activation gates: the catalog placement/transfer contract, conditional completion
 and reader floor; a format-1 adapter after the artifact-store foundation lands;
