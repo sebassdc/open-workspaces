@@ -763,6 +763,39 @@ impl Catalog {
             Ok(())
         })
     }
+    /// Resume the same fenced effects under a fresh owner authorization after grant revocation.
+    /// Never release an uncertain target, change its epoch, or restore the revoked grant.
+    pub(crate) fn resume_wake(
+        &self,
+        user: i64,
+        key: &str,
+        address: &str,
+        id: i64,
+        explicit_start: bool,
+        accept_cold: bool,
+    ) -> Result<crate::transfers::Transfer> {
+        use crate::transfers::*;
+        self.transfer_write(|c|{
+            let t=c.transfer(id)?;
+            ensure!(t.kind==Kind::Wake && !t.step.terminal(),"wake is not resumable");
+            ensure!(c.machine(user,address,"start")?==t.source,"source changed");
+            ensure!(c.db.query_row("SELECT owner=?2 AND ssh_policy_generation=(SELECT source_policy_generation FROM transfers WHERE id=?3) FROM resources WHERE kind='machine' AND physical=?1",params![t.source,user,id],|r|r.get::<_,bool>(0))?,"only the current owner may resume; policy changes need reconciliation");
+            let (actor,old_address,request,response):(i64,String,String,Option<String>)=c.db.query_row("SELECT owner,json_extract(request,'$.transfer.machine'),request,response FROM operations WHERE id=?1",[t.operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+            ensure!(!c.machine(actor,&old_address,"start").is_ok_and(|id|id==t.source),"wake initiator still authorized");
+            let mut original:serde_json::Value=serde_json::from_str(&request)?;
+            let mut intent:Intent=serde_json::from_value(original["transfer"].take())?;
+            ensure!(intent.accept_cold==accept_cold,"owner must explicitly confirm existing cold consent");
+            ensure!(explicit_start || c.db.query_row("SELECT json_extract(metadata,'$.state')<>'stopped' FROM resources WHERE kind='machine' AND physical=?1",[&t.source],|r|r.get::<_,bool>(0))?,"connection wake requires hibernation; stopped needs explicit start");
+            intent.machine=address.into();intent.explicit_start=explicit_start;
+            let mut progress:serde_json::Value=response.and_then(|s|serde_json::from_str(&s).ok()).unwrap_or(json!({}));
+            progress.as_object_mut().context("invalid operation response")?.remove("error");
+            c.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,response) VALUES(?1,'wake',?2,'pending',?3,?4,?5,?6)",params![user,address,t.target.as_deref().unwrap_or(""),key,json!({"transfer":intent}).to_string(),progress.to_string()])?;
+            let operation=c.db.last_insert_rowid();
+            c.db.execute("UPDATE operations SET state='failed',finished_at=CURRENT_TIMESTAMP,response=json_set(COALESCE(response,'{}'),'$.error','Wake authorization revoked; owner resumed the transfer.','$.resumed_by',?1) WHERE id=?2",params![operation,t.operation])?;
+            ensure!(c.db.execute("UPDATE transfers SET operation=?1 WHERE id=?2 AND operation=?3 AND EXISTS(SELECT 1 FROM transfer_locks WHERE transfer=?2 AND machine=?4)",params![operation,id,t.operation,t.machine])?==1,"wake authority changed");
+            c.transfer(id)
+        })
+    }
     #[allow(dead_code)]
     pub(crate) fn advance_transfer(
         &self,

@@ -88,7 +88,19 @@ struct Peers {
 }
 impl Peers {
     fn call(&mut self, shared: &Shared, node: &str, request: Value) -> Result<Value> {
-        assert!(shared.try_lock().is_ok(), "RPC must not hold catalog mutex");
+        if shared.try_lock().is_err() {
+            // A foreground connection may briefly inspect status concurrently with this RPC.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let catalog = shared.clone();
+            std::thread::spawn(move || {
+                drop(catalog.lock().unwrap());
+                let _ = tx.send(());
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+                "RPC must not hold catalog mutex"
+            );
+        }
         let op = request["op"].as_str().unwrap();
         let fail = self.fault.as_ref().filter(|(name, _)| name == op).cloned();
         if fail == Some((op.into(), false)) {
@@ -823,7 +835,10 @@ fn upload_failure_or_lost_reply_keeps_source_and_retries_without_parking() {
             "uploading"
         );
     }
-    tick(&f.shared, f.transfer.id, now(), &|_, r| {
+    tick(&f.shared, f.transfer.id, now(), &|node, r| {
+        if r["op"] == "inspect" {
+            return peers.borrow_mut().call(&f.shared, node, r);
+        }
         assert_eq!(r["op"], "capture-published");
         Ok(result.borrow().clone().unwrap())
     })
@@ -1267,3 +1282,6 @@ fn park_denies_a_shared_admin_before_any_runner_contact() {
     .unwrap_err();
     assert!(error.to_string().contains("owner"));
 }
+
+#[path = "parking_review_tests.rs"]
+mod review;

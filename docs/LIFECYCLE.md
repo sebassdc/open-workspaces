@@ -249,3 +249,18 @@ using real node jobs and a local AWS fixture. Its separate durable worker models
 execution. Real Firecracker continuation, live bucket IAM/policy and guest SSH/process
 continuity remain dedicated disposable-fixture acceptance; these tests do not establish
 them. Running workspaces must never be used as lifecycle test fixtures.
+
+If sharing is revoked while a shared user initiates wake, the owner can retry with
+`wake BOX` and a fresh operation key, or reconnect to a hibernated box. The controller
+records a new owner-authorized operation and marks the revoked user's operation failed.
+It retains the same transfer, epoch, target, reservation and worker step keys, including
+uncertain imports or committed activation; it never discards an uncertain target to
+start elsewhere. The grant stays revoked and the original request remains in history.
+A changed SSH policy generation still requires reconciliation, and existing cold consent
+must be explicitly confirmed by the owner; an implicit connection cannot supply it.
+
+Park may reuse a positive fence left by a failed restore. It publishes the capture named
+by that verified worker export, rather than inventing a name from the new park ID. That
+binding is persisted in the artifact row. A retry can repair an unpublished incorrect
+binding using a fresh attempt token while retaining the old attempt lease. Published
+artifacts cannot be rebound to a different capture.

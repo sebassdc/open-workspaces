@@ -192,6 +192,15 @@ fn intent(c: &Catalog, t: &Transfer) -> Result<Intent> {
     )?;
     Ok(serde_json::from_str(&text)?)
 }
+fn initiator_authorized(c: &Catalog, t: &Transfer) -> Result<bool> {
+    let (user, address): (i64, String) = c.db.query_row(
+        "SELECT owner,json_extract(request,'$.transfer.machine') FROM operations WHERE id=?1",
+        [t.operation],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(c.machine(user, &address, t.kind.permission())
+        .is_ok_and(|id| id == t.source))
+}
 fn authorized(c: &Catalog, t: &Transfer) -> Result<()> {
     let (user, address): (i64, String) = c.db.query_row(
         "SELECT owner,json_extract(request,'$.transfer.machine') FROM operations WHERE id=?1",

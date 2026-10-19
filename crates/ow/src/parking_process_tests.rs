@@ -4,33 +4,7 @@ fn park_fixture(ram: bool) -> (Processes, i64, i64) {
     let p = fixture();
     let ctl = p.root.join("controller");
     fs::write(ctl.join("store-url"), "s3://bucket/root").unwrap();
-    fs::write(p.root.join("bin/aws"),r##"#!/usr/bin/env python3
-import sys,json,hashlib,base64,pathlib
-root=pathlib.Path(__file__).parent.parent/'objects'
-a=sys.argv[1:]
-def arg(k):return a[a.index(k)+1]
-def digest(b):return base64.b64encode(hashlib.sha256(b).digest()).decode()
-if a[:3]==['s3','cp','--only-show-errors']:
- sys.stdout.buffer.write((root/a[3][5:]).read_bytes());sys.exit(0)
-assert a[0]=='s3api'
-op=a[1]
-if op=='get-bucket-versioning':print('{"Status":"Enabled"}')
-elif op=='get-bucket-lifecycle-configuration':print('{"Rules":[{"Status":"Enabled","Filter":{"Prefix":"root/store/v1/"},"NoncurrentVersionExpiration":{"NoncurrentDays":7}}]}')
-elif op=='get-bucket-policy':print(json.dumps({'Policy':json.dumps({'Statement':[{'Effect':'Deny','Principal':'*','Action':'s3:PutObject','Resource':'arn:aws:s3:::bucket/root/store/v1/*','Condition':{'Null':{'s3:if-none-match':'true'},'Bool':{'s3:ObjectCreationOperation':'true'}}}]})}))
-else:
- dest=root/arg('--bucket')/arg('--key')
- if op=='put-object':
-  assert arg('--if-none-match')=='*'
-  data=pathlib.Path(arg('--body')).read_bytes();assert digest(data)==arg('--checksum-sha256')
-  dest.parent.mkdir(parents=True,exist_ok=True)
-  try:
-   with dest.open('xb') as f:f.write(data);f.flush();__import__('os').fsync(f.fileno())
-  except FileExistsError:sys.exit(1)
-  print('{}')
- elif op=='head-object':
-  data=dest.read_bytes();print(json.dumps({'ChecksumSHA256':digest(data),'ContentLength':len(data)}))
- else:raise Exception(op)
-"##).unwrap();
+    writable_store(&p);
     let c = Catalog::open(&ctl, "test", None).unwrap();
     c.db.execute("DELETE FROM transfer_reservations", [])
         .unwrap();
@@ -73,6 +47,35 @@ else:
     state["workspace"]["lifecycle"] = json!({"phase":"active"});
     ow_core::runtime::atomic_json(&path, &state).unwrap();
     (p, user, park.id)
+}
+fn writable_store(p: &Processes) {
+    fs::write(p.root.join("bin/aws"),r##"#!/usr/bin/env python3
+import sys,json,hashlib,base64,pathlib
+root=pathlib.Path(__file__).parent.parent/'objects'
+a=sys.argv[1:]
+def arg(k):return a[a.index(k)+1]
+def digest(b):return base64.b64encode(hashlib.sha256(b).digest()).decode()
+if a[:3]==['s3','cp','--only-show-errors']:
+ sys.stdout.buffer.write((root/a[3][5:]).read_bytes());sys.exit(0)
+assert a[0]=='s3api'
+op=a[1]
+if op=='get-bucket-versioning':print('{"Status":"Enabled"}')
+elif op=='get-bucket-lifecycle-configuration':print('{"Rules":[{"Status":"Enabled","Filter":{"Prefix":"root/store/v1/"},"NoncurrentVersionExpiration":{"NoncurrentDays":7}}]}')
+elif op=='get-bucket-policy':print(json.dumps({'Policy':json.dumps({'Statement':[{'Effect':'Deny','Principal':'*','Action':'s3:PutObject','Resource':'arn:aws:s3:::bucket/root/store/v1/*','Condition':{'Null':{'s3:if-none-match':'true'},'Bool':{'s3:ObjectCreationOperation':'true'}}}]})}))
+else:
+ dest=root/arg('--bucket')/arg('--key')
+ if op=='put-object':
+  assert arg('--if-none-match')=='*'
+  data=pathlib.Path(arg('--body')).read_bytes();assert digest(data)==arg('--checksum-sha256')
+  dest.parent.mkdir(parents=True,exist_ok=True)
+  try:
+   with dest.open('xb') as f:f.write(data);f.flush();__import__('os').fsync(f.fileno())
+  except FileExistsError:sys.exit(1)
+  print('{}')
+ elif op=='head-object':
+  data=dest.read_bytes();print(json.dumps({'ChecksumSHA256':digest(data),'ContentLength':len(data)}))
+ else:raise Exception(op)
+"##).unwrap();
 }
 fn wait_transfer(p: &Processes, id: i64) {
     let start = Instant::now();
@@ -228,4 +231,76 @@ fn real_park_jobs_complete_without_process_loss() {
     p.start_agent("source");
     p.start_agent("target");
     wait_transfer(&p, park);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn real_park_publication_reuses_a_failed_restore_export() {
+    let mut p = fixture();
+    writable_store(&p);
+    let ctl = p.root.join("controller");
+    fs::write(ctl.join("store-url"), "s3://bucket/root").unwrap();
+    let source = p.root.join("source");
+    let state_path = source.join("fixture-state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state["park_fixture"] = json!(true);
+    state["ram"] = json!(false);
+    ow_core::runtime::atomic_json(&state_path, &state).unwrap();
+    let park = {
+        let c = Catalog::open(&ctl, "test", None).unwrap();
+        let old = c.transfer(1).unwrap();
+        let placement = authority(&old, "source");
+        wire::request(&source,json!({"op":"placement-register","id":"physical","committed":true,"placement":placement,"operation_key":"transfer-1-placement-register"})).unwrap();
+        let exported=wire::request(&source,json!({"op":"export","id":"physical","placement":placement,"transfer":"transfer-1","capture":"transfer-1-source","operation_key":"transfer-1-export"})).unwrap();
+        source_fence(&c, &old, &exported, &placement).unwrap();
+        c.advance_transfer(
+            old.id,
+            old.epoch,
+            Step::Preparing,
+            Step::Exported,
+            &Evidence {
+                source_fenced: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        c.advance_transfer(
+            old.id,
+            old.epoch,
+            Step::Exported,
+            Step::Failed,
+            &Evidence::default(),
+        )
+        .unwrap();
+        let user =
+            c.db.query_row(
+                "SELECT owner FROM operations WHERE id=?1",
+                [old.operation],
+                |r| r.get(0),
+            )
+            .unwrap();
+        super::super::parking::admission(
+            &c,
+            user,
+            &json!({"op":"park","id":"box","operation_key":"park-after-restore"}),
+            Kind::Park,
+        )
+        .unwrap()
+    };
+    p.start_controller();
+    p.start_agent("source");
+    p.start_agent("target");
+    wait_transfer(&p, park.id);
+    let c = nodes::db(&ctl).unwrap();
+    assert_eq!(c.query_row("SELECT a.local_name FROM artifacts a JOIN resources r ON r.current_capture=a.id WHERE r.physical='physical'",[],|r|r.get::<_,String>(0)).unwrap(),"transfer-1-source");
+    assert!(c.query_row("SELECT node='' AND reserved_mib=0 AND current_capture IS NOT NULL FROM resources WHERE physical='physical'",[],|r|r.get::<_,bool>(0)).unwrap());
+    assert_eq!(
+        fs::read(source.join("snapshots/transfer-1-source/disk.ext4")).unwrap(),
+        b"disk"
+    );
+    assert!(
+        !source
+            .join(format!("snapshots/transfer-{}-source", park.id))
+            .exists()
+    );
 }

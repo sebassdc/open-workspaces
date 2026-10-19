@@ -47,14 +47,34 @@ pub(super) fn admission(c: &Catalog, user: i64, request: &Value, kind: Kind) -> 
         // All callers and users join the single locked wake. Their own access is checked first.
         if let Some(id) = c.db.query_row("SELECT t.id FROM transfer_locks l JOIN transfers t ON t.id=l.transfer WHERE l.machine=?1 AND t.kind='wake'",[&physical],|r|r.get::<_,i64>(0)).optional()? {
             let t = c.transfer(id)?;
-            ensure!(!input.accept_cold || intent(c,&t)?.accept_cold,"wake already in progress; inspect its operation before a cold retry");
-            return Ok(t);
+            return join_wake(c,user,request,t);
         }
         input.capture = c.db.query_row("SELECT current_capture FROM resources WHERE kind='machine' AND physical=?1 AND node='' AND placement_managed=1",[&physical],|r|r.get(0))?;
     } else {
         ensure!(c.db.query_row("SELECT node<>'' AND json_extract(metadata,'$.state') IN ('stopped','hibernated') FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|r.get::<_,bool>(0))?,"park requires a stopped or hibernated placement");
     }
     c.begin_transfer(user, key, &input)
+}
+fn join_wake(c: &Catalog, user: i64, request: &Value, t: Transfer) -> Result<Transfer> {
+    let cold = request["accept_cold"].as_bool().unwrap_or(false);
+    ensure!(
+        !cold || intent(c, &t)?.accept_cold,
+        "wake already in progress; inspect its operation before a cold retry"
+    );
+    if !initiator_authorized(c, &t)? {
+        c.resume_wake(
+            user,
+            request["operation_key"]
+                .as_str()
+                .context("operation key required")?,
+            request["id"].as_str().context("machine required")?,
+            t.id,
+            matches!(request["op"].as_str(), Some("start" | "wake")),
+            cold,
+        )
+    } else {
+        Ok(t)
+    }
 }
 pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> {
     let (user, physical, node, epoch, root) = {
@@ -171,13 +191,13 @@ pub(crate) fn ensure_awake(
             |r| r.get(0),
         )?;
         let key = format!(
-            "wake-{}",
-            &store::sha256(format!("{physical}:{epoch}").as_bytes())[..32]
+            "w-{}",
+            &store::sha256(format!("{physical}:{epoch}").as_bytes())[..30]
         );
         let request =
             json!({"op":if explicit {"start"}else{"connect"},"id":address,"operation_key":key});
         match locked {
-            Some(id) => c.transfer(id)?,
+            Some(id) => join_wake(&c, user, &request, c.transfer(id)?)?,
             None => admission(&c, user, &request, Kind::Wake)?,
         }
     };
@@ -303,12 +323,42 @@ pub(super) fn tick(
     match t.step {
         Step::Preparing => export_source(shared, t, &input, &policy, &source_authority, call),
         Step::Exported => {
+            let seen = call(&t.source_node, json!({"op":"inspect","id":t.source}))?;
+            source_fence(&shared.lock().unwrap(), t, &seen, &source_authority)?;
+            let snapshot = seen["lifecycle"]["intent"]["capture"]
+                .as_str()
+                .context("fenced capture missing")?
+                .to_owned();
+            common::identifier(&snapshot)?;
             let (a, expires) = {
                 let c = shared.lock().unwrap();
                 let artifact = format!("park-{}", t.id);
-                let old:Option<(String,String,i64)>=c.db.query_row("SELECT a.attempt,a.store_url,l.expires FROM artifacts a JOIN leases l ON l.artifact=a.id AND l.token=a.attempt WHERE a.id=?1",[&artifact],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-                let (attempt, url, expires) = if let Some(old) = old {
-                    old
+                let old:Option<(String,String,i64,String,String)>=c.db.query_row("SELECT a.attempt,a.store_url,l.expires,a.local_name,a.state FROM artifacts a JOIN leases l ON l.artifact=a.id AND l.token=a.attempt WHERE a.id=?1",[&artifact],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+                let (attempt, url, expires) = if let Some((
+                    attempt,
+                    url,
+                    expires,
+                    previous,
+                    state,
+                )) = old
+                {
+                    if previous == snapshot {
+                        (attempt, url, expires)
+                    } else {
+                        ensure!(
+                            state == "uploading",
+                            "published capture identity differs from source fence"
+                        );
+                        let token = store::token()?;
+                        let tx = rusqlite::Transaction::new_unchecked(
+                            &c.db,
+                            rusqlite::TransactionBehavior::Immediate,
+                        )?;
+                        tx.execute("UPDATE artifacts SET attempt=?1,local_name=?2 WHERE id=?3 AND state='uploading'",params![token,snapshot,artifact])?;
+                        tx.execute("INSERT INTO leases(artifact,holder,purpose,token,expires) VALUES(?1,?2,'push',?3,?4)",params![artifact,name(t),token,at+7200])?;
+                        tx.commit()?;
+                        (token, url, at + 7200)
+                    }
                 } else {
                     let url = crate::image_store::configured_url(&c.root)?;
                     let attempt = store::token()?;
@@ -316,7 +366,7 @@ pub(super) fn tick(
                         &c.db,
                         rusqlite::TransactionBehavior::Immediate,
                     )?;
-                    tx.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,attempt,store_url) SELECT ?1,'capture',owner,physical,?2,'uploading',?3,?4 FROM resources WHERE kind='machine' AND physical=?5",params![artifact,format!("{}-source",name(t)),attempt,url,t.source])?;
+                    tx.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,attempt,store_url) SELECT ?1,'capture',owner,physical,?2,'uploading',?3,?4 FROM resources WHERE kind='machine' AND physical=?5",params![artifact,snapshot,attempt,url,t.source])?;
                     tx.execute("INSERT INTO leases(artifact,holder,purpose,token,expires) VALUES(?1,?2,'push',?3,?4)",params![artifact,name(t),attempt,at+7200])?;
                     tx.execute(
                         "UPDATE transfers SET capture=?1 WHERE id=?2",
@@ -334,7 +384,7 @@ pub(super) fn tick(
                             attempt,
                             digest: String::new(),
                         },
-                        snapshot: format!("{}-source", name(t)),
+                        snapshot,
                         memory_mib: input.memory_mib,
                         cpus: input.cpus,
                         disk_bytes: input.disk_bytes,
