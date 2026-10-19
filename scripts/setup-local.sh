@@ -15,6 +15,11 @@ if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
   "$installer" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
 fi
 "$CARGO_HOME/bin/rustup" toolchain install 1.97.0 --profile minimal
+# Controller packaging needs only the native binary, no runtime assets or KVM preflight.
+if [[ ${1:-} == --controller-only ]]; then
+  "$CARGO_HOME/bin/cargo" +1.97.0 build --locked --release -p ow -j 2
+  exit 0
+fi
 "$CARGO_HOME/bin/rustup" target add --toolchain 1.97.0 x86_64-unknown-linux-musl
 bash experiments/runtime-spike/fetch-firecracker.sh
 # The pinned guest kernel, also when a base image already exists (an upgrade's

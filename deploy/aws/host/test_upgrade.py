@@ -532,6 +532,23 @@ class Staging(unittest.TestCase):
         self.assertEqual(u.stage(target), name, "a complete release is reused")
         self.assertEqual(h.pins()["worker"], "0.5.0-aaaaaaaaaaaa", "staging moves no pin")
 
+    def test_controller_stage_uses_only_native_build_and_keeps_live_assets(self):
+        script = self.repo / "scripts/setup-local.sh"
+        script.parent.mkdir()
+        script.write_text('set -eu\n[ "$1" = --controller-only ]\nmkdir -p target/release\nprintf "#!/bin/sh\\necho ow 0.5.1\\n" >target/release/ow\nchmod +x target/release/ow\n')
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "native-only build"], check=True)
+        config = {"role": "controller", "release": {"repository": str(self.repo), "ref": "HEAD"}}
+        h.write_json(h.CONFIG, config)
+        os.environ.pop("OW_HOST_BUILD")
+        target = u.fetch(config)
+        live = h.p(f"{h.SRV}/run/agent/assets/guest/ow-guest")
+        before = live.read_bytes()
+        name = u.stage(target)
+        self.assertEqual(live.read_bytes(), before)
+        self.assertEqual(h.staged(name)["version"], "0.5.1")
+        self.assertEqual(h.pin("agent"), "0.5.0-aaaaaaaaaaaa")
+
     def test_a_build_reporting_another_version_is_refused(self):
         os.environ["OW_HOST_BUILD"] = os.environ["OW_HOST_BUILD"].replace("ow 0.5.1", "ow 0.5.0")
         target = u.fetch({"release": {"repository": str(self.repo), "ref": "v0.5.1"}})

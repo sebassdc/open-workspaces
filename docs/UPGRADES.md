@@ -52,6 +52,32 @@ release directory. The worker unit runs `ow supervisor` (hibernate on stop); the
 control plane runs `ow host up --external-worker`, which never starts a worker.
 They are tied by `Wants=`/`After=` only.
 
+### Controller-only hosts
+
+`role: "controller"` installs only `open-workspaces.service` (the existing
+listener via `ow host up --controller-only`), the optional dashboard and the
+configured catalog backup timer. It creates agent/dashboard pins, no worker pin.
+Boot, readiness, restart and upgrades use only installed control-plane units;
+readiness requires the listener on the expected tailnet address and an answering
+node inventory, even before any node enrolls. Reported local CPU/RAM/slots are zero.
+`restart --worker` is refused. Applying a different role to an existing host is
+refused before rendering or stopping units; use a separately planned cutover.
+
+Staging uses `scripts/setup-local.sh --controller-only`: it reuses the pinned
+Rust toolchain but builds only `ow`, without Firecracker, guest builds, network
+assets or KVM preflight. Upgrades neither probe a local worker nor inspect
+captures, quiesce, drain or canary local boxes. Worker-only release changes do
+not move any controller host pin; catalog/protocol compatibility still applies.
+The optional dashboard pin moves with the controller for a catalog schema change,
+even while its unit is disabled. Pin-only moves do not restart absent units;
+enabling the dashboard later uses the migrated catalog's compatible release.
+Controller/dashboard restarts interrupt streams; remote worker pins are untouched.
+
+This role adds no catalog migration or protocol/worker interface change.
+Packaging is class 1 for the new role and class 0 component/config on unaffected
+existing hosts. The role uses the existing stage 0 byte-for-byte: adding the
+option does not replace existing hosts or require a stage 0 upgrade.
+
 ## Config: one SSM parameter
 
 User data holds stage 0 values only (data volume, parameter name, region, stage-0

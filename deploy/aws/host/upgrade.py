@@ -55,7 +55,7 @@ def gate(rule, captures):
 
 
 def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), captures=(), compat=None,
-         accept_cold=False, max_class=2, controller=None):
+         accept_cold=False, max_class=2, controller=None, installed=None):
     """The upgrade of one host from `pins` (pin -> release version) to version `target`.
 
     rendered: pins whose unit files the target release renders differently.
@@ -67,6 +67,7 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
     compat:   the running worker's tuple ({"cpu": ...}): the CPU string comes from the host.
     controller: on a runner host, the release its controller runs: the new agent must speak
               a protocol that controller accepts (controllers upgrade first).
+    installed: optional installed unit pins; dormant pins still move, but do not restart.
     Returns the plan; raises Refused, naming what to do instead."""
     entries = {e["version"]: e for e in manifest["releases"]}
     if target not in entries:
@@ -95,11 +96,11 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
              "cold": []}
     # Catalog: the controller and dashboard move together around a schema change, after a copy.
     # A runner host has no catalog.
-    schema = {name: entries[pins[name]]["catalog"]["schema"] for name in ("agent", "dashboard")}
+    schema = {name: entries[pins[name]]["catalog"]["schema"] for name in ("agent", "dashboard") if name in pins}
     if controller is None and any(s != goal["catalog"]["schema"] for s in schema.values()):
         plan_["catalog_backup"] = True
         plan_["rollback_auto"] = min(schema.values()) >= goal["catalog"]["min_reader"]
-        move.update(agent=target, dashboard=target)
+        move.update({name: target for name in schema})
     # Agent and worker: the pair each ends on must be inside the agent's worker window;
     # if moving one alone breaks that, the other moves too.
     def paired():
@@ -107,7 +108,7 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
         speaks = entries[move.get("worker", pins["worker"])]["worker_protocol"]["speaks"]
         return agent[0] <= speaks <= agent[1]
 
-    if not paired():
+    if "worker" in pins and not paired():
         move["worker" if "agent" in move else "agent"] = target
         if not paired():
             raise Refused(f"the {target} agent cannot drive the {target} worker (worker protocol window)")
@@ -134,7 +135,8 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
             bridge = max(bridges, key=lambda e: version(e["version"]))["version"]
             raise Refused(f"upgrade runners {', '.join(low)} to {bridge} first: the target controller accepts "
                           f"protocol {lo}..{hi} only")
-    restart = sorted(set(move) | set(pending))
+    restart = set(move) | (set(pending) & set(pins))
+    restart = sorted(restart if installed is None else restart & set(installed))
     plan_["restart"] = restart
     plan_["class"] = max([PIN_CLASS[name] for name in restart], default=0)
     # Capture gate: a capture the target worker cannot resume boots cold and is deleted.
@@ -195,7 +197,7 @@ def migrate_layout_v1():
 
 
 STAGE = r"""
-rel=$1 src=$2 commit=$3 seed=$4 target=$5
+rel=$1 src=$2 commit=$3 seed=$4 target=$5 role=$6
 mkdir -p "$rel" "$target"
 git -C "$src" worktree prune
 git -C "$src" worktree add -q --detach "$rel/src" "$commit"
@@ -210,7 +212,11 @@ ln -s ../../assets "$rel/src/data/runtime-spike"
 ln -s "$target" "$rel/src/target"
 cd "$rel/src"
 # Tests swap the build for a stand-in; on a host (root) the environment is reset.
-eval "${OW_HOST_BUILD:-bash scripts/setup-local.sh}"
+if [ "$role" = controller ]; then
+  eval "${OW_HOST_BUILD:-bash scripts/setup-local.sh --controller-only}"
+else
+  eval "${OW_HOST_BUILD:-bash scripts/setup-local.sh}"
+fi
 cp target/release/ow "$rel/bin/ow.tmp"
 mv "$rel/bin/ow.tmp" "$rel/bin/ow"
 """
@@ -235,10 +241,11 @@ def stage(target):
         free = shutil.disk_usage(p(h.SRV)).free
         if free < 4 << 30:
             raise Refused(f"only {free >> 20} MiB free on {h.SRV}; staging needs 4 GiB")
-        seed = next((str(s) for s in (p(f"{h.SRV}/run/worker/assets"), p(f"{h.SRV}/src/data/runtime-spike"))
+        asset_pin = "agent" if h.role() == "controller" else "worker"
+        seed = next((str(s) for s in (p(f"{h.SRV}/run/{asset_pin}/assets"), p(f"{h.SRV}/src/data/runtime-spike"))
                      if s.is_dir()), "")
         cmd = ["bash", "-euo", "pipefail", "-c", STAGE, "stage", str(rel), str(p(f"{h.SRV}/src")),
-               target["commit"], seed, str(p(f"{h.SRV}/build/target"))]
+               target["commit"], seed, str(p(f"{h.SRV}/build/target")), h.role()]
         env = None
         if os.geteuid() == 0:
             # Niced and CPU-weighted: running boxes keep their vCPUs while it builds.
@@ -329,7 +336,8 @@ class HostOps:
     def units(self):
         # An unenrolled runner's agent has nothing to run (its unit's condition keeps it down).
         idle = h.role() == "runner" and not p(f"{h.RUNNER}/node.json").exists()
-        return [name for name in h.PINS if h.unit_exists(h.UNITS[name]) and not (idle and name == "agent")]
+        names = ("agent", "dashboard") if h.role() == "controller" else h.PINS
+        return [name for name in names if h.unit_exists(h.UNITS[name]) and not (idle and name == "agent")]
 
     def active(self, name):
         return h.active(h.UNITS[name])
@@ -344,12 +352,16 @@ class HostOps:
         return captures((self.worker_status() or {}).get("compat"))
 
     def worker_status(self):
+        if h.role() == "controller":
+            return None
         try:
             return h.ow("status", timeout=60)
         except (RuntimeError, ValueError, subprocess.TimeoutExpired):
             return None
 
     def boxes(self):
+        if h.role() == "controller":
+            return {}
         return {b["id"]: b["state"] for b in h.ow("list", timeout=1200)}
 
     def hibernate_all(self, release):
@@ -374,12 +386,15 @@ class HostOps:
 
     def quiesce_off(self):
         """Lets a quiesced worker take starts and wakes again (idempotent)."""
-        self._quiesce(False)
+        if h.role() != "controller":
+            self._quiesce(False)
 
     def start_box(self, box):
         h.ow("start", box, timeout=1200)
 
     def drain(self, on):
+        if h.role() == "controller":
+            return
         flag = p(f"{h.RUNNER}/drain")
         if on:
             flag.write_text("upgrade\n")
@@ -438,19 +453,24 @@ class HostOps:
             want = os.path.realpath(p(f"{h.SRV}/releases/{pins[name]}/bin/ow"))
             if exe != want:
                 return f"{h.UNITS[name]} runs {exe or 'nothing'}, not {want}"
-        status = self.worker_status() or {}
-        if status.get("internet") is not True or status.get("version") != expected["worker"]:
-            return f"worker answers {status.get('version')!r} (internet {status.get('internet')}), want {expected['worker']}"
-        if "agent" not in self.units():
-            return ""
-        try:
-            if not h.node_online(expected["agent"], expected["worker"]):
-                return f"runner not online with agent {expected['agent']} and worker {expected['worker']}"
-        except (RuntimeError, ValueError):
-            return "ow node list failed"
+        if h.role() != "controller":
+            status = self.worker_status() or {}
+            if status.get("internet") is not True or status.get("version") != expected["worker"]:
+                return f"worker answers {status.get('version')!r} (internet {status.get('internet')}), want {expected['worker']}"
+            if "agent" not in self.units():
+                return ""
+            try:
+                if not h.node_online(expected["agent"], expected["worker"]):
+                    return f"runner not online with agent {expected['agent']} and worker {expected['worker']}"
+            except (RuntimeError, ValueError):
+                return "ow node list failed"
         if h.role() == "runner":
             return ""
         t = h.tailnet()
+        if t == "wait":
+            return "tailnet is not ready"
+        if h.role() == "controller" and t == "none" and not h.listening():
+            return "controller is not listening"
         if t not in ("none", "wait") and h.listening() != f"{t}:8790":
             return f"controller listens on {h.listening() or 'nothing'}, not {t}:8790"
         if "dashboard" in self.units() and t != "none" and not h.dashboard_answers():
@@ -539,7 +559,7 @@ def execute(plan_, ops, frm, to, target_name):
             if name in restart:
                 ops.start(name)
         j.step("verify")
-        ops.verify({name: version_of(to[name]) for name in h.PINS})
+        ops.verify({name: version_of(to[name]) for name in j["from"] if name != "current"})
     except Exception as e:
         j.value["error"] = f"{e}"
         rollback(j, ops)
@@ -614,7 +634,7 @@ def rollback(j, ops):
     for name in ("worker", "agent", "dashboard"):
         if name in restart:
             ops.start(name)
-    ops.verify({name: version_of(j["from"][name]) for name in h.PINS})
+    ops.verify({name: version_of(j["from"][name]) for name in j["from"] if name != "current"})
     if "worker" in restart:
         wait_worker(ops)
     resume(j, ops)
@@ -672,14 +692,18 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
         config = h.validate(h.read_json(h.CONFIG))
         target = fetch(config, ref)
         frm = h.pins()
+        if config["role"] == "controller":
+            # The optional dashboard pin must remain readable after catalog migrations.
+            frm = {name: value for name, value in frm.items() if name in (*h.role_pins(config), "current")}
+        pin_names = [name for name in frm if name != "current"]
         if None in frm.values():
             raise Refused("this host has no release pins (layout v1): replace it with this release first")
-        newest = max((h.staged(frm[name]) or {"version": "0.0.0"} for name in h.PINS), key=lambda s: version(s["version"]))
+        newest = max((h.staged(frm[name]) or {"version": "0.0.0"} for name in pin_names), key=lambda s: version(s["version"]))
         if version(newest["version"]) > version(target["version"]):
             # Going back: an older release's manifest does not list what runs now; the newest running one does.
             target["manifest"] = json.loads(git("show", f"{newest['commit']}:release-impact.json"))
-        status = ops.worker_status() or {}
-        compat = status.get("compat") or {"cpu": host_cpu()}
+        status = (ops.worker_status() or {}) if config["role"] != "controller" else {}
+        compat = status.get("compat") or ({"cpu": host_cpu()} if config["role"] != "controller" else {})
         if config["role"] == "runner":
             # Its controller is another host: ow-aws passes the release that runs there.
             if controller is None:
@@ -692,13 +716,14 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
             runners = [{"id": n["id"], "protocol": (n.get("capabilities") or {}).get("protocol", 0)}
                        for n in h.ow("node", "list", timeout=30) if n["id"] != h.local_node() and not n.get("revoked")]
         common = dict(rendered=render_diff(target), pending=set(h.pending()), runners=runners,
-                      compat=compat, accept_cold=accept_cold, max_class=max_class, controller=controller)
-        current = {name: version_of(frm[name]) for name in h.PINS}
-        result = plan(target["manifest"], current, target["version"], captures=captures(compat), **common)
+                      compat=compat, accept_cold=accept_cold, max_class=max_class, controller=controller,
+                      installed=ops.units() if config["role"] == "controller" else None)
+        current = {name: version_of(frm[name]) for name in pin_names}
+        result = plan(target["manifest"], current, target["version"], captures=captures(compat) if "worker" in current else (), **common)
         say(json.dumps({"plan": result, "release": target["release"]}, indent=2))
         if plan_only:
             return 0
-        if not result["restart"] and frm["current"] == target["release"]:
+        if not result["move"] and not result["restart"] and frm["current"] == target["release"]:
             say("nothing to do")
             return 0
         release = stage(target)
@@ -715,7 +740,7 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
             if result["cold"] and p("/etc/open-workspaces/backup.env").exists():
                 say("backing up before cold boots")
                 h.run(["/usr/local/bin/ow-backup"], capture=False)
-        to = {name: release if name in result["move"] else frm[name] for name in h.PINS}
+        to = {name: release if name in result["move"] else frm[name] for name in pin_names}
         to["current"] = release
         execute(result, ops, frm, to, target["version"])
         prune()
@@ -725,6 +750,8 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
 
 def restart_worker(ops=None):
     """Class 2 restart on the same releases: drain, hibernate, restart, resume."""
+    if h.role() == "controller":
+        raise Refused("controller role has no worker to restart")
     ops = ops or HostOps()
     with locked():
         recover(ops)

@@ -169,7 +169,7 @@ def validate(config):
     if not isinstance(config, dict) or config.get("schema") != 1:
         raise Refused("config: schema must be 1")
     role = config.get("role", "host")
-    if role not in ("host", "runner"):
+    if role not in ("host", "runner", "controller"):
         raise Refused(f"config: role {role!r} is not supported by this release")
     release = config.get("release") or {}
     if not REPOSITORY.match(str(release.get("repository", ""))):
@@ -236,6 +236,8 @@ def validate(config):
     ratio = config.get("vcpuOvercommit", 1)
     if type(ratio) is not int or ratio not in (1, 2):
         raise Refused("config: vcpuOvercommit must be 1 or 2")
+    if role == "controller" and (images or backup.get("recovery") or store["images"]):
+        raise Refused("config: controller role has no local images or recovery worker; configure images/recovery on runners")
     extra = {}
     if role == "runner":
         runner = config.get("runner") or {}
@@ -265,8 +267,10 @@ def validate(config):
     }
 
 
-def budgets():
+def budgets(config=None):
     """Local runner budget: three quarters of RAM (cap 64 GiB), every vCPU (cap 64), 8 slots."""
+    if config and config["role"] == "controller":
+        return {"memory": 0, "cpus": 0, "slots": 0}
     meminfo = p("/proc/meminfo").read_text()
     kib = int(re.search(r"^MemTotal:\s+(\d+)", meminfo, re.M).group(1))
     return {"memory": min(kib * 3 // 4 // 1024, 65536), "cpus": min(os.cpu_count() or 1, 64), "slots": SLOTS}
@@ -315,6 +319,9 @@ WantedBy=multi-user.target
 """,
         0o644,
     )
+    if config["role"] == "controller":
+        files.pop("/etc/open-workspaces/worker.env")
+        files.pop("/etc/systemd/system/open-workspaces-worker.service")
     # Wants=/After= only: restarting the control plane never restarts the worker, and
     # at shutdown the control plane stops first, so no wake arrives while boxes hibernate.
     if config["role"] == "runner":
@@ -334,6 +341,19 @@ Environment=HOME=/srv/ow OW_ASSET_DIR={asset}
 EnvironmentFile={CONTROLLER_ENV}
 ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet
 ExecStart={SRV}/run/agent/bin/ow --data-dir {RUNNER} node-agent --controller ${{OW_CONTROLLER}} --credential {RUNNER}/node.json --join {JOIN} --ca-cert {CA}
+"""
+    elif config["role"] == "controller":
+        control = f"""[Unit]
+Description=Open Workspaces controller (remote capacity only)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+RequiresMountsFor=/srv/ow
+
+[Service]
+User=ow
+Environment=HOME=/srv/ow OW_ASSET_DIR={SRV}/run/agent/assets
+ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet
+ExecStart={SRV}/run/agent/bin/ow host up --controller-only
 """
     else:
         control = f"""[Unit]
@@ -375,11 +395,14 @@ WantedBy=multi-user.target
         0o644,
     )
     files["/usr/local/lib/open-workspaces/wait-tailnet"] = ((HERE / "files/wait-tailnet").read_text(), 0o755)
+    cli_root = CONTROLLER if config["role"] == "controller" else RUNNER
+    if config["role"] == "controller":
+        asset = f"{SRV}/run/agent/assets"
     files["/usr/local/bin/ow"] = (
         f"""#!/bin/sh
 # The worker checks the caller's UID, so every command runs as the ow user.
 [ "$(id -un)" = ow ] || exec runuser -u ow -- "$0" "$@"
-export HOME=/srv/ow OW_DATA_DIR={RUNNER} OW_ASSET_DIR={asset}
+export HOME=/srv/ow OW_DATA_DIR={cli_root} OW_ASSET_DIR={asset}
 exec {SRV}/current/bin/ow "$@"
 """,
         0o755,
@@ -455,6 +478,8 @@ WantedBy=multi-user.target
     if backup["url"]:
         # A runner has no catalog to copy: only its own snapshots, under its own prefix.
         catalog = "OW_BACKUP_CATALOG=0\n" if config["role"] == "runner" else ""
+        if config["role"] == "controller":
+            catalog += "OW_BACKUP_SNAPSHOTS=0\n"
         files["/etc/open-workspaces/backup.env"] = (f"OW_BACKUP_URL={backup['url']}\n{catalog}", 0o644)
         files["/usr/local/bin/ow-backup"] = ((HERE / "files/ow-backup").read_text(), 0o755)
         if backup["schedule"]:
@@ -594,7 +619,9 @@ def setup(config):
     p(DATA).mkdir(parents=True, exist_ok=True)
     os.chmod(p(DATA), 0o700)
     chown(p(DATA), "ow")
-    files = render(config, budgets())
+    if config["role"] == "controller" and (unit_exists(UNITS["worker"]) or p(RUNNER).exists()):
+        raise Refused("controller role requires a fresh host without a local worker; use the cutover procedure")
+    files = render(config, budgets(config))
     # The reloads these writes need are recorded first, so a failure on the way leaves
     # them due for the next setup, which finds no file left to rewrite.
     due = set(read_json(SETUP_DUE, []))
@@ -745,6 +772,12 @@ def staged(release):
     return read_json(f"{SRV}/releases/{release}/STAGED") if release else None
 
 
+def role_pins(config):
+    if config["role"] == "controller":
+        return ("agent", "dashboard")
+    return PINS
+
+
 def pins():
     return {name: pin(name) for name in (*PINS, "current")}
 
@@ -791,6 +824,8 @@ def listening():
 
 
 def local_node():
+    if role() == "controller":
+        return None
     # The enrolled ID: a replaced host keeps its runner credential, not its hostname.
     return (read_json(f"{RUNNER}/node.json") or read_json(f"{DATA}/host.json") or {}).get("node")
 
@@ -922,7 +957,11 @@ def controller_ready(deadline, wait):
     while True:
         t = tailnet()
         try:
-            up = t != "wait" and ow("status", timeout=30).get("internet") is True and node_online()
+            if role() == "controller":
+                # Inventory must answer before enrollment, without a local worker dependency.
+                up = t != "wait" and active(UNITS["agent"]) and isinstance(ow("node", "list", timeout=30), list)
+            else:
+                up = t != "wait" and ow("status", timeout=30).get("internet") is True and node_online()
         except (RuntimeError, ValueError, AttributeError, subprocess.TimeoutExpired):
             up = False
         if up:
@@ -934,7 +973,7 @@ def controller_ready(deadline, wait):
                 systemctl("restart", UNITS["agent"])
                 rebound = True
         if time.monotonic() > deadline:
-            raise RuntimeError(f"runner not ready after {wait} s; see journalctl -u {UNITS['agent']}")
+            raise RuntimeError(f"controller not ready after {wait} s; see journalctl -u {UNITS['agent']}")
         time.sleep(2)
     say(f"controller listening on: {addr}")
     if unit_exists(UNITS["dashboard"]) and t != "none":
@@ -994,9 +1033,11 @@ def apply_config():
     except Refused:
         old = None
     config = validate(fetch_config())
+    if old and config["role"] != old["role"]:
+        raise Refused("in-place host role changes require the cutover procedure")
     # Recorded before anything is written: a retry after a failure below (in setup too)
     # finds no file left to rewrite.
-    mark_pending(units_changed(diff(render(config, budgets()))), "config changed")
+    mark_pending(units_changed(diff(render(config, budgets(config)))), "config changed")
     changed = setup(config)
     act(config, old)
     # Last: until everything above succeeded, a retry compares against the old config.
@@ -1022,7 +1063,7 @@ def boot():
         upgrade.migrate_layout_v1()
         target = upgrade.fetch(config)
         release = upgrade.stage(target)
-        for name in (*PINS, "current"):
+        for name in (*role_pins(config), "current"):
             set_pin(name, release)
         setup(config)
         state, _ = tailscale(config)
@@ -1030,7 +1071,7 @@ def boot():
         write_json(PENDING, {})
         # The recover unit runs at later boots; this one recovers below, as a new instance.
         systemctl("enable", "open-workspaces-recover.service")
-        units = [UNITS["worker"], UNITS["agent"]]
+        units = [UNITS[name] for name in ("worker", "agent") if unit_exists(UNITS[name])]
         if unit_exists(UNITS["dashboard"]):
             # It waits, retrying, until the host is on the tailnet.
             units.append(UNITS["dashboard"])
@@ -1084,7 +1125,7 @@ def invite_runner(node, memory, slots, cpus):
     """On the controller host: mints NODE's single-use join (10 minutes) and writes it,
     with the controller's CA, into NODE's join secret. The Runner component lets only
     this host write it and only NODE's host read it. An enrolled node is left alone."""
-    if role() != "host":
+    if role() not in ("host", "controller"):
         raise Refused("invite-runner runs on a controller host")
     if not NODE.match(node) or node == "local":
         raise Refused(f"{node!r} is not a node ID")
@@ -1159,8 +1200,9 @@ def enrol(wait=120):
 
 def status():
     v = versions()
-    budget = budgets()
-    budget["cpus"] = min(budget["cpus"] * validate(read_json(CONFIG))["vcpuOvercommit"], 64)
+    config = validate(read_json(CONFIG))
+    budget = budgets(config)
+    budget["cpus"] = min(budget["cpus"] * config["vcpuOvercommit"], 64)
     out = {"role": role(), "pins": pins(), "versions": v, "budget": budget, "node": local_node(),
            "units": {name: run(["systemctl", "is-active", unit], check=False).strip() or "unknown"
                      for name, unit in UNITS.items() if unit_exists(unit)},
@@ -1203,7 +1245,7 @@ def main(argv):
         if args.command == "render":
             # Used by an older release's upgrader to diff this release's files.
             config = validate(json.loads(Path(args.config).read_text()))
-            files = {k: v[0] for k, v in render(config, budgets()).items()}
+            files = {k: v[0] for k, v in render(config, budgets(config)).items()}
             print(json.dumps({"files": files, "restarts": RESTARTS}))
             return 0
         if args.command == "boot":
