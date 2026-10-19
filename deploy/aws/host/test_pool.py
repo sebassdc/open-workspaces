@@ -42,7 +42,8 @@ class FakeAws(Fake):
         super().__init__(root)
         self.volume = VOL_A
         self.denied, self.drain, self.tags, self.activities = set(), {}, {}, []
-        self.group = {"DesiredCapacity": 0, "MaxSize": 3, "MinSize": 0, "Instances": [],
+        self.group = {"AutoScalingGroupARN": "arn:aws:autoscaling:us-east-1:111122223333:autoScalingGroup:u:autoScalingGroupName/open-workspaces-dev",
+                      "DesiredCapacity": 0, "MaxSize": 3, "MinSize": 0, "Instances": [],
                       "NewInstancesProtectedFromScaleIn": True,
                       "SuspendedProcesses": [{"ProcessName": n} for n in sorted(rp.SUSPENDED)],
                       "InstanceLifecyclePolicy": {"RetentionTriggers": {"TerminateHookAbandon": "retain"}}}
@@ -74,13 +75,19 @@ class FakeAws(Fake):
             return json.dumps({"state": self.drain.get(cmd[cmd.index("drain") + 1], "active")})
         if name == "aws" and cmd[2] == "put-secret-value" and cmd[cmd.index("--secret-id") + 1] not in self.secrets:
             raise RuntimeError("An error occurred (ResourceNotFoundException) when calling PutSecretValue")
-        if name != "aws" or cmd[1] not in ("autoscaling", "ec2", "ssm", "secretsmanager") \
+        if name != "aws" or cmd[1] not in ("autoscaling", "ec2", "ssm", "secretsmanager", "sts", "iam") \
                 or cmd[2] in ("get-secret-value", "put-secret-value"):
             return super().__call__(cmd, **kw)
         self.calls.append(cmd)
         op, arg = cmd[2], lambda flag: cmd[cmd.index(flag) + 1]
         if op in self.denied:
             raise RuntimeError(f"aws {op}: An error occurred (AccessDenied) when calling the {op} operation")
+        if op == "get-caller-identity":
+            return json.dumps({"Arn": "arn:aws:sts::111122223333:assumed-role/ow-host-host/i-0ctl"})
+        if op == "simulate-principal-policy":
+            assert arg("--policy-source-arn") == "arn:aws:iam::111122223333:role/ow-host-host"
+            assert arg("--resource-arns") == self.group["AutoScalingGroupARN"]
+            return json.dumps({"EvaluationResults": [{"EvalDecision": "implicitDeny" if "simulate:terminate" in self.denied else "allowed"}]})
         if op == "get-parameter":
             return json.dumps({"Parameter": {"Value": json.dumps({"pool": POOL})}})
         if op == "describe-auto-scaling-groups":
@@ -418,11 +425,15 @@ class Actions(PoolCase):
         self.as_controller()
         self.assertEqual(rp.check("dev"), 0, "probe validation errors are not refusals")
         for op, right in [("set-desired-capacity", "SetDesiredCapacity"), ("complete-lifecycle-action", "CompleteLifecycleAction"),
-                          ("terminate-instance-in-auto-scaling-group", "TerminateInstanceInAutoScalingGroup"),
+                          ("simulate:terminate", "TerminateInstanceInAutoScalingGroup"),
                           ("describe-secret", "join secrets")]:
             self.aws.denied = {op}
             with self.assertRaisesRegex(Refused, f"activation refused.*missing permission: {right}"):
                 rp.check("dev")
+        self.aws.denied = {"simulate-principal-policy"}
+        with self.assertRaisesRegex(Refused, "cannot verify TerminateInstanceInAutoScalingGroup"):
+            rp.check("dev")
+        self.assertFalse(any("terminate-instance-in-auto-scaling-group" in c for c in self.aws.calls), "never probed by a call")
         self.aws.denied = set()
         self.aws.hooks[0]["DefaultResult"] = "CONTINUE"
         with self.assertRaisesRegex(Refused, "abandons by default"):

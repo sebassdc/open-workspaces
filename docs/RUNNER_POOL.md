@@ -145,11 +145,22 @@ it is detached and its runner was drained empty and removed, or never enrolled.
 There is no age-based or automatic deletion.
 
 To salvage a disk whose instance failed, launch a replacement from the pool's launch
-template without its own data volume and attach the retained one:
+template data **without** its `/dev/sdf` mapping, then attach the retained disk. A
+`NoDevice` override at `run-instances` does not remove a launch-template volume (a
+fresh empty disk is attached instead), so copy the data:
 
 ```sh
-aws ec2 run-instances --launch-template LaunchTemplateId=LT,Version='$Latest' \
-  --block-device-mappings 'DeviceName=/dev/sdf,NoDevice=""' --network-interfaces ...
+aws ec2 describe-launch-template-versions --launch-template-id LT --versions '$Latest' \
+  --query 'LaunchTemplateVersions[0].LaunchTemplateData' > lt.json
+python3 - lt.json SUBNET <<'PY'
+import base64, json, sys
+d = json.load(open(sys.argv[1]))
+open("user-data", "wb").write(base64.b64decode(d.pop("UserData")))
+d["BlockDeviceMappings"] = [m for m in d["BlockDeviceMappings"] if m["DeviceName"] != "/dev/sdf"]
+d["NetworkInterfaces"][0]["SubnetId"] = sys.argv[2]
+json.dump({**d, "MinCount": 1, "MaxCount": 1}, open("input.json", "w"))
+PY
+aws ec2 run-instances --cli-input-json file://input.json --user-data file://user-data
 aws ec2 attach-volume --volume-id VOLUME --instance-id NEW --device /dev/sdf
 ```
 

@@ -93,7 +93,8 @@ done`;
 }
 
 /** The controller's rights over this pool: exact actions on its group, its join secrets, its disks. */
-export function controllerPoolPolicy(partition: string, region: string, account: string, pool: string, groupArn: string, parameterArn: string): string {
+export function controllerPoolPolicy(partition: string, region: string, account: string, pool: string, groupArn: string, parameterArn: string,
+    controllerRole: string): string {
     const secrets = `arn:${partition}:secretsmanager:${region}:${account}:secret:open-workspaces/pool/${poolName(pool)}/*`;
     return JSON.stringify({
         Version: "2012-10-17",
@@ -109,6 +110,9 @@ export function controllerPoolPolicy(partition: string, region: string, account:
             { Effect: "Allow", Resource: secrets, Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue",
                 "secretsmanager:DescribeSecret", "secretsmanager:DeleteSecret"] },
             { Effect: "Allow", Resource: parameterArn, Action: "ssm:GetParameter" },
+            // `pool check`: a termination cannot be probed without a real instance, so the
+            // controller asks IAM about its own role.
+            { Effect: "Allow", Resource: `arn:${partition}:iam::${account}:role/${controllerRole}`, Action: "iam:SimulatePrincipalPolicy" },
             // Only a disk the controller has proved empty; see `ow-host pool delete-disk`.
             { Effect: "Allow", Resource: `arn:${partition}:ec2:${region}:${account}:volume/*`, Action: "ec2:DeleteVolume",
                 Condition: { StringEquals: { "aws:ResourceTag/ow-pool": pool } } },
@@ -257,8 +261,8 @@ export class RunnerPool extends pulumi.ComponentResource {
 
         new aws.iam.RolePolicy(`${name}-controller`, {
             role: controller.roleName,
-            policy: pulumi.all([partition, region, account, group.arn, config.arn])
-                .apply(([p, r, a, groupArn, parameterArn]) => controllerPoolPolicy(p, r, a, name, groupArn, parameterArn)),
+            policy: pulumi.all([partition, region, account, group.arn, config.arn, controller.roleName])
+                .apply(([p, r, a, groupArn, parameterArn, roleName]) => controllerPoolPolicy(p, r, a, name, groupArn, parameterArn, roleName)),
         }, parent);
 
         this.groupName = group.name;

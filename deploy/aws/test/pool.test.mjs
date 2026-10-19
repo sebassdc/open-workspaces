@@ -123,13 +123,15 @@ test("rights: exact group actions, tagged secrets and disks, no real secret in P
     const prefix = "arn:aws:secretsmanager:us-east-1:111122223333:secret:open-workspaces/pool/dev/*";
     assert.deepEqual([ctl[2].Resource, ctl[3].Resource], [prefix, prefix]);
     assert.deepEqual(ctl[2].Condition.StringEquals, { "aws:RequestTag/ow-pool": "dev" });
-    assert.deepEqual(ctl[5].Condition, { StringEquals: { "aws:ResourceTag/ow-pool": "dev" } });
-    assert.equal(ctl[5].Action, "ec2:DeleteVolume");
+    assert.deepEqual(ctl[5], { Effect: "Allow", Resource: "arn:aws:iam::111122223333:role/ow-ctl-host", Action: "iam:SimulatePrincipalPolicy" },
+        "it may ask IAM about its own role only");
+    assert.deepEqual(ctl[6].Condition, { StringEquals: { "aws:ResourceTag/ow-pool": "dev" } });
+    assert.equal(ctl[6].Action, "ec2:DeleteVolume");
     assert.deepEqual(policy("dev-join"), [{ Effect: "Allow", Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"],
         Resource: prefix, Condition: { StringEquals: { "secretsmanager:ResourceTag/ow-session": "${aws:userid}" } } }]);
     assert.deepEqual(policy("dev-backup")[1].Resource, ["arn:aws:s3:::my-bucket/ow/runners/dev/catalog/*", "arn:aws:s3:::my-bucket/ow/runners/dev/snapshots/*"]);
     // The same rendering the component uses, from plain values.
-    assert.deepEqual(JSON.parse(controllerPoolPolicy("aws", "us-east-1", "111122223333", "dev", "arn:aws:mock:::dev-pool", "arn:aws:mock:::dev-config")).Statement, ctl);
+    assert.deepEqual(JSON.parse(controllerPoolPolicy("aws", "us-east-1", "111122223333", "dev", "arn:aws:mock:::dev-pool", "arn:aws:mock:::dev-config", "ow-ctl-host")).Statement, ctl);
 });
 
 test("pool names and limits are checked before anything is created", () => {

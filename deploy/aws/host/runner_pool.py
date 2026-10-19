@@ -113,19 +113,27 @@ def shape_problems(pool, group, hooks, policies):
 
 def check(name):
     """Activation preflight. Each probe is a call that changes nothing: the same desired
-    capacity, a lifecycle completion and a termination for an instance that does not exist,
-    a secret that does not exist. Only a refusal for missing rights fails it."""
+    capacity, a lifecycle completion for an instance that does not exist, a secret that
+    does not exist; IAM's own simulation for termination. Only missing rights fail it."""
     pool = load(name)
     group, hooks, policies, _, _, _ = describe(pool)
     problems = shape_problems(pool, group, hooks, policies)
+    try:  # A termination of a nonexistent instance is refused even when allowed: ask IAM.
+        me = aws("sts", "get-caller-identity")["Arn"]
+        match = re.fullmatch(r"arn:(aws[a-z-]*):sts::(\d{12}):assumed-role/([\w+=,.@-]+)/[^/]+", me)
+        verdict = aws("iam", "simulate-principal-policy", "--policy-source-arn",
+                      f"arn:{match.group(1)}:iam::{match.group(2)}:role/{match.group(3)}", "--action-names",
+                      "autoscaling:TerminateInstanceInAutoScalingGroup", "--resource-arns", group["AutoScalingGroupARN"])
+        if [r.get("EvalDecision") for r in verdict["EvaluationResults"]] != ["allowed"]:
+            problems.append("missing permission: TerminateInstanceInAutoScalingGroup")
+    except (RuntimeError, AttributeError, KeyError) as e:
+        problems.append(f"cannot verify TerminateInstanceInAutoScalingGroup: {str(e)[-200:]}")
     probes = {
         "SetDesiredCapacity": ["autoscaling", "set-desired-capacity", "--auto-scaling-group-name", pool["group"],
                                "--desired-capacity", str(group["DesiredCapacity"]), "--honor-cooldown"],
         "CompleteLifecycleAction": ["autoscaling", "complete-lifecycle-action", "--auto-scaling-group-name", pool["group"],
                                     "--lifecycle-hook-name", pool["hook"], "--instance-id", PROBE_INSTANCE,
                                     "--lifecycle-action-result", "CONTINUE"],
-        "TerminateInstanceInAutoScalingGroup": ["autoscaling", "terminate-instance-in-auto-scaling-group", "--instance-id",
-                                                PROBE_INSTANCE, "--should-decrement-desired-capacity"],
         "join secrets": ["secretsmanager", "describe-secret", "--secret-id", f"open-workspaces/pool/{name}/probe"],
     }
     for right, call in probes.items():
