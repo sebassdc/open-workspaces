@@ -417,6 +417,7 @@ pub(crate) fn recover(shared: &Shared) {
                     let _ = capture_upload::refresh_progress(&shared, id);
                 }
             }
+            crate::drain::reconcile(&shared);
             drop(shared);
             std::thread::sleep(Duration::from_secs(5));
         }
@@ -1215,3 +1216,7 @@ pub(crate) use movement::{control, relocate};
 #[cfg(test)]
 #[path = "movement_vm_tests.rs"]
 mod vm_tests;
+
+#[path = "drain_transfer.rs"]
+mod draining;
+pub(crate) use draining::{drain_cleanup, drain_park, drain_publish};

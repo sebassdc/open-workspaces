@@ -241,3 +241,10 @@ snapshots and `ow backup restore` brings one up on another runner. See
 OW_NODE_TEST_BINARY=$PWD/target/debug/ow OW_ASSET_DIR=/path/to/assets \
   OW_SELFHOST_TEST_DIR=/short/btrfs/dir cargo test -p ow -- --ignored selfhost
 ```
+
+## Retire a disposable runner
+
+Use the explicit local-owner [drain lifecycle](DRAIN.md). All existing runners are
+protected by default; soft drain waits for work and never migrates a running
+workstation. Empty proof, retained dev-disk evidence and provider removal are
+separate gates. Installing the controller does not initiate any drain.

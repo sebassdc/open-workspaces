@@ -515,7 +515,7 @@ fn missing_invalid_manifest_bad_policy_and_incomplete_authority_fail_before_dele
                 f.c.db.execute_batch("PRAGMA foreign_keys=OFF;INSERT INTO leases(artifact,holder,purpose,expires) VALUES('missing','runner','fork',9999999999);PRAGMA foreign_keys=ON;").unwrap();
             }
             _ => {
-                f.c.db.execute_batch("PRAGMA user_version=6").unwrap();
+                f.c.db.execute_batch("PRAGMA user_version=7").unwrap();
             }
         }
         let before = b.markers();
@@ -754,13 +754,13 @@ fn namespace_alias_cannot_hide_live_roots_from_gc() {
 }
 
 #[test]
-fn terminal_guards_also_constrain_prior_schema_five_writers_and_named_roots() {
+fn terminal_guards_and_reader_floor_protect_retirement_roots() {
     let mut f = Fixture::new();
     let b = Bucket::new();
     add(&f, &b, "dead", "snapshot", None);
     observe(&mut f, &b);
     let run = live(&mut f, &b);
-    crate::nodes::readable_by(&f.c.db, 5).unwrap();
+    assert!(crate::nodes::readable_by(&f.c.db, 5).is_err());
     for phase in 0..2 {
         for sql in [
             "INSERT INTO resources(owner,kind,name,physical,metadata) VALUES(1,'snapshot','new-name','dead','{}')",
@@ -939,4 +939,18 @@ fn transient_reference_during_mark_restarts_grace_before_terminal_claim() {
             );
         }
     }
+}
+
+#[test]
+fn retained_drain_publications_are_roots_after_local_source_cleanup() {
+    let mut f = Fixture::new();
+    let b = Bucket::new();
+    add(&f, &b, "retained-capture", "capture", None);
+    add(&f, &b, "unreferenced", "capture", None);
+    f.c.db.execute("INSERT INTO drain_publications(node,name,artifact,manifest) VALUES('test-runner','local-capture','retained-capture','{}')",[]).unwrap();
+    observe(&mut f, &b);
+    let run = live(&mut f, &b);
+    sweep(&mut f.c.db, &b, URL, &run.id, now()).unwrap();
+    assert_eq!(state(&f, "retained-capture"), "stored");
+    assert_eq!(state(&f, "unreferenced"), "deleted");
 }

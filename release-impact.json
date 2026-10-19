@@ -2,6 +2,46 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.13",
+      "class": 1,
+      "changes": [
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 6,
+        "min_reader": 6
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Explicit owner-operated runner draining, protected-by-default eligibility, immutable named snapshot publication and sealed empty certificates bound to fresh worker process/boot identity, authenticated node generation and catalog placement/transfer revisions. Schema 6 / reader floor 6 requires a private catalog backup and coordinated catalog-reader upgrade; prior writers are refused. Reuses installed protocol-2/3 export and source-only cleanup; worker protocol 3 (agent readers 1-3), runtime, guest kernel and host layout 2 remain unchanged. Retain running worker pins. No automatic drain on installation, running-workstation migration, provider destruction, new capacity, timer or implicit cold-memory loss. Retained dev-disk evidence and certificate consumption are separate operator gates.",
+      "waivers": {
+        "host-layout": "Only deploy/aws/host/test_upgrade.py adds an integration regression preserving the independent retirement seal when upgrade drain clears; no unit, layout or host installer behavior changes."
+      }
+    },
+    {
       "version": "0.9.12",
       "class": 2,
       "changes": [

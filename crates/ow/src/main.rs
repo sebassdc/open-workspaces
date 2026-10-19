@@ -10,6 +10,8 @@ mod dashboard;
 #[cfg(any(target_os = "linux", test))]
 mod discovery;
 #[cfg(target_os = "linux")]
+mod drain;
+#[cfg(target_os = "linux")]
 mod host;
 #[cfg(target_os = "linux")]
 mod image;
@@ -427,6 +429,16 @@ enum NodeAction {
         /// asset directory, else this binary).
         #[arg(long)]
         ow_binary: Option<PathBuf>,
+    },
+    /// Explicit local-owner runner retirement; never destroys provider resources.
+    Drain {
+        node: String,
+        #[arg(long, default_value = "status", value_parser = ["status", "allow", "begin", "cancel", "reconcile", "retain", "remove"])]
+        action: String,
+        #[arg(long)]
+        evidence: Option<PathBuf>,
+        #[arg(long)]
+        certificate: Option<String>,
     },
     /// List runners and whether each is online.
     List,

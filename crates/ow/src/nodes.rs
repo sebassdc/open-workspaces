@@ -88,7 +88,7 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     Ok(db)
 }
 /// Catalog schema this binary writes (`PRAGMA user_version`).
-pub(crate) const SCHEMA: i64 = 5;
+pub(crate) const SCHEMA: i64 = 6;
 
 /// A binary opens a catalog it can use safely: not newer than SCHEMA, or newer but
 /// declared readable by SCHEMA through `settings.min_reader_schema`, which every
@@ -356,7 +356,20 @@ pub fn inventory(root: &Path) -> Result<Value> {
         }
         cap["pool"] = json!(r.get::<_,String>(8)?);
         cap["active"] = json!(r.get::<_,bool>(9)?);
-        cap["controller_drain"] = json!(r.get::<_,bool>(10)?);
+        let declared = r.get::<_,bool>(10)?;
+        #[cfg(target_os="linux")]
+        let draining = {
+            let version:i64=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+            if version>=6 {
+                let state:Option<(String,bool,i64)>=db.query_row("SELECT state,eligible,generation FROM runner_drains WHERE node=?1",[r.get::<_,String>(0)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                let (state,eligible,generation)=state.unwrap_or(("active".into(),false,0));
+                cap["drain_state"]=json!(state);cap["scale_in_eligible"]=json!(eligible);cap["drain_generation"]=json!(generation);
+                state!="active"
+            } else {false}
+        };
+        #[cfg(not(target_os="linux"))]
+        let draining = false;
+        cap["controller_drain"] = json!(declared || draining);
         Ok(json!({"enrollment_order":r.get::<_,i64>(7)?,"id":r.get::<_,String>(0)?,"revoked":r.get::<_,bool>(1)?,"online":!r.get::<_,bool>(1)? && r.get::<_,i64>(2)?>now()-OFFLINE && r.get::<_,i64>(2)?<=now(),"last_seen_unix_s":r.get::<_,i64>(2)?,"memory_mib":cap["memory_mib"],"slots":cap["slots"],"capabilities":cap,"owner_limits":{"memory":ram,"slots":slots,"cpus":cpus}}))
     })?;
     Ok(Value::Array(
@@ -1270,12 +1283,17 @@ pub fn agent(
                     ] {
                         beat[field] = status[field].clone();
                     }
+                    #[cfg(target_os = "linux")]
+                    {
+                        beat["drain_inventory_v1"] = json!(true);
+                    }
                     beat["version"] = json!(env!("CARGO_PKG_VERSION"));
                     beat["worker"] =
                         json!({"version":status["version"],"protocol":status["worker_protocol"]});
                     // A stopping agent takes no new jobs, so placement must skip it.
                     beat["drain"] = json!(
                         root.join("drain").exists()
+                            || root.join("drain-seal.json").exists()
                             || STOPPING.load(std::sync::atomic::Ordering::SeqCst)
                     );
                     if let Some(golden) = status["images"].as_array() {
@@ -1401,6 +1419,7 @@ fn agent_job(
     let op = request["op"].as_str().context("op")?;
     ensure!(
         [
+            "drain-inventory",
             "cache-inventory",
             "cache-evict",
             "image-build",
@@ -1463,10 +1482,14 @@ fn agent_job(
             "worker lacks cache eviction support"
         );
     }
+    #[cfg(target_os = "linux")]
+    let _drain_guard = crate::drain::job_guard(root, &request)?;
     wire::expect_worker(checked["worker_pid"].as_u64().map(|pid| pid as u32));
     if op != "terminal" && op != "ssh" && op != "tunnel" {
         #[cfg(target_os = "linux")]
-        let response = if op == "image-build" || op == "image-pull" {
+        let response = if op == "drain-inventory" {
+            wire::response(crate::drain::agent_inventory(root, &request))
+        } else if op == "image-build" || op == "image-pull" {
             wire::response(crate::image_store::job(root, &request))
         } else if matches!(
             op,
@@ -1695,3 +1718,28 @@ mod tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "node_e2e.rs"]
 mod real_tests;
+
+/// Bounded fresh inspection on the current authenticated node channel.
+#[cfg(target_os = "linux")]
+pub(crate) fn drain_inventory(
+    root: &Path,
+    node: &str,
+    seal: Option<&str>,
+    close: bool,
+) -> Result<Value> {
+    let cap: String =
+        db(root)?.query_row("SELECT capabilities FROM nodes WHERE id=?1", [node], |r| {
+            r.get(0)
+        })?;
+    ensure!(
+        serde_json::from_str::<Value>(&cap)?["drain_inventory_v1"] == true,
+        "runner lacks bounded drain inventory"
+    );
+    online(root, node)?;
+    Ok(wire::connect_waiting(
+        &route(root, node)?,
+        &json!({"op":"drain-inventory","seal":seal,"close":close}),
+        Duration::from_secs(10),
+    )?
+    .1)
+}

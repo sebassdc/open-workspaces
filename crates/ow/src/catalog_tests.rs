@@ -2129,7 +2129,7 @@ fn transfer_schema_three_migration_preserves_private_catalog_and_reader_floor() 
     assert_eq!(
         c.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        5
+        nodes::SCHEMA
     );
     assert_eq!(
         c.db.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
@@ -2151,10 +2151,10 @@ fn transfer_schema_three_migration_preserves_private_catalog_and_reader_floor() 
         )
         .is_err()
     );
-    for reader in [3, 4] {
+    for reader in [3, 4, 5] {
         assert!(nodes::readable_by(&c.db, reader).is_err());
     }
-    assert!(nodes::readable_by(&c.db, 5).is_ok());
+    assert!(nodes::readable_by(&c.db, nodes::SCHEMA).is_ok());
     let backup = std::fs::read_dir(&fake.root)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -2728,7 +2728,7 @@ fn transfer_schema_four_keeps_store_roots_and_failed_preparation_rolls_back() {
     c.db.execute("INSERT INTO leases(artifact,holder,purpose,expires) VALUES('capture','fixture','pull',9999999999)",[]).unwrap();
     let triggers: Vec<String> =
         c.db.prepare(
-            "SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'cache_guard_%' OR name LIKE 'gc_%')",
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'cache_guard_%' OR name LIKE 'gc_%' OR name LIKE 'drain_%')",
         )
         .unwrap()
         .query_map([], |r| r.get(0))

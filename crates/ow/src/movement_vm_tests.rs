@@ -426,3 +426,201 @@ while True:
     fs::write(root.join("evidence.json"),json!({"passed":true,"topology":"two dedicated workers on one host","move":moved,"fork":child,"before":before,"after":after,"parent_ssh":enrolled,"child_ssh":child_ssh,"host":std::env::consts::ARCH}).to_string()).unwrap();
     drop(guests);
 }
+
+#[test]
+#[ignore = "Requires explicit fresh OW_DRAIN_TEST_ROOT, OW_MOVE_TEST_BINARY and OW_ASSET_DIR on a KVM/Btrfs host"]
+fn drain_real_vm_wake_elsewhere_before_removing_only_the_test_runner() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = PathBuf::from(
+        std::env::var_os("OW_DRAIN_TEST_ROOT").expect("explicit fresh disposable root"),
+    );
+    assert!(!root.exists());
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let binary =
+        PathBuf::from(std::env::var_os("OW_MOVE_TEST_BINARY").expect("explicit test binary"));
+    let roots = vec![root.join("source"), root.join("target")];
+    let _guests = Guests {
+        roots: roots.clone(),
+        binary: binary.clone(),
+    };
+    for runner in &roots {
+        assert!(!runner.exists());
+        let out = Command::new(&binary)
+            .args(["--local", "--data-dir", runner.to_str().unwrap(), "up"])
+            .env("OW_MAX_MEMORY_MIB", "1024")
+            .env("OW_MAX_RUNNING", "2")
+            .env("OW_MAX_VCPUS", "2")
+            .env("OW_MIN_FREE_GIB", "1")
+            .env("OW_IDLE_HIBERNATE_SECS", "0")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    rpc_vm(
+        &roots[0],
+        json!({"op":"create","id":"drain-box","image":"ubuntu","memory_mib":256,"vcpu_count":1,"disk_gib":8}),
+    );
+    exec_vm(
+        &roots[0],
+        "drain-box",
+        None,
+        "echo durable-drain-fixture >/home/dev/proof",
+    );
+    let snapshot = rpc_vm(
+        &roots[0],
+        json!({"op":"snapshot","id":"drain-box","name":"named-proof"}),
+    );
+    let stopped = rpc_vm(&roots[0], json!({"op":"stop","id":"drain-box"}));
+    let controller = root.join("controller");
+    fs::create_dir(&controller).unwrap();
+    fs::set_permissions(&controller, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut c = Catalog::open(&controller, "fixture", None).unwrap();
+    let user = c
+        .user(&Identity {
+            issuer: "fixture".into(),
+            subject: "owner".into(),
+            email: "owner@example.test".into(),
+        })
+        .unwrap();
+    c.db.execute("INSERT INTO resources(owner,kind,name,physical,node,metadata,ssh_policy) VALUES(?1,'machine','box','drain-box','source',?2,'\"disabled\"')",params![user,stopped.to_string()]).unwrap();
+    c.db.execute("INSERT INTO resources(owner,kind,name,physical,node,metadata) VALUES(?1,'snapshot','saved','named-proof','source',?2)",params![user,snapshot.to_string()]).unwrap();
+    fs::write(controller.join("store-url"), "s3://fixture/root").unwrap();
+    // The surviving runner is enrolled first and remains permanently protected as the base.
+    for (i, node) in [(1, "target"), (0, "source")] {
+        let mut cap = rpc_vm(&roots[i], json!({"op":"status"}));
+        cap["memory_mib"] = json!(1024);
+        cap["slots"] = json!(2);
+        cap["vcpus"] = json!(2);
+        cap["managed_restore_v1"] = json!(true);
+        cap["drain_inventory_v1"] = json!(true);
+        c.db.execute("INSERT INTO nodes(id,memory_mib,slots,heartbeat,session,capabilities) VALUES(?1,1024,2,?2,'fixture-connection',?3)",params![node,now(),cap.to_string()]).unwrap();
+    }
+    crate::drain::command(&controller, "source", "allow", None, None).unwrap();
+    crate::drain::command(&controller, "source", "begin", None, None).unwrap();
+    let input = parking::shape(&c, "drain-box", Kind::Park, "box").unwrap();
+    let park = c
+        .begin_transfer(user, "drain-fixture-park", &input)
+        .unwrap();
+    let shared = Arc::new(Mutex::new(c));
+    let objects = store::DirectoryObjects(root.join("objects"));
+    let published = RefCell::new(BTreeMap::<String, Value>::new());
+    let call = |node: &str, r: Value| -> Result<Value> {
+        let runner = &roots[usize::from(node == "target")];
+        let result = match r["op"].as_str().unwrap() {
+            "capture-published" => Ok(published
+                .borrow()
+                .get(r["artifact"]["reference"]["attempt"].as_str().unwrap())
+                .cloned()
+                .unwrap_or(json!({"present":false}))),
+            "capture-push" => {
+                let a: Artifact = serde_json::from_value(r["artifact"].clone())?;
+                let v = capture_upload::publish(&objects, runner, &a)?;
+                published
+                    .borrow_mut()
+                    .insert(a.reference.attempt, v.clone());
+                Ok(v)
+            }
+            "capture-cache" => cache(runner, &serde_json::from_value(r["artifact"].clone())?),
+            "capture-pull" => pull(
+                &objects,
+                runner,
+                &serde_json::from_value(r["artifact"].clone())?,
+                r["attempt"].as_str().unwrap(),
+            ),
+            "restore-policy" => job(runner, &r),
+            "drain-inventory" => {
+                let _guard = crate::drain::job_guard(runner, &r)?;
+                crate::drain::agent_inventory(runner, &r)
+            }
+            _ => wire::request(runner, r),
+        };
+        // Local worker fixture stands in for the authenticated agents' concurrent heartbeats.
+        shared.lock().unwrap().db.execute("UPDATE nodes SET heartbeat=?1,capabilities=json_set(capabilities,'$.disk_observed_unix_s',?1)",[now()])?;
+        result
+    };
+    let refresh = || {
+        shared.lock().unwrap().db.execute("UPDATE nodes SET heartbeat=?1,capabilities=json_set(capabilities,'$.disk_observed_unix_s',?1)",[now()]).unwrap()
+    };
+    for _ in 0..30 {
+        refresh();
+        if !tick(&shared, park.id, now(), &call).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(
+        shared.lock().unwrap().transfer(park.id).unwrap().step,
+        Step::Succeeded
+    );
+    let wake = {
+        let c = shared.lock().unwrap();
+        parking::admission(
+            &c,
+            user,
+            &json!({"op":"wake","id":"box","operation_key":"drain-fixture-wake"}),
+            Kind::Wake,
+        )
+        .unwrap()
+    };
+    for _ in 0..30 {
+        refresh();
+        if !tick(&shared, wake.id, now(), &call).unwrap() {
+            break;
+        }
+    }
+    let placement = shared
+        .lock()
+        .unwrap()
+        .managed_placement("drain-box")
+        .unwrap()
+        .unwrap();
+    assert_eq!(placement.node, "target");
+    assert_eq!(
+        exec_vm(
+            &roots[1],
+            "drain-box",
+            Some(placement.clone()),
+            "cat /home/dev/proof"
+        )
+        .trim(),
+        "durable-drain-fixture"
+    );
+    refresh();
+    crate::drain::pass(&shared, "source", &call).unwrap();
+    let inv = call("source", json!({"op":"drain-inventory"})).unwrap();
+    let cert = {
+        let c = shared.lock().unwrap();
+        let raw: String =
+            c.db.query_row(
+                "SELECT certificate FROM runner_drains WHERE node='source'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cert: Value = serde_json::from_str(&raw).unwrap();
+        crate::drain::consume(&c.db,"source",&cert,&inv,Some(&json!({"node":"source","dev_disk_retained":true,"proof":"disposable local fixture data directory remains retained"}))).unwrap();
+        crate::drain::consume(&c.db, "source", &cert, &inv, None).unwrap();
+        cert
+    };
+    let down = Command::new(&binary)
+        .args(["--local", "--data-dir", roots[0].to_str().unwrap(), "down"])
+        .output()
+        .unwrap();
+    assert!(down.status.success());
+    assert!(roots[0].join("snapshots/named-proof/disk.ext4").exists());
+    assert_eq!(
+        exec_vm(
+            &roots[1],
+            "drain-box",
+            Some(placement),
+            "cat /home/dev/proof"
+        )
+        .trim(),
+        "durable-drain-fixture"
+    );
+    fs::write(root.join("drain-evidence.json"),json!({"passed":true,"certificate":cert,"inventory":inv,"removed_only":"source","retained_disk":"source/snapshots","target_wake_verified":true,"store":"private local DirectoryObjects; no cloud policy claim"}).to_string()).unwrap();
+}

@@ -2276,3 +2276,246 @@ fn fork_admission_binds_snapshot_before_restart_and_replays_a_lost_reply() {
     assert_eq!(seen[0], seen[1]);
     assert_eq!(seen[0]["name"], expected);
 }
+
+#[test]
+fn drain_parks_wakes_elsewhere_then_certifies_only_the_disposable_source() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    {
+        let c = f.shared.lock().unwrap();
+        c.db.execute("UPDATE nodes SET session='fixture-connection',capabilities=json_set(capabilities,'$.drain_inventory_v1',json('true')) WHERE id='source'",[]).unwrap();
+        c.db.execute("INSERT INTO runner_drains(node,eligible,state,generation,seal) VALUES('source',1,'draining',1,'fixture-seal')",[]).unwrap();
+    }
+    // Exercise failed capture/upload before successful publication; neither releases the disk/placement.
+    tick(&f.shared, f.transfer.id, now(), &|n, r| {
+        park_call(&f, &peers, true, n, r)
+    })
+    .unwrap();
+    assert!(
+        tick(&f.shared, f.transfer.id, now(), &|n, r| {
+            if r["op"] == "capture-push" {
+                anyhow::bail!("upload failure");
+            }
+            park_call(&f, &peers, true, n, r)
+        })
+        .is_err()
+    );
+    assert_eq!(
+        f.shared
+            .lock()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT node FROM resources WHERE physical='physical'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "source"
+    );
+    assert_eq!(
+        peers.borrow().source.as_ref().unwrap()["lifecycle"]["phase"],
+        "exported"
+    );
+    f.restart();
+    complete_park(&mut f, &peers, true);
+    let wake = admit_wake(&mut f, false);
+    f.transfer = wake;
+    for _ in 0..15 {
+        if f.step() == Step::Succeeded {
+            break;
+        }
+        tick(&f.shared, f.transfer.id, now(), &|n, r| {
+            wake_call(&f, &peers, true, n, r)
+        })
+        .unwrap();
+    }
+    assert_eq!(f.step(), Step::Succeeded);
+    assert_eq!(f.transfer.target, None); // Persisted target is selected only once by the runner.
+    assert_eq!(
+        f.shared
+            .lock()
+            .unwrap()
+            .transfer(f.transfer.id)
+            .unwrap()
+            .target
+            .as_deref(),
+        Some("target")
+    );
+    assert_eq!(peers.borrow().starts, 1);
+    let source = peers.borrow().source.clone().unwrap();
+    draining::drain_cleanup(&f.shared, "source", &source, &|n, r| {
+        wake_call(&f, &peers, true, n, r)
+    })
+    .unwrap();
+    let native = {
+        let c = f.shared.lock().unwrap();
+        let raw:String=c.db.query_row("SELECT json_extract(response,'$.capture_manifest.metadata.native_manifest') FROM operations WHERE op='park'",[],|r|r.get(0)).unwrap();
+        serde_json::from_str::<Value>(&raw).unwrap()
+    };
+    crate::drain::pass(&f.shared,"source",&|n,r|{
+        assert_eq!(n,"source");assert_eq!(r["op"],"drain-inventory");
+        let mut m=peers.borrow().source.clone().unwrap();m["state"]=json!("exported-cleaned");
+        Ok(json!({"worker":{"pid":100,"start":"200","boot":"fixture"},"running":0,"machines":[m],"captures":[{"name":native["name"],"native":native,"disk_bytes":4}],"unmanaged":[],"seal":if r["close"]==true {json!("fixture-seal")}else{Value::Null}}))
+    }).unwrap();
+    let c = f.shared.lock().unwrap();
+    let certificate: Value = serde_json::from_str(
+        &c.db
+            .query_row(
+                "SELECT certificate FROM runner_drains WHERE node='source'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let mut m = peers.borrow().source.clone().unwrap();
+    m["state"] = json!("exported-cleaned");
+    let inventory = json!({"worker":{"pid":100,"start":"200","boot":"fixture"},"running":0,"machines":[m],"captures":[{"name":native["name"],"native":native,"disk_bytes":4}],"unmanaged":[],"seal":"fixture-seal"});
+    crate::drain::consume(
+        &c.db,
+        "source",
+        &certificate,
+        &inventory,
+        Some(&json!({"node":"source","dev_disk_retained":true,"proof":"fixture retained source capture"})),
+    )
+    .unwrap();
+    crate::drain::consume(&c.db, "source", &certificate, &inventory, None).unwrap();
+    assert!(
+        c.db.query_row("SELECT revoked=1 FROM nodes WHERE id='source'", [], |r| {
+            r.get::<_, bool>(0)
+        })
+        .unwrap()
+    );
+    assert!(
+        c.db.query_row("SELECT revoked=0 FROM nodes WHERE id='target'", [], |r| {
+            r.get::<_, bool>(0)
+        })
+        .unwrap()
+    );
+    assert_eq!(peers.borrow().target.as_ref().unwrap()["state"], "running");
+    assert_eq!(
+        peers.borrow().source.as_ref().unwrap()["lifecycle"]["phase"],
+        "cleaned"
+    );
+}
+
+#[test]
+fn controller_drain_blocks_wake_reservation_even_if_policy_and_upgrade_flags_are_cleared() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    let wake = admit_wake(&mut f, false);
+    {
+        let c = f.shared.lock().unwrap();
+        for node in ["source", "target"] {
+            c.db.execute("INSERT INTO runner_drains(node,state,generation,seal) VALUES(?1,'soft-draining',1,'fixture')",[node]).unwrap();
+        }
+        let input = intent(&c, &wake).unwrap();
+        assert!(c.reserve_wake(wake.id, "source", &input).is_err());
+        assert!(c.reserve_wake(wake.id, "target", &input).is_err());
+    }
+    assert!(!parking::reserve_wake(&f.shared, &wake).unwrap());
+    assert_eq!(
+        f.shared
+            .lock()
+            .unwrap()
+            .db
+            .query_row("SELECT COUNT(*) FROM transfer_reservations", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn drain_named_snapshot_retries_manifest_last_upload_and_preserves_every_local_file() {
+    let (mut f, peers) = parked_fixture("stopped");
+    complete_park(&mut f, &peers, false);
+    let native = json!({"name":"named","workspace":"physical","memory_mib":256,"vcpu_count":1,"captured_at":123,"files":{"disk.ext4":store::sha256(b"disk")}});
+    let path = f.root.join("snapshots/named");
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("disk.ext4"), b"disk").unwrap();
+    fs::write(path.join("manifest.json"), native.to_string()).unwrap();
+    {
+        let c = f.shared.lock().unwrap();
+        c.db.execute("INSERT INTO resources(owner,kind,name,physical,node,metadata) VALUES(?1,'snapshot','saved','named','source',?2)",params![f.user,json!({"workspace":"physical"}).to_string()]).unwrap();
+    }
+    let objects = store::DirectoryObjects(f.root.join("publication-objects"));
+    let capture = json!({"native":native,"disk_bytes":4});
+    assert!(
+        draining::drain_publish(&f.shared, "source", &capture, &|_, _| anyhow::bail!(
+            "upload failed"
+        ))
+        .is_err()
+    );
+    assert_eq!(fs::read(path.join("disk.ext4")).unwrap(), b"disk");
+    f.restart();
+    let requests = RefCell::new(Vec::new());
+    draining::drain_publish(&f.shared, "source", &capture, &|_, r| {
+        requests.borrow_mut().push(r.clone());
+        if r["op"] == "capture-published" {
+            return Ok(json!({"present":false}));
+        }
+        let a: Artifact = serde_json::from_value(r["artifact"].clone())?;
+        common::identifier(&a.id)?; // Same boundary enforced by the production publication job.
+        capture_upload::publish(&objects, &f.root, &a)
+    })
+    .unwrap();
+    let c = f.shared.lock().unwrap();
+    let raw: String =
+        c.db.query_row(
+            "SELECT manifest FROM drain_publications WHERE name='named'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let manifest: store::Manifest = serde_json::from_str(&raw).unwrap();
+    let stored:bool=c.db.query_row("SELECT state='stored' FROM artifacts WHERE id=(SELECT artifact FROM drain_publications WHERE name='named')",[],|r|r.get(0)).unwrap();
+    assert!(stored);
+    drop(c);
+    let before = requests.borrow().len();
+    draining::drain_publish(&f.shared, "source", &capture, &|_, _| {
+        panic!("committed publication must not upload again")
+    })
+    .unwrap();
+    assert_eq!(requests.borrow().len(), before);
+    assert_eq!(manifest.metadata["native_manifest"], native.to_string());
+    assert_eq!(fs::read(path.join("disk.ext4")).unwrap(), b"disk");
+}
+
+#[test]
+fn wake_reserved_before_soft_drain_finishes_the_existing_transfer() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    f.transfer = admit_wake(&mut f, false);
+    assert!(parking::reserve_wake(&f.shared, &f.transfer).unwrap());
+    let target = f
+        .shared
+        .lock()
+        .unwrap()
+        .transfer(f.transfer.id)
+        .unwrap()
+        .target
+        .unwrap();
+    f.shared.lock().unwrap().db.execute("INSERT INTO runner_drains(node,state,generation,seal) VALUES(?1,'soft-draining',1,'fixture')",[&target]).unwrap();
+    for _ in 0..15 {
+        if f.step() == Step::Succeeded {
+            break;
+        }
+        tick(&f.shared, f.transfer.id, now(), &|n, r| {
+            wake_call(&f, &peers, true, n, r)
+        })
+        .unwrap();
+    }
+    assert_eq!(f.step(), Step::Succeeded);
+    assert_eq!(peers.borrow().starts, 1);
+    assert_eq!(
+        f.shared
+            .lock()
+            .unwrap()
+            .transfer(f.transfer.id)
+            .unwrap()
+            .target
+            .as_deref(),
+        Some(target.as_str())
+    );
+}

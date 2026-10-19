@@ -497,6 +497,25 @@ pub fn node(base: Option<PathBuf>, action: NodeAction) -> Result<i32> {
 fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i32> {
     let base = self::base(base)?;
     let controller = host::data_root(Some(base.join("controller")))?;
+    if let NodeAction::Drain {
+        node,
+        action,
+        evidence,
+        certificate,
+    } = action
+    {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::drain::command(
+                &controller,
+                &node,
+                &action,
+                evidence.as_deref(),
+                certificate.as_deref()
+            )?)?
+        );
+        return Ok(0);
+    }
     let NodeAction::Add {
         target: destination,
         name,

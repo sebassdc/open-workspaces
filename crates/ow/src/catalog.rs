@@ -327,7 +327,7 @@ impl Catalog {
         )?;
         crate::nodes::readable(&db)?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 0 && version < 5 {
+        if version > 0 && version < nodes::SCHEMA {
             let backup = root.join(format!(
                 "catalog.pre-placement-{}.sqlite3",
                 common::nonce()?
@@ -394,12 +394,16 @@ impl Catalog {
 
         // Additive guards are enforced by SQLite even for prior schema-5 writers.
         crate::cache_catalog::initialize(&db)?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS node_usage(node TEXT PRIMARY KEY,extra_mib INTEGER NOT NULL DEFAULT 0,extra_cpus INTEGER NOT NULL DEFAULT 0,extra_slots INTEGER NOT NULL DEFAULT 0);")?;
+        crate::drain::initialize(&db)?;
         crate::store_gc::initialize(&db)?;
+        if version < 6 {
+            db.execute_batch("INSERT INTO settings(key,value) VALUES('min_reader_schema','6') ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),6);")?;
+        }
 
         // A newer catalog this binary may read (its floor allows it) keeps its version.
         db.execute_batch(&format!("UPDATE resources SET reserved_mib=COALESCE(json_extract(metadata,'$.memory_mib'),0) WHERE kind='machine' AND placement_managed=0 AND reserved_mib=0 AND json_extract(metadata,'$.state')='running'; PRAGMA user_version={}; COMMIT;", version.max(nodes::SCHEMA)))?;
         nodes::db(root)?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS node_usage(node TEXT PRIMARY KEY,extra_mib INTEGER NOT NULL DEFAULT 0,extra_cpus INTEGER NOT NULL DEFAULT 0,extra_slots INTEGER NOT NULL DEFAULT 0);")?;
         // The exclusive gateway lock proves the previous catalog owner is gone.
         db.execute(
             "UPDATE operations SET state='uncertain' WHERE state='pending'",
@@ -739,6 +743,7 @@ impl Catalog {
         intent: &crate::transfers::Intent,
     ) -> Result<()> {
         let c = self;
+        ensure!(!crate::drain::blocked(&c.db, target)?, "target draining");
         // Catalog capacity only; T3 additionally validates worker capability and disk headroom.
         let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("target offline, draining or without a registered budget")?;
         let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1 AND (?2=0 OR physical<>?3)",params![target,t.kind==crate::transfers::Kind::Move && target==t.source_node,t.source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -930,6 +935,11 @@ impl Catalog {
         Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND physical=?1 AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1))",[physical],|r|r.get(0))?)
     }
     fn legacy_access(&self, physical: &str) -> Result<()> {
+        let (node,state):(String,Option<String>)=self.db.query_row("SELECT node,json_extract(metadata,'$.state') FROM resources WHERE kind='machine' AND physical=?1",[physical],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        ensure!(
+            !crate::drain::blocked(&self.db, &node)? || state.as_deref() == Some("running"),
+            "runner draining; waiting for park and wake elsewhere"
+        );
         ensure!(
             self.legacy_machine(physical)? || self.managed_placement(physical)?.is_some(),
             "managed placement requires transfer-aware routing"
@@ -2870,7 +2880,7 @@ mod tests {
         let physical = c.reserve(user, "machine", "demo").unwrap();
         let triggers: Vec<String> =
             c.db.prepare(
-                "SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'cache_guard_%' OR name LIKE 'gc_%')",
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'cache_guard_%' OR name LIKE 'gc_%' OR name LIKE 'drain_%')",
             )
             .unwrap()
             .query_map([], |r| r.get(0))

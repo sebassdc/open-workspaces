@@ -31,6 +31,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
       CREATE TRIGGER IF NOT EXISTS gc_push_renew BEFORE UPDATE ON leases WHEN OLD.purpose='push' AND (NEW.expires>OLD.expires AND OLD.expires<=unixepoch() OR NEW.token IS NOT OLD.token OR NEW.artifact<>OLD.artifact OR NEW.parent IS NOT OLD.parent) BEGIN SELECT RAISE(ABORT,'expired or changed push needs a fresh attempt'); END;")?;
     for (table, predicate) in [
         ("resources", "a.id=NEW.current_capture"),
+        ("drain_publications", "a.id=NEW.artifact"),
         (
             "transfers",
             "NEW.step NOT IN ('succeeded','aborted','failed') AND (a.id=NEW.capture OR a.id=NEW.source_capture)",
@@ -102,7 +103,7 @@ struct Authority {
 fn authority(db: &Connection, now: i64) -> Result<Authority> {
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     ensure!(
-        version == 5,
+        version == 6,
         "GC root contract is not known for this catalog schema"
     );
     ensure!(
@@ -141,6 +142,7 @@ fn authority(db: &Connection, now: i64) -> Result<Authority> {
     let roots: BTreeSet<String> = db.prepare("SELECT current_capture FROM resources WHERE current_capture IS NOT NULL
       UNION SELECT a.id FROM resources r JOIN artifacts a ON a.kind='snapshot' AND a.owner=r.owner AND a.local_name=r.physical WHERE r.kind='snapshot'
       UNION SELECT artifact FROM images WHERE status IN ('current','kept')
+      UNION SELECT artifact FROM drain_publications
       UNION SELECT capture FROM transfers WHERE step NOT IN ('succeeded','aborted','failed') AND capture IS NOT NULL
       UNION SELECT source_capture FROM transfers WHERE step NOT IN ('succeeded','aborted','failed') AND source_capture IS NOT NULL
       UNION SELECT artifact FROM leases WHERE expires>?1
