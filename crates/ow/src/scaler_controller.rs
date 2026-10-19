@@ -399,11 +399,14 @@ pub(crate) fn command(root: &Path, tick_now: bool) -> Result<Value> {
         let mut result = status(&db)?;
         result["config_present"] = json!(root.join("scaler.json").exists());
         if let Ok(config) = read_private::<Config>(&root.join("scaler.json")) {
-            result["mode"] = json!(if matches!(config.mode, Mode::Live) {
-                "live"
-            } else {
-                "shadow"
-            });
+            let live = matches!(config.mode, Mode::Live);
+            result["mode"] = json!(if live { "live" } else { "shadow" });
+            // Persisted actions are history, not authority after evidence changes.
+            if live {
+                if let Err(e) = activation(root, &config.pools, ow_core::recovery::now()) {
+                    result["error"] = json!(format!("{e:#}"));
+                }
+            }
         }
         return Ok(result);
     }

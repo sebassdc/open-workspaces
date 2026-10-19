@@ -549,7 +549,7 @@ if __name__ == "__main__":
 
 class Executor(PoolCase):
     def live(self, kind, target, phase):
-        self.aws.scaler = {"mode": "live", "pools": [{"state": {"action": {
+        self.aws.scaler = {"mode": "live", "error": None, "pools": [{"stale": False, "state": {"action": {
             "kind": kind, "id": "dev-7", "target": target, "phase": phase, "deadline": 9, "reservation": {}}}}]}
 
     def test_a_live_launch_raises_desired_once_and_reports_the_joined_instance(self):
@@ -579,6 +579,31 @@ class Executor(PoolCase):
             rp.sync(["dev"])
             self.assertEqual(self.aws.group["DesiredCapacity"], 0, phase)
             self.assertEqual(self.observed()["receipts"], {})
+
+    def test_stored_live_actions_require_current_healthy_live_status(self):
+        self.as_controller()
+        for kind, target, phase in (("launch", "preset", "launching"), ("drain", NODE_A, "draining")):
+            for fault in ("shadow", "error", "stale", "missing_mode", "missing_error", "missing_stale"):
+                with self.subTest(kind=kind, fault=fault):
+                    self.live(kind, target, phase)
+                    status = self.aws.scaler
+                    if fault == "shadow":
+                        status["mode"] = "shadow"
+                    elif fault == "error":
+                        status["error"] = "no passing provider check"
+                    elif fault == "stale":
+                        status["pools"][0]["stale"] = True
+                    elif fault == "missing_stale":
+                        del status["pools"][0]["stale"]
+                    else:
+                        del status[fault.removeprefix("missing_")]
+                    self.aws.calls.clear()
+                    rp.sync(["dev"])
+                    self.assertEqual(self.aws.group["DesiredCapacity"], 0)
+                    self.assertEqual(self.observed()["receipts"], {})
+                    self.assertFalse(h.read_json(rp.ACTIONS), "no executor journal is written")
+                    self.assertFalse(any("drain" in c for c in self.aws.calls))
+                    self.assertFalse(any("set-desired-capacity" in c for c in self.aws.calls))
 
     def test_a_live_drain_seals_retains_removes_and_reports_absent(self):
         self.as_controller()

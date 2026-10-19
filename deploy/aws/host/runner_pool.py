@@ -297,9 +297,14 @@ def live_actions():
         status = h.ow("--data-dir", h.CONTROLLER, "scaler", timeout=60)
     except (RuntimeError, ValueError):
         return {}
+    if not isinstance(status, dict) or status.get("mode") != "live" \
+            or "error" not in status or status["error"] is not None:
+        return {}
     out = {}
-    for plan in (status.get("pools") or []) if isinstance(status, dict) else []:
-        action = (plan.get("state") or {}).get("action") if isinstance(plan, dict) else None
+    for plan in status.get("pools") or []:
+        if not isinstance(plan, dict) or plan.get("stale") is not False:
+            continue
+        action = (plan.get("state") or {}).get("action")
         if isinstance(action, dict) and action.get("phase") in ("launching", "joining", "draining") \
                 and re.fullmatch(r"[a-z][a-z0-9-]{0,13}-[0-9]+", str(action.get("id", ""))):
             out[action["id"].rsplit("-", 1)[0]] = action

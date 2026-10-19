@@ -101,6 +101,9 @@ one idempotent step, journaled before any effect in `pool-actions.json`:
   receipt is `absent` once the instance is gone.
 - any refusal or AWS error reports `unknown`: the controller holds the reservation and
   takes no further action. Shadow and uncertain actions are never executed.
+  Persisted live actions also wait when the current mode is shadow, status has an
+  error, or their plan is stale. Status rechecks activation evidence on every read
+  so a previous successful tick grants no authority after its gates are withdrawn.
 
 The scaler's pool name must be the RunnerPool's name and the runners' placement pool;
 today every runner's placement pool is `default`, so a pool that serves queued demand

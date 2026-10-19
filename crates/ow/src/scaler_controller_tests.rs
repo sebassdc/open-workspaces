@@ -163,7 +163,36 @@ fn live_mode_is_refused_without_activation_evidence_and_never_promotes_shadow_in
         Phase::Launching,
         "a newly recorded launch is effectful"
     );
-    assert_eq!(command(&root, false).unwrap()["mode"], "live");
+    let now = ow_core::recovery::now();
+    f.write(
+        "scaler-provider-check.json",
+        json!({"pools":{"default": now}}),
+    );
+    let current = command(&root, false).unwrap();
+    assert_eq!(current["mode"], "live");
+    assert!(current["error"].is_null());
+    assert_eq!(current["pools"][0]["state"]["action"], json!(action));
+    // Revoking or expiring evidence must take effect before another tick runs.
+    for check in [json!({"pools":{}}), json!({"pools":{"default":now-86401}})] {
+        f.write("scaler-provider-check.json", check);
+        assert!(
+            command(&root, false).unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("no passing provider check")
+        );
+    }
+    std::fs::remove_file(root.join("scaler-activation.json")).unwrap();
+    assert!(
+        command(&root, false).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("scaler-activation.json")
+    );
+    f.write("scaler.json", json!({"mode":"shadow","pools":[pool()]}));
+    let shadow = command(&root, false).unwrap();
+    assert_eq!(shadow["mode"], "shadow");
+    assert_eq!(shadow["pools"][0]["state"]["action"], json!(action));
     assert!(
         live["pools"][0]["live_blocked"]
             .as_str()
