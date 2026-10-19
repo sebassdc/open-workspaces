@@ -200,6 +200,8 @@ Automated, no KVM/cloud/real secret use:
 ```sh
 python3 -m unittest discover -s deploy/aws/host -p 'test_controller_recovery.py'
 cargo test --locked -p ow --bin ow backup::tests
+cargo test --locked -p ow --bin ow restored_controller_rejects_previously_issued_job_and_old_session_results
+python3 -m unittest discover -s scripts -p 'test_controller_recovery_acceptance.py'
 cargo build --locked -p ow --bin ow
 # Run only in a dedicated non-KVM Linux fixture:
 OW_NODE_TEST_BINARY=/path/to/ow cargo test --locked -p ow --bin ow \
@@ -208,12 +210,57 @@ OW_NODE_TEST_BINARY=/path/to/ow cargo test --locked -p ow --bin ow \
 
 The TLS drill restores a consistent catalog into another controller root, stops
 the old listener first, reconnects two existing credentials with unchanged agent
-PIDs and synthetic worker inventory, rejects a stale job bridge, makes a new
+PIDs and synthetic worker inventory, makes a new
 write, rejects the stale pre-cutover catalog and checks a latest backup. Host
 fixtures test freeze/conversion interruption and preserve worker pin/files and
 credential. Checklist fixtures crash at every checkpoint and reject dual
 writability receipts, stale gaps, unknown copies and stale rollback.
 **Synthetic inventory is not a guest PID, SSH or preview test.**
+
+The separate stale-authority test dispatches and completes bytes through a real
+old session/job, fences that session, and challenges a late result. It also
+captures a second production-issued job before attachment and keeps that exact
+old-generation job present in the replacement's job map. Replaying its issued
+ID must fail while a fresh job with the same runner credential succeeds. The
+old entry must remain present after denial: unknown-ID rejection cannot satisfy
+this check. Removing the job generation predicate makes the test fail.
+
+The opt-in real-guest harness below is **not run by CI**. Run it as the dedicated
+worker operator on separately authorized existing Linux KVM capacity. Its parent
+must be private, on a worker-compatible filesystem; the fresh root must be short
+enough for nested Unix sockets. Use installed assets and the unchanged installed
+worker binary, plus the candidate controller binary. Neither binary is installed
+over an operational pin.
+
+```sh
+python3 scripts/controller-recovery-acceptance.py \
+  --root /var/tmp/ow-recovery/d \
+  --binary /private/build/ow \
+  --worker-binary /private/installed-worker/bin/ow \
+  --assets /private/installed-worker/assets \
+  --protect-worker /private/operational-worker
+```
+
+The harness creates its own empty worker, one disposable Ubuntu guest, generated
+SSH/TLS keys, and loopback-only controller/gateway processes. A process-scoped
+identity adapter supplies two fixture identities; it changes no tailnet policy
+or ingress. It checks unchanged worker/VMM/guest start identities and a progressing
+guest counter during controller loss, failed controller access during that loss,
+strict SSH reconnect with an unchanged known_hosts file (and wrong-key rejection),
+real guest HTTP preview access and grant revocation, existing-credential
+reconnection, rollback before a new write, latest-catalog rollback after a write,
+stale-catalog refusal and another replacement restore. Preview publication is
+inserted only in the isolated catalog to avoid executing the shared Serve helper;
+HTTP authorization, guest tunneling and revocation use the production gateway.
+This is one-host single-controller recovery, not an external fence or HA proof.
+
+Keep `events.jsonl` and command logs private. Require both `passed` and `cleaned`
+events. Cleanup stops its own control processes, deletes its disposable guest,
+stops its worker, and verifies operational worker/VMM/unit identities and pin
+targets are unchanged. After retaining evidence, remove the entire owned scratch
+directory, including generated credentials, and record its absence. A failure
+must retain a precise stage/error and cleanup evidence; running the harness or
+passing its unit tests does not itself establish real-guest acceptance.
 
 For full fleet-foundation acceptance, run these additional steps on separately
 authorized dedicated KVM capacity with only disposable boxes; retain private

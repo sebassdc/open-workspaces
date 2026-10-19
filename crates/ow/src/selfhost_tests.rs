@@ -558,23 +558,6 @@ fn controller_fixture(replace: bool) {
                 1
             );
         }
-        // Old job IDs cannot bridge on the new authority, even with valid credentials.
-        let client = reqwest::blocking::Client::builder()
-            .no_proxy()
-            .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
-            .build()
-            .unwrap();
-        let credential: Value = serde_json::from_slice(&credentials[0]).unwrap();
-        let reply = client
-            .get(format!("https://{addr}/job/alpha/stale-operation"))
-            .bearer_auth(credential["credential"].as_str().unwrap())
-            .header("connection", "upgrade")
-            .header("upgrade", "websocket")
-            .header("sec-websocket-version", "13")
-            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-            .send()
-            .unwrap();
-        assert_eq!(reply.status(), reqwest::StatusCode::NOT_FOUND);
         // First replacement write: the pre-cutover catalog must now be rejected.
         let mut recovered = Catalog::open(&target, "test", None).unwrap();
         recovered

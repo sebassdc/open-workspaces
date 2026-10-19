@@ -80,6 +80,11 @@ jobs:
       - name: Check tailnet previews before tagging
         working-directory: .
         run: cargo +1.97.0 test --locked -p ow --bin ow preview
+      - name: Check replacement-controller stale authority and drill guards
+        working-directory: .
+        run: |
+          cargo +1.97.0 test --locked -p ow --bin ow restored_controller_rejects_previously_issued_job_and_old_session_results
+          python3 -m unittest discover -s scripts -p 'test_controller_recovery_acceptance.py'
       - name: Check snapshot admission and failure recovery before tagging
         working-directory: .
         run: |
