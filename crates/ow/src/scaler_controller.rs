@@ -12,6 +12,8 @@ use std::{
 #[serde(rename_all = "snake_case")]
 enum Mode {
     Shadow,
+    /// Effectful actions for the provider adapter; refused without activation evidence.
+    Live,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -396,6 +398,16 @@ pub(crate) fn command(root: &Path, tick_now: bool) -> Result<Value> {
     if !tick_now {
         let mut result = status(&db)?;
         result["config_present"] = json!(root.join("scaler.json").exists());
+        if let Ok(config) = read_private::<Config>(&root.join("scaler.json")) {
+            let live = matches!(config.mode, Mode::Live);
+            result["mode"] = json!(if live { "live" } else { "shadow" });
+            // Persisted actions are history, not authority after evidence changes.
+            if live {
+                if let Err(e) = activation(root, &config.pools, ow_core::recovery::now()) {
+                    result["error"] = json!(format!("{e:#}"));
+                }
+            }
+        }
         return Ok(result);
     }
     // Local tick serializes with the gateway through BEGIN IMMEDIATE.
@@ -455,9 +467,46 @@ fn refresh(db: &Connection, now: u64, call: &impl Fn(&str) -> Result<Value>) -> 
     }
     Ok(())
 }
+/// Operator attestation that the replacement-controller drill was accepted.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Activation {
+    recovery_drill: String,
+}
+/// Written by `ow-host pool check` when every right and the retention shape verified.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderCheck {
+    /// Pool name -> Unix second of its last passing check.
+    pools: BTreeMap<String, u64>,
+}
+/// Live mode needs both private files; a provider check older than a day refuses.
+fn activation(root: &Path, pools: &[Pool], now: u64) -> Result<()> {
+    let a: Activation = read_private(&root.join("scaler-activation.json"))
+        .context("live mode needs scaler-activation.json (accepted recovery drill)")?;
+    ensure!(
+        !a.recovery_drill.trim().is_empty() && a.recovery_drill.len() <= 512,
+        "scaler-activation.json needs a recovery_drill reference"
+    );
+    let c: ProviderCheck = read_private(&root.join("scaler-provider-check.json"))
+        .context("live mode needs a passing `ow-host pool check` (scaler-provider-check.json)")?;
+    for p in pools {
+        ensure!(
+            c.pools
+                .get(&p.name)
+                .is_some_and(|&at| at <= now && now - at <= 86400),
+            "no passing provider check for pool {} in the last day; rerun ow-host pool check",
+            p.name
+        );
+    }
+    Ok(())
+}
 fn tick_on(root: &Path, db: &mut Connection, now: u64) -> Result<Value> {
     let config: Config = read_private(&root.join("scaler.json"))?;
-    let Mode::Shadow = config.mode;
+    let live = matches!(config.mode, Mode::Live);
+    if live {
+        activation(root, &config.pools, now)?;
+    }
     let observed: Observations = read_private(&root.join("scaler-observations.json"))?;
     let (hours, caps, retired_nodes) = limits::elastic_caps(root)?;
     ensure!(
@@ -480,10 +529,11 @@ fn tick_on(root: &Path, db: &mut Connection, now: u64) -> Result<Value> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let collected = inputs_on(&tx, &config.pools, &observed, now, hours, &retired_nodes)?;
     for (pool, input) in config.pools.iter().zip(collected.iter()) {
-        record(&tx, pool, input, caps)?;
+        record_mode(&tx, pool, input, caps, live)?;
     }
     tx.execute("DELETE FROM scaler_health", [])?;
-    let result = status(&tx)?;
+    let mut result = status(&tx)?;
+    result["mode"] = json!(if live { "live" } else { "shadow" });
     tx.commit()?;
     Ok(result)
 }

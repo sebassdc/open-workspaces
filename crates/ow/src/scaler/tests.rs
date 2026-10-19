@@ -55,7 +55,7 @@ fn demand(id: &str, shape: Shape) -> Queued {
         compatibility_known: true,
     }
 }
-fn runner(id: &str, shape: Shape, at: u64) -> Runner {
+pub(super) fn runner(id: &str, shape: Shape, at: u64) -> Runner {
     let p = pool();
     let preset = preset("test", shape, 0);
     Runner {
@@ -69,7 +69,7 @@ fn runner(id: &str, shape: Shape, at: u64) -> Runner {
         soft_draining: false,
     }
 }
-fn input() -> Input {
+pub(super) fn input() -> Input {
     Input {
         now: 100,
         inventory_fresh: true,
@@ -586,5 +586,113 @@ fn expired_other_pool_forecast_does_not_keep_global_headroom_but_effectful_actio
             "{phase:?}"
         );
         db.execute_batch("COMMIT").unwrap();
+    }
+}
+#[test]
+fn live_mode_promotes_only_a_newly_recorded_action_and_holds_it_until_a_receipt() {
+    let demanding = |now| {
+        let mut i = input();
+        i.now = now;
+        i.queued = vec![demand("q", shape(1, 1024, 16))];
+        i
+    };
+    let db = Connection::open_in_memory().unwrap();
+    initialize(&db).unwrap();
+    let shadow = record_mode(&db, &pool(), &demanding(100), caps(), false).unwrap();
+    assert_eq!(shadow.state.action.unwrap().phase, Phase::ShadowLaunch);
+    let kept = record_mode(&db, &pool(), &demanding(101), caps(), true).unwrap();
+    assert_eq!(
+        kept.state.action.unwrap().phase,
+        Phase::ShadowLaunch,
+        "intent recorded in shadow is never promoted"
+    );
+    let db = Connection::open_in_memory().unwrap();
+    initialize(&db).unwrap();
+    let live = record_mode(&db, &pool(), &demanding(100), caps(), true).unwrap();
+    let action = live.state.action.clone().unwrap();
+    assert_eq!(action.phase, Phase::Launching);
+    assert!(live.live_blocked.is_empty());
+    let held = record_mode(&db, &pool(), &demanding(101), caps(), true).unwrap();
+    assert_eq!(
+        held.state.action.as_ref(),
+        Some(&action),
+        "one action in flight, never a second"
+    );
+    let mut i = demanding(102);
+    i.receipt = Some(Receipt {
+        action: action.id.clone(),
+        outcome: Outcome::Pending,
+        node: None,
+    });
+    assert_eq!(
+        record_mode(&db, &pool(), &i, caps(), true)
+            .unwrap()
+            .state
+            .action
+            .unwrap()
+            .phase,
+        Phase::Joining
+    );
+    let mut i = demanding(103);
+    i.receipt = Some(Receipt {
+        action: action.id.clone(),
+        outcome: Outcome::Absent,
+        node: None,
+    });
+    assert!(
+        record_mode(&db, &pool(), &i, caps(), true)
+            .unwrap()
+            .state
+            .action
+            .is_none()
+    );
+}
+
+#[test]
+fn stored_live_action_permission_follows_current_safety_gates() {
+    for fault in [
+        "inventory",
+        "retention",
+        "outcome",
+        "durability",
+        "cost",
+        "count",
+        "duplicate",
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let mut p = pool();
+        p.floor = 1;
+        let mut i = input();
+        let live = record_mode(&db, &p, &i, caps(), true).unwrap();
+        assert!(live.execution_allowed);
+        i.now += 1;
+        match fault {
+            "inventory" => i.inventory_fresh = false,
+            "retention" => i.retention_ok = false,
+            "outcome" => i.outcome_resolved = false,
+            "durability" => i.durability_healthy = false,
+            "cost" => i.liabilities.cents = caps().cents,
+            "count" => i.pool_instances = p.ceiling + 1,
+            "duplicate" => i.now -= 1,
+            _ => unreachable!(),
+        }
+        let blocked = record_mode(&db, &p, &i, caps(), true).unwrap();
+        assert!(!blocked.execution_allowed, "{fault}");
+        assert_eq!(blocked.state.action, live.state.action, "{fault}");
+        assert_eq!(status(&db).unwrap()["pools"][0]["execution_allowed"], false);
+        let healthy = record_mode(
+            &db,
+            &p,
+            &Input {
+                now: 102,
+                ..input()
+            },
+            caps(),
+            true,
+        )
+        .unwrap();
+        assert!(healthy.execution_allowed, "{fault}");
+        assert_eq!(healthy.state.action, live.state.action);
     }
 }

@@ -410,6 +410,18 @@ test("runner-add on an enrolled runner only checks that it is online, and refuse
     f.done();
 });
 
+test("pool passes only plain arguments to ow-host pool on the controller host", () => {
+    const f = fake();
+    const result = f.run(["pool", "remove", "dev", "--node", "dev-0aaaaaaaaaaaaaaaa"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.scripts().map((s) => f.lastLine(s.script)), ["ow_host pool remove dev --node dev-0aaaaaaaaaaaaaaaa"]);
+    for (const args of [["pool"], ["pool", "sync"], ["pool", "sync", "dev;id"], ["pool", "launch", "dev", "--expect", "$(id)"]]) {
+        assert.notEqual(f.run(args).status, 0, args.join(" "));
+    }
+    assert.equal(f.scripts().length, 1);
+    f.done();
+});
+
 test("a runner upgrades only to an agent its controller accepts: the controller's release is passed", () => {
     const f = fake({ parameter: RUNNER_CONFIG, instances: { "ow-test": CONTROLLER_ID, "ow-big": RUNNER_ID },
         results: [{ stdout: JSON.stringify({ versions: { agent: "0.6.0" } }) }] });

@@ -14,7 +14,7 @@ test("pulumi package get-schema finds every component", (t) => {
     }
     const dir = fileURLToPath(new URL("..", import.meta.url));
     const schema = JSON.parse(execFileSync("pulumi", ["package", "get-schema", dir], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
-    for (const name of ["Host", "Runner", "ArtifactStore"]) {
+    for (const name of ["Host", "Runner", "ArtifactStore", "RunnerPool"]) {
         assert.ok(schema.resources?.[`open-workspaces-aws:index:${name}`]?.isComponent, `${name} in the schema`);
     }
     for (const name of ["Host", "Runner"]) {
@@ -33,4 +33,10 @@ test("pulumi package get-schema finds every component", (t) => {
     assert.equal(schema.resources["open-workspaces-aws:index:Host"].inputProperties.storeGc.type, "boolean");
     assert.ok(!("storeGc" in schema.resources["open-workspaces-aws:index:Runner"].inputProperties));
     assert.ok(!("dashboardCapability" in schema.resources["open-workspaces-aws:index:Runner"].inputProperties));
+    const pool = schema.resources["open-workspaces-aws:index:RunnerPool"];
+    // A pool never follows a moving image, and the controller alone sizes it.
+    for (const input of ["amiId", "controller", "maxSize", "instanceHourlyCents", "diskMonthlyCentsPerGib", "tailscaleAuthKeySecretArn"]) {
+        assert.ok(pool.requiredInputs.includes(input), `RunnerPool requires ${input}`);
+    }
+    for (const input of ["desiredCapacity", "minSize", "role", "dashboardLogins"]) assert.ok(!(input in pool.inputProperties), input);
 });

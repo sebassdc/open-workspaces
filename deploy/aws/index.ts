@@ -6,6 +6,8 @@ import * as pulumi from "@pulumi/pulumi";
 import { storeRunnerPolicy, storeGcPolicy } from "./store";
 export { ArtifactStore, storeLifecycleRules, tlsOnlyPolicy, storeBucketPolicy, storeRunnerPolicy, storeGcPolicy } from "./store";
 export type { ArtifactStoreArgs } from "./store";
+export { RunnerPool, poolName, poolLimits, poolUserData, controllerPoolPolicy, runnerJoinPolicy, DRAIN_HOOK, SUSPENDED } from "./pool";
+export type { RunnerPoolArgs } from "./pool";
 
 export interface ImageArtifact {
     version: pulumi.Input<number>;
@@ -177,10 +179,24 @@ export interface RunnerConfig {
     joinSecretArn: string;
 }
 
+/** What a RunnerPool's shared config adds; each instance derives its node ID and join secret. */
+export interface PoolConfig {
+    name: string;
+    controller: string;
+    group: string;
+    roleId: string;
+    joinSecretPrefix: string;
+    hook: string;
+    instanceHourlyCents: number;
+    diskMonthlyCentsPerGib: number;
+}
+
 export interface HostConfigInputs {
     role?: string;
     /** Set for a runner host (role runner). */
     runner?: RunnerConfig;
+    /** Set for a RunnerPool's shared config (role runner). */
+    pool?: PoolConfig;
     repository: string;
     ref: string;
     tailscaleAuthKeySecretArn: string;
@@ -205,7 +221,7 @@ export interface HostConfigInputs {
  */
 export function hostConfig(c: HostConfigInputs): object {
     const role = c.role ?? "host";
-    if (!["host", "controller"].includes(role) || (c.runner && role !== "host")) {
+    if (!["host", "controller"].includes(role) || ((c.runner || c.pool) && role !== "host") || (c.runner && c.pool)) {
         throw new Error("role must be host or controller; Runner determines its own role");
     }
     if (role === "controller" && (c.developerImages.length || c.recoveryPoints || Object.keys(c.imageArtifacts ?? {}).length)) {
@@ -253,8 +269,8 @@ export function hostConfig(c: HostConfigInputs): object {
         throw new Error(`repository must be an https URL, not ${JSON.stringify(c.repository)}`);
     }
     const images = developerImageList(c.developerImages);
-    if (c.runner) {
-        nodeId(c.runner.node);
+    if (c.runner || c.pool) {
+        if (c.runner) nodeId(c.runner.node);
         if (!c.tailscaleAuthKeySecretArn) {
             throw new Error("a runner needs tailscaleAuthKeySecretArn: its controller listens on the tailnet only");
         }
@@ -262,7 +278,7 @@ export function hostConfig(c: HostConfigInputs): object {
     }
     return {
         schema: 1,
-        role: c.runner ? "runner" : role,
+        role: c.runner || c.pool ? "runner" : role,
         release: { repository: c.repository, ref: c.ref },
         tailscale: { secretArn: c.tailscaleAuthKeySecretArn, hostname: c.tailscaleHostname, ssh: c.tailscaleSsh,
             ...(c.directMac ? { direct: { mac: c.directMac } } : {}) },
@@ -273,6 +289,7 @@ export function hostConfig(c: HostConfigInputs): object {
         idleMinutes: c.idleMinutes,
         vcpuOvercommit,
         ...(c.runner ? { runner: c.runner } : {}),
+        ...(c.pool ? { pool: c.pool } : {}),
     };
 }
 

@@ -358,6 +358,15 @@ controller runs, and the runner refuses an agent that controller would not
 accept (the controller accepts its own protocol and the one before, so runners
 may lag one protocol version). See [docs/UPGRADES.md](../../docs/UPGRADES.md#runners).
 
+## Runner pool
+
+`RunnerPool` is an opt-in Auto Scaling group of runner hosts that the controller
+host sizes by exact actions (`ow-aws --host CONTROLLER pool ...`): launch by
+compare-and-set, removal of exactly one drained instance, and a termination hook that
+retains any instance whose removal the controller did not complete. Desired capacity
+starts at 0, so adding the component starts nothing and changes no existing host;
+its data volumes outlive their instances. See [docs/RUNNER_POOL.md](../../docs/RUNNER_POOL.md).
+
 ## Upgrades in place
 
 Run on the host as root (`ow-aws upgrade` and `ow-aws ci-post-up` do it over SSM):
