@@ -8,6 +8,8 @@
 //!   `ssh`) a provider supports, checked before each command.
 //! - [`SnapshotStore`]: off-host copies of sealed snapshots (S3 and compatible).
 //! - [`credential_broker`]: dormant per-box role/secret policy and host provider interfaces.
+#[cfg(target_os = "linux")]
+pub mod cache;
 pub mod capability;
 pub mod common;
 pub mod compute;

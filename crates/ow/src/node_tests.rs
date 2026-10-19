@@ -1480,3 +1480,47 @@ fn review_cached_unmanaged_delete_keeps_its_success_on_a_fencing_worker() {
     assert!(!root.join("machines/legacy").exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cache_shape_is_withheld_until_controller_negotiates_and_worker_enforces_it() {
+    let root =
+        std::env::temp_dir().join(format!("ow-cache-negotiate-{}", common::nonce().unwrap()));
+    fs::create_dir(&root).unwrap();
+    for (negotiated, capable, expected) in [
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let mut beat = json!({});
+        cache_extension(
+            &mut beat,
+            &json!({"cache_eviction_v1":capable}),
+            &root,
+            negotiated,
+        )
+        .unwrap();
+        assert_eq!(beat.get("cache_entries").is_some(), expected);
+        assert_eq!(beat["cache_inventory_v1"] == true, expected);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn controller_placement_policy_survives_runner_drain_changes() {
+    let root =
+        std::env::temp_dir().join(format!("ow-placement-policy-{}", common::nonce().unwrap()));
+    fs::create_dir(&root).unwrap();
+    let db = db(&root).unwrap();
+    db.execute("INSERT INTO nodes(id,memory_mib,slots,capabilities) VALUES('runner',512,1,'{\"memory_mib\":512,\"slots\":1,\"vcpus\":1,\"drain\":true}')",[]).unwrap();
+    db.execute("INSERT INTO node_placement_policy(node,pool,active,controller_drain) VALUES('runner','test-pool',1,1)",[]).unwrap();
+    for draining in [false, true, false] {
+        db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.drain',json(?1),'$.controller_drain',json('false'),'$.pool','untrusted')",[draining.to_string()]).unwrap();
+        let n = inventory(&root).unwrap();
+        assert_eq!(n[0]["capabilities"]["controller_drain"], true);
+        assert_eq!(n[0]["capabilities"]["pool"], "test-pool");
+        assert_eq!(n[0]["capabilities"]["drain"], draining);
+    }
+    drop(db);
+    fs::remove_dir_all(root).unwrap();
+}
