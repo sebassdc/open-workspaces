@@ -97,7 +97,9 @@ pub const GOLDEN_BASES: [&str; 2] = ["ubuntu", "arch"];
 /// A built-in profile or the name of a golden image; whether a golden image is
 /// built on this runner is checked when a machine is created from it.
 pub fn image_profile(image: &str) -> Result<()> {
-    identifier(image).context("unsupported image profile")
+    crate::store::image_name(image)
+        .map(|_| ())
+        .context("unsupported image profile")
 }
 
 #[cfg(test)]
@@ -154,6 +156,8 @@ pub struct Workspace {
     pub vcpu_count: u32,
     #[serde(default = "default_image")]
     pub image: String,
+    #[serde(default)]
+    pub image_digest: Option<String>,
     pub source: Option<String>,
     pub hibernation: Option<String>,
     #[serde(default)]
@@ -222,6 +226,8 @@ struct Snapshot {
     vcpu_count: u32,
     #[serde(default = "default_image")]
     image: String,
+    #[serde(default)]
+    image_digest: Option<String>,
     runtime: String,
     cpu: String,
     kernel_sha256: String,
@@ -238,7 +244,7 @@ impl Snapshot {
     }
 
     fn summary(&self) -> Value {
-        json!({"name":self.name,"workspace":self.workspace,"memory_mib":self.memory_mib,"vcpu_count":self.vcpu_count,"image":self.image,"state":"ready"})
+        json!({"name":self.name,"workspace":self.workspace,"memory_mib":self.memory_mib,"vcpu_count":self.vcpu_count,"image":self.image,"image_digest":self.image_digest,"state":"ready"})
     }
 }
 
@@ -682,7 +688,8 @@ impl Runtime {
             machine.boot(&self.kernel(), workspace.memory_mib, workspace.vcpu_count)?;
         }
         machine.network(&workspace.id, workspace.index, fork)?;
-        if workspace.image != "alpine" {
+        let profile = crate::store::image_name(&workspace.image)?.0;
+        if profile != "alpine" {
             let bundle = self.assets.join("guest/network-tools.tar.gz");
             let digest = hash(&bundle)?;
             let marker = format!("/ow/.network-{digest}");
@@ -690,12 +697,12 @@ impl Runtime {
                 let guest = format!("/run/ow-network-{digest}.tar.gz");
                 install_file(&mut machine, &bundle, &guest, &digest)?;
                 machine.checked(&format!("tar -xzf {guest} -C / && mkdir -p /etc/ssl/certs && {{ test -f /etc/ssl/certs/ca-certificates.crt || cp /ow/etc/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt; }} && touch {marker}; rm -f {guest}"))?;
-                if workspace.image == "arch" {
+                if profile == "arch" {
                     machine.checked("if ! grep -q '^Server' /etc/pacman.d/mirrorlist; then printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\\n' >> /etc/pacman.d/mirrorlist; fi")?;
                 }
             }
         }
-        if workspace.image != "alpine" {
+        if profile != "alpine" {
             machine.checked("chmod 755 /etc/ssl /etc/ssl/certs /ow /ow/bin /ow/lib /ow/etc; chmod 644 /etc/ssl/certs/ca-certificates.crt")?;
         }
         if crate::ssh_guest::path(&self.root, &workspace.id).exists() {
@@ -867,6 +874,22 @@ impl Runtime {
         fs::create_dir(&directory)?;
         vm::reflink(&source_disk, &directory.join("disk.ext4"))?;
         disk::extend(&directory.join("disk.ext4"), disk_bytes)?;
+        let image_digest = if let Some(name) = snapshot {
+            serde_json::from_slice::<Snapshot>(&fs::read(
+                self.snapshot_dir(name).join("manifest.json"),
+            )?)?
+            .image_digest
+        } else if !PROFILES.contains(&image) {
+            let manifest: Value = serde_json::from_slice(&fs::read(
+                self.root.join("images").join(image).join("manifest.json"),
+            )?)?;
+            manifest["image_digest"].as_str().map(str::to_owned)
+        } else {
+            None
+        };
+        if let Some(digest) = &image_digest {
+            crate::store::valid_digest(digest)?;
+        }
         let workspace = Workspace {
             id: id.into(),
             index: self.state.next_index,
@@ -874,6 +897,7 @@ impl Runtime {
             memory_mib: memory,
             vcpu_count: cpus,
             image: image.into(),
+            image_digest,
             source,
             hibernation: None,
             managed: false,
@@ -1047,6 +1071,7 @@ impl Runtime {
                 memory_mib: workspace.memory_mib,
                 vcpu_count: workspace.vcpu_count,
                 image: workspace.image,
+                image_digest: workspace.image_digest,
                 runtime: crate::common::RUNTIME.into(),
                 cpu: self.cpu.clone(),
                 kernel_sha256: self.kernel_hash.clone(),
@@ -1203,6 +1228,7 @@ impl Runtime {
             memory_mib: snapshot.memory_mib,
             vcpu_count: snapshot.vcpu_count,
             image: snapshot.image,
+            image_digest: snapshot.image_digest,
             source: None,
             hibernation: (!cold).then(|| name.to_owned()),
             managed: false,
@@ -1220,7 +1246,11 @@ impl Runtime {
             return Ok(images);
         };
         for entry in entries {
-            let path = entry?.path().join("manifest.json");
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path().join("manifest.json");
             if path.is_file() {
                 images.push(serde_json::from_slice(&fs::read(path)?)?);
             }
@@ -1248,7 +1278,7 @@ impl Runtime {
             "stop the builder machine before saving its disk"
         );
         ensure!(
-            GOLDEN_BASES.contains(&builder.image.as_str()),
+            GOLDEN_BASES.contains(&crate::store::image_name(&builder.image)?.0),
             "golden images are built on {GOLDEN_BASES:?}"
         );
         // Runners advertise every golden image to the controller, which takes 32.
@@ -1320,6 +1350,7 @@ impl Runtime {
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
                 "worker_pid":std::process::id(),"placement_fencing_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
+                "image_store_v1":true,"image_digests":self.images()?.iter().filter(|i| i["image_digest"].as_str().is_some()).map(|i| json!({"name":i["name"],"digest":i["image_digest"]})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
@@ -1718,6 +1749,7 @@ mod disk_tests {
             memory_mib: 1024,
             vcpu_count: 2,
             image: "alpine".into(),
+            image_digest: None,
             runtime: crate::common::RUNTIME.into(),
             cpu: String::new(),
             kernel_sha256: String::new(),
@@ -1927,6 +1959,7 @@ mod disk_tests {
             memory_mib: 1024,
             vcpu_count: 2,
             image: "alpine".into(),
+            image_digest: None,
             runtime: crate::common::RUNTIME.into(),
             cpu: String::new(),
             kernel_sha256: String::new(),

@@ -443,5 +443,26 @@ class Setup(unittest.TestCase):
         self.assertIn(["tailscale", "set", "--ssh=true", "--hostname=new-name"], self.calls)
 
 
+class StoreImages(unittest.TestCase):
+    def test_opt_in_store_pin_is_class_zero_and_existing_config_stays_unchanged(self):
+        pin = {"version": 1, "attempt": "a" * 32, "digest": "b" * 64}
+        c = config(store={"url": "s3://my-bucket/ow", "images": {"ubuntu": pin}})
+        files = h.render(c, BUDGET)
+        path = "/etc/open-workspaces/store.json"
+        self.assertEqual(json.loads(files[path][0]), c["store"])
+        self.assertEqual(h.units_changed({path}), set())
+        self.assertNotIn(path, h.render(config(), BUDGET))
+        overcommitted = h.render(config(store=c["store"], vcpuOvercommit=2), BUDGET)
+        self.assertEqual(overcommitted[path], files[path])
+        self.assertIn("OW_MAX_VCPUS=8\n", overcommitted["/etc/open-workspaces/worker.env"][0])
+        self.assertIn("--memory 11776 --slots 8 --cpus 8",
+                      overcommitted["/etc/systemd/system/open-workspaces.service"][0])
+        for bad in [dict(pin, version=0), dict(pin, attempt="../x"), dict(pin, digest="z" * 64)]:
+            with self.assertRaises(h.Refused):
+                config(store={"url": "s3://my-bucket/ow", "images": {"ubuntu": bad}})
+        with self.assertRaises(h.Refused):
+            config(store={"images": {"ubuntu": pin}})
+
+
 if __name__ == "__main__":
     unittest.main()

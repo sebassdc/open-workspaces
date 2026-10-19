@@ -336,7 +336,10 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Status
                 | Action::Nodes
                 | Action::Image {
-                    command: ImageAction::List { runner: None }
+                    command: ImageAction::List {
+                        runner: None,
+                        catalog: false
+                    }
                 }
                 | Action::Snapshots
                 | Action::Inspect { .. }
@@ -401,7 +404,11 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         | Action::Status
         | Action::Nodes
         | Action::Image {
-            command: ImageAction::List { runner: None },
+            command:
+                ImageAction::List {
+                    runner: None,
+                    catalog: false,
+                },
         }
         | Action::Snapshots
         | Action::Inspect { .. } => {
@@ -748,7 +755,10 @@ mod tests {
     fn reported_owner_quotas_bound_choices_without_defaulting_unknown_limits() {
         let mut state = json!({"discovery":{"schema":1,"images":[{"name":"ubuntu","available":true,"nodes":[{"availability":"available","development_choice":{"memory_mib":2048,"vcpu_count":2,"disk_gib":32}}]}]}});
         let action = Action::Image {
-            command: ImageAction::List { runner: None },
+            command: ImageAction::List {
+                runner: None,
+                catalog: false,
+            },
         };
         assert!(discovery_output("https://example.test",&state,&action).unwrap()[0]["nodes"][0]["development_choice"].is_object());
         state["owner_limits"] = json!({"caps":{"memory_mib":2048,"cpus":2,"disk_gib":64,"boxes":2},"usage":{"memory_mib":1024,"cpus":0,"disk_gib":0,"boxes":0}});
@@ -832,7 +842,10 @@ mod tests {
                 json!({"discovery":{"schema":1,"images":images},"owner_limits":owner_limits});
             let status = discovery_output("https://example.test", &state, &Action::Status).unwrap();
             let action = Action::Image {
-                command: ImageAction::List { runner: None },
+                command: ImageAction::List {
+                    runner: None,
+                    catalog: false,
+                },
             };
             let output = discovery_output("https://example.test", &state, &action).unwrap();
             assert_eq!(output, status["discovery"]["images"]);

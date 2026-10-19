@@ -420,10 +420,22 @@ pub fn node_capabilities(v: &serde_json::Value) -> Result<()> {
                     i == "ubuntu-arm64"
                 } else {
                     i.as_str()
-                        .is_some_and(|i| i != "ubuntu-arm64" && identifier(i).is_ok())
+                        .is_some_and(|i| i != "ubuntu-arm64" && crate::store::image_name(i).is_ok())
                 })),
         "incompatible prepared image"
     );
+    if let Some(digests) = v.get("image_digests").filter(|v| !v.is_null()) {
+        ensure!(
+            digests.as_array().is_some_and(|a| a.len() <= 32
+                && a.iter().all(|i| i["name"]
+                    .as_str()
+                    .is_some_and(|name| crate::store::image_name(name).is_ok())
+                    && i["digest"]
+                        .as_str()
+                        .is_some_and(|digest| crate::store::valid_digest(digest).is_ok()))),
+            "invalid image digest inventory"
+        );
+    }
     if mac {
         ensure!(
             v["memory_mib"].as_u64().unwrap() <= 2048
@@ -456,6 +468,12 @@ mod backend_tests {
         let mut golden = legacy.clone();
         golden["images"] = json!(["alpine", "ubuntu", "devtools"]);
         assert!(node_capabilities(&golden).is_ok());
+        golden["images"] = json!(["tools@1"]);
+        golden["image_digests"] = json!([{"name":"tools@1","digest":"a".repeat(64)}]);
+        assert!(node_capabilities(&golden).is_ok());
+        golden["image_digests"][0]["digest"] = json!("bad");
+        assert!(node_capabilities(&golden).is_err());
+        golden.as_object_mut().unwrap().remove("image_digests");
         for images in [json!(["ubuntu-arm64"]), json!(["../x"]), json!([1])] {
             golden["images"] = images;
             assert!(node_capabilities(&golden).is_err());

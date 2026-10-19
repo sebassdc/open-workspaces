@@ -292,3 +292,21 @@ at 3 and older binaries ignore it. Older gateways never route preview hosts.
 No new dashboard JSON config keys are written, preserving older gateway config
 readability during rollback. Upgrade runner agents before accepting previews
 on them: older agents reject the additive `tunnel` stream operation.
+
+
+## Shared artifact images (v0.9.0)
+
+The opt-in [artifact store and shared images](ARTIFACT_STORE.md) add catalog
+schema 4 with reader floor 3 and versioned worker image selectors. This is a
+class 2 release: copy the catalog, move controller/dashboard together around the
+schema change, then use the normal worker hibernate/swap/resume path. Compatible
+schema 3 binaries retain catalog SQL read/write access for rollback; they do not
+implement the new worker selectors or image administration.
+
+This release retains v0.8.6's worker interface 2 (agents accept workers 1–2)
+and its dormant managed-copy fences. Runtime, guest kernel and host-runner
+transport pins are unchanged. The catalog reader floor does not permit a legacy
+worker to read managed worker state; preserve that state's separate reader guard.
+Keep capture compatibility checks and explicit cold-memory-loss consent. Store
+activation requires separate opt-in bucket/IAM/configuration; publishing this
+release alone does not activate it or replace a host.

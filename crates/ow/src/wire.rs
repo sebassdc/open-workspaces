@@ -139,6 +139,7 @@ pub fn connect(root: &Path, request: &Value) -> Result<(UnixStream, Value)> {
 /// write guest RAM to disk (the VMM allows 900 s) and then hash it.
 pub fn reply_wait(request: &Value) -> Duration {
     match request["op"].as_str() {
+        Some("image-build" | "image-pull") => Duration::from_secs(7200),
         Some("hibernate" | "snapshot" | "fork" | "export" | "seal-disk" | "import-prepare") => {
             Duration::from_secs(1200)
         }
@@ -234,12 +235,22 @@ mod framing_tests {
     }
     #[test]
     fn captures_wait_longer_than_other_operations() {
-        for op in ["hibernate", "snapshot", "fork"] {
+        for op in [
+            "hibernate",
+            "snapshot",
+            "fork",
+            "export",
+            "seal-disk",
+            "import-prepare",
+        ] {
             assert_eq!(
                 reply_wait(&json!({"op":op})),
                 Duration::from_secs(1200),
                 "{op}"
             );
+        }
+        for op in ["image-build", "image-pull"] {
+            assert_eq!(reply_wait(&json!({"op":op})), Duration::from_secs(7200));
         }
         assert_eq!(reply_wait(&json!({"op":"list"})), Duration::from_secs(120));
     }

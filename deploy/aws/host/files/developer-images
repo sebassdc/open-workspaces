@@ -7,6 +7,21 @@ set -euo pipefail
 cd /srv/ow/run/worker/src
 guest=data/runtime-spike/guest
 for profile in "$@"; do
+  if [[ -f /etc/open-workspaces/store.json ]]; then
+    python3 - "$profile" "$OW_ASSET_DIR" <<'PY'
+import json, subprocess, sys
+profile, assets = sys.argv[1:]
+store = json.load(open('/etc/open-workspaces/store.json'))
+pin = store['images'].get(profile)
+if not pin:
+    raise SystemExit(f'{profile}: store enabled but no pinned image configured')
+subprocess.run(['/srv/ow/run/agent/bin/ow', 'image', 'pull', f"{profile}@{pin['version']}",
+                '--from', store['url'], '--attempt', pin['attempt'], '--digest', pin['digest'],
+                '--runner', '/srv/ow/.ow/runner', '--base-assets', assets], check=True)
+PY
+    echo "$profile: pulled pinned developer image; no worker restart"
+    continue
+  fi
   if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("developer_user") else 1)' "$guest/$profile.json" 2>/dev/null; then
     echo "$profile: developer image present"
     continue

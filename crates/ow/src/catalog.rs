@@ -75,6 +75,9 @@ fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
         (_, "node route unavailable before dispatch") => {
             "Node is unavailable; no operation was dispatched. Retry with the same operation key when it reconnects."
         }
+        (_, "image pull unavailable before create dispatch") => {
+            "Image download failed; no create was dispatched. Retry with the same operation key."
+        }
         _ => first_use_error(diagnostic).map(|(_,message)| message).unwrap_or(
             "Operation did not complete. Check its status before retrying; use the same retry key. The host journal records the cause under this operation ID."),
     }
@@ -337,6 +340,7 @@ impl Catalog {
               CREATE UNIQUE INDEX operation_retry ON operations(owner,retry_key);",
             )?;
         }
+        crate::image_catalog::initialize(&db)?;
         // A newer catalog this binary may read (its floor allows it) keeps its version.
         db.execute_batch(&format!("UPDATE resources SET reserved_mib=COALESCE(json_extract(metadata,'$.memory_mib'),0) WHERE kind='machine' AND reserved_mib=0 AND json_extract(metadata,'$.state')='running'; PRAGMA user_version={}; COMMIT;", version.max(nodes::SCHEMA)))?;
         nodes::db(root)?;
@@ -1004,9 +1008,11 @@ impl Catalog {
                 || n["online"] != true
                 || n["capabilities"]["drain"] == true
                 || common::node_operation(&n["capabilities"], "create").is_err()
-                || !n["capabilities"]["images"]
+                || !(n["capabilities"]["images"]
                     .as_array()
                     .is_some_and(|a| a.iter().any(|i| i == image))
+                    || (n["capabilities"]["image_store_v1"] == true
+                        && crate::image_catalog::resolve(&self.db, image).is_ok()))
                 || cpus > n["capabilities"]["vcpus"].as_u64().unwrap_or(0)
             {
                 continue;
@@ -1096,7 +1102,9 @@ impl Catalog {
         ensure!(
             n["capabilities"]["images"]
                 .as_array()
-                .is_some_and(|a| a.iter().any(|i| i == image)),
+                .is_some_and(|a| a.iter().any(|i| i == image))
+                || (n["capabilities"]["image_store_v1"] == true
+                    && crate::image_catalog::resolve(&self.db, image).is_ok()),
             "node lacks prepared image"
         );
         Ok(())
@@ -1279,6 +1287,29 @@ impl Catalog {
             let node = self.placement("machine", &physical)?;
             if self.missing(&physical)? && !self.listed(&node, &physical)? {
                 return self.delete_missing(user, &name, &physical, &input);
+            }
+        }
+        if op == "create" {
+            let selector = request["image"].as_str().unwrap_or("alpine").to_owned();
+            // Keep the first image version without rewriting omitted legacy defaults in retry fingerprints.
+            let previous: Option<String> = self.db.query_row("SELECT json_extract(metadata,'$.image') FROM resources WHERE owner=?1 AND kind='machine' AND name=?2", params![user,name], |r| r.get(0)).optional()?.flatten();
+            if let Some(previous) =
+                previous.filter(|p| p == &selector || crate::image_catalog::same_name(p, &selector))
+            {
+                if previous != selector {
+                    request["image"] = json!(previous);
+                }
+            } else if let Ok(image) = crate::image_catalog::resolve(&self.db, &selector) {
+                request["image"] = json!(format!("{}@{}", image.name, image.version));
+            } else if selector.contains('@') {
+                anyhow::bail!("image version is unavailable or retired");
+            }
+            if request["image"].as_str().is_some_and(|s| s.contains('@')) {
+                let image = crate::image_catalog::resolve_stored(
+                    &self.db,
+                    request["image"].as_str().unwrap(),
+                )?;
+                request["image_digest"] = json!(image.reference.digest);
             }
         }
         // Optional protocol-v1 status fields; query outside the SQLite writer. A missing
@@ -1507,17 +1538,36 @@ impl Catalog {
         if let Some(cached) = cached {
             return Ok(cached);
         }
-        let root = match nodes::route(&self.root, &node) {
+        let mut diagnostic = "node route unavailable before dispatch";
+        let preparation = (|| -> Result<PathBuf> {
+            let root = nodes::route(&self.root, &node)?;
+            diagnostic = "image pull unavailable before create dispatch";
+            let pending_create = op=="create" && self.db.query_row("SELECT json_extract(metadata,'$.state')='pending' FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|r.get::<_,bool>(0))?;
+            if pending_create && request["image"].as_str().is_some_and(|s| s.contains('@')) {
+                let selector = request["image"].as_str().unwrap();
+                let image = crate::image_catalog::resolve_stored(&self.db, selector)?;
+                crate::image_store::dispatch(
+                    &self.root,
+                    &self.root,
+                    &node,
+                    json!({"op":"image-pull","image":image}),
+                )?;
+            }
+            Ok(root)
+        })();
+        let root = match preparation {
             Ok(root) => root,
             Err(error) => {
-                eprintln!("operation {operation} routing: {error:#}");
-                if self.db.execute(
+                eprintln!("operation {operation} preparation: {error:#}");
+                let tx = self.db.transaction()?;
+                if tx.execute(
                     "UPDATE operations SET state='not_dispatched',response=?2 WHERE id=?1 AND state='pending'",
-                    params![operation, json!({"error":"node route unavailable before dispatch"}).to_string()],
+                    params![operation, json!({"error":diagnostic}).to_string()],
                 )? == 1
                 {
-                    self.db.execute("UPDATE resources SET reserved_mib=?1,reserved_cpus=?2 WHERE kind='machine' AND physical=?3",params![prior_reservation.0,prior_reservation.1,target])?;
+                    tx.execute("UPDATE resources SET reserved_mib=?1,reserved_cpus=?2 WHERE kind='machine' AND physical=?3",params![prior_reservation.0,prior_reservation.1,target])?;
                 }
+                tx.commit()?;
                 return Err(self.outcome_error(user, operation));
             }
         };
@@ -1574,6 +1624,11 @@ impl Catalog {
         } else {
             value["id"] == target
         };
+        let correlated = correlated
+            && (op != "create"
+                || request["image_digest"].is_null()
+                || (value["image_digest"] == request["image_digest"]
+                    && value["image"] == request["image"]));
         if !correlated {
             self.db.execute(
                 "UPDATE operations SET state='uncertain',response=?2 WHERE id=?1",
@@ -2116,7 +2171,9 @@ mod tests {
                 .map(|c| c.db.execute_batch(sql).unwrap())
                 .unwrap()
         };
-        set(&format!("PRAGMA user_version={next}"));
+        set(&format!(
+            "DELETE FROM settings WHERE key='min_reader_schema'; PRAGMA user_version={next}"
+        ));
         let refused = Catalog::open(&root, &owner.issuer, None).err().unwrap();
         assert!(
             refused.to_string().contains("needs a newer binary"),
@@ -2159,7 +2216,7 @@ mod tests {
         let version: i64 =
             c.db.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, nodes::SCHEMA);
         assert_eq!(c.terminal_id(user, "demo").unwrap(), physical);
         c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata) VALUES(?1,'snapshot','demo',?2,'{}')",params![user,physical]).unwrap();
         assert_eq!(c.physical(user, "snapshot", "demo").unwrap(), physical);

@@ -488,6 +488,7 @@ fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i
         slots,
         cpus,
         ubuntu,
+        from_store,
         tailscale_auth_key,
         ow_binary,
         idle_minutes,
@@ -524,9 +525,18 @@ fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i
             .filter(|p| p.exists())
             .map_or_else(std::env::current_exe, Ok)?,
     };
+    let store_image = if from_store {
+        let db = crate::image_catalog::open(&controller)?;
+        Some(crate::image_catalog::resolve(&db, "ubuntu")?)
+    } else {
+        None
+    };
     let mut files = vec![(binary, "bin/ow".to_owned(), true)];
     for (wire, path, _, executable) in onboarding::FILES {
-        if ubuntu || !matches!(wire, "ubuntu.ext4" | "network-tools.tar.gz") {
+        if ubuntu
+            || from_store && wire == "network-tools.tar.gz"
+            || !matches!(wire, "ubuntu.ext4" | "network-tools.tar.gz")
+        {
             files.push((
                 crate::assets().join(path),
                 format!("assets/{path}"),
@@ -579,6 +589,13 @@ fn node_with(ssh: &OsStr, base: Option<PathBuf>, action: NodeAction) -> Result<i
             &[&dir, remote, digest, mode],
             Stdio::from(fs::File::open(path)?),
             &[],
+        )?;
+    }
+    if let Some(image) = &store_image {
+        ssh.run(
+            r#"mkdir -p "$1/data"; chmod 700 "$1/data"; printf '%s\n' "$3" >"$1/data/store-url"; chmod 600 "$1/data/store-url"; OW_ASSET_DIR="$1/assets" "$1/bin/ow" image pull "$2" --from "$3" --attempt "$4" --digest "$5" --runner "$1/data" --base-assets "$1/assets""#,
+            &[&dir, &format!("{}@{}",image.name,image.version), &image.store_url, &image.reference.attempt, &image.reference.digest],
+            Stdio::null(), &[],
         )?;
     }
     let report = ssh.run(

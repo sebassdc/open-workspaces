@@ -11,6 +11,10 @@ mod discovery;
 mod host;
 #[cfg(target_os = "linux")]
 mod image;
+#[cfg(any(target_os = "linux", test))]
+mod image_catalog;
+#[cfg(target_os = "linux")]
+mod image_store;
 mod limits;
 #[cfg(target_os = "macos")]
 mod local_terminal;
@@ -355,6 +359,9 @@ enum NodeAction {
         /// Also install the Ubuntu developer image (about 8 GiB transfer).
         #[arg(long)]
         ubuntu: bool,
+        /// Pull the controller's current Ubuntu image from S3 instead of copying 8 GiB.
+        #[arg(long, conflicts_with = "ubuntu")]
+        from_store: bool,
         /// Join a tailnet first with the auth key held in a 0600 file or env variable.
         #[arg(long, value_name = "file:PATH|env:NAME")]
         tailscale_auth_key: Option<String>,
@@ -389,11 +396,50 @@ enum ImageAction {
         /// Give up on a recipe that runs longer than this.
         #[arg(long, default_value_t = 60)]
         timeout_minutes: u64,
+        /// Publish a version in this controller's catalog after building on --node.
+        #[arg(long)]
+        publish_to: Option<String>,
+        /// Controller runner ID (default: local); requires --publish-to.
+        #[arg(long, requires = "publish_to", conflicts_with = "runner")]
+        node: Option<String>,
+        /// Pinned catalog base, e.g. ubuntu@2; required for controller builds.
+        #[arg(long, requires = "publish_to")]
+        base_image: Option<String>,
+    },
+    /// Publish an existing sealed base/golden image as an immutable catalog version.
+    Publish {
+        name: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        runner: Option<PathBuf>,
+        /// Base provenance for an existing golden image; base profiles need no flag.
+        #[arg(long)]
+        base_image: Option<String>,
+    },
+    /// Pull a catalog image version onto a runner, verified by its pinned digest.
+    Pull {
+        image: String,
+        #[arg(long)]
+        runner: Option<PathBuf>,
+        /// S3 root for a standalone digest-pinned pull (no local catalog required).
+        #[arg(long, requires_all = ["attempt", "digest"])]
+        from: Option<String>,
+        #[arg(long, requires = "from")]
+        attempt: Option<String>,
+        #[arg(long, requires = "from")]
+        digest: Option<String>,
+        /// Also atomically install a built-in profile into this runtime asset directory.
+        #[arg(long)]
+        base_assets: Option<PathBuf>,
     },
     /// JSON remote image availability/resources, or golden images on the local runner.
     List {
         #[arg(long)]
         runner: Option<PathBuf>,
+        /// List fleet-wide catalog versions rather than this runner's images.
+        #[arg(long, conflicts_with = "runner")]
+        catalog: bool,
     },
 }
 
@@ -595,7 +641,8 @@ fn main_result() -> anyhow::Result<i32> {
     }
     if let Action::Image { command } = cli.command {
         let selected = if cli.local_mode
-            || (!matches!(command, ImageAction::List { .. }) && cli.server.is_none())
+            || (!matches!(command, ImageAction::List { catalog: false, .. })
+                && cli.server.is_none())
         {
             None
         } else {

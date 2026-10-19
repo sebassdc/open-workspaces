@@ -102,10 +102,14 @@ test("the config is validated in the component", () => {
     }
 });
 
-test("capability admission enables a dashboard without logins or user data changes", async () => {
+test("capability admission, store pins and overcommit compose without user data changes", async () => {
     const before = await deploy({});
-    const after = await deploy({ tailscaleAuthKeySecretArn: secretArn, dashboardCapability: "example.test/cap/open-workspaces" });
+    const pins = { ubuntu: { version: 1, attempt: "a".repeat(32), digest: "b".repeat(64) } };
+    const after = await deploy({ tailscaleAuthKeySecretArn: secretArn, dashboardCapability: "example.test/cap/open-workspaces",
+        storeUrl: "s3://bucket/prefix", imageArtifacts: pins, vcpuOvercommit: 2 });
     assert.deepEqual(after.config.dashboard, { logins: [], capability: "example.test/cap/open-workspaces" });
+    assert.deepEqual(after.config.store, { url: "s3://bucket/prefix", images: pins });
+    assert.equal(after.config.vcpuOvercommit, 2);
     assert.equal(before.userData, after.userData);
 });
 
@@ -180,11 +184,46 @@ test("backup URLs are checked and the host role can never delete a backup", () =
         assert.throws(() => backupLocation(bad), /backupUrl must be/, bad);
     }
     const policy = JSON.parse(backupPolicy("aws", "s3://my-bucket/ow/host-1"));
-    assert.deepEqual(policy.Statement.flatMap((s) => [s.Action].flat()).sort(),
+    assert.deepEqual([...new Set(policy.Statement.flatMap((s) => [s.Action].flat()))].sort(),
         ["s3:AbortMultipartUpload", "s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
     assert.equal(policy.Statement[0].Resource, "arn:aws:s3:::my-bucket");
-    assert.deepEqual(policy.Statement[0].Condition, { StringLike: { "s3:prefix": ["ow/host-1/*"] } });
-    assert.equal(policy.Statement[1].Resource, "arn:aws:s3:::my-bucket/ow/host-1/*");
+    assert.deepEqual(policy.Statement[0].Condition, { StringLike: { "s3:prefix": ["ow/host-1/catalog/*", "ow/host-1/snapshots/*", "ow/host-1/runners/*/snapshots/*"] } });
+    assert.deepEqual(policy.Statement[1].Resource, ["arn:aws:s3:::my-bucket/ow/host-1/catalog/*", "arn:aws:s3:::my-bucket/ow/host-1/snapshots/*"]);
+});
+
+test("controller backup policy can read runner snapshots without runner writes or store access", () => {
+    const controller = JSON.parse(backupPolicy("aws", "s3://my-bucket/ow"));
+    const runner = JSON.parse(backupPolicy("aws", "s3://my-bucket/ow/runners/alpha", false));
+    const matches = (pattern, value) => new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*")}$`).test(value);
+    const permits = (policy, action, key) => policy.Statement.some((s) => {
+        const resource = `arn:aws:s3:::my-bucket${action === "s3:ListBucket" ? "" : `/${key}`}`;
+        const prefixes = s.Condition?.StringLike?.["s3:prefix"];
+        return s.Effect === "Allow" && [s.Action].flat().some((p) => matches(p, action))
+            && [s.Resource].flat().some((p) => matches(p, resource))
+            && (!prefixes || [prefixes].flat().some((p) => matches(p, key)));
+    });
+    for (const name of ["alpha", "beta"]) {
+        const key = `ow/runners/${name}/snapshots/saved/manifest.json`;
+        assert.ok(permits(controller, "s3:ListBucket", key));
+        assert.ok(permits(controller, "s3:GetObject", key));
+        for (const action of ["s3:PutObject", "s3:AbortMultipartUpload", "s3:DeleteObject", "s3:DeleteObjectVersion"]) {
+            assert.ok(!permits(controller, action, key), action);
+        }
+        assert.equal(permits(runner, "s3:GetObject", key), name === "alpha");
+        assert.equal(permits(runner, "s3:ListBucket", key), name === "alpha");
+    }
+    for (const key of ["ow/store/v1/u/aa/token/manifest.json", "ow/runners/alpha/store/v1/u/aa/token/manifest.json", "other/snapshots/saved/manifest.json"]) {
+        for (const policy of [controller, runner]) {
+            assert.ok(!permits(policy, "s3:GetObject", key), key);
+            assert.ok(!permits(policy, "s3:ListBucket", key), key);
+        }
+    }
+    for (const key of ["ow/catalog/current.sqlite3", "ow/snapshots/saved/manifest.json"]) {
+        assert.ok(permits(controller, "s3:GetObject", key));
+        assert.ok(permits(controller, "s3:PutObject", key));
+        assert.ok(!permits(runner, "s3:GetObject", key));
+    }
+    assert.ok(permits(runner, "s3:PutObject", "ow/runners/alpha/snapshots/saved/manifest.json"));
 });
 
 test("ow-backup uploads the catalog, then the snapshots, and stops at the first failure", () => {

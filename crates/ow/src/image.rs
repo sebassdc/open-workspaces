@@ -29,7 +29,26 @@ pub fn run(base: Option<PathBuf>, action: ImageAction) -> Result<i32> {
             memory,
             cpus,
             timeout_minutes,
+            publish_to,
+            node,
+            base_image,
         } => {
+            if let Some(url) = publish_to {
+                ensure!(dir.is_none(), "controller builds use --node, not --runner");
+                return controller_build(
+                    base,
+                    &recipe,
+                    &url,
+                    node.as_deref().unwrap_or("local"),
+                    base_image
+                        .as_deref()
+                        .context("controller builds need --base-image NAME@N")?,
+                    memory,
+                    cpus,
+                    timeout_minutes,
+                );
+            }
+            ensure!(base_image.is_none(), "--base-image requires --publish-to");
             let image = build(
                 &runner(dir)?,
                 &recipe,
@@ -39,7 +58,110 @@ pub fn run(base: Option<PathBuf>, action: ImageAction) -> Result<i32> {
             )?;
             println!("{}", serde_json::to_string_pretty(&image)?);
         }
-        ImageAction::List { runner: dir } => {
+        ImageAction::Publish {
+            name,
+            to,
+            runner: dir,
+            base_image,
+        } => {
+            let controller = selfhost::base(base.clone())?.join("controller");
+            let mut db = crate::image_catalog::open(&controller)?;
+            let runner = runner(dir)?;
+            let (disk, local) = sealed_source(&runner, &name)?;
+            let disk_digest = local["disk_sha256"]
+                .as_str()
+                .context("disk seal required")?;
+            let recipe_digest = local["recipe_sha256"].as_str().unwrap_or(disk_digest);
+            let (base_name, base_digest) = if PROFILES.contains(&name.as_str()) {
+                (name.clone(), disk_digest.to_owned())
+            } else {
+                let selector = base_image
+                    .context("publishing a golden image requires --base-image NAME@N provenance")?;
+                ensure!(
+                    ow_core::store::image_name(&selector)?.1.is_some(),
+                    "pin --base-image as NAME@N"
+                );
+                let pinned = crate::image_catalog::resolve(&db, &selector)?;
+                ensure!(
+                    pinned.store_url == to,
+                    "golden base belongs to another store"
+                );
+                ensure!(
+                    local["base"]
+                        .as_str()
+                        .is_some_and(|base| ow_core::store::image_name(base)
+                            .is_ok_and(|(name, _)| name == pinned.name)),
+                    "golden image base differs from --base-image"
+                );
+                (pinned.name, pinned.reference.digest)
+            };
+            let mut intent = crate::image_catalog::reserve(
+                &mut db,
+                &name,
+                &base_name,
+                &base_digest,
+                recipe_digest,
+                &to,
+                "local",
+                crate::image_store::now(),
+            )?;
+            if intent.status == "building" {
+                let objects = ow_core::store::S3Objects::new(&to, None)?;
+                objects.verify_configuration()?;
+                let reference = crate::image_store::publish(&objects, &intent, &disk, local)?;
+                let manifest = ow_core::store::read_manifest(&objects, &reference)?;
+                intent = crate::image_catalog::commit(
+                    &mut db,
+                    &intent,
+                    &reference,
+                    &manifest,
+                    crate::image_store::now(),
+                )?;
+            }
+            println!("{}", serde_json::to_string_pretty(&intent)?);
+        }
+        ImageAction::Pull {
+            image: selector,
+            runner: dir,
+            from,
+            attempt,
+            digest,
+            base_assets,
+        } => {
+            let image = if let Some(url) = from {
+                crate::image_store::from_reference(
+                    &url,
+                    &selector,
+                    ow_core::store::Reference {
+                        attempt: attempt.context("upload token required")?,
+                        digest: digest.context("digest required")?,
+                    },
+                )?
+            } else {
+                let db =
+                    crate::image_catalog::open(&selfhost::base(base.clone())?.join("controller"))?;
+                crate::image_catalog::resolve(&db, &selector)?
+            };
+            let objects = ow_core::store::S3Objects::new(&image.store_url, None)?;
+            let runner = runner(dir)?;
+            let installed = crate::image_store::install(&objects, &image, &runner)?;
+            if let Some(assets) = base_assets {
+                crate::image_store::install_base(&objects, &image, &runner, &assets)?;
+            }
+            println!("{installed}");
+        }
+        ImageAction::List {
+            runner: dir,
+            catalog,
+        } => {
+            if catalog {
+                let db = crate::image_catalog::open(&selfhost::base(base)?.join("controller"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::image_catalog::list(&db)?)?
+                );
+                return Ok(0);
+            }
             let images = wire::request(&runner(dir)?, json!({"op":"images"}))?;
             println!("{}", serde_json::to_string_pretty(&images)?);
         }
@@ -88,7 +210,23 @@ fn build(runner: &Path, recipe: &Path, memory: u32, cpus: u32, timeout: Duration
         eprintln!("{name} is already built from this recipe");
         return Ok(same.clone());
     }
-    let builder = format!("img-{}", &common::nonce()?[..16]);
+    build_text(runner, &name, &base, &text, memory, cpus, timeout, None)
+}
+
+pub(crate) fn build_text(
+    runner: &Path,
+    name: &str,
+    base: &str,
+    text: &str,
+    memory: u32,
+    cpus: u32,
+    timeout: Duration,
+    builder_id: Option<&str>,
+) -> Result<Value> {
+    let digest = ow_core::store::sha256(text.as_bytes());
+    let builder = builder_id
+        .map(str::to_owned)
+        .unwrap_or(format!("img-{}", &common::nonce()?[..16]));
     eprintln!("building {name} on {base} in machine {builder}");
     wire::request(
         runner,
@@ -102,7 +240,11 @@ fn build(runner: &Path, recipe: &Path, memory: u32, cpus: u32, timeout: Duration
             &recipe_run(runner, &builder, &text)?,
             timeout,
         )?;
-        shell(runner, &builder, "rm -f /root/ow-recipe.*; sync")?;
+        let (_, code) = shell(runner, &builder, "rm -f /root/ow-recipe.*; sync")?;
+        ensure!(
+            code == 0,
+            "could not clean and sync the builder before sealing"
+        );
         wire::request(runner, json!({"op":"stop","id":builder}))?;
         wire::request(
             runner,
@@ -193,4 +335,90 @@ mod tests {
         assert!(parse(Path::new("ubuntu.sh"), "# ow-image: base=ubuntu\n").is_err());
         assert!(parse(Path::new("bad name.sh"), "# ow-image: base=ubuntu\n").is_err());
     }
+}
+
+/// Source remains sealed throughout transfer; base assets use their computed disk seal.
+fn sealed_source(runner: &Path, name: &str) -> Result<(PathBuf, Value)> {
+    common::identifier(name)?;
+    if PROFILES.contains(&name) {
+        let path = crate::assets().join(if name == "alpine" {
+            "guest/base.ext4".into()
+        } else {
+            format!("guest/{name}.ext4")
+        });
+        let disk_sha256 = ow_core::store::hash_file(&path)?;
+        let profile = fs::read(crate::assets().join(format!("guest/{name}.json")))
+            .ok()
+            .map(|b| serde_json::from_slice::<Value>(&b))
+            .transpose()?
+            .unwrap_or(json!({}));
+        let kernel = ow_core::store::hash_file(&crate::assets().join("downloads/vmlinux-6.1.186"))?;
+        Ok((
+            path,
+            json!({"name":name,"base":name,"disk_sha256":disk_sha256,"profile":profile,"kernel_sha256":kernel}),
+        ))
+    } else {
+        let path = runner.join("images").join(name);
+        let manifest: Value = serde_json::from_slice(&fs::read(path.join("manifest.json"))?)?;
+        ensure!(manifest["name"] == name, "local image name mismatch");
+        Ok((path.join("disk.ext4"), manifest))
+    }
+}
+fn controller_build(
+    base: Option<PathBuf>,
+    recipe: &Path,
+    url: &str,
+    node: &str,
+    base_image: &str,
+    memory: u32,
+    cpus: u32,
+    timeout_minutes: u64,
+) -> Result<i32> {
+    use crate::{image_catalog as catalog, image_store};
+    common::resources(memory, cpus)?;
+    ensure!(
+        (1..=60).contains(&timeout_minutes),
+        "controller builds allow 1–60 minutes"
+    );
+    let text = fs::read_to_string(recipe)?;
+    ensure!(text.len() <= 192 * 1024, "recipes are limited to 192 KiB");
+    let (name, base_name) = parse(recipe, &text)?;
+    ensure!(
+        ow_core::store::image_name(base_image)?.1.is_some(),
+        "pin --base-image as NAME@N"
+    );
+    let base = selfhost::base(base)?;
+    let controller = base.join("controller");
+    let mut db = catalog::open(&controller)?;
+    let base_image = catalog::resolve(&db, base_image)?;
+    ensure!(
+        base_image.name == base_name && base_image.store_url == url,
+        "recipe base or store differs from pinned base"
+    );
+    let image = catalog::reserve(
+        &mut db,
+        &name,
+        &base_name,
+        &base_image.reference.digest,
+        &ow_core::store::sha256(text.as_bytes()),
+        url,
+        node,
+        image_store::now(),
+    )?;
+    if image.status != "building" {
+        println!("{}", serde_json::to_string_pretty(&image)?);
+        return Ok(0);
+    }
+    let result = image_store::dispatch(
+        &controller,
+        &base.join("runner"),
+        &image.node,
+        json!({"op":"image-build","image":image,"base_image":base_image,"recipe":text,"memory_mib":memory,"vcpu_count":cpus,"timeout_seconds":timeout_minutes*60}),
+    )?;
+    let reference: ow_core::store::Reference = serde_json::from_value(result["reference"].clone())?;
+    let objects = ow_core::store::S3Objects::new(url, None)?;
+    let manifest = ow_core::store::read_manifest(&objects, &reference)?;
+    let current = catalog::commit(&mut db, &image, &reference, &manifest, image_store::now())?;
+    println!("{}", serde_json::to_string_pretty(&current)?);
+    Ok(0)
 }

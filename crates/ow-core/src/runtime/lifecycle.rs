@@ -436,6 +436,7 @@ impl Runtime {
                 memory_mib: workspace.memory_mib,
                 vcpu_count: workspace.vcpu_count,
                 image: workspace.image,
+                image_digest: workspace.image_digest,
                 runtime: crate::common::RUNTIME.into(),
                 cpu: self.cpu.clone(),
                 kernel_sha256: self.kernel_hash.clone(),
@@ -586,6 +587,7 @@ impl Runtime {
                 memory_mib: snapshot.memory_mib,
                 vcpu_count: snapshot.vcpu_count,
                 image: snapshot.image,
+                image_digest: snapshot.image_digest,
                 source: None,
                 hibernation: (ram && !intent.cold).then(|| intent.snapshot.clone()),
                 managed: true,
@@ -720,6 +722,46 @@ mod tests {
         runtime.state.placements.clear();
         fs::remove_dir_all(runtime.machine_dir("legacy")).unwrap();
         runtime.save().unwrap();
+    }
+
+    #[test]
+    fn pinned_image_metadata_survives_managed_disk_and_ram_exports_and_prepared_import() {
+        for ram in [false, true] {
+            let mut runtime = fixture();
+            let digest = "a".repeat(64);
+            let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
+            workspace.image = "tools@1".into();
+            workspace.image_digest = Some(digest.clone());
+            register(&mut runtime);
+            let server = if ram {
+                let (machine, server) = vm::capture_fixture(&runtime.machine_dir("legacy"), false);
+                runtime.machines.insert("legacy".into(), machine);
+                Some(server)
+            } else {
+                None
+            };
+            let exported = runtime.request(&export()).unwrap();
+            if let Some(server) = server {
+                server.join().unwrap();
+            }
+            assert_eq!(exported["capture"]["metadata"]["image"], "tools@1");
+            assert_eq!(exported["capture"]["metadata"]["image_digest"], digest);
+            assert_eq!(exported["capture"]["metadata"]["managed"], true);
+            assert_eq!(
+                exported["capture"]["files"].as_object().unwrap().len(),
+                if ram { 3 } else { 1 }
+            );
+            let req = import_request(&runtime);
+            forget_source_for_target_fixture(&mut runtime);
+            let prepared = runtime.request(&req).unwrap();
+            assert_eq!(prepared["state"], "prepared");
+            assert_eq!(prepared["image"], "tools@1");
+            assert_eq!(prepared["image_digest"], digest);
+            assert!(runtime.machines.is_empty());
+            restart(&mut runtime);
+            assert_eq!(runtime.request(&req).unwrap(), prepared);
+            fs::remove_dir_all(runtime.root).unwrap();
+        }
     }
 
     #[test]

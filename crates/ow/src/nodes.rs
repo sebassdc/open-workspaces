@@ -87,7 +87,7 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     Ok(db)
 }
 /// Catalog schema this binary writes (`PRAGMA user_version`).
-pub(crate) const SCHEMA: i64 = 3;
+pub(crate) const SCHEMA: i64 = 4;
 
 /// A binary opens a catalog it can use safely: not newer than SCHEMA, or newer but
 /// declared readable by SCHEMA through `settings.min_reader_schema`, which every
@@ -538,6 +538,11 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
                             cap["vcpus"]=json!(v["vcpus"].as_u64().unwrap().min(cpus));
                             if let Some(o)=cap.as_object_mut(){o.remove("type");o.remove("ready_ack");}
                             if db.execute("UPDATE nodes SET heartbeat=?1,capabilities=?2 WHERE id=?3 AND session=?4 AND revoked=0",params![now(),cap.to_string(),node,generation]).is_ok_and(|n|n==1) {
+                                #[cfg(target_os="linux")]
+                                if v["image_store_v1"]==true {
+                                    let (root,node,images)=(c.root.clone(),node.clone(),v["image_digests"].clone());
+                                    tokio::task::spawn_blocking(move||{let _=crate::image_store::prefetch(&root,&node,&images);});
+                                }
                                 // Old native agents expect job IDs only; acknowledge only the guided agent's optional extension.
                                 if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break;}}
                             }
@@ -1201,6 +1206,14 @@ pub fn agent(
                     }
                     // Optional fields (older controllers ignore them): releases for upgrade
                     // health checks, and a drain the host upgrader declares.
+                    #[cfg(target_os = "linux")]
+                    {
+                        beat["image_store_v1"] = json!(
+                            status["image_store_v1"] == true
+                                && crate::image_store::configured_url(root).is_ok()
+                        );
+                    }
+                    beat["image_digests"] = status["image_digests"].clone();
                     beat["disk_resize_v1"] = json!(status["disk_resize_v1"] == true);
                     beat["placement_fencing_v1"] =
                         json!(common::placement_capable(&status).is_ok());
@@ -1338,6 +1351,8 @@ fn agent_job(
     let op = request["op"].as_str().context("op")?;
     ensure!(
         [
+            "image-build",
+            "image-pull",
             "status",
             "list",
             "stats",
@@ -1385,6 +1400,13 @@ fn agent_job(
     }
     wire::expect_worker(checked["worker_pid"].as_u64().map(|pid| pid as u32));
     if op != "terminal" && op != "ssh" && op != "tunnel" {
+        #[cfg(target_os = "linux")]
+        let response = if op == "image-build" || op == "image-pull" {
+            wire::response(crate::image_store::job(root, &request))
+        } else {
+            journal_request(root, &request, common::placement_capable(&checked).is_ok())?
+        };
+        #[cfg(not(target_os = "linux"))]
         let response =
             journal_request(root, &request, common::placement_capable(&checked).is_ok())?;
         let data = serde_json::to_vec(&response)?;

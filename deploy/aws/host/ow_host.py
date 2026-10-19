@@ -213,6 +213,21 @@ def validate(config):
         raise Refused(f"config: backup.url {backup['url']!r} must be s3://bucket/prefix")
     if backup["schedule"] and (not backup["url"] or not SCHEDULE.match(backup["schedule"])):
         raise Refused("config: backup.schedule needs backup.url and a systemd calendar expression")
+    store = config.get("store", {"url": "", "images": {}})
+    if not isinstance(store, dict) or set(store) - {"url", "images"}:
+        raise Refused("config: invalid store")
+    store = {"url": "", "images": {}, **store}
+    if not isinstance(store["url"], str) or store["url"] and (not BACKUP.match(store["url"]) or ".." in store["url"].split("/")):
+        raise Refused("config: store.url must be s3://bucket/prefix")
+    if not isinstance(store["images"], dict) or store["images"] and not store["url"]:
+        raise Refused("config: store.images needs store.url")
+    for profile, pin in store["images"].items():
+        if (profile not in ("ubuntu", "arch", "alpine") or not isinstance(pin, dict)
+                or set(pin) != {"version", "attempt", "digest"}
+                or type(pin["version"]) is not int or not 1 <= pin["version"] <= 9007199254740991
+                or not re.fullmatch(r"[0-9a-f]{32}", str(pin["attempt"]))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(pin["digest"]))):
+            raise Refused("config: invalid store image pin")
     idle = config.get("idleMinutes", 30)
     if not isinstance(idle, int) or isinstance(idle, bool) or not 0 <= idle <= 10080:
         raise Refused("config: idleMinutes must be 0 to 10080")
@@ -241,6 +256,7 @@ def validate(config):
         "dashboard": {"logins": list(logins), **({"capability": capability} if capability else {})},
         "developerImages": sorted(set(images)),
         "backup": backup,
+        **({"store": store} if store["url"] else {}),
         "idleMinutes": idle,
         "vcpuOvercommit": ratio,
         **extra,
@@ -431,6 +447,8 @@ WantedBy=multi-user.target
 """,
             0o644,
         )
+    if config.get("store", {}).get("url"):
+        files["/etc/open-workspaces/store.json"] = (json.dumps(config["store"], sort_keys=True) + "\n", 0o644)
     backup = config["backup"]
     if backup["url"]:
         # A runner has no catalog to copy: only its own snapshots, under its own prefix.
@@ -500,6 +518,7 @@ OWNED = (
     "/etc/open-workspaces/worker.env",
     "/etc/open-workspaces/dashboard.env",
     "/etc/open-workspaces/backup.env",
+    "/etc/open-workspaces/store.json",
     "/etc/systemd/system/open-workspaces-worker.service",
     "/etc/systemd/system/open-workspaces.service",
     "/etc/systemd/system/open-workspaces-recover.service",

@@ -23,6 +23,7 @@ pub mod runtime;
 pub mod snapshot_store;
 #[cfg(target_os = "linux")]
 pub mod ssh_guest;
+pub mod store;
 #[cfg(target_os = "linux")]
 pub mod vm;
 
