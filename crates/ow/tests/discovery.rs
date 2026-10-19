@@ -81,7 +81,10 @@ async fn stdin_closed_remote_discovery_and_existing_output_contracts() {
         calls.push(op.clone());
         let create_calls=calls.iter().filter(|c|c["op"]=="create").count();
         async move {
-            if op["op"]=="exec" {(StatusCode::OK,Json(json!({"ok":true,"result":{"output":"raw guest output\n","exit_code":23}})))}
+            if op["op"]=="delete" && op["id"]=="missing-box" {(StatusCode::NOT_FOUND,Json(json!({"ok":false,"error_code":"not_found","error":"machine 'missing-box' was not found."})))}
+            else if op["op"]=="delete" {(StatusCode::CONFLICT,Json(json!({"ok":false,"error":"Box is running. Stop the box first with ow stop, then retry ow delete with a new operation key."})))}
+            else if op["op"]=="ssh-info" {(StatusCode::CONFLICT,Json(json!({"ok":false,"error":"SSH has no registered key. Run ow ssh-authorize BOX --key PATH_TO_PUBLIC_KEY, then retry ssh-info."})))}
+            else if op["op"]=="exec" {(StatusCode::OK,Json(json!({"ok":true,"result":{"output":"raw guest output\n","exit_code":23}})))}
             else if create_calls==1 {(StatusCode::SERVICE_UNAVAILABLE,Json(json!({"ok":false,"error":"response uncertain"})))}
             else {(StatusCode::OK,Json(json!({"ok":true,"result":{"id":"demo"}})))}
         }
@@ -226,6 +229,22 @@ async fn stdin_closed_remote_discovery_and_existing_output_contracts() {
     let calls = captured.lock().unwrap();
     assert_eq!(calls[1], calls[2]);
     drop(calls);
+    for (command, expected) in [
+        (
+            vec!["delete", "missing-box"],
+            "not_found machine 'missing-box' was not found.",
+        ),
+        (vec!["delete", "mine"], "Stop the box first with ow stop"),
+        (vec!["ssh-info", "mine"], "Run ow ssh-authorize"),
+    ] {
+        let out = run(remote_args(&command)).await.unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty());
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("Operation could not complete"));
+        assert!(!error.contains("Operation did not complete"));
+    }
     *state.lock().unwrap() = json!({"workspaces":[],"nodes":[{"id":"raw-host-secret"}]});
     let out = run(remote_args(&["nodes"])).await.unwrap();
     assert!(!out.status.success());

@@ -157,6 +157,14 @@ Recognizable failure codes are:
 - `insufficient_capacity`: inspect nodes and image list; choose fitting resources
   or wait. Full disk reservations count even when disks are sparse.
 - `node_unavailable`: wait for the intended runner; existing placement stays fixed.
+- `not_found`: the named resource is absent or not accessible to your identity.
+  Deleting an unknown machine reports `machine 'NAME' was not found.` (HTTP 404,
+  CLI exit 1). No worker operation is dispatched. Replaying a successful delete
+  with its original operation key still returns its saved success.
+
+A running box cannot be deleted: run `ow stop NAME`, then retry deletion with a
+new operation key. If `ssh-info` reports no registered key, run
+`ow ssh-authorize NAME --key PATH_TO_PUBLIC_KEY`, then retry.
 
 Admission codes are additive API `error_code` fields (or an operation's stored
 `error_code`) and included in CLI diagnostics; arbitrary worker errors retain the
