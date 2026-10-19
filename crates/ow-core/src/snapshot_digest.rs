@@ -168,7 +168,26 @@ pub fn seal_directory(
 /// Chunks `path`. With `previous` (an earlier seal and its file), chunks whose
 /// extents are identical in both files are taken from that seal unread.
 pub fn seal(path: &Path, previous: Option<(&Path, &Sealed)>) -> Result<(Sealed, Stats)> {
-    seal_with(path, previous, &extents)
+    if File::open(path).is_ok_and(|f| reflink_filesystem(&f)) {
+        seal_with(path, previous, &extents)
+    } else {
+        seal_with(path, previous, &|_, _, _| None)
+    }
+}
+
+/// Btrfs and XFS: filesystems whose extent maps are trusted to prove equal bytes.
+#[cfg(target_os = "linux")]
+fn reflink_filesystem(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fs` is a writable statfs buffer for this open descriptor.
+    let known = unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } == 0;
+    known && matches!(fs.f_type as u64, 0x9123_683E | 0x5846_5342)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reflink_filesystem(_: &File) -> bool {
+    false
 }
 
 type Map = dyn Fn(&File, u64, u64) -> Option<Vec<Extent>> + Sync;

@@ -1145,7 +1145,8 @@ fn one_snapshot_is_deleted_by_its_owner_and_its_name_is_free() {
         json!({"op":"share","id":"demo","with":"bob@example.test","role":"admin"}),
     )
     .unwrap();
-    let delete = json!({"op":"snapshot-delete","id":"demo","name":"saved","operation_key":"drop-saved"});
+    let delete =
+        json!({"op":"snapshot-delete","id":"demo","name":"saved","operation_key":"drop-saved"});
     // A runner that does not advertise the operation is never asked.
     let before = fake.calls.load(Ordering::SeqCst);
     assert!(c.operation(a, delete.clone()).is_err());
@@ -1153,10 +1154,25 @@ fn one_snapshot_is_deleted_by_its_owner_and_its_name_is_free() {
     nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.snapshot_delete_v1',json('true')) WHERE id='alpha'",[]).unwrap();
     // Snapshot names are per owner: a teammate cannot reach the owner's snapshots,
     // and a snapshot is deleted only through the machine it captured.
-    assert!(c.operation(b, json!({"op":"snapshot-delete","id":"alice@example.test/demo","name":"saved"})).is_err());
-    assert!(c.operation(a, json!({"op":"snapshot-delete","id":"demo","name":"theirs"})).is_err());
+    assert!(
+        c.operation(
+            b,
+            json!({"op":"snapshot-delete","id":"alice@example.test/demo","name":"saved"})
+        )
+        .is_err()
+    );
+    assert!(
+        c.operation(
+            a,
+            json!({"op":"snapshot-delete","id":"demo","name":"theirs"})
+        )
+        .is_err()
+    );
     let deleted = c.operation(a, delete.clone()).unwrap();
-    assert_eq!((&deleted["deleted"], &deleted["workspace"]), (&json!("saved"), &json!("demo")));
+    assert_eq!(
+        (&deleted["deleted"], &deleted["workspace"]),
+        (&json!("saved"), &json!("demo"))
+    );
     // A lost reply is answered from the record, though the snapshot is gone.
     assert_eq!(c.operation(a, delete).unwrap()["deleted"], "saved");
     let names = |c: &mut Catalog| -> Vec<String> {
@@ -1170,7 +1186,13 @@ fn one_snapshot_is_deleted_by_its_owner_and_its_name_is_free() {
         names
     };
     assert_eq!(names(&mut c), ["kept", "theirs"]);
-    assert!(c.operation(a, json!({"op":"snapshot-delete","id":"demo","name":"saved"})).is_err());
+    assert!(
+        c.operation(
+            a,
+            json!({"op":"snapshot-delete","id":"demo","name":"saved"})
+        )
+        .is_err()
+    );
     c.operation(a, json!({"op":"snapshot","id":"demo","name":"saved"}))
         .unwrap();
     assert_eq!(names(&mut c), ["kept", "saved", "theirs"]);

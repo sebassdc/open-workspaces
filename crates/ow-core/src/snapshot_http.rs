@@ -97,7 +97,8 @@ impl Http {
                     format!("{what}: HTTP {}", response.status())
                 }
                 Ok(response) => return Ok(response),
-                Err(error) => format!("{what}: {error}"),
+                // A presigned URL carries the signature and session token; never print it.
+                Err(error) => format!("{what}: {}", error.without_url()),
             };
             ensure!(attempt < ATTEMPTS, "{retry}");
             std::thread::sleep(Duration::from_millis(250 << attempt));
@@ -243,11 +244,7 @@ fn configured_region(store: &S3Store) -> Option<String> {
 
 /// AWS answers any bucket request, even an unauthenticated one to another
 /// region's endpoint, with the bucket's region.
-fn bucket_region(
-    client: &reqwest::blocking::Client,
-    bucket: &str,
-    probe: &str,
-) -> Result<String> {
+fn bucket_region(client: &reqwest::blocking::Client, bucket: &str, probe: &str) -> Result<String> {
     ensure!(
         !probe.is_empty()
             && probe

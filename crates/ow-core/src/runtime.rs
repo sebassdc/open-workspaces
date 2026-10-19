@@ -2011,7 +2011,11 @@ mod disk_tests {
                 runtime: crate::common::RUNTIME.into(),
                 cpu: String::new(),
                 kernel_sha256: String::new(),
-                files: [("disk.ext4".into(), hash(&directory.join("disk.ext4")).unwrap())].into(),
+                files: [(
+                    "disk.ext4".into(),
+                    hash(&directory.join("disk.ext4")).unwrap(),
+                )]
+                .into(),
                 digest: None,
             };
             atomic_json(&directory.join("manifest.json"), &snapshot).unwrap();
