@@ -967,7 +967,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "ow"
-version = "0.9.8"
+version = "0.9.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "ow-core"
-version = "0.9.8"
+version = "0.9.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "ow-guest"
-version = "0.9.8"
+version = "0.9.9"
 dependencies = [
  "base64 0.22.1",
  "libc",
