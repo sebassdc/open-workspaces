@@ -1,5 +1,5 @@
 //! Durable control-plane ownership. The private worker journal remains runtime recovery state.
-use crate::{common, nodes, wire};
+use crate::{common, limits, nodes, wire};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -415,6 +415,7 @@ impl Catalog {
             tx.commit()?;
         }
         catalog.db.execute("UPDATE resources SET reserved_mib=MAX(reserved_mib,COALESCE(json_extract(metadata,'$.memory_mib'),0)),reserved_cpus=MAX(reserved_cpus,COALESCE(json_extract(metadata,'$.vcpu_count'),1)) WHERE kind='machine' AND json_extract(metadata,'$.state')='running'",[])?;
+        limits::initialize(&catalog.db)?;
         Ok(catalog)
     }
 
@@ -526,7 +527,10 @@ impl Catalog {
         )?)
     }
     fn save_node(&mut self, node: &str, kind: &str, physical: &str, value: &Value) -> Result<()> {
-        self.db.execute("UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE kind=?2 AND physical=?3 AND node=?4",params![value.to_string(),kind,physical,node])?;
+        let updated = self.db.execute("UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE kind=?2 AND physical=?3 AND node=?4",params![value.to_string(),kind,physical,node])?;
+        if kind == "machine" && updated == 1 {
+            limits::observe(&self.db, physical, value)?;
+        }
         Ok(())
     }
     fn operation_info(&self, user: i64, operation: i64) -> Result<Value> {
@@ -626,6 +630,19 @@ impl Catalog {
             for physical in absent {
                 if !observed.contains(physical.as_str()) {
                     self.db.execute("UPDATE resources SET reserved_mib=0,reserved_cpus=0 WHERE kind='machine' AND physical=?1 AND node=?2",params![physical,node])?;
+                }
+            }
+            // Missing inventory releases owner demand only after all effects are resolved.
+            let mut stmt = self
+                .db
+                .prepare("SELECT physical FROM resources WHERE kind='machine' AND node=?1")?;
+            let known = stmt
+                .query_map([&node], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            for physical in known {
+                if !observed.contains(physical.as_str()) {
+                    limits::absent(&self.db, &physical)?;
                 }
             }
             // A machine this runner no longer lists is gone from it (deleted there, or the runner
@@ -740,7 +757,7 @@ impl Catalog {
         }
         let discovery = self.discovery(user, &nodes)?;
         Ok(
-            json!({"discovery":discovery,"operations":operations,"workspaces":machines,"shared":shared,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
+            json!({"discovery":discovery,"owner_limits":limits::state(&self.root,&self.db,user)?,"operations":operations,"workspaces":machines,"shared":shared,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
         )
     }
     fn discovery(&self, user: i64, inventory: &Value) -> Result<Value> {
@@ -818,6 +835,10 @@ impl Catalog {
             [physical],
         )?;
         tx.execute("DELETE FROM grants WHERE physical=?1", [physical])?;
+        tx.execute(
+            "DELETE FROM owner_allocations WHERE physical=?1",
+            [physical],
+        )?;
         tx.execute(&format!("DELETE FROM resources WHERE {OF}"), [physical])?;
         tx.execute(
             "DELETE FROM resources WHERE kind='machine' AND physical=?1",
@@ -883,6 +904,10 @@ impl Catalog {
         physical: &str,
         input: &Value,
     ) -> Result<Value> {
+        ensure!(
+            !limits::unresolved(&self.db, physical)?,
+            "missing workspace has unresolved operations; reconcile their outcomes before deleting it"
+        );
         let node = self.placement("machine", physical)?;
         let mut request = input.clone();
         request["id"] = json!(physical);
@@ -1142,6 +1167,7 @@ impl Catalog {
                 );
             }
         }
+        limits::admit(&self.root, &self.db, target, op, request, metadata)?;
         let shape = if op == "fork" && request["snapshot"].is_string() {
             let metadata: String = self.db.query_row(
                 "SELECT metadata FROM resources WHERE kind='snapshot' AND physical=?1",
@@ -1909,7 +1935,7 @@ mod tests {
     #[test]
     fn uncertain_mac_create_replay_retains_catalog_and_node_journals() {
         use std::{
-            os::unix::net::UnixListener,
+            os::unix::{fs::PermissionsExt, net::UnixListener},
             sync::{
                 Arc,
                 atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1919,6 +1945,12 @@ mod tests {
         let root =
             PathBuf::from("/tmp").join(format!("ow-create-review-{}", common::nonce().unwrap()));
         std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        nodes::write_private(
+            &root.join("limits.json"),
+            &json!({"owner_defaults":{"cpus":16,"memory_mib":32768,"disk_gib":16384,"boxes":8}}),
+        )
+        .unwrap();
         let remote = root.join("nodes/mac");
         let runtime = remote.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();

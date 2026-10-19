@@ -54,7 +54,8 @@ across both. A gateway crash after dispatch may leave `pending` work with an
 unknown outcome. Reconciliation and stable create/snapshot IDs prevent a missing
 ownership mapping, but exactly-once exec and comprehensive operation recovery
 remain open. The current gateway serializes catalog operations; it is not a
-multi-worker scheduler. PostgreSQL, per-user quotas, fair scheduling, audit
+multi-worker scheduler. Per-owner controller admission is described in [limits](LIMITS.md).
+PostgreSQL, fair scheduling, audit
 retention and full database/artifact backup recovery remain tracked follow-ups.
 
 ## Existing machines and adding users

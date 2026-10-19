@@ -9,6 +9,9 @@ original-catalog preservation and rollback status are recorded separately in the
 [planner handoff](plans/multinode-handoff.md) and
 [verification results](plans/multinode-verification-results.md).
 
+Before minting a new node invitation, configure the controller's private
+[`limits.json`](LIMITS.md); unknown instance pricing fails closed.
+
 ## What works
 
 A dedicated controller accepts outbound authenticated Linux node agents. Human

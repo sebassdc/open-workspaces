@@ -100,7 +100,8 @@ Node/Python/Rust, with guest-only passwordless sudo for the `dev` account. See
 
 Dashboard and remote CLI machines now belong to the authenticated user. Names,
 snapshots, terminal access and usage are scoped through a durable SQLite catalog.
-See [ownership, migration and database limits](docs/USERS.md).
+See [ownership, migration and database limits](docs/USERS.md) and
+[owner quotas and pool cost admission](docs/LIMITS.md).
 
 Guest OpenSSH source now provides `ow ssh`, standard ProxyCommand/config and
 SFTP for explicitly enrolled Ubuntu/Arch guests, locally and through outbound

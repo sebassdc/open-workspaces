@@ -198,6 +198,7 @@ pub fn invitation(
         "UPDATE node_joins SET consumed=1 WHERE node=?1 AND secret_hash<>?2",
         params![node, digest(&secret)],
     )?;
+    crate::limits::pool(root, &tx, node)?;
     let value = json!({"node":node,"secret":secret,"expires":now()+ttl as i64,"policy":POOL_POLICY,"controller":controller,"memory":memory,"slots":slots,"cpus":cpus});
     publish(&value)?;
     tx.commit()?;
@@ -211,6 +212,7 @@ fn enroll(root: &Path, value: Value) -> Result<Value> {
     let mut db = db(root)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     ensure!(tx.execute("UPDATE node_joins SET consumed=1 WHERE secret_hash=?1 AND node=?2 AND consumed=0 AND expires>?3 AND EXISTS(SELECT 1 FROM nodes WHERE id=?2 AND credential_hash IS NULL AND revoked=0)", params![digest(secret),node,now()])?==1, "invalid or expired enrollment");
+    crate::limits::pool(root, &tx, node)?;
     let credential = random_secret()?;
     tx.execute(
         "UPDATE nodes SET credential_hash=?1 WHERE id=?2",
@@ -286,6 +288,9 @@ pub fn budget(root: &Path, node: &str, memory: u32, slots: u32, cpus: u32) -> Re
         prior == current,
         "node authority/session changed during inventory; retry deliberately"
     );
+    if memory > prior.0 || slots > prior.1 || cpus > prior.2 {
+        crate::limits::pool(root, &tx, node)?;
+    }
     if lowering {
         let fresh: bool = tx.query_row(
             "SELECT heartbeat>?1 AND heartbeat<=?2 FROM nodes WHERE id=?3",
