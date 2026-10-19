@@ -201,6 +201,89 @@ fn live_mode_is_refused_without_activation_evidence_and_never_promotes_shadow_in
     );
 }
 #[test]
+fn delayed_aws_hook_round_trips_through_the_real_planner_and_adapter() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    let script = r#"
+import contextlib, io, json, sys
+from unittest.mock import patch
+from test_pool import Executor, NODE_A, VOL_A, rp
+f = Executor()
+f.setUp()
+try:
+    f.as_controller()
+    f.aws.nodes = [{'id': NODE_A, 'online': True, 'capabilities': {'vcpus': 4}}]
+    f.aws.drain[NODE_A] = 'removed'
+    f.aws.launch('i-0a', VOL_A)
+    f.aws.group['DesiredCapacity'] = 1
+    f.aws.termination_state = 'Terminating'
+    for turn in range(3):
+        f.aws.scaler = json.loads(sys.stdin.readline())
+        assert f.aws.scaler['pools'][0]['execution_allowed'] is True
+        if turn == 1:
+            f.aws.member('i-0a')['LifecycleState'] = 'Terminating:Wait'
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(rp.h, 'chown'):
+            rp.sync(['dev'])
+        assert f.aws.group['DesiredCapacity'] == 0
+        if turn == 0:
+            assert not any('complete-lifecycle-action' in c for c in f.aws.calls)
+        print(json.dumps(f.observed()), flush=True)
+    completed = [c for c in f.aws.calls if 'complete-lifecycle-action' in c]
+    assert len(completed) == 1 and completed[0][completed[0].index('--instance-id') + 1] == 'i-0a'
+    assert f.aws.group['Instances'] == []
+finally:
+    f.tearDown()
+"#;
+    let mut child = Command::new("python3")
+        .args(["-c", script])
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/aws/host"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let db = Connection::open_in_memory().unwrap();
+    initialize(&db).unwrap();
+    let mut p = pool();
+    p.name = "dev".into();
+    p.idle_seconds = 0;
+    let mut i = super::super::tests::input();
+    let mut runner =
+        super::super::tests::runner("dev-0aaaaaaaaaaaaaaaa", p.presets[0].capacity, i.now);
+    runner.candidate.pool = p.name.clone();
+    i.runners = vec![runner];
+    i.ready_instances = 1;
+    i.pool_instances = 1;
+    let mut plan = record_mode(&db, &p, &i, super::super::tests::caps(), true).unwrap();
+    for turn in 0..3 {
+        let mut value = json!(plan);
+        value["stale"] = json!(false);
+        writeln!(
+            stdin,
+            "{}",
+            json!({"mode":"live","error":null,"pools":[value]})
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        assert!(stdout.read_line(&mut line).unwrap() > 0);
+        let observed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(observed["outcome_resolved"], true);
+        i.now += 1;
+        i.inventory_fresh = observed["complete"] == true;
+        i.retention_ok = observed["retention_ok"] == true;
+        i.outcome_resolved = observed["outcome_resolved"] == true;
+        i.receipt = Some(serde_json::from_value(observed["receipts"]["dev"].clone()).unwrap());
+        plan = record_mode(&db, &p, &i, super::super::tests::caps(), true).unwrap();
+        assert_eq!(plan.execution_allowed, turn < 2);
+    }
+    assert!(plan.state.action.is_none());
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn stale_inventory_revokes_execution_without_discarding_a_live_launch() {
     let mut f = Fixture::new();
     f.configure();

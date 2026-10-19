@@ -110,6 +110,11 @@ one idempotent step, journaled before any effect in `pool-actions.json`:
   Sync also pauses journaled termination-hook completion without an authorized
   drain action; the hook may time out into retention. Explicit operator `remove`
   remains a separate action with its own drain and retention checks.
+  A delayed termination hook for the adapter's journaled drain is known pending
+  work, so it does not itself set the observation's unresolved-outcome hold.
+  Unjournaled terminations and failed provider activities still do. Each retry
+  runs the selected removal's checks and completes only that instance's hook;
+  sync has no separate loop that completes other journaled removals.
 
 The scaler's pool name must be the RunnerPool's name and the runners' placement pool;
 today every runner's placement pool is `default`, so a pool that serves queued demand

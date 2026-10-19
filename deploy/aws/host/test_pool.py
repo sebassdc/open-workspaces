@@ -51,6 +51,7 @@ class FakeAws(Fake):
                        "DefaultResult": "ABANDON"}]
         self.instances, self.volumes, self.policies = [], [], []
         self.scaler = {"mode": "shadow", "pools": []}
+        self.termination_state = "Terminating:Wait"
 
     def launch(self, iid, volume, state="InService"):
         self.instances.append(instance(iid, volume))
@@ -125,7 +126,7 @@ class FakeAws(Fake):
             self.group["DesiredCapacity"] = int(arg("--desired-capacity"))
             return ""
         if op == "terminate-instance-in-auto-scaling-group":
-            self.member(arg("--instance-id"))["LifecycleState"] = "Terminating:Wait"
+            self.member(arg("--instance-id"))["LifecycleState"] = self.termination_state
             if "--should-decrement-desired-capacity" in cmd:
                 self.group["DesiredCapacity"] -= 1
             return ""
@@ -656,6 +657,40 @@ class Executor(PoolCase):
         self.assertEqual(self.observed()["receipts"]["dev"], {"action": "dev-7", "outcome": "absent", "node": None})
         self.assertEqual((self.aws.group["DesiredCapacity"], self.aws.group["Instances"]), (0, []))
         self.assertEqual(next(v for v in self.aws.volumes if v["VolumeId"] == VOL_A)["State"], "available")
+
+    def test_delayed_hook_remains_a_known_pending_drain_and_completes(self):
+        self.as_controller()
+        self.aws.nodes = [{"id": NODE_A, "online": True, "capabilities": {"vcpus": 4}}]
+        self.aws.drain[NODE_A] = "removed"
+        self.aws.launch("i-0a", VOL_A)
+        self.aws.group["DesiredCapacity"] = 1
+        self.aws.termination_state = "Terminating"
+        self.live("drain", NODE_A, "draining")
+        rp.sync(["dev"])
+        self.assertEqual(self.aws.group["DesiredCapacity"], 0)
+        self.assertEqual(self.observed()["receipts"]["dev"]["outcome"], "pending")
+        self.assertTrue(self.observed()["outcome_resolved"], "our journaled pending drain must not deadlock its planner")
+        with self.assertRaisesRegex(Refused, "removal.*unresolved"):
+            rp.launch("dev", 0)
+        self.aws.member("i-0a")["LifecycleState"] = "Terminating:Wait"
+        rp.sync(["dev"])
+        self.assertEqual(self.observed()["receipts"]["dev"]["outcome"], "pending")
+        rp.sync(["dev"])
+        self.assertEqual(self.observed()["receipts"]["dev"]["outcome"], "absent")
+        completed = [c[c.index("--instance-id") + 1] for c in self.aws.calls if "complete-lifecycle-action" in c]
+        self.assertEqual(completed, ["i-0a"])
+        self.assertEqual(self.aws.group["DesiredCapacity"], 0)
+
+    def test_removal_completes_only_the_selected_journaled_instance(self):
+        self.as_controller()
+        self.aws.launch("i-0a", VOL_A, state="Terminating:Wait")
+        self.aws.launch("i-0b", VOL_B, state="Terminating:Wait")
+        h.write_json(rp.REMOVALS, {"i-0a": {"node": NODE_A, "enrolled": False},
+                                  "i-0b": {"node": NODE_B, "enrolled": False}})
+        rp.remove("dev", instance="i-0a", wait=False)
+        completed = [c[c.index("--instance-id") + 1] for c in self.aws.calls if "complete-lifecycle-action" in c]
+        self.assertEqual(completed, ["i-0a"])
+        self.assertEqual(self.aws.member("i-0b")["LifecycleState"], "Terminating:Wait")
 
     def test_drain_refuses_retention_evidence_when_the_disk_would_be_deleted(self):
         self.as_controller()

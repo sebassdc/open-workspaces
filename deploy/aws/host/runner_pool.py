@@ -42,6 +42,7 @@ GROUP_ACTIONS = ("SetDesiredCapacity", "TerminateInstanceInAutoScalingGroup", "C
 INSTANCE = re.compile(r"^i-[0-9a-f]{8,17}$")
 VOLUME = re.compile(r"^vol-([0-9a-f]{17})$")
 LIVE = "pending,running,stopping,stopped"
+TERMINATING = {"Terminating", "Terminating:Wait", "Terminating:Proceed"}
 
 
 def aws(*args):
@@ -218,13 +219,13 @@ def removals():
     return h.read_json(REMOVALS) or {}
 
 
-def complete_own(pool, group):
+def complete_own(pool, group, instance):
     """Completes (CONTINUE) only the hooks of terminations this controller started for
     a runner still removed or never enrolled. Anything else waits out its hook and is retained."""
     mine = removals()
     for member in group.get("Instances") or []:
         iid = member["InstanceId"]
-        if member.get("LifecycleState") != "Terminating:Wait" or iid not in mine:
+        if iid != instance or member.get("LifecycleState") != "Terminating:Wait" or iid not in mine:
             continue
         node, enrolled = mine[iid].get("node"), mine[iid].get("enrolled")
         # Read again now: a runner may have enrolled or been undrained since the removal began.
@@ -264,8 +265,13 @@ def observe(pool, group, hooks, policies, activities, instances, volumes, known,
               "hourly_cents": disk_cents(pool, v["Size"])} for v in volumes]
     recent = [a for a in activities if a.get("StatusCode") == "Failed"
               and calendar.timegm(time.strptime(a["StartTime"][:19], "%Y-%m-%dT%H:%M:%S")) > now - 3600]
-    resolved = not recent and not any(str(m.get("LifecycleState", "")).startswith(("Terminating:Wait", "Terminating:Proceed"))
-                                      or m.get("LifecycleState") == "Terminating" for m in members.values())
+    # A journaled drain is known pending work, not an unknown provider outcome.
+    actions = (h.read_json(ACTIONS) or {}).values()
+    expected = {iid for iid, removal in removals().items() if any(
+        a.get("kind") == "drain" and a.get("pool") == pool["name"] and a.get("node") == removal.get("node")
+        for a in actions)}
+    resolved = not recent and not any(m.get("LifecycleState") in TERMINATING and iid not in expected
+                                      for iid, m in members.items())
     return out, disks, complete, not shape_problems(pool, group, hooks, policies), resolved
 
 
@@ -394,9 +400,6 @@ def sync(names, fixed=(), hours=None):
                 snapshot["receipts"][pool["name"]] = receipt
         group, hooks, policies, activities, instances, volumes = described = describe(pool)
         answer_joins(pool, group, instances, known)
-        if pool["name"] in actions and actions[pool["name"]]["kind"] == "drain" \
-                and receipt and receipt["outcome"] == "pending":
-            complete_own(pool, group)
         found, disks, complete, retention, resolved = observe(pool, *described, known, int(time.time()))
         for i in found:  # the one instance a launch receipt speaks for
             if launched and i["id"] == launched:
@@ -435,7 +438,7 @@ def launch(name, expect):
         return 0
     if desired != expect:
         raise Refused(f"{pool['group']} wants {desired}, not {expect}; nothing launched")
-    if not complete or not resolved:
+    if not complete or not resolved or any(m.get("LifecycleState") in TERMINATING for m in group.get("Instances") or []):
         raise Refused("a removal or failed launch is unresolved; nothing launched")
     if expect + 1 > group["MaxSize"]:
         raise Refused(f"{pool['group']} is at its maximum {group['MaxSize']}")
@@ -494,7 +497,7 @@ def remove(name, node=None, instance=None, wait=True):
         group, *_ = describe(pool)
         state = next((m.get("LifecycleState") for m in group.get("Instances") or [] if m["InstanceId"] == iid), "gone")
         if state == "Terminating:Wait":
-            complete_own(pool, group)
+            complete_own(pool, group, iid)
         elif state in ("gone", "Terminating:Proceed", "Terminated"):
             h.say(f"{iid} removed ({runner}); its data volume is kept: ow-host pool disks {name}")
             return True

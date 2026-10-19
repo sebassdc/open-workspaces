@@ -55,7 +55,7 @@ fn demand(id: &str, shape: Shape) -> Queued {
         compatibility_known: true,
     }
 }
-fn runner(id: &str, shape: Shape, at: u64) -> Runner {
+pub(super) fn runner(id: &str, shape: Shape, at: u64) -> Runner {
     let p = pool();
     let preset = preset("test", shape, 0);
     Runner {
@@ -69,7 +69,7 @@ fn runner(id: &str, shape: Shape, at: u64) -> Runner {
         soft_draining: false,
     }
 }
-fn input() -> Input {
+pub(super) fn input() -> Input {
     Input {
         now: 100,
         inventory_fresh: true,
