@@ -47,8 +47,10 @@ A Pulumi component, [`deploy/aws/`](../deploy/aws/README.md), now creates one
 nested-virtualization EC2 host running controller and runner together: no
 inbound ports, SSM-only role, IMDSv2 with hop limit 1, a Btrfs gp3 data volume
 and optional Tailscale join. Its smoke test and measured timings are in
-[EC2 timings](experiments/ec2-timings.md). The guidance below still applies to
-larger deployments.
+[EC2 timings](experiments/ec2-timings.md). Hosts install each release's
+verified published binaries instead of compiling them, and build from source only
+when no matching binary exists ([released binaries](UPGRADES.md#released-binaries)).
+The guidance below still applies to larger deployments.
 
 Start with a standalone EC2 worker, control-plane service, PostgreSQL and S3. Add managed services/HA only when required. AWS supports nested virtualization on selected EC2 families; enable it explicitly, check regional support and verify runtime operation.
 

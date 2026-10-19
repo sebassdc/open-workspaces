@@ -34,10 +34,11 @@ unit whose code did not change since the release it runs is not touched.
   releases/VERSION-COMMIT12/  immutable once STAGED is written
     src/                      worktree at the release commit
     src/data/runtime-spike -> ../../assets
-    src/target -> /srv/ow/build/target     shared, incremental cargo builds
+    src/target -> /srv/ow/build/target     shared, incremental cargo builds (source builds only)
     assets/                   this release's own asset set (a reflink copy, then updated)
-    bin/ow                    copied from the build
-    STAGED                    version, commit, ref, sha256 of bin/ow, build seconds
+    bin/ow                    the released binary, or copied from the build
+    STAGED                    version, commit, ref, sha256 of bin/ow, staging seconds,
+                              source ("release" or "build")
   run/worker -> ../releases/…    pin of open-workspaces-worker.service (its assets are the live set)
   run/agent  -> ../releases/…    pin of open-workspaces.service
   run/dashboard -> ../releases/… pin of open-workspaces-dashboard.service
@@ -63,7 +64,8 @@ node inventory, even before any node enrolls. Reported local CPU/RAM/slots are z
 `restart --worker` is refused. Applying a different role to an existing host is
 refused before rendering or stopping units; use a separately planned cutover.
 
-Staging uses `scripts/setup-local.sh --controller-only`: it reuses the pinned
+Staging installs only the released `ow` (no setup script), or, when it builds,
+uses `scripts/setup-local.sh --controller-only`: it reuses the pinned
 Rust toolchain but builds only `ow`, without Firecracker, guest builds, network
 assets or KVM preflight. Upgrades neither probe a local worker nor inspect
 captures, quiesce, drain or canary local boxes. Worker-only release changes do
@@ -173,7 +175,8 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   `scripts/setup-local.sh`, which fetches the release's pinned guest kernel even
   when the copied set has a base image (niced, `CPUWeight=10`, log in
   `/var/log/open-workspaces-stage.log`), `bin/ow --version` must match, `STAGED`
-  written last. A complete release is reused.
+  written last. A complete release is reused. See [Released binaries](#released-binaries)
+  for where `ow` and the guest agent come from.
 - **gate**: again, with the staged kernel's hash and the boxes as they are now.
   With `--accept-cold` and backups configured, `ow-backup` runs first.
 - **hibernate**: the worker is quiesced first (it then refuses starts and wakes),
@@ -196,6 +199,36 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   reads the journal first and aborts, rolls back or finishes.
 
 Old releases are pruned: every pinned release plus the two newest others stay.
+
+### Released binaries
+
+Staging (first boot and `ow-host upgrade`) installs the release's published
+binaries instead of compiling them when all of these hold:
+
+- the pinned commit is the release tag `vVERSION` (VERSION from its
+  `Cargo.toml`); a branch or commit that is not the tag builds;
+- `repository` is a GitHub `https://github.com/OWNER/REPO` URL, whose release
+  `vVERSION` is downloaded by exact tag, never `latest`;
+- the host is x86-64 and the release's `SHA256SUMS` lists `ow-linux-amd64`, plus
+  `ow-guest-linux-amd64` on a host with a worker (0.9.19 is the first release
+  that publishes the guest agent).
+
+Then `source-commit.txt` and each binary must match `SHA256SUMS`, and
+`source-commit.txt` must name the pinned commit. Any mismatch is refused before
+anything is written to the release directory, so a retry starts clean. The
+static `ow` becomes `bin/ow` and the dashboard's Linux CLI download; a worker host
+still runs the release's `scripts/setup-local.sh` for Firecracker, the guest
+kernel and network assets, but with the verified guest agent and no Rust
+toolchain or cargo build (a fresh volume without a base image still installs the
+toolchain for the image's test fixture). A controller host runs no setup script.
+The dashboard is part of `ow`.
+
+Otherwise, or with `ow-host upgrade --from-source` (`ow-aws upgrade --from-source`),
+the release builds on the host as before. The output names the path:
+`installing … from the released binaries of vX.Y.Z` or `building … from source:
+REASON`, and `STAGED` records `"source"`. The upgrader that runs is the host's
+current `ow-host`, so a host on 0.9.17 or older builds when it stages 0.9.19;
+later upgrades install.
 
 ## Runners
 

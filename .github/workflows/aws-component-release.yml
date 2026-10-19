@@ -35,6 +35,9 @@ jobs:
           sudo apt-get install -y musl-tools
           rustup target add --toolchain 1.97.0 x86_64-unknown-linux-musl
           bash scripts/build-local.sh
+          # Hosts install the released guest agent instead of building it.
+          cp data/runtime-spike/guest/ow-guest data/runtime-spike/bin/ow-guest-linux-amd64
+          sha256sum data/runtime-spike/bin/ow-guest-linux-amd64 | cut -d ' ' -f 1 > data/runtime-spike/bin/ow-guest-linux-amd64.sha256
           # A musl container with no host libraries catches accidental glibc linkage.
           docker run --rm --user 65534:65534 -v "$PWD/data/runtime-spike/bin:/client:ro" alpine:3.22 /client/ow-linux-amd64 --version
       - name: Build native macOS CLI using existing build machinery
@@ -50,6 +53,7 @@ jobs:
           path: |
             data/runtime-spike/bin/${{ matrix.artifact }}
             data/runtime-spike/bin/${{ matrix.artifact }}.sha256
+            data/runtime-spike/bin/ow-guest-linux-amd64*
           if-no-files-found: error
   check-and-tag:
     needs: clients
@@ -104,7 +108,7 @@ jobs:
         run: |
           set -euo pipefail
           cd release-clients
-          for artifact in ow-linux-amd64 ow-darwin-arm64 ow-darwin-amd64; do
+          for artifact in ow-linux-amd64 ow-guest-linux-amd64 ow-darwin-arm64 ow-darwin-amd64; do
             test "$(sha256sum "$artifact" | cut -d ' ' -f 1)" = "$(cat "$artifact.sha256")"
           done
           cp ../crates/ow/cli/install.sh install.sh

@@ -2,6 +2,9 @@
 
 Run: python3 -m unittest discover -s deploy/aws/host
 """
+import contextlib
+import hashlib
+import io
 import json
 import os
 import subprocess
@@ -9,6 +12,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ow_host as h  # noqa: E402
@@ -555,6 +560,111 @@ class Staging(unittest.TestCase):
         with self.assertRaisesRegex(Refused, "reports ow 0.5.0"):
             u.stage(target)
         self.assertIsNone(h.staged(target["release"]))
+
+    def published(self, target, sums=None, source=None, drop=()):
+        """A fake GitHub release of the tagged commit: its assets, SHA256SUMS and source commit."""
+        assets = {"ow-linux-amd64": b"#!/bin/sh\necho ow 0.5.1\n", "ow-guest-linux-amd64": b"released guest agent",
+                  "source-commit.txt": ((source or target["commit"]) + "\n").encode()}
+        listed = {name: hashlib.sha256(data).hexdigest() for name, data in assets.items()}
+        listed.update(sums or {})
+        assets["SHA256SUMS"] = "".join(f"{v}  {k}\n" for k, v in listed.items() if k not in drop).encode()
+        for name in drop:
+            assets.pop(name)
+        base = "https://github.example/releases/download/v0.5.1"
+        seen = []
+
+        def download(url):
+            seen.append(url.rsplit("/", 1)[1])
+            return assets.get(url.removeprefix(base + "/"))
+
+        self.seen = seen
+        return [mock.patch.object(u, "release_url", lambda repository, tag: tag == "v0.5.1" and base),
+                mock.patch.object(u, "download", download),
+                mock.patch.object(u.os, "uname", return_value=SimpleNamespace(machine="x86_64"))]
+
+    def stage(self, target, patches, from_source=False):
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack, contextlib.redirect_stdout(out):
+            for patch in patches:
+                stack.enter_context(patch)
+            try:
+                return u.stage(target, from_source)
+            finally:
+                self.log = out.getvalue()
+
+    def test_released_binaries_are_verified_and_installed_without_a_build(self):
+        # A stand-in for setup-local.sh that installs the guest agent it is given and builds nothing.
+        os.environ["OW_HOST_BUILD"] = 'cp "$OW_PREBUILT_GUEST" data/runtime-spike/guest/ow-guest'
+        target = u.fetch({"release": {"repository": str(self.repo), "ref": "v0.5.1"}})
+        name = self.stage(target, self.published(target))
+        rel = h.p(f"{h.SRV}/releases/{name}")
+        self.assertEqual((rel / "bin/ow").read_bytes(), b"#!/bin/sh\necho ow 0.5.1\n")
+        self.assertEqual((rel / "assets/guest/ow-guest").read_bytes(), b"released guest agent")
+        self.assertEqual((rel / "assets/bin/ow-linux-amd64").read_bytes(), (rel / "bin/ow").read_bytes())
+        self.assertFalse((h.p(f"{h.SRV}/build/target/release/ow")).exists(), "nothing was compiled")
+        self.assertEqual(h.staged(name)["source"], "release")
+        self.assertIn("from the released binaries of v0.5.1", self.log)
+        self.assertEqual(self.seen, ["SHA256SUMS", "source-commit.txt", "ow-linux-amd64", "ow-guest-linux-amd64"])
+        self.assertFalse(h.p(f"{h.SRV}/build/prebuilt").exists())
+
+    def test_a_controller_installs_only_the_released_ow(self):
+        h.write_json(h.CONFIG, {"role": "controller"})
+        os.environ["OW_HOST_BUILD"] = "false"  # a controller runs no setup script at all
+        target = u.fetch({"release": {"repository": str(self.repo), "ref": "v0.5.1"}})
+        name = self.stage(target, self.published(target, drop=("ow-guest-linux-amd64",)))
+        self.assertEqual(h.staged(name)["source"], "release")
+        self.assertNotIn("ow-guest-linux-amd64", self.seen)
+
+    def test_a_checksum_mismatch_is_refused_and_installs_nothing(self):
+        target = u.fetch({"release": {"repository": str(self.repo), "ref": "v0.5.1"}})
+        with self.assertRaisesRegex(Refused, "ow-guest-linux-amd64 does not match its SHA256SUMS"):
+            self.stage(target, self.published(target, sums={"ow-guest-linux-amd64": "0" * 64}))
+        self.assertFalse(h.p(f"{h.SRV}/releases/{target['release']}").exists())
+        self.assertIsNone(h.staged(target["release"]))
+
+    def test_a_commit_mismatch_is_refused_and_installs_nothing(self):
+        target = u.fetch({"release": {"repository": str(self.repo), "ref": "v0.5.1"}})
+        with self.assertRaisesRegex(Refused, "was built from '1111"):
+            self.stage(target, self.published(target, source="1" * 40))
+        self.assertFalse(h.p(f"{h.SRV}/releases/{target['release']}").exists())
+
+    def test_a_missing_asset_falls_back_to_the_source_build(self):
+        target = u.fetch({"release": {"repository": str(self.repo), "ref": "v0.5.1"}})
+        name = self.stage(target, self.published(target, drop=("ow-guest-linux-amd64",)))
+        self.assertEqual((h.p(f"{h.SRV}/releases/{name}/assets/guest/ow-guest")).read_text(), "new guest agent\n")
+        self.assertEqual(h.staged(name)["source"], "build")
+        self.assertIn("from source: release v0.5.1 publishes no ow-guest-linux-amd64", self.log)
+
+    def test_an_untagged_commit_or_from_source_builds(self):
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "--allow-empty", "-m", "unreleased"], check=True)
+        target = u.fetch({"release": {"repository": str(self.repo), "ref": "HEAD"}})
+        self.assertEqual(h.staged(self.stage(target, self.published(target)))["source"], "build")
+        self.assertIn("is not the release tag v0.5.1", self.log)
+        self.assertEqual(self.seen, [], "no download for a commit that is not the tag")
+        target = u.fetch({"release": {"repository": str(self.repo), "ref": "v0.5.1"}})
+        self.assertEqual(h.staged(self.stage(target, self.published(target), from_source=True))["source"], "build")
+        self.assertIn("from source: --from-source", self.log)
+        self.assertEqual(self.seen, [])
+
+    def test_a_failed_download_is_refused_not_a_traceback(self):
+        def fail(*a, **k):
+            raise u.urllib.error.URLError("network unreachable")
+
+        with mock.patch.object(u.urllib.request, "urlopen", fail):
+            with self.assertRaisesRegex(Refused, "cannot download .*--from-source builds instead"):
+                u.download("https://github.com/o/r/releases/download/v1.2.3/SHA256SUMS")
+
+        def missing(*a, **k):
+            raise u.urllib.error.HTTPError(a[0], 404, "Not Found", None, None)
+
+        with mock.patch.object(u.urllib.request, "urlopen", missing):
+            self.assertIsNone(u.download("https://github.com/o/r/releases/download/v1.2.3/SHA256SUMS"))
+
+    def test_release_urls_are_github_tags_only(self):
+        self.assertEqual(u.release_url("https://github.com/o/r.git", "v1.2.3"),
+                         "https://github.com/o/r/releases/download/v1.2.3")
+        self.assertIsNone(u.release_url("/srv/mirror", "v1.2.3"))
+        self.assertIsNone(u.release_url("https://example.com/o/r.git", "v1.2.3"))
 
 
 if __name__ == "__main__":
