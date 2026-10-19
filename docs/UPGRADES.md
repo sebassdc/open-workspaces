@@ -420,3 +420,17 @@ registries use worker state schema 3 and refuse older readers. Catalog schema an
 reader floor remain 5. Use the existing dedicated-runner quiesce/swap/resume
 procedure, full RAM compatibility tuple and explicit cold-loss consent. Existing
 worker pins and boxes are not changed merely by installing a controller release.
+
+### Chunk-sealed recovery points
+
+Version 0.9.20 is class 2. The worker seals new managed recovery points under
+their chunk lists ([RECOVERY.md](RECOVERY.md#chunk-seals-reading-only-what-changed))
+and reports `snapshot_delete_v1`. Upgrade the worker with the normal
+quiesce/swap/resume procedure; the uploader timer needs no change. Points
+already uploaded keep their whole-file seals and stay restorable; the first point
+after the upgrade reads its files in full, later ones only what changed. A worker
+rolled back to an older release cannot verify chunk-sealed points: it fails
+closed, and a pending chunk-sealed point keeps failing until the worker is
+upgraded again. Restoring a chunk-sealed point needs a 0.9.20 or newer CLI. Protocol windows, worker
+interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are
+unchanged.
