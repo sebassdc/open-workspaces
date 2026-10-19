@@ -1173,3 +1173,263 @@ fn start_retry_replays_placed_history_after_park_without_admitting_wake() {
         0
     );
 }
+
+#[test]
+fn wake_skips_incompatible_runner_when_compatible_runner_exists() {
+    for field in ["runtime", "cpu", "kernel_sha256", "missing"] {
+        let (mut f, peers) = parked_fixture("hibernated");
+        complete_park(&mut f, &peers, true);
+        let mut wrong = json!({"runtime":"same","cpu":"right","kernel_sha256":"same"});
+        if field == "missing" {
+            wrong = Value::Null;
+        } else {
+            wrong[field] = json!("wrong");
+        }
+        f.shared.lock().unwrap().db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.compat',json(?1)) WHERE id='source'",[wrong.to_string()]).unwrap();
+        f.restart();
+        let wake = admit_wake(&mut f, false);
+        assert!(
+            tick(&f.shared, wake.id, now(), &|_, _| panic!(
+                "no RPC during reservation"
+            ))
+            .unwrap()
+        );
+        {
+            let c = f.shared.lock().unwrap();
+            assert_eq!(
+                c.transfer(wake.id).unwrap().target.as_deref(),
+                Some("target"),
+                "{field}"
+            );
+            assert_eq!(c.db.query_row("SELECT count(*) FROM transfer_reservations WHERE transfer=?1 AND node='target'",[wake.id],|r|r.get::<_,i64>(0)).unwrap(),1);
+        }
+        f.restart();
+        for _ in 0..12 {
+            if !tick(&f.shared, wake.id, now(), &|n, r| {
+                wake_call(&f, &peers, true, n, r)
+            })
+            .unwrap()
+            {
+                break;
+            }
+        }
+        let c = f.shared.lock().unwrap();
+        assert_eq!(
+            c.transfer(wake.id).unwrap().step,
+            Step::Succeeded,
+            "{field}"
+        );
+        assert_eq!(peers.borrow().starts, 1);
+        assert_eq!(peers.borrow().pulls.len(), 1);
+        assert!(
+            c.operation_info(f.user, f.transfer.operation).unwrap()["capture_manifest"].is_null()
+        );
+    }
+}
+
+#[test]
+fn compatible_draining_runner_queues_without_reservation_and_retries_same_operation() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    {
+        let c = f.shared.lock().unwrap();
+        c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.compat',json(?1),'$.drain',id='target')",[json!({"runtime":"same","cpu":"wrong","kernel_sha256":"same"}).to_string()]).unwrap();
+        c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.compat',json(?1)) WHERE id='target'",[json!({"runtime":"same","cpu":"right","kernel_sha256":"same"}).to_string()]).unwrap();
+    }
+    let wake = admit_wake(&mut f, false);
+    for _ in 0..2 {
+        assert!(
+            !tick(&f.shared, wake.id, now(), &|_, _| panic!(
+                "no RPC before an eligible reservation"
+            ))
+            .unwrap()
+        );
+        f.restart();
+        let c = f.shared.lock().unwrap();
+        assert_eq!(c.transfer(wake.id).unwrap().step, Step::Preparing);
+        assert!(c.transfer(wake.id).unwrap().target.is_none());
+        assert!(c.operation_info(f.user, wake.operation).unwrap()["queued"].is_string());
+        assert_eq!(
+            c.db.query_row("SELECT count(*) FROM transfer_reservations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            parking::admission(
+                &c,
+                f.user,
+                &json!({"op":"connect","id":"box","operation_key":"join-queued"}),
+                Kind::Wake
+            )
+            .unwrap()
+            .id,
+            wake.id
+        );
+    }
+    f.shared.lock().unwrap().db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.compat',json(?1),'$.drain',0) WHERE id='target'",[json!({"runtime":"same","cpu":"right","kernel_sha256":"same"}).to_string()]).unwrap();
+    for _ in 0..12 {
+        if !tick(&f.shared, wake.id, now(), &|n, r| {
+            wake_call(&f, &peers, true, n, r)
+        })
+        .unwrap()
+        {
+            break;
+        }
+    }
+    let c = f.shared.lock().unwrap();
+    assert_eq!(c.transfer(wake.id).unwrap().step, Step::Succeeded);
+    assert_eq!(
+        c.transfer(wake.id).unwrap().target.as_deref(),
+        Some("target")
+    );
+    assert_eq!(peers.borrow().starts, 1);
+    assert_eq!(
+        c.db.query_row(
+            "SELECT count(*) FROM transfers WHERE kind='wake'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn disk_only_or_explicit_cold_wake_does_not_require_a_ram_match() {
+    for ram in [false, true] {
+        let (mut f, peers) = parked_fixture(if ram { "hibernated" } else { "stopped" });
+        complete_park(&mut f, &peers, ram);
+        let wake = {
+            let c = f.shared.lock().unwrap();
+            c.db.execute(
+                "UPDATE nodes SET capabilities=json_remove(capabilities,'$.compat')",
+                [],
+            )
+            .unwrap();
+            parking::admission(
+                &c,
+                f.user,
+                &json!({"op":"wake","id":"box","operation_key":"cold-or-disk","accept_cold":ram}),
+                Kind::Wake,
+            )
+            .unwrap()
+        };
+        assert!(
+            tick(&f.shared, wake.id, now(), &|_, _| panic!(
+                "no RPC during reservation"
+            ))
+            .unwrap()
+        );
+        let c = f.shared.lock().unwrap();
+        assert_eq!(
+            c.transfer(wake.id).unwrap().target.as_deref(),
+            Some("source")
+        );
+        assert!(
+            c.db.query_row(
+                "SELECT node='' AND current_capture=?1 FROM resources WHERE physical='physical'",
+                [wake.capture],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+        );
+        assert_eq!(peers.borrow().starts, 0);
+    }
+}
+
+#[test]
+fn changed_saved_manifest_cannot_admit_a_wake_reservation() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    f.shared.lock().unwrap().db.execute("UPDATE operations SET response=json_set(response,'$.capture_manifest.created_unix',123) WHERE id=?1",[f.transfer.operation]).unwrap();
+    let wake = admit_wake(&mut f, false);
+    let error = tick(&f.shared, wake.id, now(), &|_, _| {
+        panic!("no RPC with changed manifest")
+    })
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("manifest digest differs"),
+        "{error:#}"
+    );
+    let c = f.shared.lock().unwrap();
+    assert_eq!(c.transfer(wake.id).unwrap().step, Step::Preparing);
+    assert_eq!(
+        c.db.query_row("SELECT count(*) FROM transfer_reservations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(peers.borrow().starts, 0);
+}
+
+#[test]
+fn no_compatible_runner_fails_before_pull_and_allows_explicit_cold_retry() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    f.shared
+        .lock()
+        .unwrap()
+        .db
+        .execute(
+            "UPDATE nodes SET capabilities=json_remove(capabilities,'$.compat')",
+            [],
+        )
+        .unwrap();
+    let warm = admit_wake(&mut f, false);
+    assert!(
+        !tick(&f.shared, warm.id, now(), &|_, _| panic!(
+            "no RPC to an incompatible runner"
+        ))
+        .unwrap()
+    );
+    f.restart();
+    let cold = {
+        let c = f.shared.lock().unwrap();
+        assert_eq!(c.transfer(warm.id).unwrap().step, Step::Failed);
+        assert!(
+            c.operation_info(f.user, warm.operation).unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("--accept-cold")
+        );
+        assert_eq!(
+            c.db.query_row("SELECT count(*) FROM transfer_reservations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(
+            c.db.query_row(
+                "SELECT node='' AND current_capture=?1 FROM resources WHERE physical='physical'",
+                [&warm.capture],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+        );
+        parking::admission(&c,f.user,&json!({"op":"wake","id":"box","operation_key":"explicit-cold-retry","accept_cold":true}),Kind::Wake).unwrap()
+    };
+    assert_ne!(cold.id, warm.id);
+    assert_eq!(peers.borrow().starts, 0);
+    for _ in 0..12 {
+        if !tick(&f.shared, cold.id, now(), &|n, r| {
+            wake_call(&f, &peers, true, n, r)
+        })
+        .unwrap()
+        {
+            break;
+        }
+    }
+    let c = f.shared.lock().unwrap();
+    assert_eq!(c.transfer(cold.id).unwrap().step, Step::Succeeded);
+    assert_eq!(peers.borrow().starts, 1);
+    assert_eq!(
+        c.db.query_row(
+            "SELECT state FROM artifacts WHERE id=?1",
+            [&warm.capture],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "stored"
+    );
+}

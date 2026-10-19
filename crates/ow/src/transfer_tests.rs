@@ -23,7 +23,7 @@ impl Fixture {
         c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node,ssh_policy) VALUES(?1,'machine','box','physical',?2,'source','\"disabled\"')",params![user,json!({"id":"physical","state":"stopped","memory_mib":256,"vcpu_count":1,"disk_bytes":4}).to_string()]).unwrap();
         c.db.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,attempt,digest,store_url) VALUES('capture','capture',?1,'physical','sealed','stored',?2,?3,'s3://bucket/root')",params![user,"a".repeat(32),"b".repeat(64)]).unwrap();
         for node in ["source", "target"] {
-            c.db.execute("INSERT INTO nodes(id,memory_mib,slots,heartbeat,capabilities) VALUES(?1,2048,4,?2,?3)",params![node,now(),json!({"memory_mib":2048,"slots":4,"vcpus":4,"placement_fencing_v1":true,"worker_protocol":2,"managed_restore_v1":true,"available_disk_bytes":1024,"disk_observed_unix_s":now(),"guest_ssh_v1":true}).to_string()]).unwrap();
+            c.db.execute("INSERT INTO nodes(id,memory_mib,slots,heartbeat,capabilities) VALUES(?1,2048,4,?2,?3)",params![node,now(),json!({"memory_mib":2048,"slots":4,"vcpus":4,"placement_fencing_v1":true,"worker_protocol":2,"managed_restore_v1":true,"available_disk_bytes":1024,"disk_observed_unix_s":now(),"guest_ssh_v1":true,"compat":{"runtime":"same","cpu":"right","kernel_sha256":"same"}}).to_string()]).unwrap();
         }
         let transfer = c
             .begin_transfer(
@@ -834,7 +834,7 @@ fn publication(request: &Value, ram: bool) -> Value {
             },
         );
     }
-    let native = json!({"workspace":a.machine,"name":a.snapshot,"memory_mib":256,"vcpu_count":1,"managed":true,"files":hashes});
+    let native = json!({"workspace":a.machine,"name":a.snapshot,"memory_mib":256,"vcpu_count":1,"managed":true,"runtime":"same","cpu":"right","kernel_sha256":"same","files":hashes});
     let manifest = store::Manifest {
         format: 1,
         kind: "capture".into(),
@@ -1082,9 +1082,9 @@ fn wake_call(
     request: Value,
 ) -> Result<Value> {
     match request["op"].as_str().unwrap() {
-        "status" => Ok(json!({"compat":"compatible"})),
+        "status" => Ok(json!({"compat":{"runtime":"same","cpu":"right","kernel_sha256":"same"}})),
         "capture-cache" => Ok(
-            json!({"present":peers.borrow().cached,"digest":request["artifact"]["reference"]["digest"],"manifest_sha256":"c".repeat(64),"ram":ram,"compat":"compatible"}),
+            json!({"present":peers.borrow().cached,"digest":request["artifact"]["reference"]["digest"],"manifest_sha256":"c".repeat(64),"ram":ram,"compat":{"runtime":"same","cpu":"right","kernel_sha256":"same"}}),
         ),
         "capture-pull" => {
             let digest = request["artifact"]["reference"]["digest"].clone();

@@ -220,7 +220,12 @@ transaction, preserving the transfer, epoch and uncertain effects.
 All connection types/users join one wake under the physical machine's transfer
 lock. Queued wake has no target reservation. Fresh, nonrevoked, nondraining fencing
 runners with the required agent, disk headroom and CPU/RAM/slot budget are tried
-in stable node order. No fit produces visible `queued` status; startup recovery
+in stable node order. Warm RAM also requires a matching advertised runtime, CPU
+and guest-kernel tuple before any reservation. Parking retains the digest-verified
+manifest in its durable operation record; older records read the pinned manifest
+without holding the catalog lock. Disk-only or explicitly consented cold wake
+does not require a RAM match. A compatible runner without available capacity or
+one temporarily draining/offline produces visible `queued` status; startup recovery
 tries again. Once reserved, a timeout retains that target and reservation and does
 not create another operation. The runner probes verified cache, pulls only if
 absent, imports unstarted, commits placement and then activates. Source-cache reuse
@@ -241,7 +246,9 @@ Progress reports logical bytes in completed compressed file objects. It is polle
 approximately every five seconds during a transfer, and final completion is saved
 with the transition. It is not instantaneous wire throughput or proof of import;
 the step distinguishes transfer completion from validation/commit/start. Errors
-retain the last progress. Incompatible stored RAM fails before import and keeps
+retain the last progress. When no runner matches the stored RAM, wake fails before
+reservation or pull, leaving the parked artifact available for a fresh explicit cold decision. Worker
+compatibility is rechecked after pull; a changed tuple fails before import and keeps
 the old artifact/parked placement. A new operation key with `wake --accept-cold`
 records explicit consent; the old RAM artifact stays recoverable through and after
 that decision's commit. Ordinary connections cannot supply this consent.

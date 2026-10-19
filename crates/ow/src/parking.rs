@@ -324,24 +324,94 @@ fn public_status(c: &Catalog, t: &Transfer) -> Result<Value> {
     Ok(value)
 }
 pub(super) fn reserve_wake(shared: &Shared, t: &Transfer) -> Result<bool> {
+    let (input, a, saved) = {
+        let c = shared.lock().unwrap();
+        authorized(&c, t)?;
+        let a = artifact(&c, t)?;
+        let saved: Option<String> = c.db.query_row("SELECT json_extract(o.response,'$.capture_manifest') FROM transfers p JOIN operations o ON o.id=p.operation WHERE p.capture=?1 AND p.source=?2 AND p.kind IN ('park','wake') AND json_type(o.response,'$.capture_manifest')='object' ORDER BY p.id DESC LIMIT 1",params![a.id,t.source],|r|r.get(0)).optional()?;
+        (intent(&c, t)?, a, saved)
+    };
+    let mut fetched = None;
+    let compatibility = if input.accept_cold {
+        None
+    } else {
+        let manifest: store::Manifest = if let Some(saved) = saved {
+            serde_json::from_str(&saved)?
+        } else {
+            // Older park records need only their pinned manifest; never hold the catalog over I/O.
+            let objects = store::S3Objects::new(&a.store_url, None)?;
+            let manifest = store::read_manifest(&objects, &a.reference)?;
+            fetched = Some(manifest.clone());
+            manifest
+        };
+        ensure!(
+            store::sha256(&manifest.bytes()?) == a.reference.digest,
+            "saved capture manifest digest differs"
+        );
+        let (_, native) = native(&manifest, &a)?;
+        if manifest.files.len() == 3 {
+            let compatibility = json!({"runtime":native["runtime"],"cpu":native["cpu"],"kernel_sha256":native["kernel_sha256"]});
+            ensure!(
+                compatibility
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|v| v.as_str().is_some_and(|s| !s.is_empty())),
+                "saved RAM compatibility is incomplete"
+            );
+            Some(compatibility)
+        } else {
+            None
+        }
+    };
     let c = shared.lock().unwrap();
     authorized(&c, t)?;
-    let input = intent(&c, t)?;
-    let nodes: Vec<String> =
-        c.db.prepare("SELECT id FROM nodes WHERE revoked=0 ORDER BY id")?
-            .query_map([], |r| r.get(0))?
+    let current_transfer = c.transfer(t.id)?;
+    if current_transfer.step != Step::Preparing {
+        return Ok(!current_transfer.step.terminal());
+    }
+    let current = artifact(&c, t)?;
+    ensure!(
+        current.reference.digest == a.reference.digest
+            && current.reference.attempt == a.reference.attempt
+            && current.store_url == a.store_url,
+        "stored capture changed during wake selection"
+    );
+    if let Some(manifest) = fetched {
+        c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.capture_manifest',json(?1)) WHERE id=?2",params![serde_json::to_string(&manifest)?,t.operation])?;
+    }
+    let nodes: Vec<(String, String)> =
+        c.db.prepare("SELECT id,capabilities FROM nodes WHERE revoked=0 ORDER BY id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-    for node in nodes {
-        if capable(&c, &node, input.disk_bytes.saturating_mul(2)).is_ok()
+    let mut compatible_runner = false;
+    for (node, caps) in nodes {
+        let compatible = compatibility.as_ref().is_none_or(|expected| {
+            serde_json::from_str::<Value>(&caps).is_ok_and(|caps| &caps["compat"] == expected)
+        });
+        compatible_runner |= compatible;
+        if compatible
+            && capable(&c, &node, input.disk_bytes.saturating_mul(2)).is_ok()
             && c.reserve_wake(t.id, &node, &input).is_ok()
         {
             return Ok(true);
         }
     }
+    if !compatible_runner && compatibility.is_some() {
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            Step::Preparing,
+            Step::Failed,
+            &Evidence::default(),
+        )?;
+        c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.error',?1) WHERE id=?2",params!["incompatible stored RAM; retry with a new operation key and explicit --accept-cold consent",t.operation])?;
+        return Ok(false);
+    }
     c.db.execute(
-        "UPDATE operations SET response=?1 WHERE id=?2",
+        "UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.queued',?1) WHERE id=?2",
         params![
-            json!({"queued":"No eligible runner with capacity; wake remains queued."}).to_string(),
+            "No eligible runner with capacity for this capture; wake remains queued.",
             t.operation
         ],
     )?;
@@ -489,7 +559,7 @@ pub(super) fn tick(
             let c = shared.lock().unwrap();
             authorized(&c, t)?;
             let bytes: u64 = manifest.files.values().map(|f| f.size).sum();
-            c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.progress',json(?1)) WHERE id=?2",params![json!({"bytes_completed":bytes,"bytes_total":bytes,"unit":"logical bytes in completed file objects"}).to_string(),t.operation])?;
+            c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.progress',json(?1),'$.capture_manifest',json(?2)) WHERE id=?3",params![json!({"bytes_completed":bytes,"bytes_total":bytes,"unit":"logical bytes in completed file objects"}).to_string(),serde_json::to_string(&manifest)?,t.operation])?;
             c.db.execute("UPDATE artifacts SET state='stored',digest=?1,logical_bytes=?2,stored_at=CURRENT_TIMESTAMP WHERE id=?3 AND attempt=?4 AND state IN ('uploading','stored')",params![reference.digest,bytes as i64,a.id,reference.attempt])?;
             c.db.execute("INSERT INTO artifact_copies(artifact,node,state,last_used) VALUES(?1,?2,'present',?3) ON CONFLICT(artifact,node) DO UPDATE SET state='present',last_used=excluded.last_used",params![a.id,t.source_node,at])?;
             c.advance_transfer(

@@ -1251,6 +1251,7 @@ pub fn agent(
                     beat["placement_fencing_v1"] =
                         json!(common::placement_capable(&status).is_ok());
                     for field in [
+                        "compat",
                         "max_disk_gib",
                         "reserved_disk_bytes",
                         "min_free_gib",

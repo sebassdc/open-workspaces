@@ -235,6 +235,53 @@ fn real_park_jobs_complete_without_process_loss() {
 
 #[test]
 #[cfg(target_arch = "x86_64")]
+fn legacy_park_wake_reads_pinned_manifest_and_survives_restart() {
+    let (mut p, user, park) = park_fixture(true);
+    p.start_controller();
+    p.start_agent("source");
+    p.start_agent("target");
+    wait_transfer(&p, park);
+    p.kill_controller();
+    let ctl = p.root.join("controller");
+    let c = Catalog::open(&ctl, "test", None).unwrap();
+    // Model a completed park written before manifests were retained in operation history.
+    c.db.execute("UPDATE operations SET response=json_remove(response,'$.capture_manifest') WHERE id=(SELECT operation FROM transfers WHERE id=?1)",[park]).unwrap();
+    fs::write(p.root.join("source/drain"), b"").unwrap();
+    c.db.execute(
+        "UPDATE nodes SET capabilities=json_set(capabilities,'$.drain',1) WHERE id='source'",
+        [],
+    )
+    .unwrap();
+    let wake = super::super::parking::admission(
+        &c,
+        user,
+        &json!({"op":"connect","id":"box","operation_key":"legacy-wake"}),
+        Kind::Wake,
+    )
+    .unwrap();
+    drop(c);
+    p.start_controller();
+    wait_transfer(&p, wake.id);
+    p.kill_controller();
+    let c = Catalog::open(&ctl, "test", None).unwrap();
+    assert_eq!(
+        c.transfer(wake.id).unwrap().target.as_deref(),
+        Some("target")
+    );
+    let state: Value =
+        serde_json::from_slice(&fs::read(p.root.join("target/fixture-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["counts"]["activate"], 1);
+    assert_eq!(
+        c.db.query_row("SELECT count(*) FROM transfer_reservations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
 fn real_park_publication_reuses_a_failed_restore_export() {
     let mut p = fixture();
     writable_store(&p);
