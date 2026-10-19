@@ -349,7 +349,7 @@ pub fn inventory(root: &Path) -> Result<Value> {
         for (key,bound) in [("memory_mib",ram),("slots",slots),("vcpus",cpus)] {
             cap[key]=json!(cap[key].as_u64().unwrap_or(0).min(bound as u64));
         }
-        Ok(json!({"id":r.get::<_,String>(0)?,"revoked":r.get::<_,bool>(1)?,"online":!r.get::<_,bool>(1)? && r.get::<_,i64>(2)?>now()-OFFLINE && r.get::<_,i64>(2)?<=now(),"memory_mib":cap["memory_mib"],"slots":cap["slots"],"capabilities":cap,"owner_limits":{"memory":ram,"slots":slots,"cpus":cpus}}))
+        Ok(json!({"id":r.get::<_,String>(0)?,"revoked":r.get::<_,bool>(1)?,"online":!r.get::<_,bool>(1)? && r.get::<_,i64>(2)?>now()-OFFLINE && r.get::<_,i64>(2)?<=now(),"last_seen_unix_s":r.get::<_,i64>(2)?,"memory_mib":cap["memory_mib"],"slots":cap["slots"],"capabilities":cap,"owner_limits":{"memory":ram,"slots":slots,"cpus":cpus}}))
     })?;
     Ok(Value::Array(
         rows.collect::<std::result::Result<Vec<_>, _>>()?,
@@ -1202,6 +1202,17 @@ pub fn agent(
                     // Optional fields (older controllers ignore them): releases for upgrade
                     // health checks, and a drain the host upgrader declares.
                     beat["disk_resize_v1"] = json!(status["disk_resize_v1"] == true);
+                    for field in [
+                        "max_disk_gib",
+                        "reserved_disk_bytes",
+                        "min_free_gib",
+                        "available_disk_bytes",
+                        "disk_observed_unix_s",
+                        "workspace_count",
+                        "max_workspaces",
+                    ] {
+                        beat[field] = status[field].clone();
+                    }
                     beat["version"] = json!(env!("CARGO_PKG_VERSION"));
                     beat["worker"] =
                         json!({"version":status["version"],"protocol":status["worker_protocol"]});

@@ -1364,7 +1364,14 @@ fn owner_quota_each_boundary_override_and_stopped_accounting() {
         // Stable retries neither grow usage nor fail at the exact cap.
         c.operation(a, create).unwrap();
         c.operation(a, json!({"op":"stop","id":"one"})).unwrap();
-        let usage = c.state(a).unwrap()["owner_limits"]["usage"].clone();
+        let state = c.state(a).unwrap();
+        assert_eq!(state["discovery"]["schema"], 1);
+        assert_eq!(
+            state["discovery"]["identity"]["email"],
+            "alice@example.test"
+        );
+        assert_eq!(state["owner_limits"]["caps"], caps);
+        let usage = state["owner_limits"]["usage"].clone();
         assert_eq!(
             usage,
             json!({"cpus":1,"memory_mib":256,"disk_gib":8,"boxes":1})

@@ -64,6 +64,10 @@ Use the [versioned GitHub Release installer](docs/INSTALL.md) for a compiled
 macOS or Linux client. Tailnet clients need no Rust, root or cloudflared.
 Connection endpoints and release pins belong in the consuming project.
 
+For an existing coding agent operating its own remote workspace, see the
+[remote CLI discovery guide](docs/AGENT_CLI.md) for target/identity, images,
+resource units, noninteractive output and safe retries.
+
 ## Read first
 
 1. [Agent handoff](docs/HANDOFF.md): context, first task, and acceptance criteria.

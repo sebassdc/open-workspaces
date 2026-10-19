@@ -5,6 +5,8 @@ mod catalog;
 mod client;
 #[cfg(target_os = "linux")]
 mod dashboard;
+#[cfg(any(target_os = "linux", test))]
+mod discovery;
 #[cfg(target_os = "linux")]
 mod host;
 #[cfg(target_os = "linux")]
@@ -46,7 +48,8 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     version,
-    about = "Persistent microVM workspaces: local worker and remote HTTPS/WSS client"
+    about = "Persistent microVM workspaces: local worker and remote HTTPS/WSS client",
+    after_help = "Remote first use: login URL [--tailnet] -> status -> image list -> create NAME --image ubuntu --memory 2048 --cpus 2 -> exec NAME -- COMMAND.\nCheck image list development_choice before create; omit --node for automatic placement.\nWorkspace commands: list, inspect, exec, put/get, ssh, publish/unpublish, start/stop/hibernate, snapshot/fork/restore/delete.\nMetadata is JSON; exec prints raw guest output and returns its exit status. See docs/AGENT_CLI.md.\nHost operators: host, node, backup, up/down, dashboard/serve, node-* are local/admin commands."
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -99,7 +102,7 @@ enum Action {
         #[command(subcommand)]
         command: NodeAction,
     },
-    /// Golden images built from recipes on this machine's runner (Linux).
+    /// Discover remote prepared images; build/manage local golden images (Linux).
     Image {
         #[command(subcommand)]
         command: ImageAction,
@@ -159,9 +162,9 @@ enum Action {
         #[arg(long)]
         controller: Option<String>,
     },
-    NodeRevoke {
-        node: String,
-    },
+    /// Host-only: revoke this controller's node enrollment.
+    NodeRevoke { node: String },
+    /// JSON placement resources on the selected server (or local node inventory).
     Nodes,
     /// Connect this worker outbound; credentials are stored outside the guest.
     NodeAgent {
@@ -176,24 +179,30 @@ enum Action {
         #[arg(long)]
         insecure_loopback_test: bool,
     },
+    /// Local-only: start the prototype worker.
     Up,
+    /// Local-only: shut down the prototype worker.
     Down {
         /// Hibernate running machines first, with new starts and wakes refused,
         /// so their processes survive the shutdown.
         #[arg(long)]
         hibernate: bool,
     },
+    /// JSON selected server, identity, compatibility and placement discovery.
     Status,
+    /// JSON usage for your workspaces.
     Stats,
+    /// List your owned and shared workspaces as JSON.
     List,
-    Inspect {
-        id: String,
-    },
+    /// Inspect one workspace as JSON.
+    Inspect { id: String },
+    /// Create a persistent workspace; discover remote choices with `image list` first.
     Create {
         id: String,
         /// alpine, ubuntu, arch, ubuntu-arm64 (Mac), or a golden image from `ow image build`.
         #[arg(long, default_value = "alpine")]
         image: String,
+        /// RAM in MiB; local prototype default is minimal. Prefer a discovered development choice.
         #[arg(long, default_value_t = 256)]
         memory: u32,
         #[arg(long, default_value_t = 1)]
@@ -216,20 +225,18 @@ enum Action {
         #[arg(long, value_parser = common::parse_disk_size)]
         disk: Option<u32>,
     },
-    Start {
-        id: String,
-    },
-    Stop {
-        id: String,
-    },
+    /// Start or wake an existing workspace.
+    Start { id: String },
+    /// Stop a workspace (disk persists; running processes end).
+    Stop { id: String },
+    /// Run a noninteractive command; raw combined output and guest exit status.
     Exec {
         id: String,
         #[arg(required = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
-    Shell {
-        id: String,
-    },
+    /// Open an interactive guest terminal; use exec when stdin is closed.
+    Shell { id: String },
     /// Run ordinary OpenSSH into the guest (use -- before ssh options/command).
     Ssh {
         id: String,
@@ -237,13 +244,9 @@ enum Action {
         args: Vec<String>,
     },
     /// Binary stdio for standard OpenSSH ProxyCommand; no diagnostics on stdout.
-    SshProxy {
-        id: String,
-    },
+    SshProxy { id: String },
     /// Print reviewable OpenSSH config without changing ~/.ssh/config.
-    SshConfig {
-        id: String,
-    },
+    SshConfig { id: String },
     /// Replace this machine's registered public keys; private keys stay local.
     SshAuthorize {
         id: String,
@@ -253,37 +256,34 @@ enum Action {
         upgrade: bool,
     },
     /// Remove all registered keys and invalidate existing SSH streams.
-    SshRevoke {
-        id: String,
-    },
+    SshRevoke { id: String },
     /// Inspect enrolled host public key and machine-specific identity.
-    SshInfo {
-        id: String,
-    },
+    SshInfo { id: String },
+    /// Upload a file (remote API limit: 256 KiB; use SSH/SFTP for larger files).
     Put {
         id: String,
         local: PathBuf,
         guest: String,
     },
+    /// Download a file to a new local path (remote API limit: 256 KiB).
     Get {
         id: String,
         guest: String,
         local: PathBuf,
     },
-    Snapshot {
-        id: String,
-        name: String,
-    },
+    /// Capture paired RAM and disk under an immutable snapshot name.
+    Snapshot { id: String, name: String },
+    /// List your snapshots as JSON.
     Snapshots,
+    /// Fork a workspace's paired RAM and disk into an independent workspace.
     Fork {
         id: String,
         child: String,
         #[arg(long)]
         snapshot: Option<String>,
     },
-    Hibernate {
-        id: String,
-    },
+    /// Save RAM and disk, then stop compute; start resumes the saved state.
+    Hibernate { id: String },
     /// Let a teammate use one of your machines; they address it as `you@example.com/NAME`
     /// (remote server only). A teammate's fork copies everything on it, credentials included.
     Share {
@@ -304,18 +304,16 @@ enum Action {
     },
     /// Delete a stopped or hibernated workspace with its disk and its own snapshots (on a
     /// remote server: owner only; a machine the runner no longer has just leaves the list).
-    Delete {
-        id: String,
-    },
-    Restore {
-        id: String,
-        name: String,
-    },
+    Delete { id: String },
+    /// Rewind a workspace to its named snapshot (later changes are replaced).
+    Restore { id: String, name: String },
+    /// Open a guest HTTP preview (remote availability depends on the server).
     Publish {
         id: String,
         #[arg(long, default_value_t = 8080)]
         port: u16,
     },
+    /// Remove a published guest HTTP preview.
     Unpublish {
         id: String,
         #[arg(long)]
@@ -326,10 +324,7 @@ enum Action {
     #[command(hide = true)]
     Supervisor,
     #[command(hide = true)]
-    Gateway {
-        id: String,
-        port: u16,
-    },
+    Gateway { id: String, port: u16 },
 }
 
 #[derive(Subcommand)]
@@ -395,7 +390,7 @@ enum ImageAction {
         #[arg(long, default_value_t = 60)]
         timeout_minutes: u64,
     },
-    /// Golden images built on this runner.
+    /// JSON remote image availability/resources, or golden images on the local runner.
     List {
         #[arg(long)]
         runner: Option<PathBuf>,
@@ -593,6 +588,23 @@ fn main_result() -> anyhow::Result<i32> {
         }
     }
     if let Action::Image { command } = cli.command {
+        let selected = if cli.local_mode
+            || (!matches!(command, ImageAction::List { .. }) && cli.server.is_none())
+        {
+            None
+        } else {
+            match cli
+                .server
+                .clone()
+                .or_else(|| std::env::var("OW_SERVER").ok())
+            {
+                Some(server) => Some(server),
+                None => client::saved_server()?,
+            }
+        };
+        if let Some(server) = selected {
+            return client::run(&server, Action::Image { command }, cli.operation_key);
+        }
         anyhow::ensure!(
             cli.server.is_none(),
             "images are built on this machine's runner; omit --server"
@@ -699,13 +711,16 @@ fn main_result() -> anyhow::Result<i32> {
         Action::NodeController { .. }
             | Action::NodeJoin { .. }
             | Action::NodeRevoke { .. }
-            | Action::Nodes
             | Action::NodeAgent { .. }
             | Action::Worker
             | Action::Supervisor
             | Action::Gateway { .. }
             | Action::Dashboard { .. }
             | Action::Serve { .. }
+    );
+    anyhow::ensure!(
+        !(internal && !cli.local_mode && server.is_some()),
+        "host-only command cannot use a remote server; run it on the host with --local"
     );
     let server = if cli.local_mode || internal {
         None

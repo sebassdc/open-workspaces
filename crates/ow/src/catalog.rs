@@ -75,10 +75,37 @@ fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
         (_, "node route unavailable before dispatch") => {
             "Node is unavailable; no operation was dispatched. Retry with the same operation key when it reconnects."
         }
-        _ => {
-            "Operation did not complete. Check its status before retrying; use the same retry key. The host journal records the cause under this operation ID."
-        }
+        _ => first_use_error(diagnostic).map(|(_,message)| message).unwrap_or(
+            "Operation did not complete. Check its status before retrying; use the same retry key. The host journal records the cause under this operation ID."),
     }
+}
+
+/// Exact allowlist only: arbitrary worker diagnostics can contain private host data.
+pub fn first_use_error(diagnostic: &str) -> Option<(&'static str, &'static str)> {
+    Some(match diagnostic {
+        "no online node available" | "node offline or revoked; placement remains fixed" => (
+            "node_unavailable",
+            "No usable node is online. Check ow nodes; wait for the intended runner to reconnect. Retry an uncertain mutation with its original operation key.",
+        ),
+        "node lacks prepared image" => (
+            "unavailable_image",
+            "Image is not prepared on an online node. Run ow image list and choose an available image; do not build or enroll a host without operator approval.",
+        ),
+        "node capacity exhausted"
+        | "host disk cap exhausted (OW_MAX_DISK_GIB)"
+        | "storage headroom exhausted (full disk reservations plus host reserve)" => (
+            "insufficient_capacity",
+            "Placement or disk capacity is exhausted. Check ow nodes and image list; wait or choose fitting resources. Inspect the original operation before retrying; reuse its key after an uncertain response.",
+        ),
+        "node capability does not support create"
+        | "runner does not support disk sizing; upgrade its worker and agent first (Linux Firecracker only)"
+        | "shape exceeds worker per-guest ceiling"
+        | "unsupported Mac guest shape" => (
+            "unsupported_capability",
+            "Runner does not support the requested capability or shape. Check ow status and ow image list; choose an advertised choice or ask the operator to upgrade.",
+        ),
+        _ => return None,
+    })
 }
 
 /// Open gateway streams (terminal, SSH) by user and machine, so unsharing closes them at once.
@@ -519,6 +546,9 @@ impl Catalog {
                 info["op"].as_str().unwrap_or(""),
                 response["error"].as_str().unwrap_or("")
             ));
+            if let Some((code, _)) = first_use_error(response["error"].as_str().unwrap_or("")) {
+                info["error_code"] = json!(code);
+            }
         }
         Ok(info)
     }
@@ -725,8 +755,35 @@ impl Catalog {
         for id in stmt.query_map([user], |r| r.get::<_, i64>(0))? {
             operations.push(self.operation_info(user, id?)?);
         }
+        let discovery = self.discovery(user, &nodes)?;
         Ok(
-            json!({"owner_limits":limits::state(&self.root,&self.db,user)?,"operations":operations,"workspaces":machines,"shared":shared,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
+            json!({"discovery":discovery,"owner_limits":limits::state(&self.root,&self.db,user)?,"operations":operations,"workspaces":machines,"shared":shared,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
+        )
+    }
+    fn discovery(&self, user: i64, inventory: &Value) -> Result<Value> {
+        let email: String =
+            self.db
+                .query_row("SELECT email FROM users WHERE id=?1", [user], |r| r.get(0))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let mut nodes = Vec::new();
+        for n in inventory.as_array().unwrap() {
+            if n["revoked"] == true {
+                continue;
+            }
+            let id = n["id"].as_str().context("node id")?;
+            let (memory, cpus, slots): (u64,u64,u64) = self.db.query_row(
+                "SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(CASE WHEN reserved_mib>0 THEN 1 ELSE 0 END),0) FROM resources WHERE kind='machine' AND node=?1",
+                [id], |r| Ok((r.get::<_,u32>(0)? as u64,r.get::<_,u32>(1)? as u64,r.get::<_,u32>(2)? as u64)))?;
+            let (extra_memory, extra_cpus, extra_slots) = self.extra_usage(id)?;
+            nodes.push(crate::discovery::node(n, json!({"memory_mib":memory+extra_memory,"vcpus":cpus+extra_cpus,"slots":slots+extra_slots}), now));
+        }
+        let images = crate::discovery::images(&nodes);
+        Ok(
+            json!({"schema":1,"server_version":env!("CARGO_PKG_VERSION"),"identity":{"email":email},
+            "placement":"automatic","nodes":nodes,"images":images,
+            "capacity_note":"Observed admission headroom, not a reservation. Offline or unreported capacity is null; create rechecks all limits. Omit --node for automatic placement."}),
         )
     }
     fn view(
@@ -946,6 +1003,7 @@ impl Catalog {
                 || common::guest_shape(&n["capabilities"], memory, cpus).is_err()
                 || n["online"] != true
                 || n["capabilities"]["drain"] == true
+                || common::node_operation(&n["capabilities"], "create").is_err()
                 || !n["capabilities"]["images"]
                     .as_array()
                     .is_some_and(|a| a.iter().any(|i| i == image))
@@ -965,10 +1023,40 @@ impl Catalog {
             }
         }
         candidates.sort();
+        if candidates.is_empty() {
+            let online: Vec<_> = inventory
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| {
+                    requested.is_none_or(|r| n["id"] == r)
+                        && n["online"] == true
+                        && n["capabilities"]["drain"] != true
+                })
+                .collect();
+            ensure!(!online.is_empty(), "no online node available");
+            let prepared: Vec<_> = online
+                .into_iter()
+                .filter(|n| {
+                    n["capabilities"]["images"]
+                        .as_array()
+                        .is_some_and(|a| a.contains(&json!(image)))
+                })
+                .collect();
+            ensure!(!prepared.is_empty(), "node lacks prepared image");
+            ensure!(
+                prepared
+                    .iter()
+                    .any(|n| (!disk || n["capabilities"]["disk_resize_v1"] == true)
+                        && common::node_operation(&n["capabilities"], "create").is_ok()),
+                "node capability does not support create"
+            );
+            anyhow::bail!("node capacity exhausted");
+        }
         candidates
             .first()
             .map(|(_, id)| id.clone())
-            .context("no online node has compatible capacity")
+            .context("node capacity exhausted")
     }
     fn capacity(
         &self,
@@ -1695,6 +1783,86 @@ mod tests {
             email: email.into(),
         }
     }
+    #[test]
+    fn first_use_errors_are_safe_and_distinct() {
+        for (diagnostic, code) in [
+            ("no online node available", "node_unavailable"),
+            ("node lacks prepared image", "unavailable_image"),
+            ("node capacity exhausted", "insufficient_capacity"),
+            (
+                "runner does not support disk sizing; upgrade its worker and agent first (Linux Firecracker only)",
+                "unsupported_capability",
+            ),
+        ] {
+            let (actual, message) = first_use_error(diagnostic).unwrap();
+            assert_eq!(actual, code);
+            assert!(message.contains("ow "));
+            assert_eq!(public_operation_error("create", diagnostic), message);
+        }
+        assert!(first_use_error("node capacity exhausted: /private/tenant-secret").is_none());
+        assert!(
+            !public_operation_error("create", "/private/tenant-secret").contains("tenant-secret")
+        );
+    }
+
+    #[test]
+    fn discovery_matches_admission_and_hides_other_owners() {
+        let root = fixture(false);
+        let mut c = Catalog::open(&root, "https://example.cloudflareaccess.com", None).unwrap();
+        let alice = c.user(&identity("alice", "alice@example.test")).unwrap();
+        let bob = c
+            .user(&identity("bob", "bob-private@example.test"))
+            .unwrap();
+        let physical = c.reserve(bob, "machine", "secret-project").unwrap();
+        c.db.execute("UPDATE resources SET node='runner',reserved_mib=1024,reserved_cpus=1 WHERE physical=?1", [&physical]).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cap = json!({"backend":"firecracker","arch":"x86_64","runtime":common::RUNTIME,"protocol":1,"memory_mib":4096,"vcpus":4,"slots":2,"images":["ubuntu"],"disk_resize_v1":true,"max_guest_memory_mib":4096,"max_guest_vcpus":4});
+        c.db.execute("INSERT INTO nodes(id,heartbeat,memory_mib,slots,capabilities) VALUES('runner',?1,4096,2,?2)", params![now as i64,cap.to_string()]).unwrap();
+        c.db.execute("INSERT INTO node_usage(node,extra_mib,extra_cpus,extra_slots) VALUES('runner',512,1,0)", []).unwrap();
+        let inventory = nodes::inventory(&root).unwrap();
+        let output = c.discovery(alice, &inventory).unwrap();
+        assert_eq!(output["identity"]["email"], "alice@example.test");
+        assert_eq!(output["nodes"][0]["reserved"]["memory_mib"], 1536);
+        assert_eq!(output["nodes"][0]["available"]["memory_mib"], 2560);
+        assert_eq!(output["nodes"][0]["available"]["vcpus"], 2);
+        assert_eq!(output["nodes"][0]["available"]["slots"], 1);
+        assert!(!output.to_string().contains("secret-project"));
+        assert!(!output.to_string().contains("bob-private"));
+        assert!(!output.to_string().contains(&physical));
+        assert_eq!(
+            c.choose(None, 2048, "ubuntu", 2, &json!({}), true).unwrap(),
+            "runner"
+        );
+        assert!(
+            c.choose(None, 4096, "ubuntu", 2, &json!({}), true)
+                .unwrap_err()
+                .to_string()
+                .contains("capacity exhausted")
+        );
+        assert!(
+            c.choose(None, 256, "arch", 1, &json!({}), true)
+                .unwrap_err()
+                .to_string()
+                .contains("lacks prepared image")
+        );
+        c.db.execute("UPDATE nodes SET heartbeat=0", []).unwrap();
+        assert!(
+            c.choose(None, 256, "ubuntu", 1, &json!({}), true)
+                .unwrap_err()
+                .to_string()
+                .contains("no online node")
+        );
+        let output = c
+            .discovery(alice, &nodes::inventory(&root).unwrap())
+            .unwrap();
+        assert!(output["nodes"][0]["available"].is_null());
+        drop(c);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn ownership_and_subject_binding_survive_restart() {
         let root = fixture(true);

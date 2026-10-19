@@ -668,7 +668,7 @@ impl Runtime {
         )
     }
 
-    fn storage_headroom(&self, extra: u64) -> Result<()> {
+    fn storage_available(&self) -> Result<u64> {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
         let path = CString::new(self.root.as_os_str().as_bytes())?;
@@ -678,11 +678,25 @@ impl Runtime {
             "storage capacity unavailable"
         );
         let stats = unsafe { stats.assume_init() };
+        Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+    }
+
+    fn disk_headroom(&self) -> Result<u64> {
+        Ok((u64::from(max_disk_gib()?) * GIB)
+            .saturating_sub(self.disk_reserved()?)
+            .min(
+                self.storage_available()?
+                    .saturating_sub(minimum_free_bytes()?)
+                    .saturating_sub(self.disk_reserved()?),
+            ))
+    }
+
+    fn storage_headroom(&self, extra: u64) -> Result<()> {
         let reserve = minimum_free_bytes()?;
         let required = extra
             .checked_add(reserve)
             .context("disk reservation overflow")?;
-        let available = stats.f_bavail.saturating_mul(stats.f_frsize);
+        let available = self.storage_available()?;
         ensure!(
             available >= required,
             "storage headroom exhausted: {available} bytes available, {required} bytes required"
@@ -1167,6 +1181,7 @@ impl Runtime {
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
                 "worker_pid":std::process::id(),"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
+                "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.state.workspaces.len(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
@@ -1486,6 +1501,30 @@ mod disk_tests {
             idle: crate::idle::Idle::from_env().unwrap(),
             closing: false,
         }
+    }
+
+    #[test]
+    fn disk_discovery_headroom_counts_stopped_logical_reservations() {
+        let mut runtime = fixture();
+        assert!(
+            runtime.disk_headroom().unwrap()
+                <= (u64::from(max_disk_gib().unwrap()) * GIB).saturating_sub(8 * GIB)
+        );
+        File::options()
+            .write(true)
+            .open(runtime.machine_dir("legacy").join("disk.ext4"))
+            .unwrap()
+            .set_len(u64::from(max_disk_gib().unwrap()) * GIB)
+            .unwrap();
+        let status = runtime.request(&json!({"op":"status"})).unwrap();
+        assert_eq!(status["available_disk_bytes"], 0);
+        assert_eq!(
+            status["reserved_disk_bytes"],
+            u64::from(max_disk_gib().unwrap()) * GIB
+        );
+        assert!(status["disk_observed_unix_s"].as_u64().unwrap() > 0);
+        assert!(runtime.reserve_disk(1).is_err());
+        fs::remove_dir_all(&runtime.root).unwrap();
     }
 
     #[test]

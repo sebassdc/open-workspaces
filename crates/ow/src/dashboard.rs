@@ -463,6 +463,15 @@ pub async fn handle(
                         .into_response(),
                 );
             }
+            if let Some((code, message)) = crate::catalog::first_use_error(&error.to_string()) {
+                return secure(
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({"ok":false,"error_code":code,"error":message})),
+                    )
+                        .into_response(),
+                );
+            }
             (StatusCode::CONFLICT,Json(json!({"ok":false,"error":"Operation could not complete. Check machine state, capacity, snapshot ownership and names, then refresh before retrying."}))).into_response()
         }
     })
