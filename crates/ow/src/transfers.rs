@@ -941,6 +941,14 @@ fn pull(objects: &dyn Objects, root: &Path, a: &Artifact, attempt: &str) -> Resu
     if cached["present"] == true {
         return Ok(cached);
     }
+    let manifest = store::read_manifest(objects, &a.reference)?;
+    native(&manifest, a)?;
+    let bytes = manifest.files.values().try_fold(0u64, |total, file| {
+        total
+            .checked_add(file.size)
+            .context("capture staging overflow")
+    })?;
+    let _reservation = crate::image_store::reserve_pull(root, bytes)?;
     let stage = snapshots.join(format!(".pull-{attempt}"));
     // Each agent attempt owns one staging path. Expired attempts are never replayed.
     let manifest = capture_upload::pull(objects, root, a, attempt, &stage)?;

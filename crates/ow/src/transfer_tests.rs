@@ -328,23 +328,46 @@ fn lost_activation_with_nonrunning_active_copy_does_not_blindly_restart() {
 }
 
 fn stored(root: &Path) -> (store::DirectoryObjects, Artifact) {
+    stored_capture(root, false)
+}
+fn stored_capture(root: &Path, ram: bool) -> (store::DirectoryObjects, Artifact) {
     let objects = store::DirectoryObjects(root.join("objects"));
     let disk = root.join("disk");
     fs::write(&disk, b"disk").unwrap();
-    let hash = store::hash_file(&disk).unwrap();
-    let native=json!({"name":"sealed","workspace":"physical","managed":true,"memory_mib":256,"vcpu_count":1,"image":"alpine","runtime":common::RUNTIME,"cpu":"fixture","kernel_sha256":"a".repeat(64),"files":{"disk.ext4":hash}}).to_string();
+    let mut files = BTreeMap::from([(
+        "disk.ext4".into(),
+        store::Source {
+            sha256: store::hash_file(&disk).unwrap(),
+            path: disk,
+        },
+    )]);
+    if ram {
+        for (name, bytes) in [
+            ("state", b"state".as_slice()),
+            ("memory", b"memory".as_slice()),
+        ] {
+            let path = root.join(name);
+            fs::write(&path, bytes).unwrap();
+            files.insert(
+                name.into(),
+                store::Source {
+                    sha256: store::hash_file(&path).unwrap(),
+                    path,
+                },
+            );
+        }
+    }
+    let hashes: BTreeMap<_, _> = files
+        .iter()
+        .map(|(name, source)| (name, &source.sha256))
+        .collect();
+    let native=json!({"name":"sealed","workspace":"physical","managed":true,"memory_mib":256,"vcpu_count":1,"image":"alpine","runtime":common::RUNTIME,"cpu":"fixture","kernel_sha256":"a".repeat(64),"files":hashes}).to_string();
     let reference = store::push(
         &objects,
         &store::token().unwrap(),
         "capture",
         json!({"native_manifest":native}),
-        &BTreeMap::from([(
-            "disk.ext4".into(),
-            store::Source {
-                path: disk,
-                sha256: hash,
-            },
-        )]),
+        &files,
         1,
     )
     .unwrap();
@@ -387,6 +410,105 @@ fn verified_pull_checks_pinned_manifest_lineage_files_and_existing_disk() {
     assert!(cache(&f.root, &a).is_err());
     assert!(pull(&objects, &f.root, &a, &store::token().unwrap()).is_err());
     assert_eq!(fs::read(disk).unwrap(), b"evil");
+}
+
+struct ObservedObjects<'a> {
+    inner: &'a dyn Objects,
+    on_data: &'a dyn Fn() -> Result<()>,
+}
+impl Objects for ObservedObjects<'_> {
+    fn put_once(&self, key: &str, source: &mut dyn std::io::Read) -> Result<()> {
+        self.inner.put_once(key, source)
+    }
+    fn get(&self, key: &str) -> Result<Box<dyn std::io::Read>> {
+        if !key.ends_with("/manifest.json") {
+            (self.on_data)()?;
+        }
+        self.inner.get(key)
+    }
+}
+
+#[test]
+fn capture_pull_refuses_aggregate_staging_before_reading_objects() {
+    let f = Fixture::new();
+    let (objects, a) = stored(&f.root);
+    let held = ow_core::cache::Reservation::new(&f.root, 2 * common::GIB, 0).unwrap();
+    fs::create_dir_all(f.root.join("machines/live")).unwrap();
+    let disk = fs::File::create(f.root.join("machines/live/disk.ext4")).unwrap();
+    let logical = ow_core::cache::available(&f.root).unwrap() - 10 * common::GIB;
+    disk.set_len(logical).unwrap();
+    assert!(ow_core::cache::Reservation::new(&f.root, 4, 9 * common::GIB).is_err());
+    let reads = std::cell::Cell::new(0);
+    let observe = || {
+        reads.set(reads.get() + 1);
+        Ok(())
+    };
+    let observed = ObservedObjects {
+        inner: &objects,
+        on_data: &observe,
+    };
+    let error = pull(&observed, &f.root, &a, &store::token().unwrap()).unwrap_err();
+    assert!(error.to_string().contains("staging headroom"), "{error:#}");
+    assert_eq!(reads.get(), 0, "admission must precede object downloads");
+    assert!(!f.root.join("snapshots/sealed").exists());
+    assert_eq!(disk.metadata().unwrap().len(), logical);
+    assert_eq!(
+        ow_core::cache::staging_bytes(&f.root).unwrap(),
+        2 * common::GIB
+    );
+    drop(held);
+    assert_eq!(ow_core::cache::staging_bytes(&f.root).unwrap(), 0);
+}
+
+#[test]
+fn capture_pull_reserves_disk_and_ram_until_install_or_error_cleanup() {
+    for ram in [false, true] {
+        for fail in [false, true] {
+            let f = Fixture::new();
+            let (objects, a) = stored_capture(&f.root, ram);
+            let held = ow_core::cache::Reservation::new(&f.root, 1024, 0).unwrap();
+            let bytes = if ram { 15 } else { 4 };
+            let reads = std::cell::Cell::new(0);
+            let observe = || {
+                assert_eq!(
+                    ow_core::cache::staging_bytes(&f.root).unwrap(),
+                    1024 + bytes
+                );
+                reads.set(reads.get() + 1);
+                ensure!(!fail, "interrupted capture object read");
+                Ok(())
+            };
+            let observed = ObservedObjects {
+                inner: &objects,
+                on_data: &observe,
+            };
+            let attempt = store::token().unwrap();
+            let result = pull(&observed, &f.root, &a, &attempt);
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(
+                reads.get(),
+                if fail {
+                    1
+                } else if ram {
+                    3
+                } else {
+                    1
+                }
+            );
+            assert!(!f.root.join(format!("snapshots/.pull-{attempt}")).exists());
+            assert_eq!(f.root.join("snapshots/sealed").exists(), !fail);
+            assert_eq!(ow_core::cache::staging_bytes(&f.root).unwrap(), 1024);
+            if !fail {
+                assert_eq!(cache(&f.root, &a).unwrap()["present"], true);
+                assert_eq!(
+                    pull(&observed, &f.root, &a, &store::token().unwrap()).unwrap()["present"],
+                    true
+                );
+            }
+            drop(held);
+            assert_eq!(ow_core::cache::staging_bytes(&f.root).unwrap(), 0);
+        }
+    }
 }
 
 #[test]
@@ -856,7 +978,9 @@ fn complete_park(f: &mut Fixture, peers: &RefCell<Peers>, ram: bool) {
 }
 #[test]
 fn connection_wake_coalesces_queues_through_drain_and_stopped_requires_start() {
-    for state in ["hibernated", "stopped"] {
+    for (state, policy) in ["hibernated", "stopped"].into_iter().flat_map(|state| {
+        ["runner-drain", "controller-drain", "inactive"].map(|policy| (state, policy))
+    }) {
         let (mut f, peers) = parked_fixture(state);
         complete_park(&mut f, &peers, state == "hibernated");
         let c = f.shared.lock().unwrap();
@@ -885,11 +1009,15 @@ fn connection_wake_coalesces_queues_through_drain_and_stopped_requires_start() {
                 .unwrap(),
             0
         );
-        c.db.execute(
-            "UPDATE nodes SET capabilities=json_set(capabilities,'$.drain',1)",
-            [],
-        )
-        .unwrap();
+        if policy == "runner-drain" {
+            c.db.execute(
+                "UPDATE nodes SET capabilities=json_set(capabilities,'$.drain',1)",
+                [],
+            )
+            .unwrap();
+        } else {
+            c.db.execute("INSERT INTO node_placement_policy(node,active,controller_drain) SELECT id,?1,?2 FROM nodes",params![policy != "inactive", policy == "controller-drain"]).unwrap();
+        }
         drop(c);
         assert!(
             !tick(&f.shared, wake.id, now(), &|_, _| panic!(
@@ -902,6 +1030,11 @@ fn connection_wake_coalesces_queues_through_drain_and_stopped_requires_start() {
             let c = f.shared.lock().unwrap();
             assert!(c.operation_info(f.user, wake.operation).unwrap()["queued"].is_string());
             c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.drain',0) WHERE id='target'",[]).unwrap();
+            c.db.execute(
+                "UPDATE node_placement_policy SET active=1,controller_drain=0 WHERE node='target'",
+                [],
+            )
+            .unwrap();
         }
         assert!(tick(&f.shared, wake.id, now(), &|_, _| panic!()).unwrap());
         {

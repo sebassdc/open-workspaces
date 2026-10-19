@@ -734,16 +734,7 @@ impl Runtime {
     }
 
     fn disk_reserved(&self) -> Result<u64> {
-        let mut total = 0u64;
-        for entry in fs::read_dir(self.root.join("machines"))? {
-            let disk = entry?.path().join("disk.ext4");
-            if disk.exists() {
-                total = total
-                    .checked_add(disk.metadata()?.len())
-                    .context("disk reservation overflow")?;
-            }
-        }
-        Ok(total)
+        crate::cache::logical_disks(&self.root)
     }
 
     fn reserve_disk(&self, additional: u64) -> Result<()> {
@@ -763,16 +754,7 @@ impl Runtime {
     }
 
     fn storage_available(&self) -> Result<u64> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let path = CString::new(self.root.as_os_str().as_bytes())?;
-        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        ensure!(
-            unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } == 0,
-            "storage capacity unavailable"
-        );
-        let stats = unsafe { stats.assume_init() };
-        Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+        crate::cache::available(&self.root)
     }
 
     fn disk_headroom(&self) -> Result<u64> {
@@ -781,14 +763,17 @@ impl Runtime {
             .min(
                 self.storage_available()?
                     .saturating_sub(minimum_free_bytes()?)
+                    .saturating_sub(crate::cache::staging_bytes(&self.root)?)
                     .saturating_sub(self.disk_reserved()?),
             ))
     }
 
     fn storage_headroom(&self, extra: u64) -> Result<()> {
         let reserve = minimum_free_bytes()?;
+        let staging = crate::cache::staging_bytes(&self.root)?;
         let required = extra
             .checked_add(reserve)
+            .and_then(|n| n.checked_add(staging))
             .context("disk reservation overflow")?;
         let available = self.storage_available()?;
         ensure!(
@@ -894,6 +879,10 @@ impl Runtime {
             "requested disk is smaller than the image or snapshot"
         );
         self.reserve_disk(disk_bytes)?;
+        if snapshot.is_none() && !PROFILES.contains(&image) {
+            crate::cache::verify_image(&self.root, image)?;
+        }
+        crate::cache::touch(&self.root, image)?;
         fs::create_dir(&directory)?;
         vm::reflink(&source_disk, &directory.join("disk.ext4"))?;
         disk::extend(&directory.join("disk.ext4"), disk_bytes)?;
@@ -1351,6 +1340,9 @@ impl Runtime {
     }
 
     pub fn request(&mut self, request: &Value) -> Result<Value> {
+        let op = request["op"].as_str().context("missing operation")?;
+        let _cache = crate::cache::lock(&self.root, op == "cache-evict")?;
+        let _space = crate::cache::space_lock(&self.root)?;
         let exited: Vec<_> = self
             .machines
             .iter_mut()
@@ -1383,6 +1375,34 @@ impl Runtime {
             self.wake(id)?;
         }
         match op {
+            "cache-inventory" => Ok(
+                json!({"entries":crate::cache::inventory(&self.root)?,"available_bytes":self.storage_available()?,"protected_bytes":self.disk_reserved()?.saturating_add(minimum_free_bytes()?).saturating_add(u64::from(max_memory())*1024*1024),"staging_bytes":crate::cache::staging_bytes(&self.root)?}),
+            ),
+            "cache-evict" => {
+                let url = fs::read_to_string(self.root.join("store-url"))
+                    .ok()
+                    .map(|s| s.trim().to_owned())
+                    .or_else(|| {
+                        fs::read("/etc/open-workspaces/store.json")
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                            .and_then(|v| v["url"].as_str().map(str::to_owned))
+                    })
+                    .context("runner store is not configured")?;
+                let objects = crate::store::S3Objects::new(&url, None)?;
+                let claim = request["claim"]
+                    .as_str()
+                    .context("eviction claim required")?;
+                let reference: crate::store::Reference =
+                    serde_json::from_value(request["reference"].clone())?;
+                crate::cache::evict_claim(
+                    &self.root,
+                    claim,
+                    request["name"].as_str().context("cache name required")?,
+                    &reference,
+                    &objects,
+                )
+            }
             "status" => Ok(
                 json!({"runtime":"Firecracker v1.17.0","running":self.machines.len(),
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
@@ -1390,7 +1410,7 @@ impl Runtime {
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
                 "worker_pid":std::process::id(),"placement_fencing_v1":true,"recovery_points_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
-                "image_store_v1":true,"image_digests":self.images()?.iter().filter(|i| i["image_digest"].as_str().is_some()).map(|i| json!({"name":i["name"],"digest":i["image_digest"]})).collect::<Vec<_>>(),
+                "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
