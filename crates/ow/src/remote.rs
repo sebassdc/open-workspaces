@@ -946,6 +946,7 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
         .map(|c| Arc::new(std::sync::Mutex::new(c)));
     if let Some(catalog) = &catalog {
         crate::transfers::recover(catalog);
+        crate::scaler::start(catalog);
     }
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

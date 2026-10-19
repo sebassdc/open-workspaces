@@ -2,6 +2,46 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.16",
+      "class": 1,
+      "changes": [
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Opt-in shadow-only bounded scaler planning and private operator status. Exact queued wake shapes use existing placement capability, CPU, RAM, slot and logical-disk constraints. SQLite persists one action per pool, cooldowns, unresolved outcomes and maximum forecast liabilities including configured replacement headroom. All provider instances and billable disks remain liabilities. Schema 7 / reader floor 7 requires a private catalog backup and coordinated controller/catalog-reader upgrade. No cloud executor or automatic runner drain; replacement-controller recovery and enforceable provider cost/retention proof remain live-activation gates. Worker protocol 3, runtime, guest kernel, host layout and existing CPU budgets are unchanged; preserve running worker pins. Prices, capacity presets, exclusions and launch schedule are private configuration inputs.",
+      "waivers": {
+        "worker": "crates/ow/src/host.rs adds only the unreachable dispatch arm for the local scaler CLI; no worker code, operation, runtime or service changes."
+      }
+    },
+    {
       "version": "0.9.13",
       "class": 1,
       "changes": [

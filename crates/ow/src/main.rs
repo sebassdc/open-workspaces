@@ -38,6 +38,8 @@ mod placement;
 mod preview;
 #[cfg(target_os = "linux")]
 mod remote;
+#[cfg(any(target_os = "linux", test))]
+mod scaler;
 #[cfg(target_os = "linux")]
 mod selfhost;
 mod ssh_client;
@@ -100,6 +102,12 @@ enum MacHostAction {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Local controller shadow scaler status, or one persisted shadow iteration.
+    Scaler {
+        /// Record one iteration; never calls a provider or drains a runner.
+        #[arg(long)]
+        tick: bool,
+    },
     /// Experimental local Apple Silicon runtime (separate from pool hosting).
     #[cfg(target_os = "macos")]
     MacHost {
@@ -730,6 +738,26 @@ fn main_result() -> anyhow::Result<i32> {
             "mac-host is an experimental local backend; omit --server and --operation-key"
         );
         return mac_host::run(cli.data_dir, command);
+    }
+    if let Action::Scaler { tick } = cli.command {
+        anyhow::ensure!(
+            cli.server.is_none() && cli.operation_key.is_none(),
+            "scaler runs only on the local controller"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let root = host::data_root(cli.data_dir)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&scaler::command(&root, tick)?)?
+            );
+            return Ok(0);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = tick;
+            anyhow::bail!("ow scaler runs on the Linux controller");
+        }
     }
     if let Action::Node { command } = cli.command {
         anyhow::ensure!(

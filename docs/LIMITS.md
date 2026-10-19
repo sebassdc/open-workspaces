@@ -129,3 +129,8 @@ versus uncertain outcomes, restart, sharing, snapshot resource shape, unknown
 prices, stale invitations, retirement and arithmetic overflow. These tests use
 fake workers and no provider credentials. They do not claim real VM or cloud
 billing acceptance; controller policy does not require a worker protocol change.
+
+The opt-in [shadow scaler](SCALER.md) extends this forecast with explicit
+`pool.elastic` caps for total instance, cost and billable logical-disk liabilities,
+including retained/orphaned resources and maximum replacement headroom. It has no
+live provider executor and does not change existing owner/invitation admission.

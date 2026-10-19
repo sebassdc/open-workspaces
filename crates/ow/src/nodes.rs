@@ -88,7 +88,7 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     Ok(db)
 }
 /// Catalog schema this binary writes (`PRAGMA user_version`).
-pub(crate) const SCHEMA: i64 = 6;
+pub(crate) const SCHEMA: i64 = 7;
 
 /// A binary opens a catalog it can use safely: not newer than SCHEMA, or newer but
 /// declared readable by SCHEMA through `settings.min_reader_schema`, which every

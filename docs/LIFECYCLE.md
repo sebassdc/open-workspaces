@@ -377,3 +377,7 @@ hardware acceptance. Live cloud-store IAM/policy and fleet rollout remain separa
 See [runner drain](DRAIN.md) for schema-6 controller states, protected eligibility,
 source-only cleanup and sealed, generation-bound empty certificates. Installation
 never drains a runner; provider destruction remains outside the controller slice.
+
+The opt-in [bounded shadow scaler](SCALER.md) consumes queued wake shapes and
+existing placement/drain contracts. It records one capped recommendation per pool,
+with no provider call or automatic drain; live activation remains unavailable.

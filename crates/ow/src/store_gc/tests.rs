@@ -515,7 +515,9 @@ fn missing_invalid_manifest_bad_policy_and_incomplete_authority_fail_before_dele
                 f.c.db.execute_batch("PRAGMA foreign_keys=OFF;INSERT INTO leases(artifact,holder,purpose,expires) VALUES('missing','runner','fork',9999999999);PRAGMA foreign_keys=ON;").unwrap();
             }
             _ => {
-                f.c.db.execute_batch("PRAGMA user_version=7").unwrap();
+                f.c.db
+                    .execute_batch(&format!("PRAGMA user_version={}", crate::nodes::SCHEMA + 1))
+                    .unwrap();
             }
         }
         let before = b.markers();
