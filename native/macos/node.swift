@@ -164,7 +164,7 @@ final class NativeNode {
       source.resume()
       signals.append(source)
     }
-    // The Rust worker owns this pipe. Its exit (including SIGKILL) must
+    // The worker owns this pipe. Its exit (including SIGKILL) must
     // stop the helper rather than leave an unaccounted native guest.
     let watch = DispatchSource.makeReadSource(fileDescriptor: STDIN_FILENO, queue: .main)
     watch.setEventHandler { [self] in

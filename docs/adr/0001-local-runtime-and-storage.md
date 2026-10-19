@@ -13,7 +13,7 @@ Btrfs filesystem passed host-file clone write-independence tests.
 ## Decision
 
 Use pinned Firecracker v1.17.0 and the official release binary for the local
-runtime, with a Rust CLI/worker/gateway. Use Btrfs reflinks for independent active
+runtime, with a CLI/worker/gateway. Use Btrfs reflinks for independent active
 disk files and paired disk captures. Keep RAM and VM state in immutable named
 snapshot directories, with SHA-256 manifests, compatibility checks and cached
 verification invalidated by metadata changes. Keep management on owner-only
@@ -30,7 +30,7 @@ HTTP response readiness, paired RAM/disk capture, two restored child VMs,
 independent process counters and disk writes, cold disk persistence, and
 full-state restore after the original VMMs exited.
 
-The Rust prototype's real-VM regression also verifies operation idempotency,
+The prototype's real-VM regression also verifies operation idempotency,
 snapshot tamper rejection, memory admission limits, basic guest network separation,
 hibernation and registry/disk recovery after abrupt worker loss. See the
 [experiment record](../experiments/runtime-spike.md) for revisions, methods,

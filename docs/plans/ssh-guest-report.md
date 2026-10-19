@@ -123,12 +123,12 @@ inferred from suite durations.
 Executed from this lane, with explicit trusted source templates:
 
 ```sh
-export CARGO_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo
-export RUSTUP_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/rustup
+export CARGO_HOME=/path/to/open-workspaces/data/runtime-spike/cargo
+export RUSTUP_HOME=/path/to/open-workspaces/data/runtime-spike/rustup
 "$CARGO_HOME/bin/cargo" +1.97.0 test --locked --workspace -j 2 -- --test-threads=1
 "$CARGO_HOME/bin/cargo" +1.97.0 build --locked -p ow -j 2
 export OW_SSH_TEST_BINARY="$PWD/target/debug/ow"
-export OW_SSH_TEST_ASSETS=/home/sebassdc/dev/open-workspaces/data/runtime-spike
+export OW_SSH_TEST_ASSETS=/path/to/open-workspaces/data/runtime-spike
 OW_SSH_TEST_ROOT="$PWD/v/v" "$CARGO_HOME/bin/cargo" +1.97.0 test --locked -p ow openssh_guest_real_vm -j 2 -- --ignored --nocapture
 OW_SSH_TEST_PROFILE=arch OW_SSH_TEST_ROOT="$PWD/v/w" "$CARGO_HOME/bin/cargo" +1.97.0 test --locked -p ow openssh_guest_real_vm -j 2 -- --ignored --nocapture
 python experiments/ssh-guest/legacy.py "$PWD/v/x"

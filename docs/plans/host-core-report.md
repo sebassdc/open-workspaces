@@ -73,7 +73,7 @@ stop must execute in the next smoke; harness exemptions cannot establish it.
 ## Frozen final2 receipt and executed core slice
 
 Authoritative private outputs under
-`/home/sebassdc/dev/open-workspaces/data/host-core-build/`:
+`/path/to/open-workspaces/data/host-core-build/`:
 
 - `ready-receipt-final2.json`; `release-final2/build.json` and static CLI/guest pair.
 - `host-public-final2/`: immutable fixed five-file clean Alpine bundle, copied

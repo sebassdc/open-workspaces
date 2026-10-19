@@ -1,6 +1,6 @@
 # Multi-node Linux vertical slice — plan brief
 Size: L | State: authorized by owner, 2026-10-03
-Pattern: extend the existing Rust gateway + SQLite ownership catalog + private Unix-socket worker; reuse Firecracker/Btrfs under ADR 0001.
+Pattern: extend the existing gateway + SQLite ownership catalog + private Unix-socket worker; reuse Firecracker/Btrfs under ADR 0001.
 
 ## Goal
 Operate a private pool through one controller, with outbound authenticated Linux workers, durable placement and safe offline/reconnect behavior.
@@ -12,7 +12,7 @@ flowchart LR
     E[Existing]:::old
     N[New or changed]:::new
   end
-  Client[Browser and CLI]:::old -->|authenticated workspace requests| Gateway[Rust gateway and controller]:::new
+  Client[Browser and CLI]:::old -->|authenticated workspace requests| Gateway[Gateway and controller]:::new
   Gateway -->|ownership, placement and operations| DB[(Private SQLite catalog)]:::new
   NodeA[Linux node A agent]:::new -->|outbound authenticated connection and heartbeat| Gateway
   NodeB[Linux node B agent]:::new -->|outbound authenticated connection and heartbeat| Gateway
@@ -62,6 +62,6 @@ Two isolated Linux workers enroll outbound; create on selected/automatic compati
 - **Deployment review:** deploy locally only after reviewed diffs and passing relevant checks; rollback on failure. Physical cross-network acceptance needs an actual second authorized host.
 
 ## Worker lanes
-- node-core: bounded Rust implementation in an isolated worktree; commits restricted to task code/tests/docs.
+- node-core: bounded implementation in an isolated worktree; commits restricted to task code/tests/docs.
 - node-review: architecture/threat review and later independent implementation review; no product code.
 - node-verify: independent real-worker/VM acceptance and local deployment after implementation review.

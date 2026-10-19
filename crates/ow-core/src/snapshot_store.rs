@@ -226,7 +226,7 @@ impl SnapshotStore for S3Store {
             if let Some(chunks) = chunks {
                 self.pull_chunks(chunks, &manifest, directory)?;
             } else {
-                // Original WRK-4 whole-file representation remains readable.
+                // Original whole-file representation remains readable.
                 for file in DATA_FILES {
                     let mut child = self.get(&self.key(name, &format!("{file}.zst")))?;
                     let decoded = (|| -> Result<String> {

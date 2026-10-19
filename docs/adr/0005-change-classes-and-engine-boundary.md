@@ -34,7 +34,7 @@ Decisions:
   (`settings.min_reader_schema`) so an older binary can roll back across
   additive migrations.
 - Host orchestration is Python 3 standard library (`deploy/aws/host/`); engine
-  changes stay in Rust. The release builds on the host for now; prebuilt
+  changes stay in the runtime. The release builds on the host for now; prebuilt
   binaries are a follow-up.
 
 Not decided here: worker re-adoption of running VMMs, keeping the previous VMM

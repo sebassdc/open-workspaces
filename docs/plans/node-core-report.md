@@ -27,13 +27,13 @@ Root task board updates belong to the planner; this isolated lane does not copy 
 
 ## Commands and actual results
 
-Working directory: `/home/sebassdc/dev/open-workspaces-lanes/node-core`.
+Working directory: `/path/to/worktrees/node-core`.
 Toolchain: `cargo +1.97.0`, existing installed Rust; no global installs.
 
 ```bash
-export RUSTUP_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/rustup
-export CARGO_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo
-export OW_ASSET_DIR=/home/sebassdc/dev/open-workspaces/data/runtime-spike
+export RUSTUP_HOME=/path/to/open-workspaces/data/runtime-spike/rustup
+export CARGO_HOME=/path/to/open-workspaces/data/runtime-spike/cargo
+export OW_ASSET_DIR=/path/to/open-workspaces/data/runtime-spike
 "$CARGO_HOME/bin/cargo" +1.97.0 build --locked -p ow
 "$CARGO_HOME/bin/cargo" +1.97.0 fmt --all
 "$CARGO_HOME/bin/cargo" +1.97.0 test --locked --offline --workspace -- --test-threads=1
@@ -69,7 +69,7 @@ Core real guest command (executed before verifier's exclusive turn):
 
 Result: **1 passed**, 21.40 seconds. Default fixture base was the shared ignored
 root data directory derived from OW_ASSET_DIR; successful private result:
-`/home/sebassdc/dev/open-workspaces/data/ncb5ca6775/result.json`.
+`/path/to/open-workspaces/data/ncb5ca6775/result.json`.
 For reproducible future runs, set `OW_NODE_TEST_DATA_ROOT` to a **new** short
 private path below that data directory; an existing root is refused.
 `OW_NODE_TEST_BINARY` can select the built binary. KVM/assets/Btrfs and a coordinated
@@ -99,7 +99,7 @@ No benchmark distribution is inferred from test duration.
 
 Node-verify reported **all 13 acceptance groups passed** against the frozen product
 source. Private result:
-`/home/sebassdc/dev/open-workspaces/data/mnv-vqn2fx79/result.json`.
+`/path/to/open-workspaces/data/mnv-vqn2fx79/result.json`.
 Its binary SHA-256 is
 `5b6934a0f84f1fcdb5aef3e1915deb295862a43dc724c5b406b33d9bd0ebc6a2`.
 These are independent verifier results, not executions by node-core.
@@ -117,9 +117,9 @@ cleanup. Lost-result tests observe completed agent journals before retry;
 **agent crash before journal completion was not exercised**.
 
 Root reports/harness are owned by other lanes:
-`/home/sebassdc/dev/open-workspaces/docs/plans/multinode-review.md`,
-`/home/sebassdc/dev/open-workspaces/docs/plans/multinode-verification-results.md`,
-`/home/sebassdc/dev/open-workspaces/experiments/runtime-spike/multinode-test.py`.
+`/path/to/open-workspaces/docs/plans/multinode-review.md`,
+`/path/to/open-workspaces/docs/plans/multinode-verification-results.md`,
+`/path/to/open-workspaces/experiments/runtime-spike/multinode-test.py`.
 The reviewer has not yet issued its final stable-commit deployment verdict.
 
 ## Operator handoff and limits

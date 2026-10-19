@@ -25,7 +25,7 @@ Private actual deployment artifacts: `data/nl/acceptance.json`, `deployment.json
 Release SHA-256: **e22658f7291f1403cbba7d60d44a7596fc4edc6e0ac59220cda5e0379b6ae2c0**. Release built locked/offline from merged root in a separate target, then copied to `data/nl/bin/ow` and atomically installed at `target/release/ow` so existing gateway manager uses the reviewed binary. Shared guest assets were reused without rebuilding them.
 
 ```bash
-env RUSTUP_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/rustup CARGO_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo /home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo/bin/cargo +1.97.0 build --locked --offline --release -p ow -j 2 --target-dir /home/sebassdc/dev/open-workspaces/data/nl/build
+env RUSTUP_HOME=/path/to/open-workspaces/data/runtime-spike/rustup CARGO_HOME=/path/to/open-workspaces/data/runtime-spike/cargo /path/to/open-workspaces/data/runtime-spike/cargo/bin/cargo +1.97.0 build --locked --offline --release -p ow -j 2 --target-dir /path/to/open-workspaces/data/nl/build
 python3 data/nl/upgrade.py
 python3 data/nl/manage.py start
 python3 data/nl/smoke.py
@@ -53,7 +53,7 @@ Manager verifies UID, PID/start ticks and complete argv before signaling owned c
 Independent full harness: **13 groups passed, 0 failed**, real TLS/agents/guests and actual Chromium, cleanup zero guests/reservations/errors. Frozen-product workspace unit regression: **21 passed, 0 failed, 3 ignored**; `ow-guest` zero tests. Core-authored transport/reservation mocks and planner-reported core real guest suite are separate evidence. Frozen-product unit command used the separate target:
 
 ```bash
-env RUSTUP_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/rustup CARGO_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo /home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo/bin/cargo +1.97.0 test --locked --offline --workspace --manifest-path /home/sebassdc/dev/open-workspaces-lanes/node-core/Cargo.toml --target-dir /home/sebassdc/dev/open-workspaces/data/multinode-verify-build/target -- --test-threads=1
+env RUSTUP_HOME=/path/to/open-workspaces/data/runtime-spike/rustup CARGO_HOME=/path/to/open-workspaces/data/runtime-spike/cargo /path/to/open-workspaces/data/runtime-spike/cargo/bin/cargo +1.97.0 test --locked --offline --workspace --manifest-path /path/to/worktrees/node-core/Cargo.toml --target-dir /path/to/open-workspaces/data/multinode-verify-build/target -- --test-threads=1
 ```
  Deployment adds original schema2-to3 mapping preservation and serial real guest health on both retained routes.
 
@@ -65,7 +65,7 @@ Remaining acceptance: real authenticated public owner login/reopen on existing o
 Commands:
 
 ```bash
-env RUSTUP_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/rustup CARGO_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo /home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo/bin/cargo +1.97.0 build --locked --offline -p ow -j 2 --manifest-path /home/sebassdc/dev/open-workspaces-lanes/node-core/Cargo.toml --target-dir /home/sebassdc/dev/open-workspaces/data/multinode-verify-build/target
+env RUSTUP_HOME=/path/to/open-workspaces/data/runtime-spike/rustup CARGO_HOME=/path/to/open-workspaces/data/runtime-spike/cargo /path/to/open-workspaces/data/runtime-spike/cargo/bin/cargo +1.97.0 build --locked --offline -p ow -j 2 --manifest-path /path/to/worktrees/node-core/Cargo.toml --target-dir /path/to/open-workspaces/data/multinode-verify-build/target
 python3 experiments/runtime-spike/multinode-test.py --binary data/multinode-verify-build/target/debug/ow --assets data/runtime-spike --source-manifest data/multinode-verify-build/source-manifest.json --vm-turn-released
 ```
 

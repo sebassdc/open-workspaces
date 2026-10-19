@@ -1,7 +1,16 @@
 # Browser dashboard
 
+The dashboard supports Tailscale identity with an operator-configured
+[capability grant](#admission-through-a-capability-grant), or an explicitly
+configured Cloudflare Access JWT gate. It serves the embedded browser UI and
+owner-scoped API. Use [tailnet sign-in](#tailnet-sign-in) for the current tailnet
+setup, [users and sharing](USERS.md) for authorization, and
+[previews](DAILY_USE.md#tailnet-https-previews-v080) for separate guest app URLs.
+
+## Original Access deployment (historical)
+
 The owner requested a dashboard on the **existing project hostname**, replacing
-its guest counter demo. No additional hostname or domain was created. A Rust
+its guest counter demo. No additional hostname or domain was created. An
 HTTP handler serves embedded HTML/CSS/JavaScript and a scoped API behind the
 existing Cloudflare Access application and tunnel. Infrastructure identifiers,
 user emails, tokens and deployment logs remain in ignored private storage.
@@ -20,7 +29,7 @@ user emails, tokens and deployment logs remain in ignored private storage.
   disk/snapshot data and host cache still consume resources.
 - Open a real interactive guest PTY over authenticated WebSocket, with terminal
   colors, persistent shell state, Ctrl-C, job control, resizing and interactive
-  editors. The backend is Rust; the browser uses locally vendored xterm.js.
+  editors. The browser uses locally vendored xterm.js.
 - Desktop and mobile layouts, operation progress/errors and polling updates.
   Restore and stop explain memory/disk consequences before the user's action.
 

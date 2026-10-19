@@ -1,6 +1,6 @@
 # Native Mac host — implementation brief
 Size: L | State: authorized, implementation underway
-Pattern: existing Rust control plane with explicit backend capabilities; narrow native helper around an existing virtualization engine.
+Pattern: existing control plane with explicit backend capabilities; narrow native helper around an existing virtualization engine.
 Baseline: b1703f1b443c8380273eee3f9823e304170c95e5, isolated work/mac-host branch.
 
 ## Goal
@@ -10,7 +10,7 @@ Verify native ARM64 Linux workspaces on the owner's Mac, then connect a truthful
 ```mermaid
 flowchart LR
  title[Native Mac runtime — grey existing, green new]
- R[Rust control plane]:::old -->|later: private backend requests| H[Swift Virtualization helper]:::new
+ R[Control plane]:::old -->|later: private backend requests| H[Swift Virtualization helper]:::new
  H -->|native hardware virtualization| G[ARM64 Linux guest]:::new
  H -->|private block attachment| D[Dedicated persistent disk]:::new
  classDef old fill:#eee,stroke:#aaa,color:#777
@@ -21,7 +21,7 @@ flowchart LR
 1. Inventory host, pin clean ARM64 boot inputs, implement signed native helper and capability diagnostics.
 2. Verify boot, shell/exec status, file round trip, cold persistence and owned process cleanup with one small guest.
 3. Test native save/restore availability and disk independence; deny anything unsupported.
-4. Extend Rust backend and node capability contracts in coordination with planner; STOP on conflicting wire contracts or before enrollment without a private invitation.
+4. Extend runtime backend and node capability contracts in coordination with planner; STOP on conflicting wire contracts or before enrollment without a private invitation.
 5. Evaluate Tahoe separately; STOP before new license acceptance, paid resources or downloads/guest allocations above initial budget.
 
 ## Blast radius

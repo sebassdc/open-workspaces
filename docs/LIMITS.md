@@ -113,7 +113,7 @@ runners. No cloud resource, pricing lookup or actual spend is needed for tests.
 ## Upgrade and verification
 
 This slice changes only controller code and adds `owner_allocations`; runtime
-reservations, worker interfaces and guest state are unchanged. Under the WRK-15
+reservations, worker interfaces and guest state are unchanged. Under the v0.5.0
 split-unit layout it is a **class 1 controller upgrade**, and subsequent policy
 edits are class 0. Upgrade the controller/gateway only; preserve the worker and
 VM service. Existing usage is accounted for, never evicted. Downgrading to an

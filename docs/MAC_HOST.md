@@ -29,6 +29,8 @@ files; pinned UEC key `cloud-image.gpg`; signed noble-updates `InRelease`,
 the authenticated root tar; an optional supplied `archive-keyring.gpg` must
 match those exact bytes. Successful release signers must match the pinned
 primary fingerprint in an isolated restricted keyring; UID text is not trust. Versions and hashes are in [pins](plans/mac-node-pins.json).
+Pinned acceptance receipts retain the license recorded when those artifacts
+were built; newly built project source uses the current [MIT license](../LICENSE).
 The prepared root preserves package ownership/setuid modes, adds the `dev`
 account with sudo and installs the static ARM64 guest agent. Homebrew e2fsprogs,
 GnuPG, Zig, cargo-zigbuild and the Rust ARM64-musl target are build prerequisites.
@@ -133,7 +135,7 @@ To open the serial console manually:
 
 Inside the guest, use `uname -m`, `echo hello > /persist/message`, `sync` and
 `poweroff -f`. Only /persist survives cold boot. This shell uses a controlling
-serial tty, not the product guest-agent PTY. The helper replaces the Rust CLI
+serial tty, not the product guest-agent PTY. The helper replaces the CLI
 process so its PID and signals remain direct. Host SIGTERM/SIGINT force-stop the
 VM; prefer guest sync/poweroff for disk consistency. Do not launch other fixture
 roots concurrently: the initial authorization is one guest across this lane.

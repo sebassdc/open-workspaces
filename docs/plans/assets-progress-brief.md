@@ -1,7 +1,7 @@
 # Asset download progress
 Updated: 2026-10-04 | Size: S | State: done; reviewed/merged/public CLI verified
 
-Goal: show terminal progress during host update-assets, especially large Ubuntu downloads. Pattern: existing bounded Rust reqwest streaming downloader with verified manifest sizes and sparse writes.
+Goal: show terminal progress during host update-assets, especially large Ubuntu downloads. Pattern: existing bounded reqwest streaming downloader with verified manifest sizes and sparse writes.
 
 Builder: assets-progress, isolated worktree work/assets-progress. Scope: onboarding downloader and focused UX docs/evidence only. Show aggregate percent/bytes, current filename and useful transfer rate on stderr; refresh throttled, no new dependencies. TTY single-line bar; non-TTY concise start/file/end lines without carriage-return/ANSI spam. Separate downloading, verifying and publication so 100% download does not claim successful update. Preserve size/hash/sparse/timeout/consent checks and stdout compatibility. Shared host join downloader may benefit naturally. Do not fix unrelated 1Password process inventory in this task.
 

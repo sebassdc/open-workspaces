@@ -1,8 +1,8 @@
 # Interactive terminals
 
 The dashboard's **Open Terminal** button creates a separate Linux PTY inside the
-selected running Firecracker VM. Both the guest agent and WebSocket gateway are
-Rust. The agent uses libc's `openpty`, `setsid`, `TIOCSCTTY` and `TIOCSWINSZ`;
+selected running Firecracker VM. The guest agent uses libc's `openpty`, `setsid`,
+`TIOCSCTTY` and `TIOCSWINSZ`;
 it does not implement a hypervisor or require an SSH daemon. The browser uses
 MIT-licensed xterm.js 5.5.0 and addon-fit 0.10.0, vendored locally with their
 licenses and verified npm tarball integrity. No external CDN is required.
@@ -25,8 +25,8 @@ Remote CLI login/WebSocket authentication, SSH and editor Remote-SSH remain pend
 
 ```text
 Browser/xterm.js <-> authenticated WSS /api/terminal/MACHINE
-  <-> Rust gateway <-> owner-only Unix socket <-> isolated worker
-  <-> dedicated guest TCP connection <-> Rust guest agent <-> guest PTY/shell
+  <-> gateway <-> owner-only Unix socket <-> isolated worker
+  <-> dedicated guest TCP connection <-> guest agent <-> guest PTY/shell
 ```
 
 JWT signature, issuer, audience, subject, email allowlist, expiry and Host checks
