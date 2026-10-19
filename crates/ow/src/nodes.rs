@@ -972,7 +972,7 @@ fn timeout_socket(
     Ok(())
 }
 fn timed_out(error: &tungstenite::Error) -> bool {
-    matches!(error,tungstenite::Error::Io(e) if matches!(e.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::TimedOut))
+    matches!(error,tungstenite::Error::Io(e) if matches!(e.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::TimedOut|std::io::ErrorKind::Interrupted))
 }
 
 fn channel_status(
@@ -1231,6 +1231,10 @@ pub fn agent(
                     // health checks, and a drain the host upgrader declares.
                     #[cfg(target_os = "linux")]
                     {
+                        beat["park_wake_v1"] = json!(
+                            common::placement_capable(&status).is_ok()
+                                && crate::image_store::configured_url(root).is_ok()
+                        );
                         beat["managed_restore_v1"] = json!(
                             common::placement_capable(&status).is_ok()
                                 && crate::image_store::configured_url(root).is_ok()
@@ -1247,6 +1251,7 @@ pub fn agent(
                     beat["placement_fencing_v1"] =
                         json!(common::placement_capable(&status).is_ok());
                     for field in [
+                        "compat",
                         "max_disk_gib",
                         "reserved_disk_bytes",
                         "min_free_gib",
@@ -1393,6 +1398,9 @@ fn agent_job(
             "image-build",
             "image-pull",
             "capture-pull",
+            "capture-push",
+            "capture-published",
+            "capture-progress",
             "capture-cache",
             "restore-policy",
             "status",
@@ -1451,7 +1459,15 @@ fn agent_job(
         #[cfg(target_os = "linux")]
         let response = if op == "image-build" || op == "image-pull" {
             wire::response(crate::image_store::job(root, &request))
-        } else if matches!(op, "capture-pull" | "capture-cache" | "restore-policy") {
+        } else if matches!(
+            op,
+            "capture-pull"
+                | "capture-cache"
+                | "restore-policy"
+                | "capture-push"
+                | "capture-published"
+                | "capture-progress"
+        ) {
             common::placement_capable(&checked)?;
             #[cfg(test)]
             crate::transfers::process_tests::agent_checkpoint(root, op, "before-effect")?;

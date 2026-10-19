@@ -23,7 +23,7 @@ impl Fixture {
         c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node,ssh_policy) VALUES(?1,'machine','box','physical',?2,'source','\"disabled\"')",params![user,json!({"id":"physical","state":"stopped","memory_mib":256,"vcpu_count":1,"disk_bytes":4}).to_string()]).unwrap();
         c.db.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,attempt,digest,store_url) VALUES('capture','capture',?1,'physical','sealed','stored',?2,?3,'s3://bucket/root')",params![user,"a".repeat(32),"b".repeat(64)]).unwrap();
         for node in ["source", "target"] {
-            c.db.execute("INSERT INTO nodes(id,memory_mib,slots,heartbeat,capabilities) VALUES(?1,2048,4,?2,?3)",params![node,now(),json!({"memory_mib":2048,"slots":4,"vcpus":4,"placement_fencing_v1":true,"worker_protocol":2,"managed_restore_v1":true,"available_disk_bytes":1024,"disk_observed_unix_s":now(),"guest_ssh_v1":true}).to_string()]).unwrap();
+            c.db.execute("INSERT INTO nodes(id,memory_mib,slots,heartbeat,capabilities) VALUES(?1,2048,4,?2,?3)",params![node,now(),json!({"memory_mib":2048,"slots":4,"vcpus":4,"placement_fencing_v1":true,"worker_protocol":2,"managed_restore_v1":true,"available_disk_bytes":1024,"disk_observed_unix_s":now(),"guest_ssh_v1":true,"compat":{"runtime":"same","cpu":"right","kernel_sha256":"same"}}).to_string()]).unwrap();
         }
         let transfer = c
             .begin_transfer(
@@ -39,6 +39,7 @@ impl Fixture {
                     cpus: 1,
                     disk_bytes: 4,
                     accept_cold: false,
+                    explicit_start: false,
                 },
             )
             .unwrap();
@@ -87,7 +88,19 @@ struct Peers {
 }
 impl Peers {
     fn call(&mut self, shared: &Shared, node: &str, request: Value) -> Result<Value> {
-        assert!(shared.try_lock().is_ok(), "RPC must not hold catalog mutex");
+        if shared.try_lock().is_err() {
+            // A foreground connection may briefly inspect status concurrently with this RPC.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let catalog = shared.clone();
+            std::thread::spawn(move || {
+                drop(catalog.lock().unwrap());
+                let _ = tx.send(());
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+                "RPC must not hold catalog mutex"
+            );
+        }
         let op = request["op"].as_str().unwrap();
         let fail = self.fault.as_ref().filter(|(name, _)| name == op).cloned();
         if fail == Some((op.into(), false)) {
@@ -142,7 +155,8 @@ impl Peers {
             }
             "activate" => {
                 let c = shared.lock().unwrap();
-                let t = c.transfer(1).unwrap();
+                let id=request["placement"]["transfer"].as_str().unwrap().strip_prefix("transfer-").unwrap().parse().unwrap();
+                let t = c.transfer(id).unwrap();
                 assert_eq!(t.step, Step::StartUncertain);
                 let epoch: i64 =
                     c.db.query_row(
@@ -755,3 +769,652 @@ fn policy_install_is_epoch_bound_unstarted_and_preserves_the_public_host_identit
     assert!(!installed.ready);
     worker.join().unwrap();
 }
+
+fn parked_fixture(state: &str) -> (Fixture, RefCell<Peers>) {
+    let mut f = Fixture::new();
+    let initial = {
+        let c = f.shared.lock().unwrap();
+        c.db.execute("DELETE FROM transfer_reservations", [])
+            .unwrap();
+        c.db.execute("DELETE FROM transfer_locks", []).unwrap();
+        c.db.execute("UPDATE transfers SET step='succeeded',target='source'", [])
+            .unwrap();
+        c.db.execute("UPDATE operations SET state='succeeded'", [])
+            .unwrap();
+        c.db.execute("UPDATE resources SET placement_managed=1,placement_epoch=?1,reserved_mib=256,reserved_cpus=1,metadata=json_set(metadata,'$.state',?2)",params![f.transfer.epoch,state]).unwrap();
+        let auth = authority(&f.transfer, "source");
+        let input = Intent {
+            kind: Kind::Park,
+            machine: "box".into(),
+            target: None,
+            capture: None,
+            child: None,
+            memory_mib: 256,
+            cpus: 1,
+            disk_bytes: 4,
+            accept_cold: false,
+            explicit_start: false,
+        };
+        f.transfer = c.begin_transfer(f.user, "park-retry", &input).unwrap();
+        json!({"id":"physical","memory_mib":256,"vcpu_count":1,"disk_bytes":4,"placement":auth,"state":state,"vmm_running":false,"lifecycle":{"phase":"active"}})
+    };
+    fs::write(f.root.join("store-url"), "s3://bucket/root").unwrap();
+    (
+        f,
+        RefCell::new(Peers {
+            source: Some(initial),
+            ..Default::default()
+        }),
+    )
+}
+fn publication(request: &Value, ram: bool) -> Value {
+    let a: Artifact = serde_json::from_value(request["artifact"].clone()).unwrap();
+    let mut files = BTreeMap::new();
+    let mut hashes = serde_json::Map::new();
+    for file in if ram {
+        vec!["disk.ext4", "memory", "state"]
+    } else {
+        vec!["disk.ext4"]
+    } {
+        let hash = store::sha256(file.as_bytes());
+        hashes.insert(file.into(), json!(hash));
+        files.insert(
+            file.into(),
+            store::StoredFile {
+                size: if file == "disk.ext4" { 4 } else { 3 },
+                allocated: 0,
+                sha256: hash,
+                objects: vec![store::Object {
+                    key: format!(
+                        "{}{file}.zst",
+                        store::attempt_prefix(&a.reference.attempt).unwrap()
+                    ),
+                    codec: "zstd".into(),
+                }],
+            },
+        );
+    }
+    let native = json!({"workspace":a.machine,"name":a.snapshot,"memory_mib":256,"vcpu_count":1,"managed":true,"runtime":"same","cpu":"right","kernel_sha256":"same","files":hashes});
+    let manifest = store::Manifest {
+        format: 1,
+        kind: "capture".into(),
+        attempt: a.reference.attempt.clone(),
+        created_unix: 0,
+        metadata: json!({"native_manifest":native.to_string()}),
+        files,
+    };
+    json!({"present":true,"reference":{"attempt":a.reference.attempt,"digest":store::sha256(&manifest.bytes().unwrap())},"manifest":manifest})
+}
+fn park_call(
+    f: &Fixture,
+    peers: &RefCell<Peers>,
+    ram: bool,
+    node: &str,
+    request: Value,
+) -> Result<Value> {
+    match request["op"].as_str().unwrap() {
+        "capture-published" => Ok(json!({"present":false})),
+        "capture-push" => Ok(publication(&request, ram)),
+        _ => peers.borrow_mut().call(&f.shared, node, request),
+    }
+}
+#[test]
+fn park_preserves_user_state_and_only_releases_source_after_publication_and_commit() {
+    for state in ["stopped", "hibernated"] {
+        let (mut f, peers) = parked_fixture(state);
+        let ram = state == "hibernated";
+        for step in [
+            Step::Preparing,
+            Step::Exported,
+            Step::Prepared,
+            Step::Committed,
+        ] {
+            assert_eq!(f.step(), step);
+            let node: String = f
+                .shared
+                .lock()
+                .unwrap()
+                .db
+                .query_row("SELECT node FROM resources", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                node,
+                if step == Step::Committed {
+                    ""
+                } else {
+                    "source"
+                }
+            );
+            tick(&f.shared, f.transfer.id, now(), &|node, request| {
+                park_call(&f, &peers, ram, node, request)
+            })
+            .unwrap();
+            f.restart();
+        }
+        assert_eq!(f.step(), Step::Succeeded);
+        let c = f.shared.lock().unwrap();
+        assert_eq!(c.db.query_row("SELECT node='' AND reserved_mib=0 AND reserved_cpus=0 AND json_extract(metadata,'$.state')=?1 AND current_capture IS NOT NULL FROM resources",[state],|r|r.get::<_,bool>(0)).unwrap(),true);
+        assert_eq!(
+            c.db.query_row(
+                "SELECT state FROM artifacts WHERE id=?1",
+                [format!("park-{}", f.transfer.id)],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "stored"
+        );
+        assert_eq!(
+            parking::admission(
+                &c,
+                f.user,
+                &json!({"op":"park","id":"box","operation_key":"park-retry"}),
+                Kind::Park
+            )
+            .unwrap()
+            .id,
+            f.transfer.id
+        );
+        assert_eq!(peers.borrow().starts, 0);
+    }
+}
+#[test]
+fn upload_failure_or_lost_reply_keeps_source_and_retries_without_parking() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    tick(&f.shared, f.transfer.id, now(), &|n, r| {
+        park_call(&f, &peers, true, n, r)
+    })
+    .unwrap();
+    let result = RefCell::new(None);
+    assert!(
+        tick(&f.shared, f.transfer.id, now(), &|n, r| {
+            if r["op"] == "capture-push" {
+                *result.borrow_mut() = Some(publication(&r, true));
+                anyhow::bail!("upload response lost")
+            }
+            park_call(&f, &peers, true, n, r)
+        })
+        .is_err()
+    );
+    f.restart();
+    assert_eq!(f.step(), Step::Exported);
+    {
+        let c = f.shared.lock().unwrap();
+        assert!(
+            c.db.query_row(
+                "SELECT node='source' AND reserved_mib=256 FROM resources",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            c.db.query_row(
+                "SELECT state FROM artifacts WHERE id=?1",
+                [format!("park-{}", f.transfer.id)],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "uploading"
+        );
+    }
+    tick(&f.shared, f.transfer.id, now(), &|node, r| {
+        if r["op"] == "inspect" {
+            return peers.borrow_mut().call(&f.shared, node, r);
+        }
+        assert_eq!(r["op"], "capture-published");
+        Ok(result.borrow().clone().unwrap())
+    })
+    .unwrap();
+    assert_eq!(f.step(), Step::Prepared);
+}
+fn complete_park(f: &mut Fixture, peers: &RefCell<Peers>, ram: bool) {
+    while f.step() != Step::Succeeded {
+        tick(&f.shared, f.transfer.id, now(), &|n, r| {
+            park_call(f, peers, ram, n, r)
+        })
+        .unwrap();
+        f.restart();
+    }
+}
+#[test]
+fn connection_wake_coalesces_queues_through_drain_and_stopped_requires_start() {
+    for (state, policy) in ["hibernated", "stopped"].into_iter().flat_map(|state| {
+        ["runner-drain", "controller-drain", "inactive"].map(|policy| (state, policy))
+    }) {
+        let (mut f, peers) = parked_fixture(state);
+        complete_park(&mut f, &peers, state == "hibernated");
+        let c = f.shared.lock().unwrap();
+        let request = json!({"op":"connect","id":"box","operation_key":"connect-one"});
+        if state == "stopped" {
+            assert!(parking::admission(&c, f.user, &request, Kind::Wake).is_err());
+        }
+        let request = json!({"op":if state=="stopped"{"start"}else{"connect"},"id":"box","operation_key":"connect-one"});
+        let wake = parking::admission(&c, f.user, &request, Kind::Wake).unwrap();
+        for caller in ["ssh", "exec", "terminal", "preview"] {
+            assert_eq!(
+                parking::admission(
+                    &c,
+                    f.user,
+                    &json!({"op":"connect","id":"box","operation_key":caller}),
+                    Kind::Wake
+                )
+                .unwrap()
+                .id,
+                wake.id
+            );
+        }
+        assert_eq!(
+            c.db.query_row("SELECT COUNT(*) FROM transfer_reservations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        if policy == "runner-drain" {
+            c.db.execute(
+                "UPDATE nodes SET capabilities=json_set(capabilities,'$.drain',1)",
+                [],
+            )
+            .unwrap();
+        } else {
+            c.db.execute("INSERT INTO node_placement_policy(node,active,controller_drain) SELECT id,?1,?2 FROM nodes",params![policy != "inactive", policy == "controller-drain"]).unwrap();
+        }
+        drop(c);
+        assert!(
+            !tick(&f.shared, wake.id, now(), &|_, _| panic!(
+                "no RPC during queued wake"
+            ))
+            .unwrap()
+        );
+        f.restart();
+        {
+            let c = f.shared.lock().unwrap();
+            assert!(c.operation_info(f.user, wake.operation).unwrap()["queued"].is_string());
+            c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.drain',0) WHERE id='target'",[]).unwrap();
+            c.db.execute(
+                "UPDATE node_placement_policy SET active=1,controller_drain=0 WHERE node='target'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(tick(&f.shared, wake.id, now(), &|_, _| panic!()).unwrap());
+        {
+            let c = f.shared.lock().unwrap();
+            assert_eq!(
+                c.transfer(wake.id).unwrap().target.as_deref(),
+                Some("target")
+            );
+            assert_eq!(
+                c.db.query_row("SELECT COUNT(*) FROM transfer_reservations", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+}
+#[test]
+fn concurrent_connection_admission_has_one_wake_and_one_reservation() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    let ids = std::thread::scope(|s| {
+        let joins:Vec<_>=(0..16).map(|i|{let shared=f.shared.clone();let user=f.user;s.spawn(move||{let c=shared.lock().unwrap();parking::admission(&c,user,&json!({"op":"connect","id":"box","operation_key":format!("connection-{i}")}),Kind::Wake).unwrap().id})}).collect();
+        joins
+            .into_iter()
+            .map(|j| j.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(ids.iter().all(|id| *id == ids[0]));
+    tick(&f.shared, ids[0], now(), &|_, _| panic!()).unwrap();
+    let c = f.shared.lock().unwrap();
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM transfer_reservations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+fn wake_call(
+    f: &Fixture,
+    peers: &RefCell<Peers>,
+    ram: bool,
+    node: &str,
+    request: Value,
+) -> Result<Value> {
+    match request["op"].as_str().unwrap() {
+        "status" => Ok(json!({"compat":{"runtime":"same","cpu":"right","kernel_sha256":"same"}})),
+        "capture-cache" => Ok(
+            json!({"present":peers.borrow().cached,"digest":request["artifact"]["reference"]["digest"],"manifest_sha256":"c".repeat(64),"ram":ram,"compat":{"runtime":"same","cpu":"right","kernel_sha256":"same"}}),
+        ),
+        "capture-pull" => {
+            let digest = request["artifact"]["reference"]["digest"].clone();
+            let mut result = peers.borrow_mut().call(&f.shared, node, request)?;
+            result["digest"] = digest;
+            Ok(result)
+        }
+        "export-cleanup" => {
+            let mut peers = peers.borrow_mut();
+            let seen = if node == "source" {
+                peers.source.as_mut().unwrap()
+            } else {
+                peers.target.as_mut().unwrap()
+            };
+            assert_eq!(seen["placement"], request["placement"]);
+            assert_eq!(seen["lifecycle"]["intent"]["transfer"], request["transfer"]);
+            seen["lifecycle"]["phase"] = json!("cleaned");
+            Ok(seen.clone())
+        }
+        _ => peers.borrow_mut().call(&f.shared, node, request),
+    }
+}
+fn admit_wake(f: &mut Fixture, explicit: bool) -> Transfer {
+    let c = f.shared.lock().unwrap();
+    let request =
+        json!({"op":if explicit{"start"}else{"connect"},"id":"box","operation_key":"wake-retry"});
+    parking::admission(&c, f.user, &request, Kind::Wake).unwrap()
+}
+#[test]
+fn wake_restart_and_lost_import_or_activation_reply_have_one_execution() {
+    for state in ["hibernated", "stopped"] {
+        for op in ["capture-pull", "import-prepare", "activate"] {
+            for after in [false, true] {
+                let (mut f, peers) = parked_fixture(state);
+                complete_park(&mut f, &peers, state == "hibernated");
+                {
+                    let c = f.shared.lock().unwrap();
+                    c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.drain',1) WHERE id='source'",[]).unwrap();
+                }
+                let wake = admit_wake(&mut f, state == "stopped");
+                peers.borrow_mut().fault = Some((op.into(), after));
+                let mut at = now();
+                let mut errors = 0;
+                for _ in 0..20 {
+                    match tick(&f.shared, wake.id, at, &|n, r| {
+                        wake_call(&f, &peers, state == "hibernated", n, r)
+                    }) {
+                        Ok(false) => break,
+                        Ok(true) => {}
+                        Err(_) => {
+                            errors += 1;
+                            at += 7201;
+                        }
+                    }
+                    f.restart();
+                }
+                let c = f.shared.lock().unwrap();
+                assert_eq!(
+                    c.transfer(wake.id).unwrap().step,
+                    Step::Succeeded,
+                    "{state} {op} {after}"
+                );
+                assert_eq!(errors, 1);
+                assert_eq!(peers.borrow().starts, 1);
+                assert_eq!(
+                    c.managed_placement("physical").unwrap().unwrap().node,
+                    "target"
+                );
+                assert_eq!(
+                    c.db.query_row("SELECT COUNT(*) FROM transfer_reservations", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                assert!(
+                    c.db.query_row(
+                        "SELECT current_capture IS NOT NULL FROM resources",
+                        [],
+                        |r| r.get::<_, bool>(0)
+                    )
+                    .unwrap()
+                );
+            }
+        }
+    }
+}
+#[test]
+fn wake_on_cached_source_cleans_only_old_export_and_keeps_capture() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    peers.borrow_mut().cached = true;
+    let wake = admit_wake(&mut f, false);
+    for _ in 0..12 {
+        if !tick(&f.shared, wake.id, now(), &|n, r| {
+            wake_call(&f, &peers, true, n, r)
+        })
+        .unwrap()
+        {
+            break;
+        }
+    }
+    let c = f.shared.lock().unwrap();
+    assert_eq!(c.transfer(wake.id).unwrap().step, Step::Succeeded);
+    assert_eq!(
+        c.managed_placement("physical").unwrap().unwrap().node,
+        "source"
+    );
+    assert_eq!(peers.borrow().starts, 1);
+    assert!(peers.borrow().pulls.is_empty());
+    assert_eq!(
+        c.db.query_row(
+            "SELECT state FROM artifacts WHERE id=?1",
+            [format!("park-{}", f.transfer.id)],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "stored"
+    );
+}
+#[test]
+fn revocation_during_wake_pull_blocks_import_and_preserves_retry_roots() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    let wake = admit_wake(&mut f, false);
+    tick(&f.shared, wake.id, now(), &|_, _| panic!()).unwrap();
+    let result = tick(&f.shared, wake.id, now(), &|n, r| {
+        let revoke = r["op"] == "capture-pull";
+        let result = wake_call(&f, &peers, true, n, r)?;
+        if revoke {
+            f.shared
+                .lock()
+                .unwrap()
+                .db
+                .execute(
+                    "UPDATE resources SET ssh_policy_generation=ssh_policy_generation+1",
+                    [],
+                )
+                .unwrap();
+        }
+        Ok(result)
+    });
+    assert!(result.is_err());
+    f.restart();
+    assert!(
+        tick(&f.shared, wake.id, now(), &|_, _| panic!(
+            "revoked operation must not dispatch"
+        ))
+        .is_err()
+    );
+    let c = f.shared.lock().unwrap();
+    assert!(
+        c.db.query_row(
+            "SELECT node='' AND current_capture IS NOT NULL FROM resources",
+            [],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM transfer_reservations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(peers.borrow().starts, 0);
+}
+#[test]
+fn cold_wake_retry_needs_new_explicit_consent_and_keeps_old_ram() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    let wake = admit_wake(&mut f, false);
+    tick(&f.shared, wake.id, now(), &|_, _| panic!()).unwrap();
+    f.shared
+        .lock()
+        .unwrap()
+        .db
+        .execute(
+            "UPDATE operations SET response=?1 WHERE id=?2",
+            params![
+                json!({"progress":{"bytes_completed":5,"bytes_total":10}}).to_string(),
+                wake.operation
+            ],
+        )
+        .unwrap();
+    tick(&f.shared, wake.id, now(), &|n, r| {
+        if r["op"] == "status" {
+            return Ok(json!({"compat":"different"}));
+        }
+        wake_call(&f, &peers, true, n, r)
+    })
+    .unwrap();
+    let retry = {
+        let c = f.shared.lock().unwrap();
+        assert_eq!(c.transfer(wake.id).unwrap().step, Step::Failed);
+        assert_eq!(
+            c.operation_info(f.user, wake.operation).unwrap()["progress"]["bytes_completed"],
+            5
+        );
+        assert!(
+            c.db.query_row(
+                "SELECT node='' AND current_capture IS NOT NULL FROM resources",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+        );
+        assert!(
+            parking::admission(
+                &c,
+                f.user,
+                &json!({"op":"wake","id":"box","operation_key":"wake-retry","accept_cold":true}),
+                Kind::Wake
+            )
+            .is_err()
+        );
+        parking::admission(
+            &c,
+            f.user,
+            &json!({"op":"wake","id":"box","operation_key":"cold-retry","accept_cold":true}),
+            Kind::Wake,
+        )
+        .unwrap()
+    };
+    for _ in 0..12 {
+        if !tick(&f.shared, retry.id, now(), &|n, r| {
+            if r["op"] == "import-prepare" {
+                assert_eq!(r["cold"], true);
+            }
+            wake_call(&f, &peers, true, n, r)
+        })
+        .unwrap()
+        {
+            break;
+        }
+    }
+    let c = f.shared.lock().unwrap();
+    assert_eq!(c.transfer(retry.id).unwrap().step, Step::Succeeded);
+    assert_eq!(peers.borrow().starts, 1);
+    assert_eq!(
+        c.db.query_row(
+            "SELECT state FROM artifacts WHERE id=?1",
+            [format!("park-{}", f.transfer.id)],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "stored"
+    );
+}
+
+#[test]
+fn timed_out_connection_and_metadata_lookup_do_not_create_a_second_wake() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    let wake = admit_wake(&mut f, false);
+    let identity = Identity {
+        issuer: "test".into(),
+        subject: "owner".into(),
+        email: "owner@example.test".into(),
+    };
+    for permission in ["ssh", "exec", "terminal", "preview"] {
+        let error = parking::wait_awake(
+            f.shared.clone(),
+            &identity,
+            "box",
+            permission,
+            &wake,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        let failure = error
+            .downcast_ref::<crate::catalog::OperationFailure>()
+            .unwrap();
+        assert_eq!(failure.0["id"], wake.operation);
+        assert_eq!(failure.0["transfer"]["step"], "preparing");
+    }
+    let mut c = f.shared.lock().unwrap();
+    assert!(
+        c.operation(f.user, json!({"op":"ssh-info","id":"box"}))
+            .is_err()
+    ); // unenrolled metadata, no worker contact
+    assert_eq!(
+        c.db.query_row(
+            "SELECT COUNT(*) FROM transfers WHERE kind='wake'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM transfer_reservations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let input = intent(&c, &c.transfer(1).unwrap()).unwrap();
+    assert!(
+        !serde_json::to_value(input)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("explicit_start")
+    );
+}
+
+#[test]
+fn park_denies_a_shared_admin_before_any_runner_contact() {
+    let f = Fixture::new();
+    let guest = Identity {
+        issuer: "test".into(),
+        subject: "guest".into(),
+        email: "guest@example.test".into(),
+    };
+    {
+        let mut c = f.shared.lock().unwrap();
+        c.user(&guest).unwrap();
+        c.operation(
+            f.user,
+            json!({"op":"share","id":"box","with":"guest@example.test","role":"admin"}),
+        )
+        .unwrap();
+    }
+    let error = park(
+        f.shared.clone(),
+        &guest,
+        &json!({"op":"park","id":"owner@example.test/box","operation_key":"denied"}),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("owner"));
+}
+
+#[path = "parking_review_tests.rs"]
+mod review;

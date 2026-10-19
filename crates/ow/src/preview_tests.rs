@@ -94,7 +94,14 @@ async fn preview_http_websocket_and_revocation(capability: bool) {
     };
     let user = c.user(&owner).unwrap();
     let db = rusqlite::Connection::open(root.join("catalog.sqlite3")).unwrap();
-    db.execute("INSERT INTO resources(owner,kind,name,physical,metadata) VALUES(?1,'machine','demo','guest-id','{\"state\":\"running\"}')",[user]).unwrap();
+    // Revocation watches are process-wide: parallel fixtures need distinct machine IDs and ports.
+    let physical = crate::common::nonce().unwrap();
+    db.execute("INSERT INTO resources(owner,kind,name,physical,metadata) VALUES(?1,'machine','demo',?2,'{\"state\":\"running\"}')",rusqlite::params![user, physical]).unwrap();
+    db.execute(
+        "INSERT INTO publications(https_port,physical,guest_port,active) VALUES(?1,?2,3000,0)",
+        rusqlite::params![31000 + u16::from(capability), physical],
+    )
+    .unwrap();
     let row = c
         .publication(
             user,
@@ -120,7 +127,7 @@ async fn preview_http_websocket_and_revocation(capability: bool) {
                 break;
             };
             seen.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(req, json!({"op":"tunnel","id":"guest-id","port":3000}));
+            assert_eq!(req, json!({"op":"tunnel","id":physical,"port":3000}));
             let mut tcp = std::net::TcpStream::connect(backend_addr).unwrap();
             crate::wire::send(&mut s, &json!({"ok":true,"result":{}})).unwrap();
             std::thread::spawn(move || {

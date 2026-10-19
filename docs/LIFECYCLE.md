@@ -1,7 +1,7 @@
 # Placement catalog and transfer lifecycle
 
-The catalog persists transfer intent and executes explicit managed restore requests.
-Existing boxes remain fixed-placement until an owner requests a restore. Installation
+The catalog persists transfer intent and executes explicit managed restore, park and wake requests.
+Existing boxes remain fixed-placement until an owner requests a transfer. Installation
 alone does not move, park, start, stop or upgrade a worker. See [ADR 0007](adr/0007-catalog-placement-authority.md).
 
 ## Authority and phases
@@ -42,14 +42,14 @@ or pin a new create to its old placement.
 
 Stopped and hibernated remain different user states. Parking a stopped disk capture
 preserves stopped state. Connection-triggered wake accepts only a parked hibernated
-box; explicit start orchestration for a stopped box is separate. A list, name lookup
+box; a stopped box needs explicit start/wake. A list, name lookup
 or card view grants no start authority. Cold memory loss requires explicit consent
 in the durable intent and enforcement by both the restore runner and worker.
 
 ## Permissions
 
 The public restore API accepts a catalog artifact ID, target node, owner-scoped
-operation key and optional explicit cold consent. Other transfer kinds remain
+operation key and optional explicit cold consent. Park and wake use the existing API/CLI surfaces described below; move/fork remain
 catalog contracts without a public executor.
 
 | Action | Owner | Shared admin | Shared use | Node / guest |
@@ -127,6 +127,11 @@ copy is never activated before conditional catalog commit. Activation first pers
 `start_uncertain`; a matching running copy confirms a lost reply, while contradictory
 or active-but-nonrunning state stops for reconciliation rather than replaying start.
 A responding source is checked for contradictory execution before commit/activation.
+A restarted worker may report `exporting` with an `exporting` or `captured`
+lifecycle phase. The controller replays export only when the nonrunning source,
+placement, transfer ID, capture name and export mode match its persisted intent.
+It uses the original worker step key and waits for positive completed fencing;
+a partial capture alone never permits publication, import or placement commit.
 Source absence before positive fencing never allows progress. An offline source after
 its acknowledged durable export cannot restart through legacy requests.
 
@@ -137,7 +142,7 @@ the old operation's fingerprint or re-enable the source. Compatible imported cop
 retain memory state; cold copies explicitly discard RAM at import. The worker checks
 compatibility again at the trust boundary.
 
-Only successfully adopted restore placements enable the new epoch-bearing routes.
+Successfully adopted restore and wake placements enable the epoch-bearing routes.
 Unsupported managed mutations remain blocked. Terminal/SSH check their revocation
 watch again after opening the worker stream. Ownership and existing grants remain
 catalog facts and are rechecked at admission, each step, commit and stream routing.
@@ -174,3 +179,109 @@ before/after job effects, then invoke startup recovery against durable catalogs,
 verified byte caches and node journals. Their separate durable worker fixture
 emulates VMM execution; these tests prove controller/agent process recovery, not
 hardware isolation or RAM portability. All barriers compile out of release builds.
+
+## Explicit park and shared wake
+
+`ow --server URL --operation-key KEY park BOX` parks a stopped or hibernated box.
+It never captures a running box. The source agent must advertise `park_wake_v1`
+from an installed protocol-2 fencing worker and have the same configured artifact
+store as the controller. A managed hibernated box exports its RAM/disk consistency
+set; a stopped box exports disk only. T2 can register an unmanaged **stopped**
+copy, but cannot adopt an unmanaged hibernated copy. That case refuses without
+booting or discarding RAM; it needs a separate explicit adoption/worker upgrade.
+
+Park follows preparing → exported → prepared → committed → succeeded. It shares
+`recovery-upload.lock` with the existing recovery uploader and adds no timer.
+The export fences execution before publishing a new format-1 artifact under an
+attempt token. Publication checks the configured store's retention/write-once
+policy, writes the manifest last, reads it back by digest and validates native
+lineage/shape/file hashes. Only then can the catalog commit `node = ''`, the stored
+capture root and zero source CPU/RAM reservation. The original stopped/hibernated
+state remains visible. Upload failure keeps the original placement, disk, capture
+and reservation, with a retryable uncertain operation. A publication receipt and
+write-once retry reconcile a lost reply; an expired attempt receives a fresh token
+while its old lease remains recorded. Source cache and exported disk are retained.
+
+`ow --server URL --operation-key KEY wake BOX` explicitly places and starts a
+parked box. `start BOX` also wakes a parked box, including a deliberately stopped
+one. SSH, exec, files, terminal and preview connections wake parked **hibernated**
+boxes; connecting to a stopped box refuses until explicit start/wake. List,
+inspect, SSH config/key lookup and name resolution never initiate placement.
+
+Explicit start preserves the caller's operation key. Retrying it resolves the
+original outcome before examining current placement, including after a later stop
+and park. An explicit start/wake that joins another caller's wake records its own
+key as a durable `joined` operation pointing to the same transfer; status follows
+that execution without creating another reservation. Joined keys keep their
+original input and cannot authorize a later park/wake cycle. Owner recovery after
+sharing revocation can promote an existing matching join within the same recovery
+transaction, preserving the transfer, epoch and uncertain effects.
+
+All connection types/users join one wake under the physical machine's transfer
+lock. Queued wake has no target reservation. Fresh, nonrevoked, nondraining fencing
+runners with the required agent, disk headroom and CPU/RAM/slot budget are tried
+in stable node order. Warm RAM also requires a matching advertised runtime, CPU
+and guest-kernel tuple before any reservation. Parking retains the digest-verified
+manifest in its durable operation record; older records read the pinned manifest
+without holding the catalog lock. Disk-only or explicitly consented cold wake
+does not require a RAM match. A compatible runner without available capacity or
+one temporarily draining/offline produces visible `queued` status; startup recovery
+tries again. Once reserved, a timeout retains that target and reservation and does
+not create another operation. The runner probes verified cache, pulls only if
+absent, imports unstarted, commits placement and then activates. Source-cache reuse
+first applies exact old-export cleanup after checking its completed catalog intent;
+this removes only the old machine directory, preserving every capture and fence.
+A failed or uncertain wake keeps the artifact root; it never falls back to an
+unapproved cold boot or assumes an offline source was fenced.
+
+Permissions are checked before admission/join, each durable step, commit and again
+after a connection wait. SSH policy generation changes invalidate the transfer.
+Existing stream revocation checks still run after worker stream creation. A joining
+user sees safe step/progress information, not another user's operation key/name.
+Connection waits are bounded; reconnect joins the same operation. Explicit command
+results return the existing operation record and can be followed through `status`'s
+operations, including `transfer.step`, `queued`, and `progress`.
+
+Progress reports logical bytes in completed compressed file objects. It is polled
+approximately every five seconds during a transfer, and final completion is saved
+with the transition. It is not instantaneous wire throughput or proof of import;
+the step distinguishes transfer completion from validation/commit/start. Errors
+retain the last progress. When no runner matches the stored RAM, wake fails before
+reservation or pull, leaving the parked artifact available for a fresh explicit cold decision. Worker
+compatibility is rechecked after pull; a changed tuple fails before import and keeps
+the old artifact/parked placement. A new operation key with `wake --accept-cold`
+records explicit consent; the old RAM artifact stays recoverable through and after
+that decision's commit. Ordinary connections cannot supply this consent.
+
+This is class 1 controller/agent orchestration atop already installed T2 worker
+primitives. Schema/reader floor remain 5 and no new migration number is claimed.
+The optional `explicit_start` intent field is omitted when false, preserving prior
+restore fingerprints. Older controllers do not execute park/wake or route completed
+wake placements; rollback fails closed rather than ignoring placement authority.
+New private publication/progress jobs require the advertised agent support; worker
+protocol, runtime, installed worker pins and release versions are unchanged.
+No timer, automatic parking/drain policy or workstation movement is installed.
+
+Focused tests include RAM/disk and disk-only publication, upload failure/lost reply,
+controller reopen after each phase, concurrent connection admission, drain queueing,
+revocation during pull, source-cache reuse and explicit cold consent. The subprocess
+suite kills actual controllers at every park/wake phase and agents around publication
+using real node jobs and a local AWS fixture. Its separate durable worker models VM
+execution. Real Firecracker continuation, live bucket IAM/policy and guest SSH/process
+continuity remain dedicated disposable-fixture acceptance; these tests do not establish
+them. Running workspaces must never be used as lifecycle test fixtures.
+
+If sharing is revoked while a shared user initiates wake, the owner can retry with
+`wake BOX` and a fresh operation key, or reconnect to a hibernated box. The controller
+records a new owner-authorized operation and marks the revoked user's operation failed.
+It retains the same transfer, epoch, target, reservation and worker step keys, including
+uncertain imports or committed activation; it never discards an uncertain target to
+start elsewhere. The grant stays revoked and the original request remains in history.
+A changed SSH policy generation still requires reconciliation, and existing cold consent
+must be explicitly confirmed by the owner; an implicit connection cannot supply it.
+
+Park may reuse a positive fence left by a failed restore. It publishes the capture named
+by that verified worker export, rather than inventing a name from the new park ID. That
+binding is persisted in the artifact row. A retry can repair an unpublished incorrect
+binding using a fresh attempt token while retaining the old attempt lease. Published
+artifacts cannot be rebound to a different capture.

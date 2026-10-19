@@ -537,6 +537,32 @@ async fn handle(app: &App, mut request: Request) -> Response {
         if !app.config.previews || app.config.auth != Auth::Tailscale || app.dashboard.is_none() {
             return StatusCode::FORBIDDEN.into_response();
         }
+        let wake = match app.catalog.clone() {
+            Some(catalog) => {
+                let identity = identity.clone();
+                tokio::task::spawn_blocking(move || {
+                    let name = {
+                        let mut c = catalog.lock().unwrap();
+                        let user = c.user(&identity)?;
+                        c.preview_name(user, port)?
+                    };
+                    crate::transfers::ensure_awake(catalog, &identity, &name, "preview", false)
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r)
+            }
+            None => Err(anyhow::anyhow!("ownership catalog unavailable")),
+        };
+        if let Err(error) = wake {
+            if error
+                .downcast_ref::<crate::catalog::OperationFailure>()
+                .is_some()
+            {
+                return wake_error(error);
+            }
+            return StatusCode::FORBIDDEN.into_response();
+        }
         let target = crate::dashboard::with_catalog(app.catalog.clone(), identity, move |c, u| {
             c.preview_target(u, port)
         })
@@ -563,6 +589,11 @@ async fn handle(app: &App, mut request: Request) -> Response {
             .to_owned();
         if request.uri().query().is_some() || crate::common::address(&name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid SSH target").into_response();
+        }
+        if let Err(error) =
+            wake_connection(app.catalog.clone(), identity.clone(), name.clone(), "ssh").await
+        {
+            return wake_error(error);
         }
         let target = crate::dashboard::with_catalog(
             app.catalog.clone(),
@@ -601,6 +632,16 @@ async fn handle(app: &App, mut request: Request) -> Response {
             .to_owned();
         if request.uri().query().is_some() || crate::common::address(&name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid terminal target").into_response();
+        }
+        if let Err(error) = wake_connection(
+            app.catalog.clone(),
+            identity.clone(),
+            name.clone(),
+            "terminal",
+        )
+        .await
+        {
+            return wake_error(error);
         }
         let id = crate::dashboard::with_catalog(
             app.catalog.clone(),
@@ -844,6 +885,35 @@ async fn host_admin(app: &App, identity: crate::catalog::Identity, request: Requ
 
 fn router(app: App) -> Router {
     Router::new().fallback(proxy).with_state(app)
+}
+
+async fn wake_connection(
+    catalog: Option<Arc<std::sync::Mutex<crate::catalog::Catalog>>>,
+    identity: crate::catalog::Identity,
+    name: String,
+    permission: &'static str,
+) -> Result<()> {
+    let catalog = catalog.context("ownership catalog unavailable")?;
+    tokio::task::spawn_blocking(move || {
+        crate::transfers::ensure_awake(catalog, &identity, &name, permission, false)
+    })
+    .await??;
+    Ok(())
+}
+fn wake_error(error: anyhow::Error) -> Response {
+    if let Some(operation) = error.downcast_ref::<crate::catalog::OperationFailure>() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"ok":false,"operation":operation.0})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "Workspace unavailable; stopped boxes require explicit start.",
+        )
+            .into_response()
+    }
 }
 
 pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Result<()> {
@@ -2051,7 +2121,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(root.join("control.sock")).unwrap();
         let terminals = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicUsize::new(0));
-        // A "slow" exec holds its reply (and so the gateway's catalog lock) until released.
+        // A slow worker exec remains in flight while the owner revokes the grant.
         let slow = Arc::new(AtomicUsize::new(0));
         let (opened, ended, held) = (terminals.clone(), closed.clone(), slow.clone());
         std::thread::spawn(move || {
@@ -2180,7 +2250,10 @@ mod tests {
         assert_eq!(state(bob.clone()).await["result"]["host_controls"], false);
         let exec = json!({"op":"exec","id":shared,"command":"id"});
         assert!(terminal(bob.clone()).await.unwrap().is_err());
-        assert_eq!(api(bob.clone(), exec.clone()).await.0, StatusCode::CONFLICT);
+        assert_eq!(
+            api(bob.clone(), exec.clone()).await.0,
+            StatusCode::NOT_FOUND
+        );
         let (code, value) = api(
             alice.clone(),
             json!({"op":"share","id":"legacy","with":"bob@example.test"}),
@@ -2199,7 +2272,7 @@ mod tests {
         while terminals.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // Bob's slow exec holds the catalog lock while the owner unshares.
+        // Revocation must close the live terminal without waiting for Bob's slow exec.
         let pending = tokio::spawn(api(
             bob.clone(),
             json!({"op":"exec","id":shared,"command":"slow"}),
@@ -2207,6 +2280,12 @@ mod tests {
         while slow.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert_eq!(terminals.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            closed.load(Ordering::SeqCst),
+            0,
+            "terminal closed before revocation"
+        );
         let started = Instant::now();
         let (code, value) = tokio::time::timeout(
             Duration::from_secs(3),
@@ -2245,7 +2324,7 @@ mod tests {
         );
         slow.store(2, Ordering::SeqCst);
         pending.await.unwrap();
-        assert_eq!(api(bob.clone(), exec).await.0, StatusCode::CONFLICT);
+        assert_eq!(api(bob.clone(), exec).await.0, StatusCode::NOT_FOUND);
         assert!(terminal(bob).await.unwrap().is_err());
         server.abort();
         let _ = fs::remove_dir_all(&root);

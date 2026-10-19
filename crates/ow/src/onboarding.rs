@@ -1982,9 +1982,8 @@ impl http_body::Body for AssetBody {
         http_body::SizeHint::with_exact(self.remaining)
     }
 }
-// Bounded cache for immutable selected bundle bytes. Every request opens a fresh FD
-// and validates ownership/type/size. Rewrites, chmod, replacement and manifest digest
-// changes invalidate via inode/stat/digest identity; no path-only trust or stale FD.
+// Metadata can remain identical after a same-length rewrite; hash every opened asset.
+// Serialize verification to bound concurrent large-image hashing.
 fn verified_public_file(file: &mut fs::File, size: u64, expected: &str) -> Result<()> {
     verified_public_file_before_lock(file, size, expected, || {})
 }
@@ -1994,9 +1993,8 @@ fn verified_public_file_before_lock(
     expected: &str,
     before_lock: impl FnOnce(),
 ) -> Result<()> {
-    use std::collections::BTreeSet;
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    static VERIFY: OnceLock<Mutex<()>> = OnceLock::new();
     fn identity(m: &fs::Metadata, expected: &str) -> String {
         format!(
             "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
@@ -2021,42 +2019,35 @@ fn verified_public_file_before_lock(
         "unsafe opened published asset"
     );
     let key = identity(&before, expected);
-    // Serialize first verification to avoid simultaneous large-image hash amplification.
     before_lock();
-    let mut cache = CACHE
-        .get_or_init(|| Mutex::new(BTreeSet::new()))
+    let _verification = VERIFY
+        .get_or_init(|| Mutex::new(()))
         .lock()
-        .map_err(|_| anyhow::anyhow!("asset verification cache"))?;
+        .map_err(|_| anyhow::anyhow!("asset verification lock"))?;
     ensure!(
         identity(&file.metadata()?, expected) == key,
         "published asset changed while queued for verification"
     );
-    if !cache.contains(&key) {
-        let mut hash = Sha256::new();
-        let mut buffer = [0u8; 65536];
-        let mut count = 0u64;
-        loop {
-            let n = file.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            count += n as u64;
-            ensure!(count <= size, "published asset grew");
-            hash.update(&buffer[..n]);
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    let mut count = 0u64;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
         }
-        ensure!(
-            count == size && format!("{:x}", hash.finalize()) == expected,
-            "published asset hash mismatch"
-        );
-        ensure!(
-            identity(&file.metadata()?, expected) == key,
-            "published asset changed during verification"
-        );
-        if cache.len() >= 32 {
-            cache.clear();
-        }
-        cache.insert(key);
+        count += n as u64;
+        ensure!(count <= size, "published asset grew");
+        hash.update(&buffer[..n]);
     }
+    ensure!(
+        count == size && format!("{:x}", hash.finalize()) == expected,
+        "published asset hash mismatch"
+    );
+    ensure!(
+        identity(&file.metadata()?, expected) == key,
+        "published asset changed during verification"
+    );
     use std::io::Seek;
     file.rewind()?;
     Ok(())
@@ -2287,6 +2278,31 @@ mod tests {
             let response = public_download_from(root.clone(), path, true).await;
             assert_eq!(response.status(), 200, "{path}");
             assert!(response.headers().contains_key("content-length"));
+        }
+        for (name, path) in [
+            ("ubuntu.ext4", "/cli/host/ubuntu.ext4"),
+            ("ubuntu.ext4.zst", "/cli/host/ubuntu.ext4.zst"),
+        ] {
+            let original = fs::read(root.join(name)).unwrap();
+            let mut changed = original.clone();
+            changed[0] ^= 1;
+            fs::write(root.join(name), changed).unwrap();
+            for head in [true, false] {
+                assert_eq!(
+                    public_download_from(root.clone(), path, head)
+                        .await
+                        .status(),
+                    503,
+                    "changed {path}, head={head}"
+                );
+            }
+            fs::write(root.join(name), original).unwrap();
+            assert_eq!(
+                public_download_from(root.clone(), path, false)
+                    .await
+                    .status(),
+                200
+            );
         }
         transport.manifest.files[5].sha256 = "0".repeat(64);
         fs::write(

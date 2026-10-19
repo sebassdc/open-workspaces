@@ -2,6 +2,46 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.11",
+      "class": 1,
+      "changes": [
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 2,
+        "accepts": [
+          1,
+          2
+        ]
+      },
+      "catalog": {
+        "schema": 5,
+        "min_reader": 5
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Explicit park and coalesced wake through durable catalog transfers and the single fenced hibernation publication scheduler. Park preserves stopped versus hibernated state and releases placement only after verified durable publication; connections wake hibernated boxes, while stopped boxes require explicit start. Warm wake filters the captured runtime, CPU and guest-kernel tuple before reserving a runner. Public host asset downloads hash each opened file instead of trusting metadata cache hits; repeated GET/HEAD requests also incur verification cost. Update controller, dashboard, agents and remote clients; requires the already-installed worker interface 2 placement fences. Catalog schema and reader floor 5, node protocol 1, worker interface 2, runtime, guest kernel and host layout are unchanged from v0.9.10. Retain running worker pins; no worker restart, automatic parking policy, timer, host replacement or implicit cold-memory loss.",
+      "waivers": {
+        "worker": "crates/ow/src/host.rs only rejects park/wake in the operator-local CLI and classifies Store as controller-only. Worker dispatch, runtime and lifecycle behavior are unchanged. Retain the worker pin."
+      }
+    },
+    {
       "version": "0.9.10",
       "class": 1,
       "changes": [

@@ -59,6 +59,7 @@ impl std::error::Error for OperationFailure {}
 /// operation response and host journal, where the operation ID makes them discoverable.
 fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
     match (op, diagnostic) {
+        (_, d) if d.starts_with("incompatible stored RAM;") => "Saved RAM is incompatible. Retry wake with a new operation key and explicit --accept-cold; the old RAM artifact is retained.",
         ("delete", "workspace is running; stop or hibernate it first") => {
             "Box is running. Stop the box first with ow stop, then retry ow delete with a new operation key."
         }
@@ -96,6 +97,10 @@ fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
 /// Exact allowlist only: arbitrary worker diagnostics can contain private host data.
 pub fn first_use_error(diagnostic: &str) -> Option<(&'static str, &'static str)> {
     Some(match diagnostic {
+        "connection wake requires hibernation; stopped needs explicit start" => (
+            "stopped",
+            "Box is deliberately stopped. Use ow start or ow wake explicitly before connecting.",
+        ),
         "no online node available" | "node offline or revoked; placement remains fixed" => (
             "node_unavailable",
             "No usable node is online. Check ow nodes; wait for the intended runner to reconnect. Retry an uncertain mutation with its original operation key.",
@@ -648,8 +653,12 @@ impl Catalog {
         common::identifier(key)?;
         common::address(&intent.machine)?;
         ensure!(
-            (intent.kind == Kind::Park) == intent.target.is_none(),
-            "only park has no target"
+            if intent.kind == Kind::Park {
+                intent.target.is_none()
+            } else {
+                intent.target.is_some() || intent.kind == Kind::Wake
+            },
+            "park cannot have a target; other transfers need one"
         );
         ensure!(
             (intent.kind == Kind::Fork) == intent.child.is_some(),
@@ -677,7 +686,7 @@ impl Catalog {
             if intent.kind == Kind::Wake {
                 ensure!(source_node.is_empty(), "wake requires a parked placement");
                 let state:String = c.db.query_row("SELECT json_extract(metadata,'$.state') FROM resources WHERE kind='machine' AND physical=?1",[&source],|r|r.get(0))?;
-                ensure!(state == "hibernated", "connection wake requires hibernation; stopped needs explicit start");
+                ensure!((state == "hibernated" || state == "stopped" && intent.explicit_start), "connection wake requires hibernation; stopped needs explicit start");
             }
             if let Some(capture) = &intent.capture {
                 c.transfer_capture(capture, owner, &source)?;
@@ -705,13 +714,96 @@ impl Catalog {
                 c.db.execute("INSERT INTO transfer_locks(machine,transfer) VALUES(?1,?2)",params![affected,id])?;
             }
             if let Some(target) = &intent.target {
-                // Catalog capacity only; T3 additionally validates worker capability and disk headroom.
-                let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("target offline, draining or without a registered budget")?;
-                let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-                let (extra_mib,extra_cpus,extra_slots) = c.extra_usage(target)?;
-                ensure!(used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64 && used_cpus as u64 + extra_cpus + intent.cpus as u64 <= cpus as u64 && used_slots as u64 + extra_slots < slots as u64,"node capacity exhausted");
-                c.db.execute("INSERT INTO transfer_reservations(transfer,node,epoch,memory_mib,cpus,disk_bytes) VALUES(?1,?2,?3,?4,?5,?6)",params![id,target,epoch,intent.memory_mib,intent.cpus,intent.disk_bytes as i64])?;
+                c.reserve_transfer(&c.transfer(id)?, target, intent)?;
             }
+            c.transfer(id)
+        })
+    }
+    fn reserve_transfer(
+        &self,
+        t: &crate::transfers::Transfer,
+        target: &str,
+        intent: &crate::transfers::Intent,
+    ) -> Result<()> {
+        let c = self;
+        // Catalog capacity only; T3 additionally validates worker capability and disk headroom.
+        let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("target offline, draining or without a registered budget")?;
+        let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let (extra_mib, extra_cpus, extra_slots) = c.extra_usage(target)?;
+        ensure!(
+            used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64
+                && used_cpus as u64 + extra_cpus + intent.cpus as u64 <= cpus as u64
+                && used_slots as u64 + extra_slots < slots as u64,
+            "node capacity exhausted"
+        );
+        c.db.execute("INSERT INTO transfer_reservations(transfer,node,epoch,memory_mib,cpus,disk_bytes) VALUES(?1,?2,?3,?4,?5,?6)",params![t.id,target,t.epoch,intent.memory_mib,intent.cpus,intent.disk_bytes as i64])?;
+        Ok(())
+    }
+    pub(crate) fn reserve_wake(
+        &self,
+        id: i64,
+        target: &str,
+        intent: &crate::transfers::Intent,
+    ) -> Result<()> {
+        self.transfer_write(|c| {
+            let t = c.transfer(id)?;
+            ensure!(
+                t.kind == crate::transfers::Kind::Wake
+                    && t.step == crate::transfers::Step::Preparing
+                    && t.target.is_none(),
+                "wake already reserved"
+            );
+            c.reserve_transfer(&t, target, intent)?;
+            c.db.execute(
+                "UPDATE transfers SET target=?1 WHERE id=?2",
+                params![target, id],
+            )?;
+            c.db.execute(
+                "UPDATE operations SET node=?1,state='pending',response=NULL WHERE id=?2",
+                params![target, t.operation],
+            )?;
+            // The committed park already fenced the source; exported here waits for a verified pull.
+            c.db.execute("UPDATE transfers SET step='exported' WHERE id=?1", [id])?;
+            Ok(())
+        })
+    }
+    /// Resume the same fenced effects under a fresh owner authorization after grant revocation.
+    /// Never release an uncertain target, change its epoch, or restore the revoked grant.
+    pub(crate) fn resume_wake(
+        &self,
+        user: i64,
+        key: &str,
+        address: &str,
+        id: i64,
+        explicit_start: bool,
+        accept_cold: bool,
+    ) -> Result<crate::transfers::Transfer> {
+        use crate::transfers::*;
+        self.transfer_write(|c|{
+            let t=c.transfer(id)?;
+            ensure!(t.kind==Kind::Wake && !t.step.terminal(),"wake is not resumable");
+            ensure!(c.machine(user,address,"start")?==t.source,"source changed");
+            ensure!(c.db.query_row("SELECT owner=?2 AND ssh_policy_generation=(SELECT source_policy_generation FROM transfers WHERE id=?3) FROM resources WHERE kind='machine' AND physical=?1",params![t.source,user,id],|r|r.get::<_,bool>(0))?,"only the current owner may resume; policy changes need reconciliation");
+            let (actor,old_address,request,response):(i64,String,String,Option<String>)=c.db.query_row("SELECT owner,json_extract(request,'$.transfer.machine'),request,response FROM operations WHERE id=?1",[t.operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+            ensure!(!c.machine(actor,&old_address,"start").is_ok_and(|id|id==t.source),"wake initiator still authorized");
+            let mut original:serde_json::Value=serde_json::from_str(&request)?;
+            let mut intent:Intent=serde_json::from_value(original["transfer"].take())?;
+            ensure!(intent.accept_cold==accept_cold,"owner must explicitly confirm existing cold consent");
+            ensure!(explicit_start || c.db.query_row("SELECT json_extract(metadata,'$.state')<>'stopped' FROM resources WHERE kind='machine' AND physical=?1",[&t.source],|r|r.get::<_,bool>(0))?,"connection wake requires hibernation; stopped needs explicit start");
+            intent.machine=address.into();intent.explicit_start=explicit_start;
+            let mut progress:serde_json::Value=response.and_then(|s|serde_json::from_str(&s).ok()).unwrap_or(json!({}));
+            progress.as_object_mut().context("invalid operation response")?.remove("error");
+            let fingerprint=json!({"transfer":intent}).to_string();
+            let joined:Option<i64>=c.db.query_row("SELECT id FROM operations WHERE owner=?1 AND retry_key=?2 AND state='joined' AND request=?3 AND json_extract(response,'$.wake_transfer')=?4",params![user,key,fingerprint,id],|r|r.get(0)).optional()?;
+            let operation=if let Some(operation)=joined {
+                c.db.execute("UPDATE operations SET state='pending',node=?1,response=?2 WHERE id=?3",params![t.target.as_deref().unwrap_or(""),progress.to_string(),operation])?;
+                operation
+            } else {
+                c.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,response) VALUES(?1,'wake',?2,'pending',?3,?4,?5,?6)",params![user,address,t.target.as_deref().unwrap_or(""),key,fingerprint,progress.to_string()])?;
+                c.db.last_insert_rowid()
+            };
+            c.db.execute("UPDATE operations SET state='failed',finished_at=CURRENT_TIMESTAMP,response=json_set(COALESCE(response,'{}'),'$.error','Wake authorization revoked; owner resumed the transfer.','$.resumed_by',?1) WHERE id=?2",params![operation,t.operation])?;
+            ensure!(c.db.execute("UPDATE transfers SET operation=?1 WHERE id=?2 AND operation=?3 AND EXISTS(SELECT 1 FROM transfer_locks WHERE transfer=?2 AND machine=?4)",params![operation,id,t.operation,t.machine])?==1,"wake authority changed");
             c.transfer(id)
         })
     }
@@ -809,7 +901,7 @@ impl Catalog {
         Ok(())
     }
     pub(crate) fn managed_placement(&self, physical: &str) -> Result<Option<common::Placement>> {
-        let placement: Option<(i64,String,i64)> = self.db.query_row("SELECT r.placement_epoch,r.node,t.id FROM resources r JOIN transfers t ON t.machine=r.physical AND t.epoch=r.placement_epoch AND t.target=r.node AND t.step='succeeded' AND t.kind='restore' WHERE r.kind='machine' AND r.physical=?1 AND r.placement_managed=1 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=r.physical)",[physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let placement: Option<(i64,String,i64)> = self.db.query_row("SELECT r.placement_epoch,r.node,t.id FROM resources r JOIN transfers t ON t.machine=r.physical AND t.epoch=r.placement_epoch AND t.target=r.node AND t.step='succeeded' AND t.kind IN ('restore','wake') WHERE r.kind='machine' AND r.physical=?1 AND r.placement_managed=1 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=r.physical)",[physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         Ok(placement.map(|(epoch, node, id)| common::Placement {
             epoch: epoch as u64,
             node,
@@ -843,6 +935,30 @@ impl Catalog {
     }
     pub(crate) fn operation_info(&self, user: i64, operation: i64) -> Result<Value> {
         let (mut info, response): (Value, Option<String>) = self.db.query_row("SELECT id,op,resource,state,node,retry_key,response FROM operations WHERE owner=?1 AND id=?2",params![user,operation],|r|Ok((json!({"id":r.get::<_,i64>(0)?,"op":r.get::<_,String>(1)?,"resource":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"node":r.get::<_,String>(4)?,"retry_key":r.get::<_,Option<String>>(5)?}),r.get(6)?)))?;
+        if info["state"] == "joined" {
+            let response: Value =
+                serde_json::from_str(response.as_deref().context("missing wake join")?)?;
+            let mut status = crate::transfers::wake_status(
+                self,
+                response["wake_transfer"]
+                    .as_i64()
+                    .context("missing joined transfer")?,
+            )?;
+            for field in ["id", "op", "resource", "retry_key"] {
+                status[field] = info[field].clone();
+            }
+            return Ok(status);
+        }
+        if let Some(value) = response
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        {
+            for field in ["progress", "queued"] {
+                if let Some(v) = value.get(field) {
+                    info[field] = v.clone();
+                }
+            }
+        }
         if matches!(
             info["state"].as_str(),
             Some("failed" | "uncertain" | "not_dispatched")
@@ -1654,6 +1770,23 @@ impl Catalog {
         // Resolve authority before any worker contact, including inventory refresh.
         if op != "create" {
             let physical = self.machine(user, &name, &op)?;
+            if op == "ssh-info" {
+                let parked:bool=self.db.query_row("SELECT node='' AND placement_managed=1 FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|r.get(0))?;
+                if parked {
+                    let raw: String = self.db.query_row(
+                        "SELECT ssh_policy FROM resources WHERE kind='machine' AND physical=?1",
+                        [&physical],
+                        |r| r.get(0),
+                    )?;
+                    let policy: crate::transfers::PublicSshPolicy = serde_json::from_str(&raw)?;
+                    return match policy {
+                        crate::transfers::PublicSshPolicy::Enrolled(policy) => {
+                            Ok(ow_core::ssh_guest::info(&policy))
+                        }
+                        _ => anyhow::bail!("SSH is not enrolled"),
+                    };
+                }
+            }
             self.legacy_access(&physical)?;
             if let Some(placement) = self.managed_placement(&physical)? {
                 ensure!(
@@ -2188,6 +2321,18 @@ impl Catalog {
         }
     }
 
+    pub(crate) fn preview_name(&self, user: i64, https: u16) -> Result<String> {
+        let physical: String = self.db.query_row(
+            "SELECT physical FROM publications WHERE https_port=?1 AND active=1",
+            [https],
+            |r| r.get(0),
+        )?;
+        let name = self
+            .logical(user, "machine", &physical)?
+            .context("not shared")?;
+        self.machine(user, &name, "preview")?;
+        Ok(name)
+    }
     pub fn preview_target(&self, user: i64, https: u16) -> Result<crate::preview::Target> {
         let (physical, port): (String,u16) = self.db.query_row("SELECT p.physical,p.guest_port FROM publications p JOIN resources r ON r.kind='machine' AND r.physical=p.physical WHERE p.https_port=?1 AND p.active=1",[https],|r|Ok((r.get(0)?,r.get(1)?)))?;
         let name = self
