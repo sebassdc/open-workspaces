@@ -53,6 +53,7 @@ def main():
     c = root / "c"
     n = root / "n"
     mkdir(c)
+    private_json(c / "limits.json", {"pool": {"default_type": "test-self-hosted", "hourly_cents": {"test-self-hosted": 0}}})
     mkdir(n)
     receipt = receipt_api.begin(root, ow, assets)
     checks = []

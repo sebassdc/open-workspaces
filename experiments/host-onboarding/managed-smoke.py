@@ -107,6 +107,7 @@ def main():
     (a.evidence/'before.json').write_text(json.dumps(before,indent=2))
     ident=uuid.uuid4().hex[:8];home=Path.home()/('.ow-hch-'+ident);controller=Path.home()/('.ow-hcc-'+ident)
     home.mkdir(mode=0o700);controller.mkdir(mode=0o700);root=home/'.ow-host'
+    (controller/'limits.json').write_text(json.dumps({'pool': {'default_type': 'test-self-hosted', 'hourly_cents': {'test-self-hosted': 0}}}))
     ca=a.evidence/'ca.pem';key=a.evidence/'key.pem'
     subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(key),'-out',str(ca),'-days','1','-subj','/CN=Host smoke CA','-addext','basicConstraints=critical,CA:TRUE','-addext','keyUsage=critical,keyCertSign,cRLSign'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     cert=a.evidence/'server.pem';server_key=a.evidence/'server-key.pem';csr=a.evidence/'server.csr';extensions=a.evidence/'server.ext'

@@ -823,7 +823,7 @@ async fn host_admin(app: &App, identity: crate::catalog::Identity, request: Requ
         }
     })
     .await;
-    let mut response=match result { Ok(Ok(value)) => axum::Json(json!({"ok":true,"result":value})).into_response(), _ => (StatusCode::CONFLICT,axum::Json(json!({"ok":false,"error":"Host operation rejected; check node ID, expiry and capacity."}))).into_response() };
+    let mut response=match result { Ok(Ok(value)) => axum::Json(json!({"ok":true,"result":value})).into_response(), Ok(Err(error)) if error.is::<crate::limits::Rejection>() => (StatusCode::CONFLICT, axum::Json(json!({"ok":false,"error":error.to_string()}))).into_response(), _ => (StatusCode::CONFLICT,axum::Json(json!({"ok":false,"error":"Host operation rejected; check node ID, expiry and capacity."}))).into_response() };
     response
         .headers_mut()
         .insert("cache-control", HeaderValue::from_static("no-store"));
@@ -2760,6 +2760,7 @@ mod tests {
         assert_eq!(crate::nodes::inventory(&root).unwrap(), json!([]));
         app.config.node_owner_subject = Some(identity.subject);
         app.config.node_owner_user_id = Some(owner);
+        crate::limits::free_pool(&root);
         let response = handle(&app, make(Some(token(&key, &claims())), "friend")).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["cache-control"], "no-store");
@@ -2782,6 +2783,17 @@ mod tests {
         assert_eq!(
             crate::nodes::inventory(&root).unwrap()[0]["owner_limits"],
             json!({"memory":8192,"slots":4,"cpus":32})
+        );
+        fs::write(root.join("limits.json"),json!({"pool":{"max_estimated_cents":0,"hours":1,"default_type":"test-instance","hourly_cents":{"test-instance":1}}}).to_string()).unwrap();
+        let response = handle(&app, make(Some(token(&key, &claims())), "over-budget")).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let rejection: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            rejection["error"]
+                .as_str()
+                .unwrap()
+                .contains("pool spend cap exceeded")
         );
         drop(app);
         fs::remove_dir_all(root).unwrap();

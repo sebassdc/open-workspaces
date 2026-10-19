@@ -83,7 +83,7 @@ impl Fake {
                         m.clone()
                     }
                     "create" => {
-                        let m = json!({"id":id,"memory_mib":request["memory_mib"],"vcpu_count":request["vcpu_count"],"image":request["image"],"state":"running","source":null,"disk_bytes":request["disk_gib"].as_u64().unwrap_or(8)*common::GIB});
+                        let m = json!({"id":id,"memory_mib":request["memory_mib"].as_u64().unwrap_or(256),"vcpu_count":request["vcpu_count"].as_u64().unwrap_or(1),"image":request["image"].as_str().unwrap_or("alpine"),"state":"running","source":null,"disk_bytes":request["disk_gib"].as_u64().unwrap_or(8)*common::GIB});
                         machines.insert(id.into(), m.clone());
                         m
                     }
@@ -1324,4 +1324,439 @@ async fn preview_publication_is_owner_only_durable_and_never_reassigns_origins()
                 .is_err()
         );
     }
+}
+
+fn quota_config(root: &Path, caps: Value) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(
+        root.join("limits.json"),
+        json!({"owner_defaults":caps}).to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        root.join("limits.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+}
+fn quota_node(fake: &Fake) {
+    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET memory_mib=4096,slots=8,capabilities=json_set(capabilities,'$.memory_mib',4096,'$.slots',8,'$.vcpus',8,'$.disk_resize_v1',json('true'))",[]).unwrap();
+}
+#[test]
+fn owner_quota_each_boundary_override_and_stopped_accounting() {
+    for (field, cap, message) in [
+        ("cpus", 1, "CPU"),
+        ("memory_mib", 256, "RAM MiB"),
+        ("disk_gib", 8, "disk GiB"),
+        ("boxes", 1, "boxes"),
+    ] {
+        let mut fake = Fake::new();
+        let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+        fake.worker("alpha");
+        quota_node(&fake);
+        let a = c.user(&identity("alice")).unwrap();
+        let b = c.user(&identity("bob")).unwrap();
+        let mut caps = json!({"cpus":16,"memory_mib":32768,"disk_gib":256,"boxes":8});
+        caps[field] = json!(cap);
+        quota_config(&fake.root, caps.clone());
+        let create = json!({"op":"create","id":"one","node":"alpha","memory_mib":256,"vcpu_count":1,"disk_gib":8});
+        c.operation(a, create.clone()).unwrap();
+        // Stable retries neither grow usage nor fail at the exact cap.
+        c.operation(a, create).unwrap();
+        c.operation(a, json!({"op":"stop","id":"one"})).unwrap();
+        let usage = c.state(a).unwrap()["owner_limits"]["usage"].clone();
+        assert_eq!(
+            usage,
+            json!({"cpus":1,"memory_mib":256,"disk_gib":8,"boxes":1})
+        );
+        let error = c
+            .operation(
+                a,
+                json!({"op":"create","id":"two","memory_mib":256,"vcpu_count":1,"disk_gib":8}),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("owner {message} limit exceeded")),
+            "{error:#}"
+        );
+        assert!(
+            c.physical(a, "machine", "two").is_err(),
+            "denied reservation rolled back"
+        );
+        assert_eq!(c.state(b).unwrap()["owner_limits"]["usage"]["boxes"], 0);
+        c.operation(
+            b,
+            json!({"op":"create","id":"two","memory_mib":256,"vcpu_count":1,"disk_gib":8}),
+        )
+        .unwrap();
+        // Overrides are trusted config keyed by durable owner ID, not request fields.
+        std::fs::write(fake.root.join("limits.json"),json!({"owner_defaults":caps,"owners":{a.to_string():{"cpus":16,"memory_mib":32768,"disk_gib":256,"boxes":8}}}).to_string()).unwrap();
+        c.operation(a, json!({"op":"fork","id":"one","child":"copy"}))
+            .unwrap();
+        assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 2);
+        c.operation(a, json!({"op":"delete","id":"one"})).unwrap();
+        assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 1);
+    }
+}
+#[test]
+fn owner_quota_growth_and_lowered_caps_leave_existing_boxes_usable() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    quota_node(&fake);
+    let a = c.user(&identity("alice")).unwrap();
+    quota_config(
+        &fake.root,
+        json!({"cpus":1,"memory_mib":256,"disk_gib":8,"boxes":1}),
+    );
+    c.operation(
+        a,
+        json!({"op":"create","id":"one","memory_mib":256,"vcpu_count":1,"disk_gib":8}),
+    )
+    .unwrap();
+    c.operation(a, json!({"op":"stop","id":"one"})).unwrap();
+    for (key, n) in [("vcpu_count", 2), ("memory_mib", 512), ("disk_gib", 9)] {
+        let mut r = json!({"op":"resize","id":"one"});
+        r[key] = json!(n);
+        assert!(
+            c.operation(a, r)
+                .unwrap_err()
+                .to_string()
+                .contains("limit exceeded")
+        );
+    }
+    quota_config(
+        &fake.root,
+        json!({"cpus":0,"memory_mib":0,"disk_gib":0,"boxes":0}),
+    );
+    c.operation(a, json!({"op":"start","id":"one"})).unwrap();
+    assert_eq!(
+        c.operation(a, json!({"op":"exec","id":"one","command":"true"}))
+            .unwrap()["exit_code"],
+        0
+    );
+    c.operation(a, json!({"op":"stop","id":"one"})).unwrap();
+    c.operation(a, json!({"op":"resize","id":"one","disk_gib":8}))
+        .unwrap();
+    c.operation(a, json!({"op":"delete","id":"one"})).unwrap();
+    assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 0);
+}
+#[test]
+fn owner_quota_failed_create_releases_but_uncertain_survives_restart() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    quota_node(&fake);
+    let a = c.user(&identity("alice")).unwrap();
+    quota_config(
+        &fake.root,
+        json!({"cpus":1,"memory_mib":256,"disk_gib":32,"boxes":1}),
+    );
+    *fake.reject.lock().unwrap() = Some("create".into());
+    let r =
+        json!({"op":"create","id":"one","memory_mib":256,"vcpu_count":1,"operation_key":"first"});
+    assert!(c.operation(a, r.clone()).is_err());
+    assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 0);
+    fake.uncertain.store(true, Ordering::SeqCst);
+    let mut r = r;
+    r["operation_key"] = json!("second");
+    assert!(c.operation(a, r.clone()).is_err());
+    drop(c);
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 1);
+    assert!(
+        c.operation(a, json!({"op":"create","id":"two"}))
+            .unwrap_err()
+            .to_string()
+            .contains("limit exceeded")
+    );
+    *fake.reject.lock().unwrap() = None;
+    c.operation(a, r).unwrap();
+    assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 1);
+}
+#[test]
+fn owner_quota_shared_fork_charges_recipient_and_snapshot_shape() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    quota_node(&fake);
+    let a = c.user(&identity("alice")).unwrap();
+    let b = c.user(&identity("bob")).unwrap();
+    c.operation(
+        a,
+        json!({"op":"create","id":"one","memory_mib":512,"vcpu_count":1,"disk_gib":8}),
+    )
+    .unwrap();
+    c.operation(a, json!({"op":"snapshot","id":"one","name":"big"}))
+        .unwrap();
+    c.operation(a, json!({"op":"stop","id":"one"})).unwrap();
+    c.operation(a, json!({"op":"resize","id":"one","memory_mib":256}))
+        .unwrap();
+    quota_config(
+        &fake.root,
+        json!({"cpus":1,"memory_mib":256,"disk_gib":8,"boxes":1}),
+    );
+    // Parent now fits; the captured RAM shape does not.
+    assert!(
+        c.operation(
+            a,
+            json!({"op":"fork","id":"one","snapshot":"big","child":"copy"})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("limit exceeded")
+    );
+    assert!(
+        c.operation(a, json!({"op":"restore","id":"one","name":"big"}))
+            .unwrap_err()
+            .to_string()
+            .contains("RAM MiB")
+    );
+    c.operation(
+        a,
+        json!({"op":"share","id":"one","with":"bob@example.test"}),
+    )
+    .unwrap();
+    c.operation(
+        b,
+        json!({"op":"fork","id":"alice@example.test/one","child":"mine"}),
+    )
+    .unwrap();
+    assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 1);
+    assert_eq!(c.state(b).unwrap()["owner_limits"]["usage"]["boxes"], 1);
+    assert!(c.operation(b,json!({"op":"fork","id":"alice@example.test/one","child":"extra","owner":a,"admin_override":true})).unwrap_err().to_string().contains("limit exceeded"));
+}
+
+#[test]
+fn owner_quota_concurrent_transactions_have_one_winner() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let owner = c.user(&identity("alice")).unwrap();
+    drop(c);
+    quota_config(
+        &fake.root,
+        json!({"cpus":1,"memory_mib":256,"disk_gib":8,"boxes":1}),
+    );
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let threads:Vec<_>=["one","two"].into_iter().map(|physical|{
+        let root=fake.root.clone();let barrier=barrier.clone();
+        std::thread::spawn(move||{
+            let mut db=nodes::db(&root).unwrap();barrier.wait();
+            let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            tx.execute("INSERT INTO resources(owner,kind,name,physical,metadata) VALUES(?1,'machine',?2,?2,'{}')",params![owner,physical]).unwrap();
+            let admitted=limits::admit(&root,&tx,physical,"create",&json!({"memory_mib":256,"vcpu_count":1,"disk_gib":8}),&json!({})).is_ok();
+            if admitted {tx.commit().unwrap();}
+            admitted
+        })
+    }).collect();
+    assert_eq!(
+        threads
+            .into_iter()
+            .filter_map(|t| t.join().ok())
+            .filter(|won| *won)
+            .count(),
+        1
+    );
+    let c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(
+        limits::state(&fake.root, &c.db, owner).unwrap()["usage"]["boxes"],
+        1
+    );
+}
+#[test]
+fn owner_quota_config_is_private_strict_and_never_silently_falls_back() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let owner = c.user(&identity("alice")).unwrap();
+    assert_eq!(
+        limits::state(&fake.root, &c.db, owner).unwrap()["caps"]["boxes"],
+        8
+    );
+    quota_config(
+        &fake.root,
+        json!({"cpus":1,"memory_mib":256,"disk_gib":8,"boxes":1}),
+    );
+    std::fs::set_permissions(
+        fake.root.join("limits.json"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(limits::load(&fake.root).is_err());
+    std::fs::set_permissions(
+        fake.root.join("limits.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    for invalid in [
+        json!({"owner_default":{}}),
+        json!({"pool":{"hours":0}}),
+        json!({"owner_defaults":{"cpus":-1}}),
+        json!({"owners":{"alice":{}}}),
+        json!({"owners":{"01":{"cpus":1,"memory_mib":256,"disk_gib":8,"boxes":1}}}),
+    ] {
+        std::fs::write(fake.root.join("limits.json"), invalid.to_string()).unwrap();
+        assert!(limits::load(&fake.root).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn owner_quota_uncertain_growth_and_pre_policy_intents_remain_reserved() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    quota_node(&fake);
+    let owner = c.user(&identity("alice")).unwrap();
+    quota_config(
+        &fake.root,
+        json!({"cpus":2,"memory_mib":512,"disk_gib":16,"boxes":2}),
+    );
+    let created = c
+        .operation(
+            owner,
+            json!({"op":"create","id":"one","memory_mib":256,"vcpu_count":1,"disk_gib":8}),
+        )
+        .unwrap();
+    let physical = c.physical(owner, "machine", "one").unwrap();
+    c.operation(owner, json!({"op":"stop","id":"one"})).unwrap();
+    *fake.reject.lock().unwrap() = Some("resize".into());
+    fake.uncertain.store(true, Ordering::SeqCst);
+    assert!(
+        c.operation(
+            owner,
+            json!({"op":"resize","id":"one","memory_mib":512,"disk_gib":16})
+        )
+        .is_err()
+    );
+    let usage = c.state(owner).unwrap()["owner_limits"]["usage"].clone();
+    assert_eq!(usage["memory_mib"], 512);
+    assert_eq!(usage["disk_gib"], 16);
+    // A different runner's invented observation cannot reduce this owner's demand.
+    c.save_node("other-node", "machine", &physical, &created)
+        .unwrap();
+    assert_eq!(
+        limits::state(&fake.root, &c.db, owner).unwrap()["usage"],
+        usage
+    );
+    drop(c);
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(c.state(owner).unwrap()["owner_limits"]["usage"], usage);
+    c.db.execute("UPDATE operations SET state='failed' WHERE op='resize'", [])
+        .unwrap();
+    assert_eq!(
+        c.state(owner).unwrap()["owner_limits"]["usage"]["memory_mib"],
+        256
+    );
+    // Upgrade a legacy catalog with an uncertain intent but no owner allocation table.
+    c.db.execute(
+        "UPDATE operations SET state='uncertain' WHERE op='resize'",
+        [],
+    )
+    .unwrap();
+    c.db.execute_batch("DROP TABLE owner_allocations").unwrap();
+    drop(c);
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let legacy = c.state(owner).unwrap()["owner_limits"]["usage"].clone();
+    assert_eq!(legacy["memory_mib"], common::HOST_MEMORY_MIB);
+    assert_eq!(legacy["disk_gib"], common::MAX_DISK_GIB);
+    assert!(
+        c.operation(owner, json!({"op":"create","id":"two"}))
+            .unwrap_err()
+            .to_string()
+            .contains("limit exceeded")
+    );
+    // Forgetting an offline row must not release capacity an uncertain effect can reclaim.
+    c.db.execute(
+        "UPDATE resources SET metadata=json_set(metadata,'$.state','missing') WHERE physical=?1",
+        [&physical],
+    )
+    .unwrap();
+    c.db.execute("UPDATE nodes SET heartbeat=0 WHERE id='alpha'", [])
+        .unwrap();
+    assert!(
+        c.operation(owner, json!({"op":"delete","id":"one"}))
+            .unwrap_err()
+            .to_string()
+            .contains("unresolved operations")
+    );
+    assert_eq!(
+        limits::state(&fake.root, &c.db, owner).unwrap()["usage"]["boxes"],
+        1
+    );
+    // An unknown delete cannot recreate a box, so it does not pin a confirmed-gone row.
+    c.db.execute("UPDATE operations SET state='failed' WHERE op='resize'", [])
+        .unwrap();
+    c.db.execute("INSERT INTO operations(owner,op,resource,state,request) VALUES(?1,'delete','one','uncertain',?2)",params![owner,json!({"request":{"op":"delete","id":physical},"node":"alpha"}).to_string()]).unwrap();
+    c.operation(
+        owner,
+        json!({"op":"delete","id":"one","operation_key":"confirm-gone"}),
+    )
+    .unwrap();
+    assert_eq!(
+        limits::state(&fake.root, &c.db, owner).unwrap()["usage"]["boxes"],
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_quota_dashboard_error_names_the_resource_and_cap() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    let mut fake = Fake::new();
+    let c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    quota_node(&fake);
+    quota_config(
+        &fake.root,
+        json!({"cpus":0,"memory_mib":0,"disk_gib":0,"boxes":0}),
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/operation")
+        .header("content-type", "application/json")
+        .header("x-ow-request", "dashboard")
+        .body(Body::from(json!({"op":"create","id":"quota"}).to_string()))
+        .unwrap();
+    let response = crate::dashboard::handle(
+        Some(Arc::new(Mutex::new(c))),
+        Some(fake.root.clone()),
+        identity("alice"),
+        request,
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["ok"], false);
+    let error = v["error"].as_str().unwrap();
+    assert!(error.contains("owner CPU limit exceeded"));
+    assert!(error.contains("limit 0"));
+    assert!(!error.contains("/tmp/"));
+}
+
+#[test]
+fn owner_quota_unknown_native_disk_never_uses_linux_default() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let owner = c.user(&identity("alice")).unwrap();
+    let physical = c.reserve(owner, "machine", "native").unwrap();
+    let error = limits::admit(
+        &fake.root,
+        &c.db,
+        &physical,
+        "create",
+        &json!({"image":"ubuntu-arm64","memory_mib":256,"vcpu_count":1}),
+        &json!({}),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("disk GiB limit exceeded"));
+    assert_eq!(
+        limits::state(&fake.root, &c.db, owner).unwrap()["usage"]["boxes"],
+        0
+    );
 }
