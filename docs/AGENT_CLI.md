@@ -51,8 +51,12 @@ substituted for that registry. An empty node array means no connected nodes.
 For built-in Ubuntu/Arch developer images, a non-null `development_choice`
 suggests 2048 MiB and two virtual CPUs only when they fit that node's observed
 compute limits. Linux choices specify the existing 32 GiB disk default. Mac
-choices omit disk sizing because that backend does not support it. A small
-Alpine prototype is not suggested as a development environment. If no development
+choices omit disk sizing because that backend does not support it. When the
+server reports owner quotas, discovery accounts for the same conservative
+16,384 GiB charge that admission uses for an unknown Mac clone disk. A smaller
+remaining owner disk allowance makes that image unavailable; wait for quota
+headroom or ask the administrator to inspect the disk accounting and policy.
+A small Alpine prototype is not suggested as a development environment. If no development
 choice fits, wait or inspect the node's available resources and allowed memory
 sizes; do not silently substitute a minimal image for a requested development box.
 

@@ -547,19 +547,16 @@ fn discovery_output(url: &str, state: &Value, action: &Action) -> Result<Value> 
     if let Some(images) = discovery.get_mut("images").and_then(Value::as_array_mut) {
         for image in images {
             let mac = image["name"] == "ubuntu-arm64";
+            // Admission charges the maximum when a native clone's disk size is unknown.
+            let disk = u64::from(if mac {
+                common::MAX_DISK_GIB
+            } else {
+                common::DEFAULT_DISK_GIB
+            });
             if let Some(placements) = image.get_mut("nodes").and_then(Value::as_array_mut) {
                 for placement in placements.iter_mut() {
                     if placement["availability"] == "available"
-                        && !owner_fits(
-                            &state["owner_limits"],
-                            if mac { 512 } else { 256 },
-                            1,
-                            if mac {
-                                0
-                            } else {
-                                common::DEFAULT_DISK_GIB as u64
-                            },
-                        )
+                        && !owner_fits(&state["owner_limits"], if mac { 512 } else { 256 }, 1, disk)
                     {
                         placement["availability"] = json!("insufficient_capacity");
                         placement["development_choice"] = json!(null);
@@ -570,7 +567,11 @@ fn discovery_output(url: &str, state: &Value, action: &Action) -> Result<Value> 
                             &state["owner_limits"],
                             choice["memory_mib"].as_u64().unwrap_or(0),
                             choice["vcpu_count"].as_u64().unwrap_or(0),
-                            choice["disk_gib"].as_u64().unwrap_or(0),
+                            if mac {
+                                disk
+                            } else {
+                                choice["disk_gib"].as_u64().unwrap_or(disk)
+                            },
                         )
                     {
                         placement["development_choice"] = json!(null);
@@ -765,6 +766,97 @@ mod tests {
                 ["discovery_supported"],
             false
         );
+    }
+
+    #[test]
+    fn mac_discovery_choices_match_owner_disk_admission() {
+        use crate::limits;
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("ow-discovery-quota-{}", common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE resources(kind TEXT,physical TEXT,owner INTEGER,metadata TEXT);",
+        )
+        .unwrap();
+        limits::initialize(&db).unwrap();
+        db.execute_batch("INSERT INTO resources VALUES('machine','native',1,'{}'),('machine','existing',1,'{}');").unwrap();
+        let cap = json!({"type":"heartbeat","protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","guest_ssh_v1":false,"operations":common::MAC_OPERATIONS,"memory_mib":2048,"slots":1,"vcpus":2,"images":["ubuntu-arm64"],"max_guest_memory_mib":2048,"max_guest_vcpus":2});
+        common::node_capabilities(&cap).unwrap();
+        let node = crate::discovery::node(
+            &json!({"id":"mac","online":true,"memory_mib":2048,"slots":1,"capabilities":cap}),
+            json!({"memory_mib":0,"vcpus":0,"slots":0}),
+            100,
+        );
+        let images = crate::discovery::images(&[node]);
+        let request = images
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "ubuntu-arm64")
+            .unwrap()["nodes"][0]["development_choice"]
+            .clone();
+        assert!(request.is_object());
+        assert!(request.get("disk_gib").is_none());
+        let max = u64::from(common::MAX_DISK_GIB);
+        for (cap, used, expected) in [
+            (None, 0, false),
+            (Some(max - 1), 0, false),
+            (Some(max), 0, true),
+            (Some(max + 31), 32, false),
+            (Some(max + 32), 32, true),
+        ] {
+            db.execute("DELETE FROM owner_allocations", []).unwrap();
+            if used > 0 {
+                db.execute(
+                    "INSERT INTO owner_allocations VALUES('existing',1,512,?1)",
+                    [used],
+                )
+                .unwrap();
+            }
+            if let Some(cap) = cap {
+                std::fs::write(root.join("limits.json"), json!({"owner_defaults":{"cpus":16,"memory_mib":32768,"disk_gib":cap,"boxes":8}}).to_string()).unwrap();
+                std::fs::set_permissions(
+                    root.join("limits.json"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            let owner_limits = limits::state(&root, &db, 1).unwrap();
+            let admitted =
+                limits::admit(&root, &db, "native", "create", &request, &json!({})).is_ok();
+            assert_eq!(admitted, expected, "cap={cap:?}, usage={used}");
+            let state =
+                json!({"discovery":{"schema":1,"images":images},"owner_limits":owner_limits});
+            let status = discovery_output("https://example.test", &state, &Action::Status).unwrap();
+            let action = Action::Image {
+                command: ImageAction::List { runner: None },
+            };
+            let output = discovery_output("https://example.test", &state, &action).unwrap();
+            assert_eq!(output, status["discovery"]["images"]);
+            let image = output
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["name"] == "ubuntu-arm64")
+                .unwrap();
+            assert_eq!(image["available"], admitted, "cap={cap:?}, usage={used}");
+            assert_eq!(
+                image["nodes"][0]["development_choice"].is_object(),
+                admitted
+            );
+            assert_eq!(
+                image["nodes"][0]["availability"],
+                if admitted {
+                    "available"
+                } else {
+                    "insufficient_capacity"
+                }
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
