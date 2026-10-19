@@ -110,6 +110,15 @@ class RecoveryHost(unittest.TestCase):
         self.assertIn('node-agent', h.p('/etc/systemd/system/open-workspaces.service').read_text())
         self.assertFalse(h.unit_exists(h.UNITS['dashboard']))
 
+    def test_role_transition_cannot_redirect_or_disable_existing_backups(self):
+        r.durable(r.FREEZE, {'state': 'stopped'})
+        self.new['backup'] = {'url': 's3://another-bucket/elsewhere', 'schedule': ''}
+        self.config.write_text(json.dumps(self.new))
+        with mock.patch.object(r, 'writer_stopped', return_value=True), mock.patch.object(h, 'budgets', return_value=BUDGET), \
+             mock.patch.object(r.ssl, 'create_default_context'), self.assertRaisesRegex(h.Refused, 'preserve backup'):
+            r.runner(self.config, 'https://replacement:8790', self.ca)
+        self.assertFalse(h.p(r.TRANSITION).exists())
+
     def test_private_inputs_and_stale_readiness(self):
         os.chmod(self.config, 0o644)
         with self.assertRaisesRegex(h.Refused, 'private regular file'):

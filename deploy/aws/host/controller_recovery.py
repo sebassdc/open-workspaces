@@ -140,7 +140,7 @@ def runner(config_file, controller, ca_file):
                                   or h.p(path).stat().st_mode & 0o777 != after[path][1]):
             raise h.Refused(f'installed worker file differs: {path}; resolve separately')
     # No unrelated tailnet/release/budget/image/storage changes in a role transition.
-    for key in ('release', 'tailscale', 'developerImages', 'idleMinutes', 'vcpuOvercommit', 'store'):
+    for key in ('release', 'tailscale', 'developerImages', 'idleMinutes', 'vcpuOvercommit', 'store', 'backup'):
         if old.get(key) != new.get(key):
             raise h.Refused(f'runner conversion must preserve {key}')
     intent = {'schema': 1, 'state': 'prepared', 'config': new, 'controller': controller,
