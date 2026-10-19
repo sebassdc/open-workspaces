@@ -83,11 +83,14 @@ export interface HostArgs {
     backupSchedule?: pulumi.Input<string>;
     /** Minutes without a connection or activity before a box hibernates; 0 turns it off. Default: 30. */
     idleMinutes?: pulumi.Input<number>;
+    /** CPU admission ratio: 1 (default) or 2 for dev workloads; RAM, slots and disk are unchanged. */
+    vcpuOvercommit?: pulumi.Input<number>;
 }
 
 /** A runner host: everything a Host takes except the dashboard, plus the controller it joins. */
 export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability"> {
-    // The package analyzer loses nested optional types inherited through Omit.
+    // The package analyzer loses optional types inherited through Omit.
+    vcpuOvercommit?: pulumi.Input<number>;
     tailscaleDirect?: pulumi.Input<TailscaleDirectArgs>;
     storeUrl?: pulumi.Input<string>;
     imageArtifacts?: pulumi.Input<{ [profile: string]: pulumi.Input<ImageArtifact> }>;
@@ -175,6 +178,7 @@ export interface HostConfigInputs {
     imageArtifacts?: { [profile: string]: { version: number; attempt: string; digest: string } };
     backupSchedule: string;
     idleMinutes: number;
+    vcpuOvercommit?: number;
     directMac?: string;
 }
 
@@ -210,6 +214,10 @@ export function hostConfig(c: HostConfigInputs): object {
     if (c.backupSchedule && (!backup || !/^[A-Za-z0-9 *:/,.~_-]{1,100}$/.test(c.backupSchedule))) {
         throw new Error(`backupSchedule needs backupUrl and a systemd calendar expression, not ${JSON.stringify(c.backupSchedule)}`);
     }
+    const vcpuOvercommit = c.vcpuOvercommit === undefined ? 1 : c.vcpuOvercommit;
+    if (vcpuOvercommit !== 1 && vcpuOvercommit !== 2) {
+        throw new Error("vcpuOvercommit must be 1 or 2");
+    }
     if (!Number.isInteger(c.idleMinutes) || c.idleMinutes < 0 || c.idleMinutes > 10080) {
         throw new Error(`idleMinutes must be a whole number from 0 to 10080, not ${c.idleMinutes}`);
     }
@@ -238,6 +246,7 @@ export function hostConfig(c: HostConfigInputs): object {
         ...(c.storeUrl ? { store: { url: c.storeUrl, images: artifacts } } : {}),
         backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule },
         idleMinutes: c.idleMinutes,
+        vcpuOvercommit,
         ...(c.runner ? { runner: c.runner } : {}),
     };
 }
@@ -444,15 +453,15 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                     pulumi.all([args.repository ?? DEFAULT_REPOSITORY, args.ref ?? `v${require("./package.json").version}`]),
                     pulumi.all([args.tailscaleAuthKeySecretArn ?? "", args.tailscaleHostname ?? name, args.tailscaleSsh ?? false]),
                     pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? [], args.dashboardCapability ?? ""]),
-                    pulumi.all([backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30]),
+                    pulumi.all([backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30, args.vcpuOvercommit ?? 1]),
                     runner,
                     directInterface ? directInterface.macAddress : pulumi.output(""),
                     pulumi.all([args.storeUrl ?? "", args.imageArtifacts ?? {}]),
                 ])
-                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes], runner, directMac, [storeUrl, imageArtifacts]]) =>
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit], runner, directMac, [storeUrl, imageArtifacts]]) =>
                     JSON.stringify(hostConfig({
                         repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
-                        dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, runner, directMac, storeUrl, imageArtifacts,
+                        dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, runner, directMac, storeUrl, imageArtifacts,
                     })),
                 ),
             tags,

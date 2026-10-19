@@ -63,7 +63,7 @@ test("a runner has its own instance, volume, role, join secret and backup prefix
     created.length = 0;
     const host = new Host("ow-ctl", hostArgs);
     new Runner("ow-big", { controller: host, tailscaleAuthKeySecretArn: secretArn, instanceType: "m8i.2xlarge",
-        backupUrl: "s3://my-bucket/ow/", backupSchedule: "*-*-* 02:00:00 UTC", developerImages: ["ubuntu"] });
+        backupUrl: "s3://my-bucket/ow/", backupSchedule: "*-*-* 02:00:00 UTC", developerImages: ["ubuntu"], vcpuOvercommit: 2 });
     await settle();
     const instance = byName("ow-big-host", "ec2/instance:");
     assert.equal(instance.inputs.instanceType, "m8i.2xlarge");
@@ -78,6 +78,7 @@ test("a runner has its own instance, volume, role, join secret and backup prefix
     const config = JSON.parse(byName("ow-big-config", "ssm/parameter:").inputs.insecureValue);
     assert.deepEqual(config.runner, { node: "ow-big", controller: "ow-ctl", joinSecretArn: "arn:aws:mock:::ow-big-join" });
     assert.equal(config.role, "runner");
+    assert.equal(config.vcpuOvercommit, 2);
     assert.deepEqual(config.dashboard, { logins: [] });
     assert.deepEqual(config.backup, { url: "s3://my-bucket/ow/runners/ow-big", schedule: "*-*-* 02:00:00 UTC" });
     assert.deepEqual(config.developerImages, ["ubuntu"]);

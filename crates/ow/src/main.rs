@@ -538,6 +538,9 @@ enum HostAction {
         /// Minimum free disk space to retain (preflight threshold, not a quota).
         #[arg(long)]
         storage_gib: Option<u32>,
+        /// Linux CPU admission ratio: 1 for CPU-heavy jobs, 2 for dev overcommit.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=2))]
+        vcpu_overcommit: u32,
         #[arg(long)]
         accept_shared_pool: bool,
         /// Prepare enrollment/config only; do not start processes.
@@ -557,6 +560,9 @@ enum HostAction {
         cpus: u32,
         #[arg(long)]
         storage_gib: Option<u32>,
+        /// Linux CPU admission ratio: 1 for CPU-heavy jobs, 2 for dev overcommit.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=2))]
+        vcpu_overcommit: u32,
         #[arg(long)]
         accept_shared_pool: bool,
     },

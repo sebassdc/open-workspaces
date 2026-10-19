@@ -231,6 +231,9 @@ def validate(config):
     idle = config.get("idleMinutes", 30)
     if not isinstance(idle, int) or isinstance(idle, bool) or not 0 <= idle <= 10080:
         raise Refused("config: idleMinutes must be 0 to 10080")
+    ratio = config.get("vcpuOvercommit", 1)
+    if type(ratio) is not int or ratio not in (1, 2):
+        raise Refused("config: vcpuOvercommit must be 1 or 2")
     extra = {}
     if role == "runner":
         runner = config.get("runner") or {}
@@ -255,6 +258,7 @@ def validate(config):
         "backup": backup,
         **({"store": store} if store["url"] else {}),
         "idleMinutes": idle,
+        "vcpuOvercommit": ratio,
         **extra,
     }
 
@@ -272,6 +276,8 @@ def budgets():
 def render(config, budget):
     """Every file setup owns: host path -> (content, mode). Pure; also run from a
     target release's copy to see which units an upgrade changes."""
+    # The input is a physical budget; all rendered consumers use the same effective CPU cap.
+    budget = {**budget, "cpus": min(budget["cpus"] * config.get("vcpuOvercommit", 1), 64)}
     files = {}
     asset = f"{SRV}/run/worker/assets"
     worker_bin = f"{SRV}/run/worker/bin/ow"
@@ -1123,7 +1129,9 @@ def enrol(wait=120):
 
 def status():
     v = versions()
-    out = {"role": role(), "pins": pins(), "versions": v, "budget": budgets(), "node": local_node(),
+    budget = budgets()
+    budget["cpus"] = min(budget["cpus"] * validate(read_json(CONFIG))["vcpuOvercommit"], 64)
+    out = {"role": role(), "pins": pins(), "versions": v, "budget": budget, "node": local_node(),
            "units": {name: run(["systemctl", "is-active", unit], check=False).strip() or "unknown"
                      for name, unit in UNITS.items() if unit_exists(unit)},
            "pending": pending(), "upgrade": read_json(f"{DATA}/upgrade.json")}

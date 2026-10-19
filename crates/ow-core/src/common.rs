@@ -74,6 +74,29 @@ pub fn nonce() -> Result<String> {
 pub const HOST_MEMORY_MIB: u32 = 65536;
 pub const HOST_CPUS: u32 = 64;
 pub const HOST_SLOTS: u32 = 8;
+/// Admission budget, not a CPU quota or a guarantee of dedicated cores.
+pub fn vcpu_budget(host_cpus: u32, ratio: u32) -> Result<u32> {
+    ensure!(matches!(ratio, 1 | 2), "vCPU overcommit must be 1 or 2");
+    ensure!(host_cpus > 0, "host CPU count must be positive");
+    Ok(host_cpus.saturating_mul(ratio).min(HOST_CPUS))
+}
+
+#[cfg(test)]
+mod overcommit_tests {
+    use super::*;
+
+    #[test]
+    fn ratio_scales_only_cpu_and_keeps_the_protocol_ceiling() {
+        assert_eq!(vcpu_budget(8, 1).unwrap(), 8);
+        assert_eq!(vcpu_budget(8, 2).unwrap(), 16);
+        assert_eq!(vcpu_budget(48, 2).unwrap(), 64);
+        assert_eq!(vcpu_budget(u32::MAX, 2).unwrap(), 64);
+        for ratio in [0, 3, u32::MAX] {
+            assert!(vcpu_budget(8, ratio).is_err());
+        }
+        assert!(vcpu_budget(0, 1).is_err());
+    }
+}
 pub const DEFAULT_DISK_GIB: u32 = 32;
 pub const MAX_DISK_GIB: u32 = 16384;
 pub const GIB: u64 = 1024 * 1024 * 1024;
