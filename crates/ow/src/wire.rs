@@ -7,6 +7,19 @@ use std::{
     time::Duration,
 };
 
+/// The caller supplies catalog authority; never fill this from worker inspect/list.
+pub fn workspace_request(
+    op: &str,
+    id: &str,
+    placement: Option<&crate::common::Placement>,
+) -> Value {
+    let mut request = json!({"op":op,"id":id});
+    if let Some(placement) = placement {
+        request["placement"] = json!(placement);
+    }
+    request
+}
+
 /// Drain TLS/WebSocket buffers without waiting for the opposite byte direction.
 /// Restore blocking writes so the existing socket write deadline remains authoritative.
 pub fn read_available(
@@ -127,7 +140,9 @@ pub fn connect(root: &Path, request: &Value) -> Result<(UnixStream, Value)> {
 pub fn reply_wait(request: &Value) -> Duration {
     match request["op"].as_str() {
         Some("image-build" | "image-pull") => Duration::from_secs(7200),
-        Some("hibernate" | "snapshot" | "fork") => Duration::from_secs(1200),
+        Some("hibernate" | "snapshot" | "fork" | "export" | "seal-disk" | "import-prepare") => {
+            Duration::from_secs(1200)
+        }
         _ => Duration::from_secs(120),
     }
 }
@@ -220,12 +235,22 @@ mod framing_tests {
     }
     #[test]
     fn captures_wait_longer_than_other_operations() {
-        for op in ["hibernate", "snapshot", "fork"] {
+        for op in [
+            "hibernate",
+            "snapshot",
+            "fork",
+            "export",
+            "seal-disk",
+            "import-prepare",
+        ] {
             assert_eq!(
                 reply_wait(&json!({"op":op})),
                 Duration::from_secs(1200),
                 "{op}"
             );
+        }
+        for op in ["image-build", "image-pull"] {
+            assert_eq!(reply_wait(&json!({"op":op})), Duration::from_secs(7200));
         }
         assert_eq!(reply_wait(&json!({"op":"list"})), Duration::from_secs(120));
     }
@@ -253,5 +278,29 @@ mod framing_tests {
         write.write_all(b"{}").unwrap();
         drop(write);
         assert!(line(&mut read).is_err());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn every_stream_envelope_preserves_supplied_catalog_placement() {
+    let authority = crate::common::Placement {
+        epoch: 7,
+        node: "alpha".into(),
+        transfer: "move1".into(),
+    };
+    for op in ["ssh", "terminal", "tunnel"] {
+        let request = workspace_request(op, "box", Some(&authority));
+        assert_eq!(
+            crate::common::Placement::from_request(&request).unwrap(),
+            authority
+        );
+        assert_eq!(request["op"], op);
+        assert_eq!(request["id"], "box");
+        assert!(
+            workspace_request(op, "box", None)
+                .get("placement")
+                .is_none()
+        );
     }
 }

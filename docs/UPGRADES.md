@@ -303,7 +303,10 @@ schema change, then use the normal worker hibernate/swap/resume path. Compatible
 schema 3 binaries retain catalog SQL read/write access for rollback; they do not
 implement the new worker selectors or image administration.
 
-Runtime, guest kernel, host-runner and agent-worker protocol pins are unchanged.
+This release retains v0.8.6's worker interface 2 (agents accept workers 1–2)
+and its dormant managed-copy fences. Runtime, guest kernel and host-runner
+transport pins are unchanged. The catalog reader floor does not permit a legacy
+worker to read managed worker state; preserve that state's separate reader guard.
 Keep capture compatibility checks and explicit cold-memory-loss consent. Store
 activation requires separate opt-in bucket/IAM/configuration; publishing this
 release alone does not activate it or replace a host.

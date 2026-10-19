@@ -1215,6 +1215,8 @@ pub fn agent(
                     }
                     beat["image_digests"] = status["image_digests"].clone();
                     beat["disk_resize_v1"] = json!(status["disk_resize_v1"] == true);
+                    beat["placement_fencing_v1"] =
+                        json!(common::placement_capable(&status).is_ok());
                     for field in [
                         "max_disk_gib",
                         "reserved_disk_bytes",
@@ -1374,7 +1376,8 @@ fn agent_job(
             "ssh-keys",
             "delete"
         ]
-        .contains(&op),
+        .contains(&op)
+            || common::PLACEMENT_OPERATIONS.contains(&op),
         "unsupported node operation"
     );
     // Only the worker process whose status passed the protocol check is driven; a job
@@ -1388,16 +1391,24 @@ fn agent_job(
         let _ = socket.close(None);
         return Ok(());
     };
+    if common::PLACEMENT_OPERATIONS.contains(&op) || request.get("placement").is_some() {
+        common::placement_capable(&checked)?;
+        ensure!(
+            common::Placement::from_request(&request)?.node == node,
+            "placement targets another node"
+        );
+    }
     wire::expect_worker(checked["worker_pid"].as_u64().map(|pid| pid as u32));
     if op != "terminal" && op != "ssh" && op != "tunnel" {
         #[cfg(target_os = "linux")]
         let response = if op == "image-build" || op == "image-pull" {
             wire::response(crate::image_store::job(root, &request))
         } else {
-            journal_request(root, &request)?
+            journal_request(root, &request, common::placement_capable(&checked).is_ok())?
         };
         #[cfg(not(target_os = "linux"))]
-        let response = journal_request(root, &request)?;
+        let response =
+            journal_request(root, &request, common::placement_capable(&checked).is_ok())?;
         let data = serde_json::to_vec(&response)?;
         ensure!(data.len() < 1024 * 1024, "response too large");
         for chunk in data.chunks(FRAME) {
@@ -1409,28 +1420,7 @@ fn agent_job(
     }
     // Streams (terminal, SSH) end with the process; a graceful stop does not wait for them.
     drop(busy);
-    if op == "ssh" {
-        ensure!(
-            request
-                .as_object()
-                .is_some_and(|o| o.len() == 2 && o.contains_key("id")),
-            "invalid SSH stream request"
-        );
-        common::identifier(request["id"].as_str().context("SSH ID")?)?;
-    }
-    if op == "tunnel" {
-        ensure!(
-            request.as_object().is_some_and(|o| o.len() == 3),
-            "invalid tunnel request"
-        );
-        common::identifier(request["id"].as_str().context("tunnel ID")?)?;
-        ensure!(
-            request["port"]
-                .as_u64()
-                .is_some_and(|p| (1..=65535).contains(&p)),
-            "invalid tunnel port"
-        );
-    }
+    common::stream_request(&request)?;
     let (unix, response) = wire::connect(root, &request)?;
     socket.send(tungstenite::Message::Binary(
         format!("{}\n", json!({"ok":true,"result":response}))
@@ -1500,12 +1490,12 @@ fn agent_stream(
 }
 #[cfg(test)]
 pub(crate) fn review_journal_request(root: &Path, request: &Value) -> Result<Value> {
-    journal_request(root, request)
+    journal_request(root, request, false)
 }
 
 // Persist-before-execute: crash-pending effects are not silently repeated. Stable create/fork IDs
 // may be reconciled by the runtime's existing parameter/lineage checks; arbitrary exec is uncertain.
-fn journal_request(root: &Path, request: &Value) -> Result<Value> {
+fn journal_request(root: &Path, request: &Value, fencing_worker: bool) -> Result<Value> {
     let Some(key) = request["operation_key"].as_str() else {
         return Ok(wire::response(wire::request(root, request.clone())));
     };
@@ -1547,10 +1537,27 @@ fn journal_request(root: &Path, request: &Value) -> Result<Value> {
         if let Some(response) = response {
             let v: Value = serde_json::from_str(&response)?;
             if v["uncertain"] != true {
+                if request.get("placement").is_some()
+                    || (fencing_worker && request["id"].as_str().is_some_and(|id| !id.is_empty()))
+                {
+                    // Old successful replies are observations, never current placement authority.
+                    tx.commit()?;
+                    let check =
+                        json!({"op":"placement-check","id":request["id"],"request":request});
+                    let current = wire::request_envelope(root, &check)?;
+                    if current["ok"] != true {
+                        return Ok(current);
+                    }
+                }
                 return Ok(v);
             }
         }
-        if !matches!(request["op"].as_str(), Some("create" | "fork" | "snapshot")) {
+        if !matches!(request["op"].as_str(), Some("create" | "fork" | "snapshot"))
+            && !(request["op"] == "start" && request.get("placement").is_some())
+            && !request["op"]
+                .as_str()
+                .is_some_and(|op| common::PLACEMENT_OPERATIONS.contains(&op))
+        {
             return Ok(
                 json!({"ok":false,"error":"uncertain node outcome; operator reconciliation required","uncertain":true}),
             );

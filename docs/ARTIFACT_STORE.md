@@ -149,7 +149,10 @@ The additive catalog is schema 4 with reader floor 3. Schema 3 SQL readers/write
 can retain existing ownership/resource data and preserve artifact rows and schema
 version. They do not implement image administration; old controllers may refuse
 versioned node advertisements. This is not a promise that old workers implement
-new image selectors. Release v0.9.0 declares the new catalog and worker impacts.
+new image selectors. Release v0.9.0 declares the new catalog and worker impacts,
+retaining v0.8.6's worker interface 2 (agent readers 1–2). Managed disk/RAM
+exports and prepared imports retain the pinned image digest alongside their
+managed provenance; transport adapters and controller movement remain separate.
 The upgrader copies the catalog and moves both controller and dashboard around this schema change;
 the worker follows its normal class 2 capture gate. Published release entries
 remain immutable.
@@ -157,7 +160,7 @@ remain immutable.
 ## Limits and acceptance
 
 There is no store delete/list API, live controller GC, image cache eviction,
-placement fencing, chunk deduplication or scaling in this foundation. Unreferenced
+controller placement moves, chunk deduplication or scaling in this foundation. Unreferenced
 uploads and old local build results consume storage until controller GC/cache work
 ships. Prefetch currently covers all current images, within the existing
 32-image runner ceiling. There is no age-based eviction of working templates.
