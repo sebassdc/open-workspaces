@@ -261,9 +261,10 @@ export function nodeId(name: string): string {
     return name;
 }
 
-/** Host role policy for backups: list under the prefix, read and write objects there, never delete. */
-export function backupPolicy(partition: string, url: string): string {
+/** Own backup writes; controllers also read runner snapshots. Never grants store access or deletion. */
+export function backupPolicy(partition: string, url: string, includeRunnerSnapshots = true): string {
     const { bucket, prefix } = backupLocation(url);
+    const runnerSnapshots = `${prefix}/runners/*/snapshots/*`;
     return JSON.stringify({
         Version: "2012-10-17",
         Statement: [
@@ -271,13 +272,16 @@ export function backupPolicy(partition: string, url: string): string {
                 Effect: "Allow",
                 Action: "s3:ListBucket",
                 Resource: `arn:${partition}:s3:::${bucket}`,
-                Condition: { StringLike: { "s3:prefix": [`${prefix}/catalog/*`, `${prefix}/snapshots/*`] } },
+                Condition: { StringLike: { "s3:prefix": [`${prefix}/catalog/*`, `${prefix}/snapshots/*`,
+                    ...(includeRunnerSnapshots ? [runnerSnapshots] : [])] } },
             },
             {
                 Effect: "Allow",
                 Action: ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
                 Resource: ["catalog", "snapshots"].map((p) => `arn:${partition}:s3:::${bucket}/${prefix}/${p}/*`),
             },
+            ...(includeRunnerSnapshots ? [{ Effect: "Allow", Action: "s3:GetObject",
+                Resource: `arn:${partition}:s3:::${bucket}/${runnerSnapshots}` }] : []),
         ],
     });
 }
@@ -379,7 +383,7 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
         if (backupUrl) {
             new aws.iam.RolePolicy(`${name}-backup`, {
                 role: role.id,
-                policy: pulumi.all([partition, backupUrl]).apply(([p, url]) => backupPolicy(p, url)),
+                policy: pulumi.all([partition, backupUrl]).apply(([p, url]) => backupPolicy(p, url, !controller)),
             }, parent);
         }
         // A runner's single-use join: the controller host writes it (`ow-aws runner-add`),

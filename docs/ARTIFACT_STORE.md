@@ -126,7 +126,9 @@ under `snapshots/`, `runners/` and `store/` remain until explicit controller GC;
 noncurrent versions retain at least seven days of undo. The store/runner role has
 get, conditional put, abort and bucket safety-read rights, no list or delete.
 Backup role access is narrowed to its `catalog/` and `snapshots/` children so it
-cannot grant store listing accidentally. No role receives DeleteObjectVersion.
+cannot grant store listing accidentally. Controllers additionally have read/list
+access to `runners/*/snapshots/` for existing backup listing/restore commands;
+runner roles retain only their own backup namespace. No role receives DeleteObjectVersion.
 
 `Host` and `Runner` have optional `storeUrl` and `imageArtifacts` inputs. A base pin
 is `{version, attempt, digest}` keyed by profile. With store enabled, each requested

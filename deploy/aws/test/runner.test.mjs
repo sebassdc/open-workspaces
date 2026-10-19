@@ -92,7 +92,9 @@ test("a runner has its own instance, volume, role, join secret and backup prefix
     const backup = policy("ow-big-backup");
     assert.deepEqual(backup[1].Resource, ["arn:aws:s3:::my-bucket/ow/runners/ow-big/catalog/*", "arn:aws:s3:::my-bucket/ow/runners/ow-big/snapshots/*"], "its own backup prefixes only");
     assert.deepEqual(backup[0].Condition, { StringLike: { "s3:prefix": ["ow/runners/ow-big/catalog/*", "ow/runners/ow-big/snapshots/*"] } });
+    assert.equal(backup.length, 2, "a runner receives no controller-wide read grants");
     assert.deepEqual(policy("ow-ctl-backup")[1].Resource, ["arn:aws:s3:::my-bucket/ow/catalog/*", "arn:aws:s3:::my-bucket/ow/snapshots/*"]);
+    assert.deepEqual(policy("ow-ctl-backup")[2], { Effect: "Allow", Action: "s3:GetObject", Resource: "arn:aws:s3:::my-bucket/ow/runners/*/snapshots/*" });
 });
 
 test("a runner's name is its node ID, and it needs the tailnet and no dashboard", () => {
