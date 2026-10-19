@@ -12,7 +12,7 @@
                                 and removed (ow node drain), or that never enrolled
   pool disks POOL               every billable disk of the pool, with its runner's state
   pool delete-disk POOL VOLUME  delete one detached disk whose runner was drained empty
-                                and removed; never by age, never automatically
+                                and removed (and its join secret); never by age or automatically
 
 Every AWS call runs with this host's role, which the RunnerPool scopes to its group,
 its join secrets and its tagged disks. Nothing here runs on a timer.
@@ -31,7 +31,7 @@ OBSERVATIONS = f"{h.CONTROLLER}/scaler-observations.json"
 # Terminations this controller asked for: instance -> {"node", "enrolled"}.
 REMOVALS = f"{h.CONTROLLER}/pool-removals.json"
 SUSPENDED = {"AZRebalance", "AlarmNotification", "InstanceRefresh", "ReplaceUnhealthy", "ScheduledActions"}
-PROBE_INSTANCE = "i-00000000000000000"
+GROUP_ACTIONS = ("SetDesiredCapacity", "TerminateInstanceInAutoScalingGroup", "CompleteLifecycleAction")
 INSTANCE = re.compile(r"^i-[0-9a-f]{8,17}$")
 VOLUME = re.compile(r"^vol-([0-9a-f]{17})$")
 LIVE = "pending,running,stopping,stopped"
@@ -112,30 +112,24 @@ def shape_problems(pool, group, hooks, policies):
 
 
 def check(name):
-    """Activation preflight. Each probe is a call that changes nothing: the same desired
-    capacity, a lifecycle completion for an instance that does not exist, a secret that
-    does not exist; IAM's own simulation for termination. Only missing rights fail it."""
+    """Activation preflight, writing nothing: IAM's simulation of this role for the group's
+    three actions (a write or a made-up instance cannot test them safely), and a lookup of
+    a secret that does not exist. Missing rights, shape problems or an unanswered
+    simulation refuse activation."""
     pool = load(name)
     group, hooks, policies, _, _, _ = describe(pool)
     problems = shape_problems(pool, group, hooks, policies)
-    try:  # A termination of a nonexistent instance is refused even when allowed: ask IAM.
+    try:  # No write and no fake instance answers for these honestly: ask IAM about this role.
         me = aws("sts", "get-caller-identity")["Arn"]
         match = re.fullmatch(r"arn:(aws[a-z-]*):sts::(\d{12}):assumed-role/([\w+=,.@-]+)/[^/]+", me)
         verdict = aws("iam", "simulate-principal-policy", "--policy-source-arn",
                       f"arn:{match.group(1)}:iam::{match.group(2)}:role/{match.group(3)}", "--action-names",
-                      "autoscaling:TerminateInstanceInAutoScalingGroup", "--resource-arns", group["AutoScalingGroupARN"])
-        if [r.get("EvalDecision") for r in verdict["EvaluationResults"]] != ["allowed"]:
-            problems.append("missing permission: TerminateInstanceInAutoScalingGroup")
+                      *[f"autoscaling:{a}" for a in GROUP_ACTIONS], "--resource-arns", group["AutoScalingGroupARN"])
+        decisions = {r.get("EvalActionName"): r.get("EvalDecision") for r in verdict["EvaluationResults"]}
+        problems += [f"missing permission: {a}" for a in GROUP_ACTIONS if decisions.get(f"autoscaling:{a}") != "allowed"]
     except (RuntimeError, AttributeError, KeyError) as e:
-        problems.append(f"cannot verify TerminateInstanceInAutoScalingGroup: {str(e)[-200:]}")
-    probes = {
-        "SetDesiredCapacity": ["autoscaling", "set-desired-capacity", "--auto-scaling-group-name", pool["group"],
-                               "--desired-capacity", str(group["DesiredCapacity"]), "--honor-cooldown"],
-        "CompleteLifecycleAction": ["autoscaling", "complete-lifecycle-action", "--auto-scaling-group-name", pool["group"],
-                                    "--lifecycle-hook-name", pool["hook"], "--instance-id", PROBE_INSTANCE,
-                                    "--lifecycle-action-result", "CONTINUE"],
-        "join secrets": ["secretsmanager", "describe-secret", "--secret-id", f"open-workspaces/pool/{name}/probe"],
-    }
+        problems.append(f"cannot verify the group rights: {str(e)[-200:]}")
+    probes = {"join secrets": ["secretsmanager", "describe-secret", "--secret-id", f"open-workspaces/pool/{name}/probe"]}
     for right, call in probes.items():
         try:
             aws(*call)
@@ -203,7 +197,7 @@ def removals():
     return h.read_json(REMOVALS) or {}
 
 
-def complete_own(pool, group, known):
+def complete_own(pool, group):
     """Completes (CONTINUE) only the hooks of terminations this controller started for
     a runner still removed or never enrolled. Anything else waits out its hook and is retained."""
     mine = removals()
@@ -212,7 +206,8 @@ def complete_own(pool, group, known):
         if member.get("LifecycleState") != "Terminating:Wait" or iid not in mine:
             continue
         node, enrolled = mine[iid].get("node"), mine[iid].get("enrolled")
-        if (enrolled and drain_state(node) == "removed") or (enrolled is False and node not in known):
+        # Read again now: a runner may have enrolled or been undrained since the removal began.
+        if node and ((enrolled and drain_state(node) == "removed") or (enrolled is False and node not in catalog())):
             aws("autoscaling", "complete-lifecycle-action", "--auto-scaling-group-name", pool["group"],
                 "--lifecycle-hook-name", pool["hook"], "--instance-id", iid, "--lifecycle-action-result", "CONTINUE")
             h.say(f"{iid}: removal completed")
@@ -289,14 +284,15 @@ def sync(names, fixed=(), hours=None):
     for pool in pools:
         group, hooks, policies, activities, instances, volumes = described = describe(pool)
         answer_joins(pool, group, instances, known)
-        complete_own(pool, group, known)
+        complete_own(pool, group)
         found, disks, complete, retention, resolved = observe(pool, *described, known, int(time.time()))
         snapshot["instances"] += found
         snapshot["disks"] += disks
         snapshot["complete"] &= complete
         snapshot["retention_ok"] &= retention
         snapshot["outcome_resolved"] &= resolved
-    extra, disks = fixed_instances(fixed, known, pools[0])
+    # Hosts outside the pools are priced at the highest pool disk rate: an overestimate, never under.
+    extra, disks = fixed_instances(fixed, known, max(pools, key=lambda p: p["diskMonthlyCentsPerGib"]))
     snapshot["instances"] += extra
     snapshot["disks"] += [d for d in disks if d["id"] not in {x["id"] for x in snapshot["disks"]}]
     snapshot["observed_at"] = int(time.time())
@@ -328,6 +324,9 @@ def launch(name, expect):
         raise Refused("a removal or failed launch is unresolved; nothing launched")
     if expect + 1 > group["MaxSize"]:
         raise Refused(f"{pool['group']} is at its maximum {group['MaxSize']}")
+    # Auto Scaling has no compare-and-set: read again right before the write to narrow the window.
+    if describe(pool)[0]["DesiredCapacity"] != expect:
+        raise Refused(f"{pool['group']} changed while launching; nothing launched")
     aws("autoscaling", "set-desired-capacity", "--auto-scaling-group-name", pool["group"], "--desired-capacity", str(expect + 1))
     h.say(f"{pool['group']}: desired {expect} -> {expect + 1}")
     return 0
@@ -345,6 +344,8 @@ def remove(name, node=None, instance=None):
     if len(found) != 1 or found[0]["InstanceId"] not in members:
         raise Refused(f"expected one instance of group {pool['group']} for {node or instance}, found {len(found)}")
     iid, runner = found[0]["InstanceId"], node_of(pool, found[0])
+    if not runner:
+        raise Refused(f"{iid} has no pool data volume at /dev/sdf, so its runner cannot be proven empty")
     known = catalog()
     if runner in known:
         if drain_state(runner) != "removed":
@@ -365,7 +366,7 @@ def remove(name, node=None, instance=None):
         group, *_ = describe(pool)
         state = next((m.get("LifecycleState") for m in group.get("Instances") or [] if m["InstanceId"] == iid), "gone")
         if state == "Terminating:Wait":
-            complete_own(pool, group, catalog())
+            complete_own(pool, group)
         elif state in ("gone", "Terminating:Proceed", "Terminated"):
             h.say(f"{iid} removed ({runner}); its data volume is kept: ow-host pool disks {name}")
             return 0
@@ -375,15 +376,17 @@ def remove(name, node=None, instance=None):
 
 def disks(name, show=True):
     pool = load(name)
+    listed = {entry["id"]: entry for entry in h.ow("node", "list", timeout=30)}
     known = catalog()
     out = []
     for v in aws("ec2", "describe-volumes", "--filters", f"Name=tag:ow-pool,Values={name}")["Volumes"]:
         node = f"{name}-{VOLUME.match(v['VolumeId']).group(1)}"
         attached = [a["InstanceId"] for a in v.get("Attachments") or []]
-        runner = drain_state(node) if node in known else "never enrolled"
+        # Deletable only with positive evidence: no catalog row, or a join that never connected.
+        runner = drain_state(node) if node in known else "join never used" if node in listed else "never enrolled"
         out.append({"volume": v["VolumeId"], "state": v["State"], "gib": v["Size"], "created": v["CreateTime"],
                     "instances": attached, "node": node, "runner": runner, "monthly_cents": v["Size"] * pool["diskMonthlyCentsPerGib"],
-                    "deletable": v["State"] == "available" and runner in ("removed", "never enrolled")})
+                    "deletable": v["State"] == "available" and runner in ("removed", "join never used", "never enrolled")})
     if show:
         print(json.dumps(out, indent=2))
     return out
@@ -401,6 +404,12 @@ def delete_disk(name, volume):
         raise Refused(f"{volume} is {match[0]['state']} and its runner {match[0]['runner']}: salvage it first")
     aws("ec2", "delete-volume", "--volume-id", volume)
     h.say(f"deleted {volume} ({match[0]['node']}, {match[0]['runner']})")
+    try:  # the runner's spent join secret goes with its disk; each secret is billed
+        aws("secretsmanager", "delete-secret", "--secret-id", f"open-workspaces/pool/{name}/{match[0]['node']}",
+            "--force-delete-without-recovery")
+    except RuntimeError as e:
+        if "ResourceNotFoundException" not in str(e):
+            raise
     return 0
 
 

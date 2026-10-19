@@ -61,6 +61,7 @@ and the package schema check cover it. An organization policy that denies
 |---|---|---|
 | controller role | `SetDesiredCapacity`, `TerminateInstanceInAutoScalingGroup`, `CompleteLifecycleAction` | this group's ARN only |
 | controller role | describe groups, hooks, policies, activities, instances, volumes | describe calls only |
+| controller role | `iam:SimulatePrincipalPolicy` | its own role only (`pool check`) |
 | controller role | create/tag join secrets | `open-workspaces/pool/NAME/*`, request tag `ow-pool=NAME`, tag keys `ow-pool`/`ow-session` only |
 | controller role | read/write/delete join secrets | `open-workspaces/pool/NAME/*` |
 | controller role | `ec2:DeleteVolume` | volumes tagged `ow-pool=NAME` (used only by `delete-disk`) |
@@ -85,13 +86,16 @@ ow-host pool delete-disk dev VOLUME
 ```
 
 **Activation.** `check` verifies the group shape (hook, retention policy, no scaling
-policy, suspended processes, scale-in protection, minimum 0) and probes each right
-with a call that changes nothing: the current desired capacity, a lifecycle
-completion and a termination for an instance that does not exist, and a lookup of a
-secret that does not exist. An access refusal is reported as a missing permission
-and refuses activation. `launch` and `remove` repeat the shape check.
+policy, suspended processes, scale-in protection, minimum 0) and checks the rights
+without writing anything: IAM's simulation of the controller's own role for
+`SetDesiredCapacity`, `TerminateInstanceInAutoScalingGroup` and
+`CompleteLifecycleAction` on this group (a termination of a made-up instance is refused
+even when allowed, and a desired-capacity write could race a launch), and a lookup of
+a secret that does not exist. A missing right, or a simulation that cannot be run,
+refuses activation. `launch` and `remove` repeat the shape check.
 
-**Launch.** `launch --expect N` sets desired capacity to N+1 only while it is N; a
+**Launch.** `launch --expect N` sets desired capacity to N+1 only while it is N (read twice,
+the second time right before the write: Auto Scaling has no compare-and-set); a
 repeat after success is a no-op, so a lost reply never launches twice. It refuses at
 the maximum, while a removal is in progress, or after a failed launch activity in
 the last hour.
@@ -103,7 +107,8 @@ which `sync` created for exactly that instance's role session. The next `sync` m
 the existing single-use join (10 minutes) into the same secret; the instance redeems
 it and marks it used. A runner counts as `ready` only once enrolled and reporting a
 fresh heartbeat; placement still checks its capabilities as for any runner. An
-instance that never joins stays `pending` and billable until removed.
+instance asks for 30 minutes during its first boot; one that never joins stays
+`pending` and billable until removed with `pool remove --instance`.
 
 **Observation.** `sync` writes `scaler-observations.json` (mode 0600, owned by `ow`)
 in the controller data directory: every pool instance (`ready`, `pending`,
@@ -121,7 +126,8 @@ desired-capacity decrement, records the removal, and completes the hook with
 the controller did not start (or whose runner stopped being removable) is never
 completed: it waits out `drainTimeoutSeconds`, is abandoned and the instance is
 retained. Rerunning `remove` on a retained instance terminates it again without a
-second decrement.
+second decrement. An instance without its pool data volume is refused: its runner
+cannot be proven empty.
 
 ## Retention, replacement and cost bound
 
@@ -141,7 +147,9 @@ replacement; keep such rights away from other principals.
 
 A data volume is never deleted with its instance. `pool disks` lists every disk
 with its runner's drain state and monthly cost; `delete-disk` deletes one only when
-it is detached and its runner was drained empty and removed, or never enrolled.
+it is detached and its runner was drained empty and removed, or never connected
+(no catalog row, or a join that was never used); it then also deletes that runner's
+spent join secret.
 There is no age-based or automatic deletion.
 
 To salvage a disk whose instance failed, launch a replacement from the pool's launch

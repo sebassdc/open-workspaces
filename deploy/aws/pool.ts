@@ -110,10 +110,10 @@ export function controllerPoolPolicy(partition: string, region: string, account:
             { Effect: "Allow", Resource: secrets, Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue",
                 "secretsmanager:DescribeSecret", "secretsmanager:DeleteSecret"] },
             { Effect: "Allow", Resource: parameterArn, Action: "ssm:GetParameter" },
-            // `pool check`: a termination cannot be probed without a real instance, so the
-            // controller asks IAM about its own role.
+            // `pool check` asks IAM about its own role instead of probing the group with writes.
             { Effect: "Allow", Resource: `arn:${partition}:iam::${account}:role/${controllerRole}`, Action: "iam:SimulatePrincipalPolicy" },
-            // Only a disk the controller has proved empty; see `ow-host pool delete-disk`.
+            // IAM limits this to the pool's disks; `ow-host pool delete-disk` also requires a detached
+            // disk whose runner was drained empty and removed, or never connected.
             { Effect: "Allow", Resource: `arn:${partition}:ec2:${region}:${account}:volume/*`, Action: "ec2:DeleteVolume",
                 Condition: { StringEquals: { "aws:ResourceTag/ow-pool": pool } } },
         ],

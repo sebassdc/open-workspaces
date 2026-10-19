@@ -87,7 +87,9 @@ class FakeAws(Fake):
         if op == "simulate-principal-policy":
             assert arg("--policy-source-arn") == "arn:aws:iam::111122223333:role/ow-host-host"
             assert arg("--resource-arns") == self.group["AutoScalingGroupARN"]
-            return json.dumps({"EvaluationResults": [{"EvalDecision": "implicitDeny" if "simulate:terminate" in self.denied else "allowed"}]})
+            actions = cmd[cmd.index("--action-names") + 1:cmd.index("--resource-arns")]
+            return json.dumps({"EvaluationResults": [{"EvalActionName": a, "EvalDecision": "implicitDeny"
+                                                      if f"simulate:{a.split(':')[1]}" in self.denied else "allowed"} for a in actions]})
         if op == "get-parameter":
             return json.dumps({"Parameter": {"Value": json.dumps({"pool": POOL})}})
         if op == "describe-auto-scaling-groups":
@@ -106,15 +108,13 @@ class FakeAws(Fake):
             self.group["DesiredCapacity"] = int(arg("--desired-capacity"))
             return ""
         if op == "terminate-instance-in-auto-scaling-group":
-            if arg("--instance-id") == rp.PROBE_INSTANCE:
-                raise RuntimeError("ValidationError: Instance Id not found")
             self.member(arg("--instance-id"))["LifecycleState"] = "Terminating:Wait"
             if "--should-decrement-desired-capacity" in cmd:
                 self.group["DesiredCapacity"] -= 1
             return ""
         if op == "complete-lifecycle-action":
             iid = arg("--instance-id")
-            if iid == rp.PROBE_INSTANCE or self.member(iid)["LifecycleState"] != "Terminating:Wait":
+            if self.member(iid)["LifecycleState"] != "Terminating:Wait":
                 raise RuntimeError("ValidationError: No active Lifecycle Action found")
             self.group["Instances"] = [m for m in self.group["Instances"] if m["InstanceId"] != iid]
             next(i for i in self.instances if i["InstanceId"] == iid)["State"]["Name"] = "terminated"
@@ -124,6 +124,12 @@ class FakeAws(Fake):
             return ""
         if op == "delete-volume":
             self.volumes = [v for v in self.volumes if v["VolumeId"] != arg("--volume-id")]
+            return ""
+        if op == "delete-secret":
+            secret = arg("--secret-id")
+            if secret not in self.secrets:
+                raise RuntimeError("An error occurred (ResourceNotFoundException) when calling DeleteSecret")
+            del self.secrets[secret]
             return ""
         if op == "describe-secret":
             secret = arg("--secret-id")
@@ -407,6 +413,39 @@ class Actions(PoolCase):
         rp.sync(["dev"])
         self.assertFalse(any("complete-lifecycle-action" in c for c in self.aws.calls))
 
+    def test_removal_needs_a_resolvable_runner_and_rechecks_it_before_completing(self):
+        self.as_controller()
+        self.aws.launch("i-0a", VOL_A)
+        self.aws.instances[0]["BlockDeviceMappings"] = self.aws.instances[0]["BlockDeviceMappings"][:1]
+        with self.assertRaisesRegex(Refused, "cannot be proven empty"):
+            rp.remove("dev", instance="i-0a")
+        self.aws.launch("i-0b", VOL_B)
+        h.write_json(rp.REMOVALS, {"i-0b": {"node": NODE_B, "enrolled": False}})  # never enrolled when removal began
+        self.aws.member("i-0b")["LifecycleState"] = "Terminating:Wait"
+        self.aws.nodes = [{"id": NODE_B, "online": True, "capabilities": {"vcpus": 4}}]  # ... but it joined since
+        rp.sync(["dev"])
+        self.assertFalse(any("complete-lifecycle-action" in c for c in self.aws.calls), "abandoned and retained instead")
+
+    def test_launch_rereads_desired_capacity_right_before_writing(self):
+        self.as_controller()
+        real = rp.describe
+        reads = []
+
+        def racing(pool):
+            out = real(pool)
+            reads.append(1)
+            if len(reads) == 2:
+                self.aws.group["DesiredCapacity"] = 1  # another launch landed in between
+                out = real(pool)
+            return out
+        rp.describe = racing
+        try:
+            with self.assertRaisesRegex(Refused, "changed while launching"):
+                rp.launch("dev", 0)
+        finally:
+            rp.describe = real
+        self.assertFalse(any("set-desired-capacity" in c for c in self.aws.calls))
+
     def test_a_retained_instance_is_removed_without_lowering_desired_capacity(self):
         self.as_controller()
         self.aws.launch("i-0a", VOL_A, state="Terminating:Retained")
@@ -423,17 +462,18 @@ class Actions(PoolCase):
 
     def test_missing_permission_or_shape_refuses_activation(self):
         self.as_controller()
-        self.assertEqual(rp.check("dev"), 0, "probe validation errors are not refusals")
-        for op, right in [("set-desired-capacity", "SetDesiredCapacity"), ("complete-lifecycle-action", "CompleteLifecycleAction"),
-                          ("simulate:terminate", "TerminateInstanceInAutoScalingGroup"),
+        self.assertEqual(rp.check("dev"), 0, "a missing probe secret is not a refusal")
+        for op, right in [("simulate:SetDesiredCapacity", "SetDesiredCapacity"), ("simulate:CompleteLifecycleAction", "CompleteLifecycleAction"),
+                          ("simulate:TerminateInstanceInAutoScalingGroup", "TerminateInstanceInAutoScalingGroup"),
                           ("describe-secret", "join secrets")]:
             self.aws.denied = {op}
             with self.assertRaisesRegex(Refused, f"activation refused.*missing permission: {right}"):
                 rp.check("dev")
         self.aws.denied = {"simulate-principal-policy"}
-        with self.assertRaisesRegex(Refused, "cannot verify TerminateInstanceInAutoScalingGroup"):
+        with self.assertRaisesRegex(Refused, "cannot verify the group rights"):
             rp.check("dev")
-        self.assertFalse(any("terminate-instance-in-auto-scaling-group" in c for c in self.aws.calls), "never probed by a call")
+        self.assertFalse(any(op in c for c in self.aws.calls for op in ("set-desired-capacity", "complete-lifecycle-action",
+                                                                         "terminate-instance-in-auto-scaling-group")), "check writes nothing")
         self.aws.denied = set()
         self.aws.hooks[0]["DefaultResult"] = "CONTINUE"
         with self.assertRaisesRegex(Refused, "abandons by default"):
@@ -442,8 +482,6 @@ class Actions(PoolCase):
         self.aws.group["SuspendedProcesses"] = []
         with self.assertRaisesRegex(Refused, "ReplaceUnhealthy"):
             rp.check("dev")
-        probe = [c for c in self.aws.calls if "set-desired-capacity" in c]
-        self.assertTrue(all(c[c.index("--desired-capacity") + 1] == "0" for c in probe), "probes keep desired capacity")
 
     def test_only_a_detached_disk_of_a_removed_or_never_enrolled_runner_is_deleted(self):
         self.as_controller()
@@ -463,7 +501,14 @@ class Actions(PoolCase):
         self.aws.drain[NODE_A] = "removed"
         listed = rp.disks("dev", show=False)
         self.assertEqual((listed[0]["runner"], listed[0]["deletable"], listed[0]["monthly_cents"]), ("removed", True, 800))
+        self.aws.secrets["open-workspaces/pool/dev/" + NODE_A] = json.dumps({"used": NODE_A})
         rp.delete_disk("dev", VOL_A)
+        self.assertEqual(self.aws.volumes, [])
+        self.assertNotIn("open-workspaces/pool/dev/" + NODE_A, self.aws.secrets, "its spent join secret goes too")
+        self.aws.volumes = [{"VolumeId": VOL_B, "Size": 40, "State": "available", "CreateTime": "x", "Attachments": []}]
+        self.aws.nodes = [{"id": NODE_B, "online": False, "last_seen_unix_s": 0, "capabilities": {}}]
+        self.assertEqual(rp.disks("dev", show=False)[0]["runner"], "join never used")
+        rp.delete_disk("dev", VOL_B)
         self.assertEqual(self.aws.volumes, [])
         with self.assertRaisesRegex(Refused, "not a volume ID"):
             rp.delete_disk("dev", "vol-1; rm -rf /")
