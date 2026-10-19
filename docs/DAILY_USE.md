@@ -111,6 +111,10 @@ Snapshots hold guest memory and disks, including any credentials in them. Use a
 private bucket with encryption at rest (default on AWS S3) and credentials that
 may write only that bucket.
 
+Managed running/hibernate recovery, incremental transfers, retention and
+last-durable status: [Recovery points](RECOVERY.md). Manual backups retain their
+original whole-file format; the new reader accepts both formats.
+
 ## Golden images
 
 A recipe is a shell script whose header names its base image:

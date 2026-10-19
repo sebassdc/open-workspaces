@@ -53,6 +53,8 @@ The `ow-core` crate holds the compute, connect and capability traits, and
 Idle boxes hibernate and wake on the next connection, snapshots restore from S3
 onto another runner, and `ow image build` makes golden images from recipes; see
 [wake on connect, snapshot store and golden images](docs/DAILY_USE.md).
+Opt-in running recovery points, hibernate uploads and last-durable status are
+described in [recovery points](docs/RECOVERY.md).
 
 The opt-in [write-once artifact store and shared images](docs/ARTIFACT_STORE.md)
 publish base/golden images once through S3, with catalog versions and digest-verified

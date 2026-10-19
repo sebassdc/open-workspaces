@@ -185,10 +185,15 @@ test("backup URLs are checked and the host role can never delete a backup", () =
     }
     const policy = JSON.parse(backupPolicy("aws", "s3://my-bucket/ow/host-1"));
     assert.deepEqual([...new Set(policy.Statement.flatMap((s) => [s.Action].flat()))].sort(),
-        ["s3:AbortMultipartUpload", "s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
+        ["s3:AbortMultipartUpload", "s3:GetBucketVersioning", "s3:GetLifecycleConfiguration", "s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
     assert.equal(policy.Statement[0].Resource, "arn:aws:s3:::my-bucket");
     assert.deepEqual(policy.Statement[0].Condition, { StringLike: { "s3:prefix": ["ow/host-1/catalog/*", "ow/host-1/snapshots/*", "ow/host-1/runners/*/snapshots/*"] } });
     assert.deepEqual(policy.Statement[1].Resource, ["arn:aws:s3:::my-bucket/ow/host-1/catalog/*", "arn:aws:s3:::my-bucket/ow/host-1/snapshots/*"]);
+    const safety = policy.Statement.filter((s) => [s.Action].flat().some((a) =>
+        ["s3:GetBucketVersioning", "s3:GetLifecycleConfiguration"].includes(a)));
+    assert.deepEqual(safety, [{ Effect: "Allow",
+        Action: ["s3:GetBucketVersioning", "s3:GetLifecycleConfiguration"],
+        Resource: "arn:aws:s3:::my-bucket" }], "safety reads have their own bucket statement, independent of position");
 });
 
 test("controller backup policy can read runner snapshots without runner writes or store access", () => {
@@ -277,4 +282,32 @@ exit 0
     assert.equal(upload.log.length, 2, "a failed catalog upload stops before the snapshots");
     assert.notEqual(run("ow backup").code, 0, "a failed catalog copy fails the run");
     rmSync(dir, { recursive: true });
+});
+
+// Recovery config never changes stage 0 or starts work without an explicit opt-in.
+test("recovery points require a store and remain opt in", () => {
+    const base = { repository: "https://github.com/example/open-workspaces.git", ref: "v0.7.4",
+        tailscaleAuthKeySecretArn: "", tailscaleHostname: "ow-host", tailscaleSsh: false,
+        dashboardLogins: [], developerImages: [], backupUrl: "", backupSchedule: "", idleMinutes: 30 };
+    assert.throws(() => hostConfig({...base, recoveryPoints: true}), /needs backupUrl/);
+    assert.equal(hostConfig(base).backup.recovery, undefined);
+    assert.equal(hostConfig({...base, backupUrl: "s3://my-bucket/p", recoveryPoints: true}).backup.recovery, true);
+});
+
+
+test("recovery opt-in preserves dashboard, CPU and artifact store configuration", async () => {
+    const result = await deploy({
+        tailscaleAuthKeySecretArn: secretArn,
+        dashboardCapability: "example.test/cap/open-workspaces",
+        backupUrl: "s3://my-bucket/ow",
+        recoveryPoints: true,
+        vcpuOvercommit: 2,
+        storeUrl: "s3://my-bucket/artifacts",
+        imageArtifacts: { alpine: { version: 1, attempt: "a".repeat(32), digest: "b".repeat(64) } },
+    });
+    assert.equal(result.config.vcpuOvercommit, 2);
+    assert.deepEqual(result.config.store, { url: "s3://my-bucket/artifacts",
+        images: { alpine: { version: 1, attempt: "a".repeat(32), digest: "b".repeat(64) } } });
+    assert.equal(result.config.dashboard.capability, "example.test/cap/open-workspaces");
+    assert.equal(result.config.backup.recovery, true);
 });

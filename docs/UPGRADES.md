@@ -310,3 +310,17 @@ worker to read managed worker state; preserve that state's separate reader guard
 Keep capture compatibility checks and explicit cold-memory-loss consent. Store
 activation requires separate opt-in bucket/IAM/configuration; publishing this
 release alone does not activate it or replace a host.
+
+
+## Recovery points (v0.9.2)
+
+The opt-in [recovery timer and incremental snapshots](RECOVERY.md) require the
+normal class-2 worker hibernate/swap/resume cycle and a dashboard update for
+last-durable/error/retry status. Applying the timer configuration never restarts
+the worker; recovery remains off until explicitly enabled against a safe store.
+Data volumes are retained for salvage when their resources are removed.
+
+Catalog schema4/reader floor3, worker interface2/readers1–2, host-runner protocol,
+runtime, guest kernel, host layout and stage0 are unchanged from v0.9.0. Keep
+capture compatibility and explicit cold-memory-loss gates. A published release
+alone neither activates recovery nor upgrades a running host.

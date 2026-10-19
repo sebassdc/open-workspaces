@@ -1,0 +1,6 @@
+#!/bin/bash
+# Existing wrapper drops to the worker owner; AWS uses its instance-role chain.
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+. /etc/open-workspaces/backup.env
+exec ow backup recover --to "$OW_BACKUP_URL/snapshots"

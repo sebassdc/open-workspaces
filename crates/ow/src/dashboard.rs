@@ -557,6 +557,8 @@ mod tests {
         for op in [
             "shutdown",
             "quiesce",
+            "recovery-prepare",
+            "recovery-result",
             "tunnel",
             "put",
             "get",

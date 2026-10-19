@@ -430,6 +430,9 @@ impl Runtime {
                 files.insert(file.into(), hash(&staging.join(file))?);
             }
             let snapshot = Snapshot {
+                // Export replay may reuse an earlier seal; its capture start is unknown.
+                captured_at: 0,
+                managed_recovery: false,
                 name: intent.capture.clone(),
                 workspace: id.into(),
                 managed: true,
@@ -676,6 +679,46 @@ mod tests {
         runtime.cleanup_pending_snapshots().unwrap();
         runtime.save().unwrap();
     }
+    #[test]
+    fn recovery_preserves_managed_authority_and_durability_summary() {
+        let mut runtime = fixture();
+        fs::create_dir(runtime.root.join("recovery")).unwrap();
+        register(&mut runtime);
+        let mut prepare = request("recovery-prepare");
+        prepare["store"] = json!("a".repeat(64));
+        let mut missing = prepare.clone();
+        missing.as_object_mut().unwrap().remove("placement");
+        assert!(runtime.request(&missing).is_err());
+        let mut stale = prepare.clone();
+        stale["placement"] = authority(6);
+        assert!(runtime.request(&stale).is_err());
+        assert!(runtime.request(&prepare).unwrap().is_null());
+        let summary = runtime
+            .request(&json!({"op":"inspect","id":"legacy"}))
+            .unwrap();
+        assert_eq!(summary["placement"], authority(7));
+        assert!(summary["durability"]["last_durable_at"].is_null());
+        assert!(summary["durability"]["overdue"].as_bool().unwrap());
+        let mut journal: crate::recovery::Recovery =
+            serde_json::from_slice(&fs::read(runtime.root.join("recovery/legacy.json")).unwrap())
+                .unwrap();
+        journal.pending = Some(crate::recovery::Point {
+            snapshot: "sleep-recovery-fixture".into(),
+            captured_at: 1000,
+            source: None,
+        });
+        atomic_json(&runtime.root.join("recovery/legacy.json"), &journal).unwrap();
+        let mut result = request("recovery-result");
+        result["store"] = prepare["store"].clone();
+        result["snapshot"] = json!("sleep-recovery-fixture");
+        result["uploaded"] = json!(false);
+        stale = result.clone();
+        stale["placement"] = authority(6);
+        assert!(runtime.request(&stale).is_err());
+        assert_eq!(runtime.request(&result).unwrap()["failures"], 1);
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
     fn assert_fenced(runtime: &mut Runtime) {
         for op in [
             "start",
@@ -689,6 +732,8 @@ mod tests {
             "restore",
             "snapshot",
             "fork",
+            "recovery-prepare",
+            "recovery-result",
         ] {
             let e = runtime.request(&request(op)).unwrap_err();
             assert!(e.to_string().contains("fenced"), "{op}: {e:#}");

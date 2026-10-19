@@ -228,6 +228,8 @@ def validate(config):
                 or not re.fullmatch(r"[0-9a-f]{32}", str(pin["attempt"]))
                 or not re.fullmatch(r"[0-9a-f]{64}", str(pin["digest"]))):
             raise Refused("config: invalid store image pin")
+    if not isinstance(backup.get("recovery", False), bool) or (backup.get("recovery") and not backup["url"]):
+        raise Refused("config: backup.recovery must be a boolean and needs backup.url")
     idle = config.get("idleMinutes", 30)
     if not isinstance(idle, int) or isinstance(idle, bool) or not 0 <= idle <= 10080:
         raise Refused("config: idleMinutes must be 0 to 10080")
@@ -479,6 +481,29 @@ WantedBy=timers.target
 """,
                 0o644,
             )
+    if backup.get("recovery"):
+        files["/usr/local/bin/ow-recovery"] = ((HERE / "files/ow-recovery").read_text(), 0o755)
+        files["/etc/systemd/system/ow-recovery.service"] = ("""[Unit]
+Description=Open Workspaces recovery points to snapshot store
+After=open-workspaces-worker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ow-recovery
+TimeoutStartSec=50min
+KillMode=control-group
+""", 0o644)
+        files["/etc/systemd/system/ow-recovery.timer"] = ("""[Unit]
+Description=Check workspace recovery every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+""", 0o644)
     direct = config["tailscale"].get("direct")
     if direct:
         files[DIRECT_NETWORK] = (f"""[Match]
@@ -533,6 +558,9 @@ OWNED = (
     "/usr/local/lib/open-workspaces/developer-images",
     "/usr/local/bin/ow",
     "/usr/local/bin/ow-backup",
+    "/usr/local/bin/ow-recovery",
+    "/etc/systemd/system/ow-recovery.service",
+    "/etc/systemd/system/ow-recovery.timer",
     "/usr/local/sbin/ow-host",
     "/etc/apparmor.d/open-workspaces",
 )
@@ -936,6 +964,8 @@ def services():
     if unit_exists("open-workspaces-images.service"):
         systemctl("enable", "open-workspaces-images.service")
         systemctl("start", "--no-block", "open-workspaces-images.service")
+    if unit_exists("ow-recovery.timer"):
+        systemctl("enable", "--now", "ow-recovery.timer")
     if unit_exists("ow-backup.timer"):
         systemctl("enable", "--now", "ow-backup.timer")
 
