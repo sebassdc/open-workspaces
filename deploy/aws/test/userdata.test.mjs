@@ -189,6 +189,11 @@ test("backup URLs are checked and the host role can never delete a backup", () =
     assert.equal(policy.Statement[0].Resource, "arn:aws:s3:::my-bucket");
     assert.deepEqual(policy.Statement[0].Condition, { StringLike: { "s3:prefix": ["ow/host-1/catalog/*", "ow/host-1/snapshots/*", "ow/host-1/runners/*/snapshots/*"] } });
     assert.deepEqual(policy.Statement[1].Resource, ["arn:aws:s3:::my-bucket/ow/host-1/catalog/*", "arn:aws:s3:::my-bucket/ow/host-1/snapshots/*"]);
+    const safety = policy.Statement.filter((s) => [s.Action].flat().some((a) =>
+        ["s3:GetBucketVersioning", "s3:GetLifecycleConfiguration"].includes(a)));
+    assert.deepEqual(safety, [{ Effect: "Allow",
+        Action: ["s3:GetBucketVersioning", "s3:GetLifecycleConfiguration"],
+        Resource: "arn:aws:s3:::my-bucket" }], "safety reads have their own bucket statement, independent of position");
 });
 
 test("controller backup policy can read runner snapshots without runner writes or store access", () => {
@@ -290,15 +295,19 @@ test("recovery points require a store and remain opt in", () => {
 });
 
 
-test("recovery opt-in preserves dashboard capability and CPU admission", async () => {
+test("recovery opt-in preserves dashboard, CPU and artifact store configuration", async () => {
     const result = await deploy({
         tailscaleAuthKeySecretArn: secretArn,
         dashboardCapability: "example.test/cap/open-workspaces",
         backupUrl: "s3://my-bucket/ow",
         recoveryPoints: true,
         vcpuOvercommit: 2,
+        storeUrl: "s3://my-bucket/artifacts",
+        imageArtifacts: { alpine: { version: 1, attempt: "a".repeat(32), digest: "b".repeat(64) } },
     });
     assert.equal(result.config.vcpuOvercommit, 2);
+    assert.deepEqual(result.config.store, { url: "s3://my-bucket/artifacts",
+        images: { alpine: { version: 1, attempt: "a".repeat(32), digest: "b".repeat(64) } } });
     assert.equal(result.config.dashboard.capability, "example.test/cap/open-workspaces");
     assert.equal(result.config.backup.recovery, true);
 });
