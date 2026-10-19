@@ -89,8 +89,8 @@ backup gap and all capture/transfer roots are reconciled.
 This is a class 1 controller/catalog change. Update every catalog-reading controller,
 dashboard and node-management process together; keep running worker pins unchanged.
 A control-plane restart may interrupt streams but must not restart a worker or VM.
-No version, release entry or tag is assigned here; coordinated release metadata
-must declare catalog schema 5 / reader floor 5 before publishing this code.
+Release 0.9.3 declares catalog schema 5 / reader floor 5 as a class 1 change
+from v0.9.2. Keep the worker pin unchanged; transfer execution remains dormant.
 
 Before enabling transfer execution, require worker-enforced placement fences and
 replay-safe steps, exact runtime compatibility checks, artifact validation, owner

@@ -61,6 +61,16 @@ class Planner(unittest.TestCase):
         plan = u.plan(m, {**AT, "dashboard": "0.5.1"}, "0.5.2")
         self.assertEqual(plan["move"], {"agent": "0.5.2"})
 
+    def test_placement_release_requires_backup_without_moving_the_worker(self):
+        actual = json.loads((Path(__file__).resolve().parents[3] / "release-impact.json").read_text())
+        pins = {name: "0.9.2" for name in AT}
+        plan = u.plan(actual, pins, "0.9.3")
+        self.assertEqual(plan["class"], 1)
+        self.assertEqual(plan["move"], {"agent": "0.9.3", "dashboard": "0.9.3"})
+        self.assertTrue(plan["catalog_backup"])
+        self.assertFalse(plan["rollback_auto"])
+        self.assertNotIn("worker", plan["restart"])
+
     def test_guest_kernel_only_release_is_refused_without_accept_cold(self):
         m = manifest(entry("0.5.1", ["guest-kernel"], 2, kernel="f" * 64))
         caps = [{"name": "box-a", **COMPAT}, {"name": "hib/sleep-1", **COMPAT}, {"name": "box-b/snap1", **COMPAT}]
