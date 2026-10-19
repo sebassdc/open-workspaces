@@ -286,6 +286,17 @@ fn host_up_then_node_add() {
 #[test]
 #[ignore = "requires x86-64 non-KVM Linux and OW_NODE_TEST_BINARY; boots no VM"]
 fn controller_only_boot_enroll_create_and_restart() {
+    controller_fixture(false);
+}
+
+/// Real TLS/credential reconnect to a different catalog root. Workers are synthetic.
+#[test]
+#[ignore = "requires x86-64 non-KVM Linux and OW_NODE_TEST_BINARY; boots no VM"]
+fn replacement_controller_restores_catalog_and_existing_credentials() {
+    controller_fixture(true);
+}
+
+fn controller_fixture(replace: bool) {
     use crate::catalog::{Catalog, Identity};
     use std::{
         collections::BTreeMap,
@@ -470,6 +481,131 @@ fn controller_only_boot_enroll_create_and_restart() {
     while fixture.children[0].try_wait().unwrap().is_none() {
         assert!(since.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(25));
+    }
+    if replace {
+        let credentials =
+            ["alpha", "beta"].map(|n| fs::read(base.join(n).join("node.json")).unwrap());
+        // Positive stop above; no two listener processes overlap. The stopped
+        // source catalog is kept for negative rollback checks, never reopened.
+        let final_copy = base.join("final.sqlite3");
+        crate::backup::run(
+            None,
+            crate::BackupAction::Catalog {
+                output: final_copy.clone(),
+                from: Some(controller.clone()),
+            },
+        )
+        .unwrap();
+        drop(catalog);
+        let replacement = base.join("r");
+        fs::create_dir(&replacement).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = replacement.join("controller");
+        host::data_root(Some(target.clone())).unwrap();
+        fs::copy(&final_copy, target.join("catalog.sqlite3")).unwrap();
+        fs::create_dir_all(replacement.join("tls")).unwrap();
+        fs::set_permissions(replacement.join("tls"), fs::Permissions::from_mode(0o700)).unwrap();
+        for entry in fs::read_dir(base.join("tls")).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(
+                entry.path(),
+                replacement.join("tls").join(entry.file_name()),
+            )
+            .unwrap();
+        }
+        crate::backup::run(
+            None,
+            crate::BackupAction::CatalogCheck {
+                catalog: target.join("catalog.sqlite3"),
+                against: Some(final_copy.clone()),
+            },
+        )
+        .unwrap();
+        fixture.children[0] = Command::new(&binary)
+            .arg("--data-dir")
+            .arg(&replacement)
+            .args([
+                "host",
+                "up",
+                "--controller-only",
+                "--listen",
+                &addr.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        ready();
+        for (i, node) in ["alpha", "beta"].iter().enumerate() {
+            assert_eq!(fixture.children[i + 1].id(), agents[i]);
+            assert!(fixture.children[i + 1].try_wait().unwrap().is_none());
+            assert!(wait_online(
+                &target,
+                node,
+                unix_now(),
+                Duration::from_secs(20)
+            ));
+            assert_eq!(
+                fs::read(base.join(node).join("node.json")).unwrap(),
+                credentials[i]
+            );
+            // Worker inventory survives controller loss; this is not VM evidence.
+            assert_eq!(
+                crate::wire::request(&base.join(node), json!({"op":"list"}))
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        // First replacement write: the pre-cutover catalog must now be rejected.
+        let mut recovered = Catalog::open(&target, "test", None).unwrap();
+        recovered
+            .user(&Identity {
+                issuer: "test".into(),
+                subject: "new".into(),
+                email: "new@example.test".into(),
+            })
+            .unwrap();
+        assert!(
+            crate::backup::run(
+                None,
+                crate::BackupAction::CatalogCheck {
+                    catalog: target.join("catalog.sqlite3"),
+                    against: Some(final_copy),
+                }
+            )
+            .is_err()
+        );
+        unsafe {
+            libc::kill(fixture.children[0].id() as i32, libc::SIGTERM);
+        }
+        assert!(fixture.children[0].wait().unwrap().success());
+        let latest = base.join("latest.sqlite3");
+        crate::backup::run(
+            None,
+            crate::BackupAction::Catalog {
+                output: latest.clone(),
+                from: Some(target.clone()),
+            },
+        )
+        .unwrap();
+        crate::backup::run(
+            None,
+            crate::BackupAction::CatalogCheck {
+                catalog: latest,
+                against: Some(target.join("catalog.sqlite3")),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.state(owner).unwrap()["workspaces"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        return;
     }
     fixture.children[0] = start();
     ready();

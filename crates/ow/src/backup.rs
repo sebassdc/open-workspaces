@@ -18,6 +18,17 @@ use std::{
 
 pub fn run(base: Option<PathBuf>, action: BackupAction) -> Result<i32> {
     match action {
+        BackupAction::CatalogCheck { catalog, against } => {
+            let checked = catalog_check(&catalog)?;
+            if let Some(source) = against {
+                ensure!(
+                    checked == catalog_check(&source)?,
+                    "catalogs differ; keep writers and GC stopped and resolve the backup gap"
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&checked)?);
+            Ok(0)
+        }
         BackupAction::Catalog { output, from } => {
             let from = match from {
                 Some(dir) => dir,
@@ -371,8 +382,91 @@ fn fetch(store: &dyn SnapshotStore, name: &str, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copies a live catalog with `VACUUM INTO` (one read transaction, so writers keep
-/// going) into a new 0600 file, then checks the copy. Returns its size in bytes.
+/// Hash every persisted table, including future roots; never print private rows.
+fn catalog_check(path: &Path) -> Result<Value> {
+    use rusqlite::types::ValueRef;
+    crate::nodes::private(path)?;
+    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.execute_batch("BEGIN")?;
+    let checks = db
+        .prepare("PRAGMA integrity_check")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(checks == ["ok"], "catalog integrity check failed");
+    ensure!(
+        !db.prepare("PRAGMA foreign_key_check")?.exists([])?,
+        "catalog foreign key violations"
+    );
+    let schema: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    crate::nodes::readable_by(&db, crate::nodes::SCHEMA)?;
+    let floor: String = db.query_row(
+        "SELECT value FROM settings WHERE key='min_reader_schema'",
+        [],
+        |r| r.get(0),
+    )?;
+    let floor: i64 = floor.parse().context("invalid catalog reader floor")?;
+    ensure!(
+        floor > 0 && floor <= crate::nodes::SCHEMA && floor <= schema,
+        "unsupported catalog reader floor"
+    );
+    let high: String = db.query_row(
+        "SELECT COALESCE((SELECT value FROM settings WHERE key='transfer_epoch'),'0')",
+        [],
+        |r| r.get(0),
+    )?;
+    let high: i64 = high
+        .parse()
+        .context("invalid transfer epoch high-watermark")?;
+    let used: i64 = db.query_row("SELECT MAX(epoch) FROM (SELECT COALESCE(MAX(placement_epoch),0) AS epoch FROM resources UNION ALL SELECT COALESCE(MAX(epoch),0) FROM transfers UNION ALL SELECT COALESCE(MAX(epoch),0) FROM transfer_reservations)", [], |r| r.get(0))?;
+    ensure!(
+        high >= used && high >= 0,
+        "catalog epoch high-watermark is below persisted authority; remain non-destructive"
+    );
+    let objects = db
+        .prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name")?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let schema_digest = ow_core::store::sha256(&serde_json::to_vec(&objects)?);
+    let mut tables = serde_json::Map::new();
+    let definitions = db
+        .prepare("SELECT name,sql FROM sqlite_schema WHERE type='table' ORDER BY name")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (name, definition) in definitions {
+        let mut stmt = db.prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\"")))?;
+        let columns = stmt.column_count();
+        let mut rows = stmt
+            .query_map([], |r| {
+                let mut row = Vec::new();
+                for column in 0..columns {
+                    // Tag SQLite types so null/text/blob/numeric values cannot collide.
+                    row.push(match r.get_ref(column)? {
+                        ValueRef::Null => json!(["null"]),
+                        ValueRef::Integer(v) => json!(["integer", v]),
+                        ValueRef::Real(v) => json!(["real", v.to_bits()]),
+                        ValueRef::Text(v) => json!(["text", v]),
+                        ValueRef::Blob(v) => json!(["blob", v]),
+                    });
+                }
+                Ok(ow_core::store::sha256(&serde_json::to_vec(&row).unwrap()))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.sort();
+        tables.insert(name, json!({"rows":rows.len(),"digest":ow_core::store::sha256(&serde_json::to_vec(&(definition,rows))?)}));
+    }
+    Ok(
+        json!({"schema":schema,"schema_digest":schema_digest,"min_reader_schema":floor,"epoch_high_watermark":high,"tables":tables}),
+    )
+}
+
+/// Copies a live catalog with `VACUUM INTO` into a new private, checked file.
 fn catalog(source: &Path, output: &Path) -> Result<u64> {
     ensure!(
         source.is_file(),
@@ -387,7 +481,7 @@ fn catalog(source: &Path, output: &Path) -> Result<u64> {
         .open(output)
         .with_context(|| format!("{} must not exist yet", output.display()))?;
     let copied = (|| -> Result<u64> {
-        let db = Connection::open(source)?;
+        let db = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.execute(
             "VACUUM INTO ?1",
@@ -463,6 +557,91 @@ mod tests {
         assert!(catalog(&source, &output).is_err(), "overwrote a backup");
         assert!(catalog(&dir.join("missing.sqlite3"), &dir.join("x")).is_err());
         assert!(!dir.join("x").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn catalog_check_covers_all_roots_and_rejects_stale_or_invalid_copies() {
+        let dir = temp("check");
+        let live = crate::catalog::Catalog::open(&dir, "fixture", None).unwrap();
+        let source = dir.join("catalog.sqlite3");
+        live.db.execute_batch(r#"INSERT INTO settings VALUES('transfer_epoch','77');
+            INSERT INTO users(id,issuer,subject,email) VALUES(1,'fixture','owner','owner@example.test');
+            INSERT INTO resources(owner,kind,name,physical,metadata,node,placement_epoch,ssh_policy,ssh_policy_generation)
+            VALUES(1,'machine','parked','m-parked','{}','',77,'{"keys":[]}',9);
+            INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(1,'snapshot','named','s-named','{}','runner-a');
+            INSERT INTO grants(physical,grantee,role) VALUES('m-parked',1,'admin');
+            INSERT INTO publications(https_port,physical,guest_port) VALUES(11001,'m-parked',8080);
+            INSERT INTO nodes(id,credential_hash,memory_mib,slots) VALUES('runner-a','private-credential-digest',1024,4);
+            INSERT INTO artifacts(id,kind,owner,machine,local_name,state,store_url) VALUES('capture','capture',1,'m-parked','sealed','stored','s3://fixture/private');
+            UPDATE resources SET current_capture='capture' WHERE physical='m-parked';
+            INSERT INTO artifact_copies(artifact,node,state,last_used) VALUES('capture','runner-a','present',1);
+            INSERT INTO leases(artifact,holder,purpose,expires) VALUES('capture','fixture','pull',9999999999);
+            INSERT INTO operations(id,owner,op,resource,state) VALUES(1,1,'wake','parked','pending');
+            INSERT INTO transfers(id,operation,kind,source,machine,source_node,source_epoch,source_policy_generation,target,epoch,capture,step)
+              VALUES(1,1,'wake','m-parked','m-parked','',76,9,'runner-a',77,'capture','prepared');
+            INSERT INTO transfer_locks(machine,transfer) VALUES('m-parked',1);
+            INSERT INTO transfer_reservations(transfer,node,epoch,memory_mib,cpus,disk_bytes) VALUES(1,'runner-a',77,256,1,1048576);
+            CREATE TABLE future_roots(id TEXT, payload BLOB);
+            INSERT INTO future_roots VALUES('keep',x'000102');"#).unwrap();
+        let snapshot = dir.join("final.sqlite3");
+        catalog(&source, &snapshot).unwrap();
+        let checked = catalog_check(&snapshot).unwrap();
+        assert_eq!(checked, catalog_check(&source).unwrap());
+        for table in [
+            "users",
+            "resources",
+            "grants",
+            "nodes",
+            "transfers",
+            "transfer_reservations",
+            "artifacts",
+            "artifact_copies",
+            "leases",
+            "settings",
+            "future_roots",
+        ] {
+            assert!(
+                checked["tables"][table]["rows"].as_u64().unwrap() > 0,
+                "missing roots in {table}"
+            );
+        }
+        assert!(!checked.to_string().contains("owner@example.test"));
+        // Parked roots cannot be reconstructed from an online runner's inventory.
+        live.db
+            .execute_batch(
+                "UPDATE resources SET name='renamed',placement_epoch=78;
+                               UPDATE settings SET value='78' WHERE key='transfer_epoch';",
+            )
+            .unwrap();
+        assert_ne!(checked, catalog_check(&source).unwrap());
+        let copy = Connection::open(&snapshot).unwrap();
+        copy.execute_batch("UPDATE settings SET value='0' WHERE key='transfer_epoch';")
+            .unwrap();
+        assert!(
+            catalog_check(&snapshot)
+                .unwrap_err()
+                .to_string()
+                .contains("high-watermark")
+        );
+        copy.execute_batch("UPDATE settings SET value='77' WHERE key='transfer_epoch'; CREATE TRIGGER future_fence BEFORE DELETE ON future_roots BEGIN SELECT RAISE(ABORT,'fenced'); END;").unwrap();
+        assert_ne!(
+            checked,
+            catalog_check(&snapshot).unwrap(),
+            "lost schema guard"
+        );
+        copy.execute_batch("DROP TRIGGER future_fence;").unwrap();
+        assert_eq!(checked, catalog_check(&snapshot).unwrap());
+        copy.execute_batch("PRAGMA foreign_keys=OFF; UPDATE resources SET owner=999;")
+            .unwrap();
+        assert!(
+            catalog_check(&snapshot)
+                .unwrap_err()
+                .to_string()
+                .contains("foreign key")
+        );
+        copy.execute_batch("UPDATE resources SET owner=1; UPDATE settings SET value='999' WHERE key='min_reader_schema';").unwrap();
+        assert!(catalog_check(&snapshot).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1219,6 +1219,12 @@ def main(argv):
     sub.add_parser("apply")
     sub.add_parser("status")
     sub.add_parser("recover")
+    sub.add_parser("recovery-freeze", help="stop controller/maintenance units, preserve worker")
+    sub.add_parser("recovery-status", help="read-only recovery state; not a cross-host fence")
+    rr = sub.add_parser("recovery-runner", help="configure an existing runner while frozen; never starts it")
+    rr.add_argument("--config", required=True)
+    rr.add_argument("--controller", required=True)
+    rr.add_argument("--ca", required=True)
     invite = sub.add_parser("invite-runner")
     invite.add_argument("node")
     for limit in ("--memory", "--slots", "--cpus"):
@@ -1242,6 +1248,15 @@ def main(argv):
     render_cmd.add_argument("--config", required=True)
     args = parser.parse_args(argv)
     try:
+        import controller_recovery as recovery
+        if args.command == "recovery-status":
+            return recovery.status()
+        if args.command == "recovery-freeze":
+            return recovery.freeze()
+        if args.command == "recovery-runner":
+            return recovery.runner(args.config, args.controller, args.ca)
+        if recovery.frozen() and args.command not in ("status", "render"):
+            raise Refused("controller recovery is frozen; follow docs/CONTROLLER_RECOVERY.md")
         if args.command == "render":
             # Used by an older release's upgrader to diff this release's files.
             config = validate(json.loads(Path(args.config).read_text()))

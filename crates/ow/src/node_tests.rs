@@ -1534,3 +1534,213 @@ fn controller_placement_policy_survives_runner_drain_changes() {
     drop(db);
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Keep a genuinely issued old job present on the restored authority: an unknown
+/// ID would test only lookup failure and could miss a broken generation fence.
+#[test]
+fn restored_controller_rejects_previously_issued_job_and_old_session_results() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = rt.enter();
+    let old_root = root();
+    let replacement_root = root();
+    drop(crate::catalog::Catalog::open(&old_root, "fixture", None).unwrap());
+    let enrolled = enrollment(&old_root, "alpha");
+    let token = enrolled["credential"].as_str().unwrap();
+    let controller = |root: &Path| Controller {
+        root: root.to_owned(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        jobs: Arc::new(Mutex::new(HashMap::new())),
+        slots: Arc::new(Semaphore::new(32)),
+    };
+    let serve = |c: &Controller| {
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let app = routes(c.clone());
+        let server = rt.spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let proxies = rt.spawn(proxies(c.clone()));
+        (origin, server, proxies)
+    };
+    let heartbeat = json!({"type":"heartbeat","protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":512,"slots":2,"vcpus":2,"images":["alpine"]}).to_string();
+    let connect = |origin: &str, root: &Path| {
+        let mut session = socket(origin, "/node/alpha", token, None).unwrap();
+        timeout_socket(&session).unwrap();
+        let since = std::time::Instant::now();
+        while online(root, "alpha").is_err() {
+            assert!(since.elapsed() < Duration::from_secs(5));
+            session
+                .send(tungstenite::Message::Text(heartbeat.clone().into()))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        session
+    };
+    let dispatch = |c: &Controller, marker: &str| {
+        let (mut local, remote) = std::os::unix::net::UnixStream::pair().unwrap();
+        local
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        remote.set_nonblocking(true).unwrap();
+        let upstream = tokio::net::UnixStream::from_std(remote).unwrap();
+        let task = rt.spawn(proxy(c.clone(), "alpha".into(), upstream));
+        wire::send(
+            &mut local,
+            &json!({"op":"exec","id":"fixture","command":marker}),
+        )
+        .unwrap();
+        (local, task)
+    };
+    let next_job = |session: &mut tungstenite::WebSocket<
+        tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+    >| {
+        loop {
+            match session.read().unwrap() {
+                tungstenite::Message::Text(id) => break id.to_string(),
+                tungstenite::Message::Ping(p) => {
+                    session.send(tungstenite::Message::Pong(p)).unwrap()
+                }
+                other => panic!("expected issued job, got {other:?}"),
+            }
+        }
+    };
+    let old = controller(&old_root);
+    let (origin, server, proxy_loop) = serve(&old);
+    let mut old_session = connect(&origin, &old_root);
+    let old_generation = old.sessions.lock().unwrap()["alpha"].generation.clone();
+    let (mut live_local, live_proxy) = dispatch(&old, "accepted-before-cutover");
+    let live_id = next_job(&mut old_session);
+    let mut live_job = socket(&origin, &format!("/job/alpha/{live_id}"), token, None).unwrap();
+    timeout_socket(&live_job).unwrap();
+    assert!(
+        String::from_utf8_lossy(&live_job.read().unwrap().into_data())
+            .contains("accepted-before-cutover")
+    );
+    live_job
+        .send(tungstenite::Message::Binary(b"before\n".to_vec().into()))
+        .unwrap();
+    let mut before = [0; 7];
+    live_local.read_exact(&mut before).unwrap();
+    assert_eq!(
+        &before, b"before\n",
+        "old session must actually work before fencing"
+    );
+
+    let (pending_local, pending_proxy) = dispatch(&old, "issued-but-not-attached");
+    let pending_id = next_job(&mut old_session);
+    let pending = old
+        .jobs
+        .lock()
+        .unwrap()
+        .remove(&pending_id)
+        .expect("production proxy issued this job");
+    assert_eq!(pending.node, "alpha");
+    assert_eq!(pending.generation, old_generation);
+    old.sessions.lock().unwrap().clear();
+    // Challenge a result on the previously accepted stream AFTER the authority is fenced.
+    let _ = live_job.send(tungstenite::Message::Binary(
+        b"STALE-RESULT\n".to_vec().into(),
+    ));
+    let mut late = [0; 32];
+    assert_eq!(
+        live_local.read(&mut late).unwrap(),
+        0,
+        "old result reached the caller"
+    );
+    assert!(rt.block_on(live_proxy).unwrap().is_err());
+    pending_proxy.abort();
+    let _ = rt.block_on(pending_proxy);
+    drop(pending_local);
+    let _ = old_session.close(None);
+    proxy_loop.abort();
+    server.abort();
+    let _ = rt.block_on(proxy_loop);
+    let _ = rt.block_on(server);
+    // Wait for the upgraded old session's final generation-scoped DB write.
+    let since = std::time::Instant::now();
+    while db(&old_root)
+        .unwrap()
+        .query_row("SELECT heartbeat FROM nodes WHERE id='alpha'", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+        != 0
+    {
+        assert!(since.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    crate::backup::run(
+        None,
+        crate::BackupAction::Catalog {
+            output: replacement_root.join("catalog.sqlite3"),
+            from: Some(old_root.clone()),
+        },
+    )
+    .unwrap();
+    let replacement = controller(&replacement_root);
+    let (replacement_origin, replacement_server, replacement_loop) = serve(&replacement);
+    let mut new_session = connect(&replacement_origin, &replacement_root);
+    let new_generation = replacement.sessions.lock().unwrap()["alpha"]
+        .generation
+        .clone();
+    assert_ne!(new_generation, old_generation);
+    replacement
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(pending_id.clone(), pending);
+    let denied = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("{replacement_origin}/job/alpha/{pending_id}"))
+        .bearer_auth(token)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .unwrap();
+    assert_eq!(denied.status().as_u16(), 404);
+    assert!(
+        replacement.jobs.lock().unwrap().contains_key(&pending_id),
+        "denial must be generation fencing, not unknown-job lookup"
+    );
+
+    // A current production-issued job with the SAME credential still works.
+    let (mut current_local, current_proxy) = dispatch(&replacement, "current-authority");
+    let current_id = next_job(&mut new_session);
+    let mut current_job = socket(
+        &replacement_origin,
+        &format!("/job/alpha/{current_id}"),
+        token,
+        None,
+    )
+    .unwrap();
+    timeout_socket(&current_job).unwrap();
+    assert!(
+        String::from_utf8_lossy(&current_job.read().unwrap().into_data())
+            .contains("current-authority")
+    );
+    current_job
+        .send(tungstenite::Message::Binary(b"fresh\n".to_vec().into()))
+        .unwrap();
+    let mut fresh = [0; 6];
+    current_local.read_exact(&mut fresh).unwrap();
+    assert_eq!(&fresh, b"fresh\n");
+    current_proxy.abort();
+    let _ = rt.block_on(current_proxy);
+    let _ = new_session.close(None);
+    replacement_loop.abort();
+    replacement_server.abort();
+    let _ = rt.block_on(replacement_loop);
+    let _ = rt.block_on(replacement_server);
+    drop(_entered);
+    drop(rt);
+    fs::remove_dir_all(old_root).unwrap();
+    fs::remove_dir_all(replacement_root).unwrap();
+}
