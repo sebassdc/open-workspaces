@@ -89,7 +89,7 @@ Copy-on-write delays allocation; it does not remove storage growth. Memory captu
 
 ## Reuse assessment
 
-Ignition is a promising Rust foundation, not confirmed current Boxd source. Its public README warns against production use and lacks a complete self-hosting guide. Its AGPL license requires a deliberate choice before incorporation.
+Ignition is a promising runtime foundation, not confirmed current Boxd source. Its public README warns against production use and lacks a complete self-hosting guide. Its AGPL license requires a deliberate choice before incorporation.
 
 Firecracker supplies a KVM microVM engine and snapshot primitives, but not the finished platform. Its snapshot documentation identifies clone entropy/identity risks, trusted snapshot inputs, and connection loss across restores. We must implement artifact authentication, consistency, identity refresh, policy enforcement, scheduling, and recovery.
 

@@ -2,7 +2,7 @@
 Updated: 2026-10-03 | Size: L | State: done; independent stable-commit review/merge pending
 
 ## Goal
-Deliver the authorized working Rust Linux multi-node slice in `work/node-core`.
+Deliver the authorized working Linux multi-node slice in `work/node-core`.
 
 ## Where it stands
 - Implemented: node enrollment/TLS/outbound transport, generation/revoke, fixed
@@ -27,9 +27,9 @@ None. Owner already authorized implementation; deployment is planner-owned revie
 - Brief/interface: `docs/plans/node-core-brief.md`, `node-core-interface.md`.
 - Operator/ADR: `docs/MULTINODE.md`, `docs/adr/0002-bounded-linux-multinode.md`.
 - Full command/evidence report: `docs/plans/node-core-report.md`.
-- Core private result: `/home/sebassdc/dev/open-workspaces/data/ncb5ca6775/result.json`.
-- Independent result/manifest: `/home/sebassdc/dev/open-workspaces/data/mnv-vqn2fx79/result.json`.
-- Review: `/home/sebassdc/dev/open-workspaces/docs/plans/multinode-review.md`.
+- Core private result: `/path/to/open-workspaces/data/ncb5ca6775/result.json`.
+- Independent result/manifest: `/path/to/open-workspaces/data/mnv-vqn2fx79/result.json`.
+- Review: `/path/to/open-workspaces/docs/plans/multinode-review.md`.
 
 ## Gotchas
 Keep short new Btrfs guest roots; long worktree roots exceed Unix socket limits.

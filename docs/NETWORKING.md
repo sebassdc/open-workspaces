@@ -10,7 +10,7 @@ Access-authenticated HTTPS/WebSocket connections; no guest SSH daemon is require
 `ow up` starts a dedicated supervisor, user/network namespace worker, and upstream
 slirp4netns 1.3.6 (libslirp 4.9.5). The pinned executable is fetched and SHA256
 verified by `scripts/prepare-network.py`. It is a separate GPL-2.0-or-later upstream
-executable, not imported source in the Apache Rust crates. Its sandbox, seccomp,
+executable, not imported source in the MIT-licensed project crates. Its sandbox, seccomp,
 and disable-host-loopback options are enabled. There are no inbound port mappings.
 All nftables rules and forwarding sysctls live in the disposable worker network
 namespace. No host routes, host firewall rules or global sysctls are changed.
@@ -77,7 +77,7 @@ Only `/cli/install.sh`, `ow-linux-amd64`, `ow-darwin-arm64`, `ow-darwin-amd64`
 and their `.sha256` files under `/cli/` are
 public GET/HEAD resources. A dedicated Access bypass application covers `/cli/*`,
 but the Tunnel authentication exception matches only those seven exact files.
-The Rust gateway also bypasses JWT only for those exact fixed resources, rejects
+The gateway also bypasses JWT only for those exact fixed resources, rejects
 queries and non-read methods, and never maps a request to an arbitrary host file.
 The dashboard, API and terminal retain their existing Access allowlist/JWT checks.
 `scripts/publish-cli.py` owns only this project's path-specific Access application

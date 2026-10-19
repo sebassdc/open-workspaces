@@ -23,7 +23,7 @@ in this lane), then publishes only the reviewed CLI through gateway asset select
 None. Public publication belongs to parent; this lane performed none.
 
 ## Files
-- Brief: /home/sebassdc/dev/open-workspaces/docs/plans/assets-progress-brief.md
+- Brief: /path/to/open-workspaces/docs/plans/assets-progress-brief.md
 - Report/pins/commands: docs/plans/assets-progress-report.md
 - Changed: crates/ow/src/onboarding.rs, docs/HOSTS.md,
   experiments/assets-progress/tls-progress.py, report and this handoff.

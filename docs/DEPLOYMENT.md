@@ -1,6 +1,6 @@
 # Deployment proposal
 
-A dedicated authenticated guest-app ingress has been deployed. A Rust/Firecracker prototype
+A dedicated authenticated guest-app ingress has been deployed. A Firecracker prototype
 runs on the development machine; see [local setup](LOCAL_PROTOTYPE.md) and
 [runtime spike](experiments/runtime-spike.md).
 
@@ -10,7 +10,7 @@ dedicated DNS route are running. Public anonymous/forged browser requests redire
 to login and invalid origin assertions are denied. Positive owner login and
 session revocation checks remain pending. See
 [remote access](REMOTE_ACCESS.md). This authorization does not include changing
-unrelated Hostinger services or shared ingress.
+unrelated services or shared ingress.
 
 The same project hostname now serves the [browser dashboard](DASHBOARD.md),
 replacing the guest counter page. It connects to the local Unix worker through
@@ -23,23 +23,23 @@ The owner has a separate machine available. Verify Linux/KVM, architecture, perm
 
 A 1 vCPU / 1 GiB guest can be an initial experimental profile, not a production guarantee. Browser/build workloads will often need more. Choose concurrency from observed CPU, memory, disk I/O and host headroom rather than virtual disk size or theoretical CoW sharing.
 
-## Existing Hostinger server
+## Shared hosting without KVM
 
-A read-only check during research found /dev/kvm absent. Published Hostinger policy disables nested virtualization: https://www.hostinger.com/support/10429687-is-nested-virtualization-supported-in-hostinger/
+Some shared hosting providers do not expose `/dev/kvm` or allow nested virtualization. Verify the provider's policy and the actual host before choosing a microVM backend.
 
 Options:
 
-1. API/dashboard on existing Dokku, separate KVM worker reached through authenticated private transport.
-2. Trusted container workspaces on Hostinger, advertising shared-kernel isolation and reduced state features.
+1. API/dashboard on an existing application host, separate KVM worker reached through authenticated private transport.
+2. Trusted container workspaces on shared hosting, advertising shared-kernel isolation and reduced state features.
 3. All components on the new development machine initially, move the control plane after the alpha is usable.
 
-Option 3 is the simplest development start. Option 1 is the preferred eventual reuse of current hosting for a microVM product.
+Option 3 is the simplest development start. Option 1 allows reuse of an existing application host for a microVM product.
 
-The owner's local dokku-cloudflare.md is the source of truth for that host. Do not copy its credentials, account identifiers or full live configuration into this public repository. Existing Dokku ingress uses HTTP behind Cloudflare; Tailscale Funnel is reserved for other services. OpenClaw configuration is protected.
+Keep deployment configuration private. Do not copy credentials, account identifiers or live configuration into this public repository. Preserve unrelated applications, ingress and shared HTTPS listeners.
 
-Proposed workspace endpoints should use one-level names such as ws-123.example.com. The existing Cloudflare certificate arrangement does not cover deeper workspace/port hostnames. Route a dedicated project gateway through Dokku; avoid creating a Dokku application per guest. Tune project-specific streaming/file limits when deployment is authorized.
+Proposed workspace endpoints can use one-level names such as ws-123.example.com. Verify certificate coverage before using deeper workspace/port hostnames. Route a dedicated project gateway through the application host; avoid creating an application per guest. Tune project-specific streaming/file limits when deployment is authorized.
 
-Raw SSH/TCP/UDP needs a separately planned listener or authenticated tunnel; ordinary Cloudflare HTTP proxying is insufficient. Never repurpose the existing Tailscale HTTPS listener. The current Flexible SSL origin path is a prototype hosting constraint; design authenticated encrypted worker transport and an enterprise TLS ingress independently, without changing the host's global SSL mode.
+Raw SSH/TCP/UDP needs a separately planned listener or authenticated tunnel; ordinary Cloudflare HTTP proxying is insufficient. Never repurpose an existing Tailscale HTTPS listener. Design authenticated encrypted worker transport and TLS ingress without changing shared global SSL settings.
 
 ## AWS
 

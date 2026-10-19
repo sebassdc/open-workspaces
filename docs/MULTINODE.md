@@ -1,6 +1,6 @@
 # Bounded Linux multi-node prototype
 
-Implemented by node-core, 2026-10-03. Pattern: existing Rust gateway, SQLite
+Implemented by node-core, 2026-10-03. Pattern: existing gateway, SQLite
 ownership catalog, private Unix worker, Firecracker/Btrfs under ADR 0001.
 Architecture decision: [ADR 0002](adr/0002-bounded-linux-multinode.md).
 Independent HTTP/guest/browser acceptance and stable-commit source review passed.
@@ -49,9 +49,9 @@ Do not shorten IDs or bypass socket checks. Do not reuse existing prototype data
 for experiments.
 
 ```bash
-export RUSTUP_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/rustup
-export CARGO_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo
-export OW_ASSET_DIR=/home/sebassdc/dev/open-workspaces/data/runtime-spike
+export RUSTUP_HOME=/path/to/open-workspaces/data/runtime-spike/rustup
+export CARGO_HOME=/path/to/open-workspaces/data/runtime-spike/cargo
+export OW_ASSET_DIR=/path/to/open-workspaces/data/runtime-spike
 "$CARGO_HOME/bin/cargo" +1.97.0 build --locked -p ow
 OW_BIN="$PWD/target/debug/ow"
 # Choose short, dedicated roots; these are examples for a new topology.

@@ -8,7 +8,7 @@ the local worker directly; no additional domain or hostname was created. The
 standalone guest-app gateway described below remains available as `ow serve`,
 but arbitrary guest HTML is not served on the management origin.
 
-The local prototype now includes `ow serve`: a Rust gateway for **one guest HTTP
+The local prototype now includes `ow serve`: a gateway for **one guest HTTP
 app**, protected by Cloudflare Access JWT verification. It binds only to loopback
 and has no worker connection, workspace lifecycle API, terminal, or dashboard.
 The existing `ow --local publish` loopback relay remains available for local use.
@@ -24,7 +24,7 @@ are running. Browser-shaped anonymous and forged-token requests redirect to the
 configured Access login; origin requests without valid assertions return 401.
 Positive owner login, session expiry/logout and another-user denial still require
 browser verification. A public login redirect alone does not prove app access.
-Existing Hostinger apps, OpenClaw ingress, Tailscale listeners and global SSL
+Existing unrelated apps and ingress, Tailscale listeners and global SSL
 settings must remain untouched.
 
 ```text

@@ -21,7 +21,7 @@ NEEDED entries. Reviewer ran no tests/builds/VMs/services/cloud actions and chan
 only this report.
 
 Artifacts below are relative to
-`/home/sebassdc/dev/open-workspaces-lanes/compressed-assets/data/compressed-assets-build/`:
+`/path/to/worktrees/compressed-assets/data/compressed-assets-build/`:
 
 | Accepted evidence/artifact | SHA-256 / value |
 | --- | --- |
@@ -88,7 +88,7 @@ neither is being called public gateway acceptance.
 
 Review contract: `docs/plans/compressed-assets-review-brief.md` and
 `docs/plans/compressed-assets-brief.md`. Product lane:
-`/home/sebassdc/dev/open-workspaces-lanes/compressed-assets`, branch
+`/path/to/worktrees/compressed-assets`, branch
 `work/compressed-assets`. Reviewer writes only this root report; no tests, builds,
 VM/service/cloud actions, product edits or commits.
 

@@ -1,6 +1,6 @@
 # Local microVM prototype
 
-The prototype runs real Firecracker/KVM Linux guests on this machine. Its Rust
+The prototype runs real Firecracker/KVM Linux guests on this machine. Its
 CLI and worker support commands, files, persistent disks, RAM+disk snapshots,
 independent forks, hibernation, and local HTTP publishing. This is a single
 operator development prototype, not a production or public sandbox service.

@@ -1,7 +1,7 @@
 # Runtime feasibility experiment
 
 These Python standard-library probes support the runtime spike; the product
-runtime remains planned in Rust. No public API or VM service exists yet.
+runtime remains planned. No public API or VM service exists yet.
 
 Run from the repository root:
 
@@ -44,7 +44,7 @@ unshare --user --map-root-user --net python3 experiments/runtime-spike/guest-smo
 Preparation refuses to overwrite an existing base image. The shell/network test
 keeps its generated disks and snapshots in ignored data and closes its VMMs.
 
-The Rust prototype's real-VM tests and measurement tools are:
+The prototype's real-VM tests and measurement tools are:
 
 ```bash
 python3 experiments/runtime-spike/prototype-e2e.py

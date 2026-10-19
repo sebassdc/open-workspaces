@@ -1,5 +1,5 @@
 # Multi-node implementation — plan brief
-Size: L | State: authorized | Pattern: Rust gateway / SQLite ownership / private Unix worker
+Size: L | State: authorized | Pattern: gateway / SQLite ownership / private Unix worker
 
 ## Goal
 Two outbound Linux agents provide authenticated, fixed-placement workspace control and terminals, preserving single-host operation.

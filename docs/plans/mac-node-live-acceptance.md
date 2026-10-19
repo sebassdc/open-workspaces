@@ -25,12 +25,12 @@ hashes to `mac-node-pins.json`; no new image download is required if they match.
 Do not reuse a fixture's node root, guest disk or credentials as a live node.
 
 ## Invitation and bounded enrollment
-Controller: `https://workspaces.sebashurtado.com/_nodes`
-Dashboard: `https://workspaces.sebashurtado.com`
+Controller: `https://workspaces.example.com/_nodes`
+Dashboard: `https://workspaces.example.com`
 Dedicated node ID: `mac-arm64-pilot`; owner cap: 1024MiB,2vCPU,one slot.
 
 Owner has a mode0600 one-use invitation on the Linux controller machine at
-`/home/sebassdc/dev/open-workspaces/data/mac-node-rollout/mac-invite.json`.
+`/path/to/open-workspaces/data/mac-node-rollout/mac-invite.json`.
 It expires one hour after issuance. The owner must transfer this file privately
 to your Mac (for example an existing trusted SSH channel or local clipboard).
 Never commit, post or log its contents. If absent/expired, stop only enrollment,
@@ -63,7 +63,7 @@ planner to revoke/reinvite a fresh node identity instead of blind retries.
 ## Actual acceptance through human gateway
 The owner signs in with Cloudflare Access in the dashboard. The node invitation
 does not provide human account access. If testing remote CLI, obtain an authorized
-human session through `ow login https://workspaces.sebashurtado.com`; do not use
+human session through `ow login https://workspaces.example.com`; do not use
 node credentials as human credentials. Planner's cached session had expired, so
 positive live human acceptance is intentionally still pending.
 

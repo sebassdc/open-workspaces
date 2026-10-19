@@ -150,7 +150,7 @@ def main():
     try:
         guest=Guest(helper, root, via_cli=True)
         receipt["boot_seconds"]=guest.ready_seconds
-        receipt["checks"].append("native Rust CLI boots signed helper")
+        receipt["checks"].append("native CLI boots signed helper")
         output,code=guest.command("uname -m; uname -r; tty; stty rows 37 cols 111; stty size")
         assert code==0 and "aarch64" in output and "/dev/hvc0" in output and "37 111" in output,output
         receipt["checks"].append("architecture, controlling console, resize")

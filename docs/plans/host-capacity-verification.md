@@ -3,7 +3,7 @@ Updated: 2026-10-04 | Size: S | State: **focused V4 no-VM acceptance passed**.
 
 W8 is closed by the independent executed legacy/new/local HTTP/TLS checks below. This is a bounded verification verdict, not release approval: reviewer and parent own source review, services, artifact selection and rollout. V2/V3 results are superseded and remain preserved privately. No product edits, commits, owner/remote mutations, cloud writes or VM activity were performed by this verifier.
 
-Authority: [verification brief](host-capacity-verify-brief.md), [capacity brief](host-capacity-brief.md), [review](host-capacity-review.md), [rollout](host-capacity-rollout.md). Pattern: ADR 0002 Rust gateway + SQLite owner authority + outbound node agent + private bounded worker. Fixtures are new owned private `data/cv/` roots; report/receipts are under `data/host-capacity-verify/`.
+Authority: [verification brief](host-capacity-verify-brief.md), [capacity brief](host-capacity-brief.md), [review](host-capacity-review.md), [rollout](host-capacity-rollout.md). Pattern: ADR 0002 gateway + SQLite owner authority + outbound node agent + private bounded worker. Fixtures are new owned private `data/cv/` roots; report/receipts are under `data/host-capacity-verify/`.
 
 ## Exact V4 attribution
 
@@ -19,13 +19,13 @@ Authority: [verification brief](host-capacity-verify-brief.md), [capacity brief]
 | Bundle preparation script | `99cfda4e84d9a853e374481fad4e649da6a3c57ec0747b22f1bdb16058db77b0` |
 | Ingress script | `7be8eb3a339d6267a7977e0d21d49e0a8f195d8e65324061544bf2f9882c467c` |
 
-Lane: `/home/sebassdc/dev/open-workspaces-lanes/capacity-core`. Read-only artifact inputs: `data/capacity-build/release-v4/build.json` and sibling `ow-linux-amd64`, `dynamic-v4/build.json` and sibling CLI, `bundle-v4/`, `frozen-pins-v4.json`. Static/dynamic receipts have identical source maps. Recomputed source-map fingerprint, every listed current source file, separately pinned scripts and both CLI hashes before/after execution and at final cleanup. All matched. Bundle build receipt equals static receipt. No old dynamic artifact was used with new source.
+Lane: `/path/to/worktrees/capacity-core`. Read-only artifact inputs: `data/capacity-build/release-v4/build.json` and sibling `ow-linux-amd64`, `dynamic-v4/build.json` and sibling CLI, `bundle-v4/`, `frozen-pins-v4.json`. Static/dynamic receipts have identical source maps. Recomputed source-map fingerprint, every listed current source file, separately pinned scripts and both CLI hashes before/after execution and at final cleanup. All matched. Bundle build receipt equals static receipt. No old dynamic artifact was used with new source.
 
 Final observed lane HEAD: `1ca48437a236bf8ebffe2b771538824e21e71ae7`. Final `git diff --binary HEAD` hash: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` (empty tracked diff). Parent/core committed the previously dirty freeze; compiled input identity is the manifest above. Toolchain receipt: Rust 1.97.0; static release musl vs dynamic release glibc. Dynamic evidence is not a shipping claim.
 
 ## Executed commands and results
 
-All commands ran from `/home/sebassdc/dev/open-workspaces`. Exact child argv/exit/output, HTTP statuses, runner/helper hashes and cleanup are in the private receipts. No broad unit, VM, installer or previously finished source suite was rerun.
+All commands ran from `/path/to/open-workspaces`. Exact child argv/exit/output, HTTP statuses, runner/helper hashes and cleanup are in the private receipts. No broad unit, VM, installer or previously finished source suite was rerun.
 
 | Command | Final result | Private receipt |
 |---|---|---|
@@ -86,7 +86,7 @@ Verifier work is complete for the assigned focused no-VM scope. Parent reviews t
 
 ## Completed bounded pinned-local positive gate
 
-Command: `python3 data/host-capacity-verify/w8-v4-local-positive-focused.py` — **exit 0; one targeted group passed**. Source/static/dynamic manifests matched before/after. Private receipt `data/host-capacity-verify/w8-v4-local-positive-result.json`; root `/home/sebassdc/dev/open-workspaces/data/cv/d21po7vky`; runner SHA-256 `0ec26af7643a803375bddbb33c464840d478583918540b4a846618aba8b96a66`.
+Command: `python3 data/host-capacity-verify/w8-v4-local-positive-focused.py` — **exit 0; one targeted group passed**. Source/static/dynamic manifests matched before/after. Private receipt `data/host-capacity-verify/w8-v4-local-positive-result.json`; root `/path/to/open-workspaces/data/cv/d21po7vky`; runner SHA-256 `0ec26af7643a803375bddbb33c464840d478583918540b4a846618aba8b96a66`.
 
 An existing owned stopped local resource is modeled only in the private catalog and returned by the actual synthetic local worker list. Actual signed gateway resize **2048 MiB/2 CPU** succeeded, left it stopped with zero running RAM/CPU reservation, and added exactly one durable operation and one mock resize effect. Subsequent **4096 MiB/2 CPU** and **2048 MiB/8 CPU** requests both rejected before new durable operation/resource/reservation/effect dispatch. Parsed semantic metadata and the stopped mock machine stayed unchanged; timestamps/JSON formatting were excluded from the comparison. No worker binary or guest ran. This closes the positive local resize gate without relying on local automatic-create policy.
 

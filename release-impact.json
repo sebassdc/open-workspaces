@@ -2,6 +2,41 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.14",
+      "class": 0,
+      "changes": [
+        "component"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 6,
+        "min_reader": 6
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Project source is now MIT licensed; upstream dependencies and vendored terminal notices retain their own licenses. Documentation names components by responsibility, adds the feature matrix and uses public examples. Packaging and documentation metadata only; runtime, worker and host protocols, catalog schema and reader floor, guest kernel, host layout and stage 0 are unchanged. Keep all running service pins; no restart, transfer, store activation, infrastructure change or guest-state change is required."
+    },
+    {
       "version": "0.9.13",
       "class": 1,
       "changes": [

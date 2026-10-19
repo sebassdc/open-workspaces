@@ -2,7 +2,7 @@
 Date: 2026-10-05 | Status: implemented and locally validated; live acceptance and planner review pending. Evidence: ../plans/mac-node-report.md
 
 Keep the existing node protocol v1 and SQLite fixed placement. Use a separate
-Rust Mac worker and managed host onboarding; compile the existing outbound node
+Mac worker and managed host onboarding; compile the existing outbound node
 transport on macOS, sharing TLS, job journaling and generation fences rather than
 creating a new transport. The Linux controller remains planner-reviewed.
 

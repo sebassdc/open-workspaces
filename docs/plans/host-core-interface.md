@@ -1,5 +1,5 @@
 # host-core interface — implementation contract
-State: final2 product frozen; bounded core managed slice passed; independent acceptance/public release pending. Pattern: ADR 0002 Rust gateway + SQLite ownership + outbound node protocol. Owner already authorized.
+State: final2 product frozen; bounded core managed slice passed; independent acceptance/public release pending. Pattern: ADR 0002 gateway + SQLite ownership + outbound node protocol. Owner already authorized.
 
 ```mermaid
 flowchart LR

@@ -28,8 +28,8 @@ None. Owner already authorized bounded work; public release is held by planner.
 - Brief: `docs/plans/host-core-brief.md`, `docs/plans/host-onboarding.md`.
 - Interface/report/runbook: `docs/plans/host-core-interface.md`,
   `docs/plans/host-core-report.md`, `docs/HOSTS.md`.
-- Branch: `work/host-core` in `/home/sebassdc/dev/open-workspaces-lanes/host-core`.
-- Private outputs: `/home/sebassdc/dev/open-workspaces/data/host-core-build/`;
+- Branch: `work/host-core` in `/path/to/worktrees/host-core`.
+- Private outputs: `/path/to/open-workspaces/data/host-core-build/`;
   `ready-receipt-final2.json`, `release-final2/build.json`, `host-public-final2`,
   `restaged-serial-units.log`, `restaged-source-checks.log`, `smoke-final4/`,
   `cleanup-final.json`. Earlier smoke attempts failed before VM startup.
