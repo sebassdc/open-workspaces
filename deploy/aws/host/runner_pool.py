@@ -120,6 +120,10 @@ def check(name):
     creating, tagging and answering join secrets as sync does. Missing rights, shape
     problems or an unanswered simulation refuse activation; a pass is recorded for the
     controller's live mode."""
+    # Revoke the previous pass before any check that could fail or be interrupted.
+    checks = {p: at for p, at in ((h.read_json(PROVIDER_CHECK) or {}).get("pools") or {}).items()
+              if h.POOL.match(p) and p != name}
+    h.write_atomic(PROVIDER_CHECK, json.dumps({"pools": checks}) + "\n", 0o600, owner="ow")
     pool = load(name)
     group, hooks, policies, _, _, _ = describe(pool)
     problems = shape_problems(pool, group, hooks, policies)
@@ -302,7 +306,7 @@ def live_actions():
         return {}
     out = {}
     for plan in status.get("pools") or []:
-        if not isinstance(plan, dict) or plan.get("stale") is not False:
+        if not isinstance(plan, dict) or plan.get("stale") is not False or plan.get("execution_allowed") is not True:
             continue
         action = (plan.get("state") or {}).get("action")
         if isinstance(action, dict) and action.get("phase") in ("launching", "joining", "draining") \
@@ -390,7 +394,9 @@ def sync(names, fixed=(), hours=None):
                 snapshot["receipts"][pool["name"]] = receipt
         group, hooks, policies, activities, instances, volumes = described = describe(pool)
         answer_joins(pool, group, instances, known)
-        complete_own(pool, group)
+        if pool["name"] in actions and actions[pool["name"]]["kind"] == "drain" \
+                and receipt and receipt["outcome"] == "pending":
+            complete_own(pool, group)
         found, disks, complete, retention, resolved = observe(pool, *described, known, int(time.time()))
         for i in found:  # the one instance a launch receipt speaks for
             if launched and i["id"] == launched:

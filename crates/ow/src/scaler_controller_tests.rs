@@ -201,6 +201,46 @@ fn live_mode_is_refused_without_activation_evidence_and_never_promotes_shadow_in
     );
 }
 #[test]
+fn stale_inventory_revokes_execution_without_discarding_a_live_launch() {
+    let mut f = Fixture::new();
+    f.configure();
+    let root = f.c.root.clone();
+    let now = ow_core::recovery::now();
+    let mut p = pool();
+    p.floor = 1;
+    f.write("scaler.json", json!({"mode":"live","pools":[p]}));
+    f.write(
+        "scaler-activation.json",
+        json!({"recovery_drill":"accepted fixture"}),
+    );
+    f.write(
+        "scaler-provider-check.json",
+        json!({"pools":{"default":now-2}}),
+    );
+    let mut observed = json!({"hours":24,"observed_at":now-1,"complete":true,"retention_ok":true,"outcome_resolved":true,"instances":[],"disks":[],"receipts":{}});
+    f.write("scaler-observations.json", observed.clone());
+    let launched = attempt(&root, &mut f.c.db, now - 1).unwrap();
+    assert_eq!(launched["pools"][0]["execution_allowed"], true);
+    observed["observed_at"] = json!(now - 100);
+    f.write("scaler-observations.json", observed);
+    attempt(&root, &mut f.c.db, now).unwrap();
+    let current = command(&root, false).unwrap();
+    assert_eq!(current["mode"], "live");
+    assert!(current["error"].is_null());
+    let plan = &current["pools"][0];
+    assert_eq!(plan["stale"], false);
+    assert_eq!(
+        plan["reason"],
+        "provider inventory missing, incomplete or stale; actions disabled"
+    );
+    assert_eq!(
+        plan["state"]["action"],
+        launched["pools"][0]["state"]["action"]
+    );
+    assert_eq!(plan["execution_allowed"], false);
+}
+
+#[test]
 fn retained_pending_orphaned_instances_and_all_disks_remain_billable_liabilities() {
     let f = Fixture::new();
     f.node("base", 100);

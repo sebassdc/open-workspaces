@@ -647,3 +647,52 @@ fn live_mode_promotes_only_a_newly_recorded_action_and_holds_it_until_a_receipt(
             .is_none()
     );
 }
+
+#[test]
+fn stored_live_action_permission_follows_current_safety_gates() {
+    for fault in [
+        "inventory",
+        "retention",
+        "outcome",
+        "durability",
+        "cost",
+        "count",
+        "duplicate",
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let mut p = pool();
+        p.floor = 1;
+        let mut i = input();
+        let live = record_mode(&db, &p, &i, caps(), true).unwrap();
+        assert!(live.execution_allowed);
+        i.now += 1;
+        match fault {
+            "inventory" => i.inventory_fresh = false,
+            "retention" => i.retention_ok = false,
+            "outcome" => i.outcome_resolved = false,
+            "durability" => i.durability_healthy = false,
+            "cost" => i.liabilities.cents = caps().cents,
+            "count" => i.pool_instances = p.ceiling + 1,
+            "duplicate" => i.now -= 1,
+            _ => unreachable!(),
+        }
+        let blocked = record_mode(&db, &p, &i, caps(), true).unwrap();
+        assert!(!blocked.execution_allowed, "{fault}");
+        assert_eq!(blocked.state.action, live.state.action, "{fault}");
+        assert_eq!(status(&db).unwrap()["pools"][0]["execution_allowed"], false);
+        let healthy = record_mode(
+            &db,
+            &p,
+            &Input {
+                now: 102,
+                ..input()
+            },
+            caps(),
+            true,
+        )
+        .unwrap();
+        assert!(healthy.execution_allowed, "{fault}");
+        assert_eq!(healthy.state.action, live.state.action);
+    }
+}

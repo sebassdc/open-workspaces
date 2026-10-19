@@ -497,7 +497,7 @@ class Actions(PoolCase):
             rp.check("dev")
         self.assertFalse(any(op in c for c in self.aws.calls for op in ("set-desired-capacity", "complete-lifecycle-action",
                                                                          "terminate-instance-in-auto-scaling-group")), "check writes nothing")
-        self.assertFalse(h.p(rp.PROVIDER_CHECK).exists(), "a refused check records no pass")
+        self.assertNotIn("dev", h.read_json(rp.PROVIDER_CHECK)["pools"], "a refused check records no pass")
         self.aws.denied = set()
         self.aws.hooks[0]["DefaultResult"] = "CONTINUE"
         with self.assertRaisesRegex(Refused, "abandons by default"):
@@ -549,7 +549,7 @@ if __name__ == "__main__":
 
 class Executor(PoolCase):
     def live(self, kind, target, phase):
-        self.aws.scaler = {"mode": "live", "error": None, "pools": [{"stale": False, "state": {"action": {
+        self.aws.scaler = {"mode": "live", "error": None, "pools": [{"stale": False, "execution_allowed": True, "state": {"action": {
             "kind": kind, "id": "dev-7", "target": target, "phase": phase, "deadline": 9, "reservation": {}}}}]}
 
     def test_a_live_launch_raises_desired_once_and_reports_the_joined_instance(self):
@@ -583,7 +583,7 @@ class Executor(PoolCase):
     def test_stored_live_actions_require_current_healthy_live_status(self):
         self.as_controller()
         for kind, target, phase in (("launch", "preset", "launching"), ("drain", NODE_A, "draining")):
-            for fault in ("shadow", "error", "stale", "missing_mode", "missing_error", "missing_stale"):
+            for fault in ("shadow", "error", "stale", "safety_hold", "missing_mode", "missing_error", "missing_stale", "missing_permission"):
                 with self.subTest(kind=kind, fault=fault):
                     self.live(kind, target, phase)
                     status = self.aws.scaler
@@ -595,6 +595,11 @@ class Executor(PoolCase):
                         status["pools"][0]["stale"] = True
                     elif fault == "missing_stale":
                         del status["pools"][0]["stale"]
+                    elif fault == "safety_hold":
+                        status["pools"][0]["execution_allowed"] = False
+                        status["pools"][0]["reason"] = "provider inventory missing, incomplete or stale; actions disabled"
+                    elif fault == "missing_permission":
+                        del status["pools"][0]["execution_allowed"]
                     else:
                         del status[fault.removeprefix("missing_")]
                     self.aws.calls.clear()
@@ -604,6 +609,38 @@ class Executor(PoolCase):
                     self.assertFalse(h.read_json(rp.ACTIONS), "no executor journal is written")
                     self.assertFalse(any("drain" in c for c in self.aws.calls))
                     self.assertFalse(any("set-desired-capacity" in c for c in self.aws.calls))
+
+    def test_paused_sync_does_not_complete_a_journaled_termination(self):
+        self.as_controller()
+        self.aws.nodes = [{"id": NODE_A, "online": True, "capabilities": {"vcpus": 4}}]
+        self.aws.drain[NODE_A] = "removed"
+        self.aws.launch("i-0a", VOL_A, state="Terminating:Wait")
+        h.write_json(rp.REMOVALS, {"i-0a": {"node": NODE_A, "enrolled": True}})
+        for fault in ("shadow", "error", "safety_hold"):
+            self.live("drain", NODE_A, "draining")
+            if fault == "shadow":
+                self.aws.scaler = {"mode": "shadow", "pools": []}
+            elif fault == "error":
+                self.aws.scaler["error"] = "activation refused"
+            else:
+                self.aws.scaler["pools"][0]["execution_allowed"] = False
+            self.aws.calls.clear()
+            rp.sync(["dev"])
+            self.assertEqual(self.aws.member("i-0a")["LifecycleState"], "Terminating:Wait", fault)
+            self.assertFalse(any("complete-lifecycle-action" in c for c in self.aws.calls), fault)
+
+    def test_failed_preflight_revokes_only_its_previous_pass(self):
+        self.as_controller()
+        for failure in ("simulate:PutSecretValue", "describe-auto-scaling-groups", "simulate-principal-policy"):
+            self.aws.denied = set()
+            rp.check("dev")
+            checks = h.read_json(rp.PROVIDER_CHECK)
+            checks["pools"]["other"] = 123
+            h.write_json(rp.PROVIDER_CHECK, checks)
+            self.aws.denied = {failure}
+            with self.assertRaises((Refused, RuntimeError)):
+                rp.check("dev")
+            self.assertEqual(h.read_json(rp.PROVIDER_CHECK)["pools"], {"other": 123})
 
     def test_a_live_drain_seals_retains_removes_and_reports_absent(self):
         self.as_controller()

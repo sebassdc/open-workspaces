@@ -149,6 +149,9 @@ pub(crate) struct Input {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Plan {
+    /// Current safety gates permit the adapter to advance this action.
+    #[serde(default)]
+    pub execution_allowed: bool,
     pub state: State,
     pub decision: String,
     pub reason: String,
@@ -252,7 +255,7 @@ fn validate(p: &Pool) -> Result<()> {
 /// Deterministic single-pool iteration. The result is intent, never permission to call a provider.
 pub(crate) fn plan(p: &Pool, old: &State, input: &Input, caps: limits::Liability) -> Result<Plan> {
     validate(p)?;
-    let mut result = Plan { state: old.clone(), decision: "wait".into(), reason: String::new(),
+    let mut result = Plan { execution_allowed: false, state: old.clone(), decision: "wait".into(), reason: String::new(),
         queued: input.queued.iter().map(|q|q.id.clone()).collect(),
         live_blocked: "Shadow only: live mode needs an accepted replacement-controller recovery drill and a passing provider check; nothing is dispatched.".into() };
     macro_rules! done {
@@ -354,6 +357,10 @@ pub(crate) fn plan(p: &Pool, old: &State, input: &Input, caps: limits::Liability
             if input.now >= action.deadline {
                 action.phase = Phase::Uncertain;
             }
+            result.execution_allowed = action.phase != Phase::Uncertain
+                && input.liabilities.add(held)?.within(caps)
+                && input.pool_instances <= p.ceiling
+                && input.durability_healthy;
             done!(if action.phase == Phase::Uncertain {
                 "provider outcome or join timeout unresolved; reservation held; actions disabled"
             } else {
@@ -479,6 +486,7 @@ pub(crate) fn plan(p: &Pool, old: &State, input: &Input, caps: limits::Liability
         });
         result.state.cooldown_until = input.now.saturating_add(p.cooldown_seconds);
         result.decision = "launch".into();
+        result.execution_allowed = true;
         done!(if below_floor {
             "count floor; maximum new liability reserved in shadow"
         } else {
@@ -526,6 +534,7 @@ pub(crate) fn plan(p: &Pool, old: &State, input: &Input, caps: limits::Liability
     });
     result.state.cooldown_until = input.now.saturating_add(p.cooldown_seconds);
     result.decision = "drain".into();
+    result.execution_allowed = true;
     done!(
         "idle surplus; shadow soft drain only; sealed empty and retained-disk proof still required"
     );
@@ -614,6 +623,7 @@ fn record_mode(
         }
     }
     let mut result = plan(p, &old, &adjusted, caps)?;
+    result.execution_allowed &= live;
     if live {
         result.live_blocked = String::new();
         if let Some(a) = result.state.action.as_mut()
@@ -632,7 +642,13 @@ fn record_mode(
             [&p.name],
             |r| r.get(0),
         )?;
-        return Ok(serde_json::from_str(&stored)?);
+        let mut stored: Plan = serde_json::from_str(&stored)?;
+        stored.execution_allowed = false;
+        db.execute(
+            "UPDATE scaler_state SET plan=?1 WHERE pool=?2",
+            params![serde_json::to_string(&stored)?, p.name],
+        )?;
+        return Ok(stored);
     }
     let raw = serde_json::to_string(&result)?;
     db.execute("INSERT INTO scaler_state VALUES(?1,?2,?3) ON CONFLICT(pool) DO UPDATE SET state=?2,plan=?3",params![p.name,serde_json::to_string(&result.state)?,raw])?;

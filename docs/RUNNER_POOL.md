@@ -104,6 +104,12 @@ one idempotent step, journaled before any effect in `pool-actions.json`:
   Persisted live actions also wait when the current mode is shadow, status has an
   error, or their plan is stale. Status rechecks activation evidence on every read
   so a previous successful tick grants no authority after its gates are withdrawn.
+  The plan must explicitly set `execution_allowed`: a fresh tick alone is not
+  permission when inventory, retention, provider outcome, durability or caps hold
+  execution. Older plans without this field wait for a new controller tick.
+  Sync also pauses journaled termination-hook completion without an authorized
+  drain action; the hook may time out into retention. Explicit operator `remove`
+  remains a separate action with its own drain and retention checks.
 
 The scaler's pool name must be the RunnerPool's name and the runners' placement pool;
 today every runner's placement pool is `default`, so a pool that serves queued demand
@@ -120,6 +126,8 @@ creating, tagging, reading and answering a join secret as `sync` does (with the
 pool's request tag). A missing right, or a simulation that cannot be run, refuses
 activation. A pass is recorded in `scaler-provider-check.json`, which the controller's
 live mode requires per pool within the last day. `launch` and `remove` repeat the shape check.
+Each preflight revokes that pool's previous pass before checking AWS; failure or
+interruption leaves it revoked while preserving other pools' evidence.
 
 **Launch.** `launch --expect N` sets desired capacity to N+1 only while it is N (read twice,
 the second time right before the write: Auto Scaling has no compare-and-set); a
