@@ -262,3 +262,32 @@ that CLI**. Then install the reviewed new binary, configure/update assets while
 stopped, and start. The installer preserves saved host/node configuration,
 assets and workspace disks. Do not rely on a newly installed executable to stop
 a worker still executing the deleted old binary inode.
+
+## Linux vCPU overcommit
+
+Guided Linux enrollment accepts `host join --vcpu-overcommit 1|2` (default **1**).
+This raises the selectable **total running guest vCPU budget** to the smaller of
+`logical host CPUs × ratio`, the invitation's CPU cap, and the 64-vCPU protocol
+ceiling. `--cpus` is the effective guest budget, so it is never multiplied again.
+For example, an eight-CPU host can consent to `--cpus 16 --vcpu-overcommit 2` if
+the owner invitation allows 16. CPU-heavy jobs should use ratio 1; ratio 2 is an
+operator choice for development workloads whose CPU bursts usually overlap little.
+Neither ratio reserves exclusive host cores or guarantees latency.
+
+Saved consent retains the ratio; older consent files default to 1. Changes use
+`host configure --vcpu-overcommit 2` while participation is fully stopped, with
+all existing resource/consent flags. Owner-side `host budget` is independent:
+raise its CPU cap before increasing local consent. Lower only through the idle
+inventory procedure above. RAM, eight running slots, disk admission, per-guest
+shapes, and controller owner quotas remain independent limits. Multiple workers
+sharing a machine still need operator-assigned budgets whose **combined** CPU
+reservation fits the intended ratio; each must not claim the whole machine.
+Native Mac participation currently supports ratio 1 only. Older CLIs reject the new
+saved field; rollback requires the prior saved consent while stopped and a matching
+owner cap, rather than deleting the field from an overcommitted configuration.
+
+Low-level `ow host up --cpus N`, SSH `ow node add --cpus N`, and
+`OW_MAX_VCPUS=N ow supervisor` already take an **effective** guest budget. Set N
+explicitly to the intended ratio's budget; these operator interfaces do not
+multiply it or discover disjoint capacity. Worker status `max_vcpus` and the node
+heartbeat advertise that same effective budget for scheduler admission.

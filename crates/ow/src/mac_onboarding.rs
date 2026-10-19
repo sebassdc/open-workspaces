@@ -233,10 +233,15 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
             slots,
             cpus,
             storage_gib,
+            vcpu_overcommit,
             accept_shared_pool,
             no_start,
             ..
         } => {
+            ensure!(
+                vcpu_overcommit == 1,
+                "vCPU overcommit is supported on Linux only"
+            );
             if root.join("node.json").exists() {
                 config(&root)?;
                 if !no_start {
@@ -393,8 +398,13 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
             slots,
             cpus,
             storage_gib,
+            vcpu_overcommit,
             accept_shared_pool,
         } => {
+            ensure!(
+                vcpu_overcommit == 1,
+                "vCPU overcommit is supported on Linux only"
+            );
             ensure!(
                 accept_shared_pool
                     && !active(&root)?

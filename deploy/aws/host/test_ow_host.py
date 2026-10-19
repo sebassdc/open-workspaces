@@ -3,6 +3,10 @@
 Run: python3 -m unittest discover -s deploy/aws/host
 """
 import copy
+import contextlib
+import io
+import json
+from unittest import mock
 import subprocess
 import sys
 import tempfile
@@ -41,6 +45,38 @@ def config(**changes):
 class Render(unittest.TestCase):
     def setUp(self):
         self.files = {k: v[0] for k, v in h.render(config(), BUDGET).items()}
+
+    def test_overcommit_changes_both_admission_consumers_only(self):
+        for ratio, expected in [(1, 4), (2, 8)]:
+            files = {k: v[0] for k, v in h.render(config(vcpuOvercommit=ratio), BUDGET).items()}
+            self.assertIn(f"OW_MAX_VCPUS={expected}\n", files["/etc/open-workspaces/worker.env"])
+            self.assertIn(f"--memory 11776 --slots 8 --cpus {expected}", files["/etc/systemd/system/open-workspaces.service"])
+            self.assertIn("OW_MAX_MEMORY_MIB=11776\n", files["/etc/open-workspaces/worker.env"])
+            self.assertIn("OW_MAX_RUNNING=8\n", files["/etc/open-workspaces/worker.env"])
+        files = h.render(config(vcpuOvercommit=2), {**BUDGET, "cpus": 48})
+        self.assertIn("OW_MAX_VCPUS=64\n", files["/etc/open-workspaces/worker.env"][0])
+        self.assertEqual(config()["vcpuOvercommit"], 1)
+        for ratio in [0, 3, 1.5, "2", None, True]:
+            with self.assertRaisesRegex(Refused, "vcpuOvercommit"):
+                config(vcpuOvercommit=ratio)
+        old = h.render(config(), BUDGET)
+        new = h.render(config(vcpuOvercommit=2), BUDGET)
+        changed = [path for path in old if old[path] != new[path]]
+        self.assertEqual(h.units_changed(changed), {"worker", "agent"})
+
+    def test_status_reports_the_effective_budget_used_by_runner_enrollment(self):
+        with mock.patch.object(h, "versions", return_value={}), \
+             mock.patch.object(h, "pins", return_value={}), \
+             mock.patch.object(h, "role", return_value="runner"), \
+             mock.patch.object(h, "local_node", return_value=None), \
+             mock.patch.object(h, "pending", return_value={}), \
+             mock.patch.object(h, "unit_exists", return_value=False), \
+             mock.patch.object(h, "budgets", return_value=BUDGET.copy()), \
+             mock.patch.object(h, "read_json", side_effect=lambda path, *a: config(vcpuOvercommit=2) if path == h.CONFIG else None):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                h.status()
+            self.assertEqual(json.loads(output.getvalue())["budget"], {**BUDGET, "cpus": 8})
 
     def test_worker_unit_hibernates_and_control_plane_never_takes_it_down(self):
         worker = self.files["/etc/systemd/system/open-workspaces-worker.service"]

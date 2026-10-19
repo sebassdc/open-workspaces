@@ -380,3 +380,40 @@ the run and the stack is still destroyed.
   the volume (`protect` resource option on the component) for long-lived hosts.
 
 Check: `npm run check` (type check, user-data, release manifest, `ArtifactStore` and `ow-aws` tests, shellcheck when installed, then the `ow-host` Python tests; Node 22.18+, Python 3.12+).
+
+### CPU admission ratio
+
+Both `Host` and `Runner` accept `vcpuOvercommit: 1 | 2` (default **1**). The host
+computes `min(logical CPUs * ratio, 64)` and uses that effective budget in both
+`OW_MAX_VCPUS` and the local controller's `host up --cpus`. A runner's `ow-host
+status` budget supplies its initial invitation through `ow-aws runner-add`.
+Ratio 2 suits measured development workloads; use 1 for sustained CPU-heavy jobs.
+This is admission oversubscription, without dedicated-core or CPU-time guarantees.
+The 8-slot, 64 GiB RAM, disk and owner-quota limits still apply.
+
+The setting lives in SSM config; changing it leaves instance user data unchanged
+and does not replace the host. `apply` stages the worker/controller changes;
+existing class-2 restart/upgrade controls must apply them deliberately, including
+warm captures and cold-memory-loss refusal. Do not restart an active review
+workstation just to change this setting. A component setting does not prove a
+running worker has received it: inspect worker status and the node heartbeat.
+
+When upgrading from a release without this field, first upgrade the host helper
+with the default ratio 1, then set and apply the new ratio. Older helpers drop
+unknown config fields while applying them; a single combined pin/ratio change is
+not proof the ratio was retained. Confirm the stored config, worker status and
+controller cap after the deliberate application.
+
+For an **already enrolled** runner, its controller-side owner CPU cap is also
+independent. Increase it with the designated owner's `ow host budget` before
+increasing the worker budget. For a decrease, first obtain idle inventory and
+clear reservations, lower the owner cap, then change the stopped worker. Re-running
+`runner-add` does not raise an existing node's owner cap. No secrets, identity,
+owner quotas or capacity costs are changed by the ratio itself.
+
+This adds no autoscaling or schedule. Keep deployment-specific working hours,
+always-on workstation policy and pool values in the consuming repository. Measure
+both short development bursts and sustained compilation before enabling 2:1;
+record host and guest CPU steal separately, plus build and preview p50/p95,
+errors, sample counts and host configuration. Guest-local preview timing does not
+include the gateway, tailnet or a user's WAN.
