@@ -48,7 +48,9 @@ keys with S3 `LastModified` strictly before that cutoff can become candidates.
 Pinned manifests are fetched by catalog digest, validated and HEAD-checked before
 any terminal claim. Unknown schema/root contracts, incomplete ownership import,
 foreign-key violations, missing manifests/data or unavailable bucket configuration
-fail closed. Catalog changes during network verification require a fresh run.
+fail closed. Catalog or grace-observation changes during network verification
+require a fresh run, even when a temporary reference has disappeared from the root
+set.
 
 An immediate SQLite transaction rechecks authority and marks doomed artifacts
 `deleting` before deletion. Database triggers reject new roots/leases/parent uses

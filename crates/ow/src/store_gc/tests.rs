@@ -881,3 +881,62 @@ fn a_temporary_named_snapshot_restarts_grace_for_every_matching_artifact() {
     assert_eq!(state(&f, "first"), "stored");
     assert_eq!(state(&f, "second"), "stored");
 }
+
+#[test]
+fn transient_reference_during_mark_restarts_grace_before_terminal_claim() {
+    for purpose in ["pull", "fork"] {
+        let mut f = Fixture::new();
+        let b = Bucket::new();
+        let reference = add(&f, &b, "dead", "image", None);
+        let prefix = store::attempt_prefix(&reference.attempt).unwrap();
+        observe(&mut f, &b);
+        let path = f.root.join("catalog.sqlite3");
+        *b.before_list.borrow_mut() = Some(Box::new(move || {
+            let db = Connection::open(path).unwrap();
+            db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+            db.execute("INSERT INTO leases(artifact,holder,purpose,expires) VALUES('dead','transient',?1,?2)", params![purpose,now()+7200]).unwrap();
+            assert!(
+                !db.query_row::<bool, _, _>(
+                    "SELECT EXISTS(SELECT 1 FROM gc_grace WHERE artifact='dead')",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap()
+            );
+            db.execute("DELETE FROM leases WHERE holder='transient'", [])
+                .unwrap();
+        }));
+        match prepare(&mut f.c.db, &b, URL, now(), true, Some("fixture")) {
+            Err(error) => assert!(error.to_string().contains("grace changed"), "{error:#}"),
+            Ok(run) => {
+                sweep(&mut f.c.db, &b, URL, &run.id, now()).unwrap();
+                panic!(
+                    "{purpose} grace reset was ignored: candidates={}, state={}, manifest_present={}",
+                    run.candidates.len(),
+                    state(&f, "dead"),
+                    b.present(&format!("{prefix}manifest.json"))
+                );
+            }
+        }
+        assert_eq!(state(&f, "dead"), "stored");
+        for name in ["manifest.json", "disk.ext4.zst"] {
+            assert!(b.present(&format!("{prefix}{name}")));
+        }
+        assert_eq!(b.markers(), 0);
+        // A fresh mark must observe a new server-clock hour before deletion is eligible.
+        for advance in [0, GRACE, 1] {
+            b.clock.set(b.clock.get() + advance);
+            let run = live(&mut f, &b);
+            if advance == 1 {
+                assert_eq!(run.candidates.len(), 2);
+            } else {
+                assert!(run.candidates.is_empty());
+            }
+            sweep(&mut f.c.db, &b, URL, &run.id, now()).unwrap();
+            assert_eq!(
+                state(&f, "dead"),
+                if advance == 1 { "deleted" } else { "stored" }
+            );
+        }
+    }
+}

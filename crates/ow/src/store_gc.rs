@@ -264,6 +264,7 @@ fn prepare_inner(
     );
     let rooted = closure(&a, a.roots.clone())?;
     let mut live_ids = rooted.clone();
+    let mut observed_grace = BTreeMap::new();
     for row in &a.artifacts {
         if !same_store(&row.url, url) || !matches!(row.state.as_str(), "stored" | "uploading") {
             continue;
@@ -278,6 +279,7 @@ fn prepare_inner(
                 [&row.id],
                 |r| r.get(0),
             )?;
+            observed_grace.insert(row.id.clone(), since);
             if since >= cutoff {
                 live_ids.insert(row.id.clone());
             }
@@ -339,6 +341,17 @@ fn prepare_inner(
         authority(&tx, now)? == a,
         "catalog changed during mark; retry with a new run"
     );
+    // Transient references can reset grace without changing the final root set.
+    for (artifact, since) in &observed_grace {
+        ensure!(
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM gc_grace WHERE artifact=?1 AND since=?2)",
+                params![artifact, since],
+                |r| r.get::<_, bool>(0)
+            )?,
+            "artifact grace changed during mark; retry with a new run"
+        );
+    }
     tx.execute("INSERT INTO gc_runs(id,store_url,started,cutoff,live,plan,state,gate) VALUES(?1,?2,?3,?4,?5,?6,'ready',?7)",params![id,url,started,cutoff,live,serde_json::to_string(&plan)?,gate])?;
     if live {
         for id in &plan.doomed {
