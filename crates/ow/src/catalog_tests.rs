@@ -97,6 +97,14 @@ impl Fake {
                         snapshots.insert(name.into(), s.clone());
                         s
                     }
+                    "snapshot-delete" => {
+                        let name = request["name"].as_str().unwrap();
+                        let existed = snapshots.get(name).is_some_and(|s| s["workspace"] == id);
+                        if existed {
+                            snapshots.remove(name);
+                        }
+                        json!({"deleted":name,"workspace":id,"existed":existed})
+                    }
                     "exec" => json!({"output":"ok","exit_code":0}),
                     "fork" => {
                         let child = request["child"].as_str().unwrap();
@@ -1116,6 +1124,56 @@ fn delete_keys_replay_their_result_and_never_touch_a_replacement() {
     c.operation(a, create).unwrap();
     assert_eq!(c.operation(a, delete).unwrap(), deleted);
     assert_eq!(c.state(a).unwrap()["workspaces"][0]["state"], "running");
+}
+
+#[test]
+fn one_snapshot_is_deleted_by_its_owner_and_its_name_is_free() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    let b = c.user(&identity("bob")).unwrap();
+    for id in ["demo", "other"] {
+        c.operation(a, json!({"op":"create","id":id,"node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    }
+    for (id, name) in [("demo", "saved"), ("demo", "kept"), ("other", "theirs")] {
+        c.operation(a, json!({"op":"snapshot","id":id,"name":name}))
+            .unwrap();
+    }
+    c.operation(
+        a,
+        json!({"op":"share","id":"demo","with":"bob@example.test","role":"admin"}),
+    )
+    .unwrap();
+    let delete = json!({"op":"snapshot-delete","id":"demo","name":"saved","operation_key":"drop-saved"});
+    // A runner that does not advertise the operation is never asked.
+    let before = fake.calls.load(Ordering::SeqCst);
+    assert!(c.operation(a, delete.clone()).is_err());
+    assert_eq!(fake.calls.load(Ordering::SeqCst), before);
+    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.snapshot_delete_v1',json('true')) WHERE id='alpha'",[]).unwrap();
+    // Snapshot names are per owner: a teammate cannot reach the owner's snapshots,
+    // and a snapshot is deleted only through the machine it captured.
+    assert!(c.operation(b, json!({"op":"snapshot-delete","id":"alice@example.test/demo","name":"saved"})).is_err());
+    assert!(c.operation(a, json!({"op":"snapshot-delete","id":"demo","name":"theirs"})).is_err());
+    let deleted = c.operation(a, delete.clone()).unwrap();
+    assert_eq!((&deleted["deleted"], &deleted["workspace"]), (&json!("saved"), &json!("demo")));
+    // A lost reply is answered from the record, though the snapshot is gone.
+    assert_eq!(c.operation(a, delete).unwrap()["deleted"], "saved");
+    let names = |c: &mut Catalog| -> Vec<String> {
+        let mut names: Vec<String> = c.state(a).unwrap()["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&mut c), ["kept", "theirs"]);
+    assert!(c.operation(a, json!({"op":"snapshot-delete","id":"demo","name":"saved"})).is_err());
+    c.operation(a, json!({"op":"snapshot","id":"demo","name":"saved"}))
+        .unwrap();
+    assert_eq!(names(&mut c), ["kept", "saved", "theirs"]);
 }
 
 #[test]

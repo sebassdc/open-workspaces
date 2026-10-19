@@ -37,7 +37,7 @@ impl Capability {
     /// The capability a worker operation such as `{"op":"fork"}` needs, if any.
     pub fn required(request: &Value) -> Option<Self> {
         Some(match request["op"].as_str()? {
-            "snapshot" | "snapshots" | "restore" => Self::Snapshot,
+            "snapshot" | "snapshots" | "snapshot-delete" | "restore" => Self::Snapshot,
             "fork" if request["snapshot"].is_null() => Self::LiveFork,
             "fork" => Self::Snapshot,
             "hibernate" => Self::Hibernate,

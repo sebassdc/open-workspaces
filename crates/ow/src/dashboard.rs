@@ -206,7 +206,7 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             request["artifact"] = json!(artifact);
             request["accept_cold"] = json!(operation.accept_cold.unwrap_or(false));
         }
-        "snapshot" | "restore" => {
+        "snapshot" | "snapshot-delete" | "restore" => {
             let name = operation
                 .name
                 .ok_or_else(|| anyhow::anyhow!("Snapshot name required"))?;
@@ -653,6 +653,8 @@ mod tests {
         invalid["accept_cold"] = json!("yes");
         assert!(validated(&serde_json::to_vec(&invalid).unwrap()).is_err());
         assert!(validated(br#"{"op":"restore","id":"box","name":"local-snapshot"}"#).is_ok());
+        assert!(validated(br#"{"op":"snapshot-delete","id":"box","name":"old"}"#).is_ok());
+        assert!(validated(br#"{"op":"snapshot-delete","id":"box"}"#).is_err());
     }
 
     #[test]

@@ -1373,9 +1373,15 @@ impl Catalog {
             |r| r.get::<_, Option<bool>>(0),
         )? == Some(true))
     }
-    /// The saved result of a delete retried with its key. A key held by another operation or
-    /// name conflicts; one whose machine went without a recorded result is uncertain.
-    fn delete_replay(&self, user: i64, name: &str, key: Option<&str>) -> Result<Option<Value>> {
+    /// The saved result of a delete (`op`) retried with its key. A key held by another operation
+    /// or name conflicts; one whose machine went without a recorded result is uncertain.
+    fn delete_replay(
+        &self,
+        user: i64,
+        delete: &str,
+        name: &str,
+        key: Option<&str>,
+    ) -> Result<Option<Value>> {
         let Some(key) = key else {
             return Ok(None);
         };
@@ -1386,7 +1392,7 @@ impl Catalog {
         };
         let forgotten = resource == format!("deleted:{name}");
         ensure!(
-            op == "delete" && (resource == name || forgotten),
+            op == delete && (resource == name || forgotten),
             "operation key conflicts with original parameters"
         );
         if state == "succeeded" {
@@ -1687,6 +1693,9 @@ impl Catalog {
         metadata: &Value,
         local_status: &Value,
     ) -> Result<()> {
+        if node == "local" && op == "snapshot-delete" {
+            common::node_operation(local_status, op)?;
+        }
         if node != "local" {
             let pool = nodes::inventory(&self.root)?;
             let n = pool
@@ -1795,7 +1804,8 @@ impl Catalog {
                 "restore",
                 "share",
                 "unshare",
-                "delete"
+                "delete",
+                "snapshot-delete"
             ]
             .contains(&op.as_str()),
             "unsupported user operation"
@@ -1813,7 +1823,17 @@ impl Catalog {
         // A finished delete has no row left to resolve: answer its key before looking.
         if op == "delete"
             && let Some(cached) =
-                self.delete_replay(user, &name, input["operation_key"].as_str())?
+                self.delete_replay(user, "delete", &name, input["operation_key"].as_str())?
+        {
+            return Ok(cached);
+        }
+        if op == "snapshot-delete"
+            && let Some(cached) = self.delete_replay(
+                user,
+                "snapshot-delete",
+                input["name"].as_str().context("snapshot name")?,
+                input["operation_key"].as_str(),
+            )?
         {
             return Ok(cached);
         }
@@ -2000,6 +2020,25 @@ impl Catalog {
                     );
                     request["name"] = json!(id);
                 }
+                "snapshot-delete" => {
+                    let id = self.physical(
+                        user,
+                        "snapshot",
+                        request["name"].as_str().context("snapshot")?,
+                    )?;
+                    self.snapshot_source(user, &id, &physical)?;
+                    ensure!(
+                        self.placement("snapshot", &id)? == node,
+                        "snapshot placement mismatch"
+                    );
+                    // A move or publication in flight still needs the sealed files.
+                    let busy: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1) OR EXISTS(SELECT 1 FROM artifacts WHERE kind='snapshot' AND local_name=?2 AND state='uploading')",params![physical,id],|r|r.get(0))?;
+                    ensure!(
+                        !busy,
+                        "snapshot is in use by a move or publication; retry when it finishes"
+                    );
+                    request["name"] = json!(id);
+                }
                 "restore" => {
                     let id = self.physical(
                         user,
@@ -2120,7 +2159,7 @@ impl Catalog {
             self.admit(&node, &target, &op, &request, &metadata, &local_status)?;
             let resource = if op == "fork" {
                 input["child"].as_str().unwrap_or(&name)
-            } else if op == "snapshot" {
+            } else if matches!(op.as_str(), "snapshot" | "snapshot-delete") {
                 input["name"].as_str().unwrap_or(&name)
             } else {
                 &name
@@ -2245,6 +2284,8 @@ impl Catalog {
             value["workspace"]["id"] == request["id"]
         } else if op == "delete" {
             value["deleted"] == request["id"]
+        } else if op == "snapshot-delete" {
+            value["deleted"] == request["name"] && value["workspace"] == request["id"]
         } else {
             value["id"] == target
         };
@@ -2315,6 +2356,18 @@ impl Catalog {
             value["workspace"] = self.public(user, "machine", &value["workspace"])?;
         } else if op == "delete" {
             value = json!({"deleted":name,"snapshots":self.forget(user, &physical)?});
+        } else if op == "snapshot-delete" {
+            let snapshot = input["name"].as_str().unwrap();
+            let id = request["name"].as_str().unwrap();
+            let tx = self.db.transaction()?;
+            // The name is free again: its capture operation stops claiming it.
+            tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND owner=?1 AND resource=?2",params![user,snapshot])?;
+            tx.execute(
+                "DELETE FROM resources WHERE kind='snapshot' AND physical=?1",
+                [id],
+            )?;
+            tx.commit()?;
+            value = json!({"deleted":snapshot,"workspace":name});
         } else {
             self.save_node(&node, "machine", &target, &value)?;
             value = self.public(user, "machine", &value)?;

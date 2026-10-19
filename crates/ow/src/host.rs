@@ -934,6 +934,9 @@ pub fn run(cli: Cli) -> Result<i32> {
         }
         Action::Snapshot { id, name } => json!({"op":"snapshot","id":id,"name":name}),
         Action::Snapshots => json!({"op":"snapshots"}),
+        Action::DeleteSnapshot { id, name } => {
+            json!({"op":"snapshot-delete","id":id,"name":name})
+        }
         Action::Fork {
             id,
             child,

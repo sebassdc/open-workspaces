@@ -132,6 +132,15 @@ print one JSON value on stdout, without an interactive prompt or progress banner
 - `start`, `stop`, `hibernate`, `snapshot`, `fork`, `restore`, `delete`: lifecycle.
   Stop preserves disk but ends processes; hibernate preserves paired state;
   restore replaces later changes. Delete is deliberate and owner-scoped.
+- `delete-snapshot NAME SNAPSHOT`: delete one of your named snapshots of that
+  workspace (the machine it captured). Workspaces forked or restored from it keep
+  their own disks, and the snapshot name can be used again. It needs the
+  `snapshot` capability and a runner whose worker reports `snapshot_delete_v1`;
+  an older runner refuses it before any worker contact. While the box is moving
+  or the snapshot is being published, it is refused; retry afterwards. Replaying
+  a successful delete with its original operation key returns its saved success;
+  a local worker answers a repeat with `"existed": false`. Hibernation, recovery
+  and transfer captures cannot be deleted this way.
 
 Host participation, enrollment, local image build, backup, `node` (singular),
 `up`/`down`, `dashboard`/`serve` and `node-*` are host/operator commands, not steps
