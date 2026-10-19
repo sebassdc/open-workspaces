@@ -200,6 +200,8 @@ class Harness:
         os.umask(0o077)
         self.root = Path(tempfile.mkdtemp(prefix='mnv-', dir=REPO / 'data'))
         self.controller = self.root / 'c'
+        self.controller.mkdir(mode=0o700)
+        (self.controller / 'limits.json').write_text(json.dumps({'pool': {'default_type': 'test-self-hosted', 'hourly_cents': {'test-self-hosted': 0}}}))
         self.workers = {n: self.root / n for n in ['a', 'b']}
         self.processes = []
         self.agents = {}

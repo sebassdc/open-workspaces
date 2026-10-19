@@ -13,6 +13,9 @@ pool workspaces; host operators can inspect or stop workloads on their hardware.
 Participation gives no human workspace-management authority. Physical-host/NAT
 acceptance remains pending until the owner runs the commands on the second host.
 
+The controller operator configures [owner quotas and pool cost admission](LIMITS.md)
+before minting invitations; participants cannot override those limits.
+
 ## Participant
 
 Install the project CLI with the existing domain's `/cli/install.sh`, then run:

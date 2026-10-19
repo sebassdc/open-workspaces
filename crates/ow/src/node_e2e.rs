@@ -115,6 +115,7 @@ fn two_worker_tls_real_guests() {
     );
     // Initialize controller root before credentials are written; all three roots are dedicated.
     command(&binary, &ctl, &["nodes"]);
+    crate::limits::free_pool(&ctl);
     let cert = root.join("cert.pem");
     let key = root.join("key.pem");
     let result = Command::new("openssl")

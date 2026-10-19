@@ -237,6 +237,12 @@ Progress: `/var/log/open-workspaces-bootstrap.log`; state:
 
 ## Runners
 
+Configure the controller's private [owner limits and pool cost forecast](../../docs/LIMITS.md)
+before authorizing new capacity. Unknown instance-type prices refuse invitations;
+creating a cloud resource is not itself controller admission. Deployments must
+supply this policy before first local-runner enrollment as well. Policy values
+belong to the consuming deployment and are not guessed from a live price API.
+
 A `Runner` is a second (usually bigger) machine for an existing Host's
 controller: its own nested-virtualization instance, Btrfs data volume (kept
 across replacement), role, config parameter and Tailscale identity, a worker and

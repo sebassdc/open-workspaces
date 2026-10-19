@@ -9,6 +9,7 @@ mod dashboard;
 mod host;
 #[cfg(target_os = "linux")]
 mod image;
+mod limits;
 #[cfg(target_os = "macos")]
 mod local_terminal;
 #[cfg(target_os = "macos")]

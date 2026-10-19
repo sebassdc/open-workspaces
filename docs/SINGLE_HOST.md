@@ -23,6 +23,20 @@ the runtime assets (`scripts/setup-local.sh`, or `OW_ASSET_DIR`).
 
 ## Start the controller
 
+Before the first enrollment, put an owned mode-0600 `limits.json` in the
+controller data directory (`~/.ow/controller`, or `BASE/controller` with
+`--data-dir BASE`). New runner authorization requires explicit cost estimates;
+see [owner quotas and pool cost admission](LIMITS.md). For an entirely
+self-hosted test/local pool, this explicit zero-price declaration suffices:
+
+```json
+{"pool":{"default_type":"self-hosted","hourly_cents":{"self-hosted":0}}}
+```
+
+For cloud capacity, configure actual instance types, hourly rates and a forecast
+cap instead. Existing enrolled runners keep reconnecting without a policy file;
+unknown prices refuse additions, not running boxes.
+
 ```sh
 ow host up                      # foreground; Ctrl-C stops controller and agent
 ow --data-dir /data/ow host up  # base directory on Btrfs, shorter than 52 bytes

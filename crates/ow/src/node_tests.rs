@@ -88,6 +88,7 @@ fn root() -> PathBuf {
     let p = std::env::temp_dir().join(format!("ow-n-{}", common::nonce().unwrap()));
     fs::create_dir(&p).unwrap();
     fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::limits::free_pool(&p);
     p
 }
 fn enrollment(root: &Path, node: &str) -> Value {
@@ -1187,4 +1188,92 @@ fn preview_tunnel_job_uses_the_existing_worker_stream() {
     }
     runtime.join().unwrap();
     fs::remove_dir_all(worker).unwrap();
+}
+
+fn spend_config(root: &Path, cap: u64, rate: u64, hours: u64, retired: &[&str]) {
+    fs::write(root.join("limits.json"), json!({"pool":{"max_estimated_cents":cap,"hours":hours,"default_type":"test-instance","hourly_cents":{"test-instance":rate},"retired_nodes":retired}}).to_string()).unwrap();
+    fs::set_permissions(root.join("limits.json"), fs::Permissions::from_mode(0o600)).unwrap();
+}
+#[test]
+fn pool_spend_defaults_unknown_price_exact_cap_and_enrollment_recheck() {
+    let root = root();
+    fs::remove_file(root.join("limits.json")).unwrap();
+    assert!(
+        invitation(&root, "alpha", 600, 512, 2, 2, None, |_| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("price missing")
+    );
+    assert_eq!(inventory(&root).unwrap(), json!([]));
+    spend_config(&root, 100, 50, 2, &[]);
+    let first = invitation(&root, "alpha", 600, 512, 2, 2, None, |_| Ok(())).unwrap();
+    // Replacing an invitation counts the node once, invalidates the previous secret.
+    let second = invitation(&root, "alpha", 600, 512, 2, 2, None, |_| Ok(())).unwrap();
+    assert!(enroll(&root, first).is_err());
+    let published = std::cell::Cell::new(false);
+    let error = invitation(&root, "beta", 600, 512, 2, 2, None, |_| {
+        published.set(true);
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("pool spend cap exceeded"));
+    assert!(!published.get());
+    assert_eq!(inventory(&root).unwrap().as_array().unwrap().len(), 1);
+    // A cap change between mint and consume prevents stale authorization.
+    spend_config(&root, 99, 50, 2, &[]);
+    assert!(
+        enroll(&root, second.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("spend cap")
+    );
+    spend_config(&root, 100, 50, 2, &[]);
+    enroll(&root, second).unwrap();
+    // Offline/revoked capacity still costs money until explicitly retired.
+    revoke(&root, "alpha").unwrap();
+    assert!(invitation(&root, "beta", 600, 512, 2, 2, None, |_| Ok(())).is_err());
+    spend_config(&root, 100, 50, 2, &["alpha"]);
+    invitation(&root, "beta", 600, 512, 2, 2, None, |_| Ok(())).unwrap();
+    spend_config(&root, 100, 50, 2, &["alpha", "beta"]);
+    assert!(
+        invitation(&root, "gamma", 600, 512, 2, 2, None, |_| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("must first be revoked")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn pool_spend_concurrent_invitations_have_one_winner_and_overflow_refuses() {
+    let root = root();
+    spend_config(&root, 100, 100, 1, &[]);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let threads: Vec<_> = ["alpha", "beta"]
+        .into_iter()
+        .map(|node| {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                invitation(&root, node, 600, 512, 2, 2, None, |_| Ok(())).is_ok()
+            })
+        })
+        .collect();
+    assert_eq!(
+        threads
+            .into_iter()
+            .filter_map(|t| t.join().ok())
+            .filter(|won| *won)
+            .count(),
+        1
+    );
+    spend_config(&root, u64::MAX, u64::MAX, 2, &[]);
+    assert!(
+        invitation(&root, "overflow", 600, 512, 2, 2, None, |_| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("overflow")
+    );
+    assert_eq!(inventory(&root).unwrap().as_array().unwrap().len(), 1);
+    fs::remove_dir_all(root).unwrap();
 }

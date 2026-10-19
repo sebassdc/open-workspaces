@@ -181,6 +181,10 @@ fn host_up_then_node_add() {
             }
         }
     }
+    fs::create_dir_all(base.join("controller")).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(base.join("controller"), fs::Permissions::from_mode(0o700)).unwrap();
+    crate::limits::free_pool(&base.join("controller"));
     let port = 20000 + (std::process::id() % 20000) as u16;
     let _cleanup = Cleanup(
         Command::new(&binary)
