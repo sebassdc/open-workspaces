@@ -42,9 +42,12 @@ export interface HostArgs {
     /**
      * Tailnet logins (for example `you@example.com`) allowed into the web dashboard.
      * The dashboard listens on loopback and is served to the tailnet only, through
-     * `tailscale serve`. Needs `tailscaleAuthKeySecretArn`. Omit for no dashboard.
+     * `tailscale serve`. Needs `tailscaleAuthKeySecretArn`. Alternative to dashboardCapability.
      */
     dashboardLogins?: pulumi.Input<pulumi.Input<string>[]>;
+    /** Application capability (domain/path) admitting tailnet users. Needs tailscaleAuthKeySecretArn.
+     * Omit both this and dashboardLogins for no dashboard. When both are set, either admits a user. */
+    dashboardCapability?: pulumi.Input<string>;
     /**
      * Developer images (`ubuntu` only for now) to build on the host after boot: the `dev`
      * user, SSH server and toolchains that SSH access and golden-image recipes need.
@@ -72,7 +75,7 @@ export interface HostArgs {
 }
 
 /** A runner host: everything a Host takes except the dashboard, plus the controller it joins. */
-export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins"> {
+export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability"> {
     // The package analyzer loses nested optional types inherited through Omit.
     tailscaleDirect?: pulumi.Input<TailscaleDirectArgs>;
     /**
@@ -152,6 +155,7 @@ export interface HostConfigInputs {
     tailscaleHostname: string;
     tailscaleSsh: boolean;
     dashboardLogins: string[];
+    dashboardCapability?: string;
     developerImages: string[];
     backupUrl: string;
     backupSchedule: string;
@@ -164,8 +168,17 @@ export interface HostConfigInputs {
  * applies in place. The host validates it again; see deploy/aws/host/ow_host.py.
  */
 export function hostConfig(c: HostConfigInputs): object {
-    if (c.dashboardLogins.length > 0 && !c.tailscaleAuthKeySecretArn) {
-        throw new Error("dashboardLogins needs tailscaleAuthKeySecretArn: the dashboard is served over the tailnet only");
+    const capability = c.dashboardCapability ?? "";
+    if (capability) {
+        const [domain, ...parts] = capability.split("/");
+        if (capability.length > 512 || domain.length > 253 || !domain.includes(".")
+            || !domain.split(".").every((part) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(part))
+            || !/^[A-Za-z0-9._/-]+$/.test(parts.join("/"))) {
+            throw new Error("dashboardCapability must be domain/path (at most 512 characters)");
+        }
+    }
+    if ((c.dashboardLogins.length > 0 || capability) && !c.tailscaleAuthKeySecretArn) {
+        throw new Error("dashboardLogins/dashboardCapability needs tailscaleAuthKeySecretArn: the dashboard is served over the tailnet only");
     }
     if (c.directMac && (!c.tailscaleAuthKeySecretArn || !/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(c.directMac))) {
         throw new Error("tailscaleDirect needs tailscaleAuthKeySecretArn and a valid interface MAC");
@@ -190,7 +203,7 @@ export function hostConfig(c: HostConfigInputs): object {
         if (!c.tailscaleAuthKeySecretArn) {
             throw new Error("a runner needs tailscaleAuthKeySecretArn: its controller listens on the tailnet only");
         }
-        if (c.dashboardLogins.length > 0) throw new Error("a runner has no dashboard");
+        if (c.dashboardLogins.length > 0 || capability) throw new Error("a runner has no dashboard");
     }
     return {
         schema: 1,
@@ -198,7 +211,7 @@ export function hostConfig(c: HostConfigInputs): object {
         release: { repository: c.repository, ref: c.ref },
         tailscale: { secretArn: c.tailscaleAuthKeySecretArn, hostname: c.tailscaleHostname, ssh: c.tailscaleSsh,
             ...(c.directMac ? { direct: { mac: c.directMac } } : {}) },
-        dashboard: { logins: c.dashboardLogins },
+        dashboard: { logins: c.dashboardLogins, ...(capability ? { capability } : {}) },
         developerImages: images ? images.split(" ") : [],
         backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule },
         idleMinutes: c.idleMinutes,
@@ -399,15 +412,15 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                 .all([
                     pulumi.all([args.repository ?? DEFAULT_REPOSITORY, args.ref ?? `v${require("./package.json").version}`]),
                     pulumi.all([args.tailscaleAuthKeySecretArn ?? "", args.tailscaleHostname ?? name, args.tailscaleSsh ?? false]),
-                    pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? []]),
+                    pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? [], args.dashboardCapability ?? ""]),
                     pulumi.all([backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30]),
                     runner,
                     directInterface ? directInterface.macAddress : pulumi.output(""),
                 ])
-                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images], [backupUrl, backupSchedule, idleMinutes], runner, directMac]) =>
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes], runner, directMac]) =>
                     JSON.stringify(hostConfig({
                         repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
-                        dashboardLogins: logins, developerImages: images, backupUrl, backupSchedule, idleMinutes, runner, directMac,
+                        dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, runner, directMac,
                     })),
                 ),
             tags,

@@ -94,6 +94,10 @@ pub async fn proxy(target: Target, mut request: Request, expires: u64, host: &st
     };
     let downstream = websocket.then(|| hyper::upgrade::on(&mut request));
     let (parts, body) = request.into_parts();
+    let session = parts
+        .extensions
+        .get::<crate::remote::TailnetSession>()
+        .cloned();
     let Ok(bytes) = to_bytes(body, 1024 * 1024).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
@@ -133,6 +137,7 @@ pub async fn proxy(target: Target, mut request: Request, expires: u64, host: &st
         tokio::select! {
             _ = revoked.notified() => {},
             _ = unpublished.notified() => {},
+            _ = crate::remote::TailnetSession::revoked(session) => {},
             _ = tokio::time::sleep(lifetime) => {},
             _ = async {
                 // Hyper returns the upgraded stream; keep authorization and the slot for its lifetime.
