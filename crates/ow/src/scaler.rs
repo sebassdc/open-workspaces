@@ -1,4 +1,5 @@
-//! Bounded shadow decisions. This module has no provider or worker effect path.
+//! Bounded decisions. Planning never calls a provider; in live mode a newly recorded
+//! action enters its effectful phase for the provider adapter (`ow-host pool sync`) to execute.
 use crate::{common, limits, placement};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -253,7 +254,7 @@ pub(crate) fn plan(p: &Pool, old: &State, input: &Input, caps: limits::Liability
     validate(p)?;
     let mut result = Plan { state: old.clone(), decision: "wait".into(), reason: String::new(),
         queued: input.queued.iter().map(|q|q.id.clone()).collect(),
-        live_blocked: "Shadow only: no provider executor; replacement-controller recovery and provider cost/retention enforcement have not been accepted.".into() };
+        live_blocked: "Shadow only: live mode needs an accepted replacement-controller recovery drill and a passing provider check; nothing is dispatched.".into() };
     macro_rules! done {
         ($why:expr) => {{
             result.reason = $why.into();
@@ -570,7 +571,20 @@ fn state(db: &Connection, pool: &str) -> Result<State> {
     .map_err(Into::into)
 }
 /// Caller holds BEGIN IMMEDIATE. Forecasts across pools serialize with the journal.
+#[cfg(test)]
 fn record(db: &Connection, p: &Pool, input: &Input, caps: limits::Liability) -> Result<Plan> {
+    record_mode(db, p, input, caps, false)
+}
+/// Live: an action this tick newly recorded becomes effectful (Launching/Draining), holding
+/// its reservation until the provider adapter's receipt or its deadline. Shadow intent
+/// recorded before going live stays shadow and expires as before.
+fn record_mode(
+    db: &Connection,
+    p: &Pool,
+    input: &Input,
+    caps: limits::Liability,
+    live: bool,
+) -> Result<Plan> {
     let old = state(db, &p.name)?;
     let mut adjusted = Input {
         now: input.now,
@@ -599,7 +613,19 @@ fn record(db: &Connection, p: &Pool, input: &Input, caps: limits::Liability) -> 
             }
         }
     }
-    let result = plan(p, &old, &adjusted, caps)?;
+    let mut result = plan(p, &old, &adjusted, caps)?;
+    if live {
+        result.live_blocked = String::new();
+        if let Some(a) = result.state.action.as_mut()
+            && old.action.as_ref().is_none_or(|o| o.id != a.id)
+        {
+            a.phase = match a.phase {
+                Phase::ShadowLaunch => Phase::Launching,
+                Phase::ShadowDrain => Phase::Draining,
+                ref other => other.clone(),
+            };
+        }
+    }
     if old.tick.is_some_and(|at| input.now <= at) {
         let stored: String = db.query_row(
             "SELECT plan FROM scaler_state WHERE pool=?1",

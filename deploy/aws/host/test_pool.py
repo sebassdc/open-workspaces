@@ -31,8 +31,8 @@ NODE_A, NODE_B = "dev-0aaaaaaaaaaaaaaaa", "dev-0bbbbbbbbbbbbbbbb"
 
 def instance(iid, volume, state="running"):
     return {"InstanceId": iid, "State": {"Name": state},
-            "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"VolumeId": "vol-0ffffffffffffffff"}},
-                                    {"DeviceName": "/dev/sdf", "Ebs": {"VolumeId": volume}}]}
+            "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"VolumeId": "vol-0ffffffffffffffff", "DeleteOnTermination": True}},
+                                    {"DeviceName": "/dev/sdf", "Ebs": {"VolumeId": volume, "DeleteOnTermination": False}}]}
 
 
 class FakeAws(Fake):
@@ -50,6 +50,7 @@ class FakeAws(Fake):
         self.hooks = [{"LifecycleHookName": "open-workspaces-drain", "LifecycleTransition": "autoscaling:EC2_INSTANCE_TERMINATING",
                        "DefaultResult": "ABANDON"}]
         self.instances, self.volumes, self.policies = [], [], []
+        self.scaler = {"mode": "shadow", "pools": []}
 
     def launch(self, iid, volume, state="InService"):
         self.instances.append(instance(iid, volume))
@@ -72,7 +73,21 @@ class FakeAws(Fake):
             return f"vol{self.volume[4:]}\n" if self.volume else ""
         if name == "ow" and "drain" in cmd:
             self.calls.append(cmd)
-            return json.dumps({"state": self.drain.get(cmd[cmd.index("drain") + 1], "active")})
+            node, action = cmd[cmd.index("drain") + 1], cmd[cmd.index("--action") + 1]
+            state = self.drain.get(node, "active")
+            # begin -> (the workflow empties it) -> retain with evidence -> remove, each once
+            step = {("begin", "active"): "empty", ("retain", "empty"): "retained", ("remove", "retained"): "removed"}
+            if action != "status":
+                if (action, state) not in step or (action != "begin" and "--certificate" not in cmd):
+                    raise RuntimeError(f"ow node drain {action} refused in {state}")
+                if action == "retain":
+                    evidence = json.loads(h.p(cmd[cmd.index("--evidence") + 1]).read_text())
+                    assert evidence["node"] == node and evidence["dev_disk_retained"] is True, evidence
+                self.drain[node] = step[(action, state)]
+                return "{}"
+            return json.dumps({"state": state, "certificate": {"token": "t"} if state in ("empty", "retained") else None})
+        if name == "ow" and "scaler" in cmd:
+            return json.dumps(self.scaler)
         if name == "aws" and cmd[2] == "put-secret-value" and cmd[cmd.index("--secret-id") + 1] not in self.secrets:
             raise RuntimeError("An error occurred (ResourceNotFoundException) when calling PutSecretValue")
         if name != "aws" or cmd[1] not in ("autoscaling", "ec2", "ssm", "secretsmanager", "sts", "iam") \
@@ -86,7 +101,9 @@ class FakeAws(Fake):
             return json.dumps({"Arn": "arn:aws:sts::111122223333:assumed-role/ow-host-host/i-0ctl"})
         if op == "simulate-principal-policy":
             assert arg("--policy-source-arn") == "arn:aws:iam::111122223333:role/ow-host-host"
-            assert arg("--resource-arns") == self.group["AutoScalingGroupARN"]
+            resource = arg("--resource-arns")
+            assert resource == self.group["AutoScalingGroupARN"] or (
+                resource == PREFIX + "dev-probe-AbCdEf" and "ContextKeyName=aws:RequestTag/ow-pool,ContextKeyValues=dev,ContextKeyType=string" in cmd)
             actions = cmd[cmd.index("--action-names") + 1:cmd.index("--resource-arns")]
             return json.dumps({"EvaluationResults": [{"EvalActionName": a, "EvalDecision": "implicitDeny"
                                                       if f"simulate:{a.split(':')[1]}" in self.denied else "allowed"} for a in actions]})
@@ -121,6 +138,9 @@ class FakeAws(Fake):
             for v in self.volumes:  # the data volume stays, detached
                 if v["Attachments"] and v["Attachments"][0]["InstanceId"] == iid:
                     v.update(State="available", Attachments=[])
+            return ""
+        if op == "terminate-instances":
+            next(i for i in self.instances if i["InstanceId"] == arg("--instance-ids"))["State"]["Name"] = "terminated"
             return ""
         if op == "delete-volume":
             self.volumes = [v for v in self.volumes if v["VolumeId"] != arg("--volume-id")]
@@ -462,18 +482,22 @@ class Actions(PoolCase):
 
     def test_missing_permission_or_shape_refuses_activation(self):
         self.as_controller()
-        self.assertEqual(rp.check("dev"), 0, "a missing probe secret is not a refusal")
+        self.assertEqual(rp.check("dev"), 0)
+        recorded = json.loads(h.p(rp.PROVIDER_CHECK).read_text())["pools"]["dev"]
+        self.assertLessEqual(abs(recorded - time.time()), 5, "a pass is recorded for live mode")
+        h.p(rp.PROVIDER_CHECK).unlink()
         for op, right in [("simulate:SetDesiredCapacity", "SetDesiredCapacity"), ("simulate:CompleteLifecycleAction", "CompleteLifecycleAction"),
                           ("simulate:TerminateInstanceInAutoScalingGroup", "TerminateInstanceInAutoScalingGroup"),
-                          ("describe-secret", "join secrets")]:
+                          ("simulate:CreateSecret", "CreateSecret"), ("simulate:PutSecretValue", "PutSecretValue")]:
             self.aws.denied = {op}
             with self.assertRaisesRegex(Refused, f"activation refused.*missing permission: {right}"):
                 rp.check("dev")
         self.aws.denied = {"simulate-principal-policy"}
-        with self.assertRaisesRegex(Refused, "cannot verify the group rights"):
+        with self.assertRaisesRegex(Refused, "cannot verify the controller's rights"):
             rp.check("dev")
         self.assertFalse(any(op in c for c in self.aws.calls for op in ("set-desired-capacity", "complete-lifecycle-action",
                                                                          "terminate-instance-in-auto-scaling-group")), "check writes nothing")
+        self.assertFalse(h.p(rp.PROVIDER_CHECK).exists(), "a refused check records no pass")
         self.aws.denied = set()
         self.aws.hooks[0]["DefaultResult"] = "CONTINUE"
         with self.assertRaisesRegex(Refused, "abandons by default"):
@@ -521,3 +545,112 @@ class Actions(PoolCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Executor(PoolCase):
+    def live(self, kind, target, phase):
+        self.aws.scaler = {"mode": "live", "pools": [{"state": {"action": {
+            "kind": kind, "id": "dev-7", "target": target, "phase": phase, "deadline": 9, "reservation": {}}}}]}
+
+    def test_a_live_launch_raises_desired_once_and_reports_the_joined_instance(self):
+        self.as_controller()
+        self.live("launch", "preset", "launching")
+        rp.sync(["dev"])
+        rp.sync(["dev"])  # a retry or restart never launches twice
+        self.assertEqual(self.aws.group["DesiredCapacity"], 1)
+        self.assertEqual(self.observed()["receipts"]["dev"], {"action": "dev-7", "outcome": "pending", "node": None})
+        self.aws.launch("i-0a", VOL_A)
+        rp.sync(["dev"])
+        o = self.observed()
+        self.assertEqual(o["receipts"]["dev"]["outcome"], "pending", "not joined until enrolled and online")
+        self.assertEqual(next(i for i in o["instances"] if i["id"] == "i-0a")["action"], "dev-7")
+        self.aws.nodes = [{"id": NODE_A, "online": True, "capabilities": {"vcpus": 4}}]
+        rp.sync(["dev"])
+        self.assertEqual(self.observed()["receipts"]["dev"], {"action": "dev-7", "outcome": "joined", "node": NODE_A})
+        self.assertEqual(self.aws.group["DesiredCapacity"], 1)
+        self.aws.launch("i-0b", VOL_B)  # a second instance for one launch is never claimed
+        rp.sync(["dev"])
+        self.assertEqual(self.observed()["receipts"]["dev"]["outcome"], "unknown")
+
+    def test_shadow_or_uncertain_actions_are_never_executed(self):
+        self.as_controller()
+        for phase in ("shadow_launch", "uncertain"):
+            self.live("launch", "preset", phase)
+            rp.sync(["dev"])
+            self.assertEqual(self.aws.group["DesiredCapacity"], 0, phase)
+            self.assertEqual(self.observed()["receipts"], {})
+
+    def test_a_live_drain_seals_retains_removes_and_reports_absent(self):
+        self.as_controller()
+        self.aws.nodes = [{"id": NODE_A, "online": True, "capabilities": {"vcpus": 4}}]
+        self.aws.launch("i-0a", VOL_A)
+        self.aws.group["DesiredCapacity"] = 1
+        self.live("drain", NODE_A, "draining")
+        for _ in range(4):
+            rp.sync(["dev"])
+            self.assertEqual(self.observed()["receipts"]["dev"]["outcome"], "pending")
+        self.assertEqual(self.aws.drain[NODE_A], "removed")
+        rp.sync(["dev"])
+        self.assertEqual(self.observed()["receipts"]["dev"], {"action": "dev-7", "outcome": "absent", "node": None})
+        self.assertEqual((self.aws.group["DesiredCapacity"], self.aws.group["Instances"]), (0, []))
+        self.assertEqual(next(v for v in self.aws.volumes if v["VolumeId"] == VOL_A)["State"], "available")
+
+    def test_drain_refuses_retention_evidence_when_the_disk_would_be_deleted(self):
+        self.as_controller()
+        self.aws.nodes = [{"id": NODE_A, "online": True, "capabilities": {"vcpus": 4}}]
+        self.aws.launch("i-0a", VOL_A)
+        self.aws.instances[0]["BlockDeviceMappings"][1]["Ebs"]["DeleteOnTermination"] = True
+        self.aws.drain[NODE_A] = "empty"
+        self.live("drain", NODE_A, "draining")
+        rp.sync(["dev"])
+        self.assertEqual(self.observed()["receipts"]["dev"]["outcome"], "unknown")
+        self.assertEqual(self.aws.drain[NODE_A], "empty")
+
+
+class Faults(PoolCase):
+    def test_an_expired_join_is_renewed_on_request(self):
+        self.as_controller()
+        self.aws.launch("i-0a", VOL_A)
+        rp.sync(["dev"])
+        secret = "open-workspaces/pool/dev/" + NODE_A
+        self.aws.secrets[secret] = json.dumps({"ready": NODE_A, "budget": {"memory": 1024, "slots": 1, "cpus": 1}})
+        rp.sync(["dev"])
+        value = json.loads(self.aws.secrets[secret])
+        value["join"]["expires"] = int(time.time()) - 1
+        self.aws.secrets[secret] = json.dumps(value)
+        rp.sync(["dev"])
+        self.assertEqual(json.loads(self.aws.secrets[secret]), {"pending": NODE_A}, "reset for a new request")
+        controller = h.read_json(h.CONFIG)
+        h.write_json(h.CONFIG, h.validate(POOL_CONFIG))
+        self.aws.secrets[secret] = json.dumps(value)  # the runner still sees the expired join
+
+        def controller_turn(_):
+            mine = h.read_json(h.CONFIG)
+            h.write_json(h.CONFIG, controller)
+            rp.sync(["dev"])
+            h.write_json(h.CONFIG, mine)
+        time.sleep = controller_turn
+        self.assertEqual(h.enrol(wait=60), 0)
+        self.assertEqual(sum("node-join" in c for c in self.aws.calls), 2, "a fresh join replaced the expired one")
+
+    def test_removal_refuses_when_retention_was_lost(self):
+        self.as_controller()
+        self.aws.launch("i-0a", VOL_A)
+        self.aws.group["InstanceLifecyclePolicy"] = {}
+        with self.assertRaisesRegex(Refused, "removal refused.*lifecycle policy"):
+            rp.remove("dev", instance="i-0a")
+        self.assertFalse(any("terminate-instance-in-auto-scaling-group" in c for c in self.aws.calls))
+
+    def test_a_salvage_replacement_outside_the_group_can_be_removed(self):
+        self.as_controller()
+        self.aws.instances.append(instance("i-0s", VOL_A))  # tagged, not a member
+        self.aws.volumes.append({"VolumeId": VOL_A, "Size": 40, "State": "in-use", "CreateTime": "x",
+                                 "Attachments": [{"InstanceId": "i-0s"}]})
+        self.aws.nodes = [{"id": NODE_A, "online": True, "capabilities": {"vcpus": 4}}]
+        with self.assertRaisesRegex(Refused, "not drained and removed"):
+            rp.remove("dev", node=NODE_A)
+        self.aws.drain[NODE_A] = "removed"
+        self.assertEqual(rp.main(["remove", "dev", "--node", NODE_A]), 0)
+        self.assertEqual(self.aws.instances[0]["State"]["Name"], "terminated")
+        self.assertFalse(any("terminate-instance-in-auto-scaling-group" in c for c in self.aws.calls))
+        self.assertTrue(rp.remove("dev", node=NODE_A), "a rerun after success is done")

@@ -125,8 +125,10 @@ test("rights: exact group actions, tagged secrets and disks, no real secret in P
     assert.deepEqual(ctl[2].Condition.StringEquals, { "aws:RequestTag/ow-pool": "dev" });
     assert.deepEqual(ctl[5], { Effect: "Allow", Resource: "arn:aws:iam::111122223333:role/ow-ctl-host", Action: "iam:SimulatePrincipalPolicy" },
         "it may ask IAM about its own role only");
-    assert.deepEqual(ctl[6].Condition, { StringEquals: { "aws:ResourceTag/ow-pool": "dev" } });
-    assert.equal(ctl[6].Action, "ec2:DeleteVolume");
+    assert.deepEqual(ctl[6], { Effect: "Allow", Resource: "arn:aws:ec2:us-east-1:111122223333:instance/*", Action: "ec2:TerminateInstances",
+        Condition: { StringEquals: { "aws:ResourceTag/ow-pool": "dev" } } }, "only the pool's own instances");
+    assert.deepEqual(ctl[7].Condition, { StringEquals: { "aws:ResourceTag/ow-pool": "dev" } });
+    assert.equal(ctl[7].Action, "ec2:DeleteVolume");
     assert.deepEqual(policy("dev-join"), [{ Effect: "Allow", Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"],
         Resource: prefix, Condition: { StringEquals: { "secretsmanager:ResourceTag/ow-session": "${aws:userid}" } } }]);
     assert.deepEqual(policy("dev-backup")[1].Resource, ["arn:aws:s3:::my-bucket/ow/runners/dev/catalog/*", "arn:aws:s3:::my-bucket/ow/runners/dev/snapshots/*"]);

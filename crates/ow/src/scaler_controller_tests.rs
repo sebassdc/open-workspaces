@@ -74,7 +74,7 @@ fn real_catalog_tick_restart_status_and_reader_floor_preserve_shadow_only_state(
         first["pools"][0]["live_blocked"]
             .as_str()
             .unwrap()
-            .contains("no provider executor")
+            .contains("nothing is dispatched")
     );
     assert_eq!(
         attempt(&root, &mut f.c.db, 100).unwrap()["pools"][0]["state"],
@@ -95,7 +95,7 @@ fn real_catalog_tick_restart_status_and_reader_floor_preserve_shadow_only_state(
     );
     assert_eq!(backup_count, std::fs::read_dir(&root).unwrap().count());
     assert_eq!(command(&root, false).unwrap()["config_present"], true);
-    f.write("scaler.json", json!({"mode":"live","pools":[pool()]}));
+    f.write("scaler.json", json!({"mode":"other","pools":[pool()]}));
     assert!(attempt(&root, &mut f.c.db, 101).is_err());
     assert!(
         status(&f.c.db).unwrap()["error"]
@@ -104,6 +104,72 @@ fn real_catalog_tick_restart_status_and_reader_floor_preserve_shadow_only_state(
             .contains("invalid private scaler file")
     );
     assert_eq!(state(&f.c.db, "default").unwrap(), held);
+}
+#[test]
+fn live_mode_is_refused_without_activation_evidence_and_never_promotes_shadow_intent() {
+    let mut f = Fixture::new();
+    f.configure();
+    let root = f.c.root.clone();
+    let mut p = pool();
+    p.floor = 1;
+    f.write("scaler.json", json!({"mode":"live","pools":[p]}));
+    let error = |f: &Fixture| {
+        status(&f.c.db).unwrap()["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    assert!(attempt(&root, &mut f.c.db, 100).is_err());
+    assert!(
+        error(&f).contains("scaler-activation.json"),
+        "{}",
+        error(&f)
+    );
+    f.write(
+        "scaler-activation.json",
+        json!({"recovery_drill":"private drill record"}),
+    );
+    assert!(attempt(&root, &mut f.c.db, 100).is_err());
+    assert!(error(&f).contains("pool check"), "{}", error(&f));
+    f.write(
+        "scaler-provider-check.json",
+        json!({"pools":{"default": 101}}),
+    );
+    assert!(
+        attempt(&root, &mut f.c.db, 100).is_err(),
+        "a check from the future refuses"
+    );
+    f.write(
+        "scaler-provider-check.json",
+        json!({"pools":{"other": 100}}),
+    );
+    assert!(
+        attempt(&root, &mut f.c.db, 100).is_err(),
+        "every configured pool needs its own check"
+    );
+    assert!(
+        state(&f.c.db, "default").unwrap().action.is_none(),
+        "refused ticks record nothing"
+    );
+    f.write(
+        "scaler-provider-check.json",
+        json!({"pools":{"default": 90}}),
+    );
+    let live = attempt(&root, &mut f.c.db, 100).unwrap();
+    assert_eq!(live["mode"], "live");
+    let action = state(&f.c.db, "default").unwrap().action.unwrap();
+    assert_eq!(
+        action.phase,
+        Phase::Launching,
+        "a newly recorded launch is effectful"
+    );
+    assert_eq!(command(&root, false).unwrap()["mode"], "live");
+    assert!(
+        live["pools"][0]["live_blocked"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
 }
 #[test]
 fn retained_pending_orphaned_instances_and_all_disks_remain_billable_liabilities() {

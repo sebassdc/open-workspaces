@@ -1236,7 +1236,9 @@ def enrol(wait=120):
     except ValueError:
         value = {}
     join = value.get("join") or {}
-    if not join and config.get("pool"):
+    if config.get("pool") and not (isinstance(join, dict) and isinstance(join.get("expires"), (int, float))
+                                   and join["expires"] >= time.time() + 15):
+        # Absent or expired: ask the controller for a fresh one.
         value = await_pool_join(me, config, wait)
         join = value["join"]
     if not join:
