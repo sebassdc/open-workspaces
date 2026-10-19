@@ -40,8 +40,12 @@ The provider observation must cover every enrolled node, including revoked and
 expired invitations, except explicitly revoked `limits.pool.retired_nodes` after
 operator deprovisioning. Listed provider resources still count even when their
 node is retired; forgetting a catalog node does not stop its billing.
-Durability consumes the existing per-box `durability` observation and capture-age
-objective; no second recovery timer or uploader is introduced. Missing or stale
+Each unattended tick polls the existing read-only runner `list` transport outside
+the gateway mutex and writer transaction. Conditional updates refresh only state
+and durability for the same node session and committed placement; catalog pins,
+shape and policy remain intact. Missing/failed replies do not refresh age.
+Durability consumes the existing per-box observation and capture-age objective;
+no second recovery timer or uploader is introduced. Missing or stale
 observations fail closed. A stopped box is allowed to publish during the existing
 drain workflow; a stale recovery point never grants permission to lose its disk.
 
@@ -171,9 +175,10 @@ ow --local --data-dir /private/controller scaler --tick
 Status is local/operator-only and includes `mode`, error, plan/reason, action,
 forecast reservation, cooldown and tick. Stale plans are marked `stale`; absent
 config is reported through `config_present`. A duplicate or backward tick returns
-the recorded plan without a second action. Shadow forecasts are reconsidered
-after cooldown and can be cancelled without a provider receipt, because nothing
-was dispatched. History remains in `scaler_actions`.
+the recorded plan without a second action. Shadow forecasts are discarded before cap checks after cooldown, including
+other pools' expired forecasts. They can be cancelled without a provider receipt,
+because nothing was dispatched. Effectful and uncertain reservations never expire
+this way. History remains in `scaler_actions`.
 
 Effectful launch/join/drain phases are dormant reconciliation contracts exercised
 by tests. There is no command that enters them or promotes shadow intent to live.
@@ -208,7 +213,9 @@ for this feature.
 
 ## Compatibility and verification
 
-Release 0.9.16 is class 1 (controller/catalog readers and operator client). Catalog
+This slice is class 1 (controller/catalog readers and operator client). Release
+version selection and numbered release-manifest entries belong to the coordinated
+release owner. Catalog
 schema/reader floor 7 adds the action, health and cooldown journal. Migration
 creates a private pre-upgrade SQLite backup and refuses older readers. The scaler
 journal introduces no artifact roots; GC explicitly recognizes schemas 6 and 7

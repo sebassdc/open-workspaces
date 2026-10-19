@@ -231,7 +231,8 @@ fn inputs_on(
                 let m: Value = serde_json::from_str(&raw)?;
                 drain_safe &= fresh(at, now)
                     && matches!(m["state"].as_str(), Some("stopped" | "hibernated"))
-                    && m["pinned"] != true;
+                    && m["pinned"] != true
+                    && m["vmm_running"] != true;
                 if matches!(m["state"].as_str(), Some("running" | "hibernated")) {
                     let d = &m["durability"];
                     let healthy = fresh(at, now)
@@ -400,6 +401,60 @@ pub(crate) fn command(root: &Path, tick_now: bool) -> Result<Value> {
     // Local tick serializes with the gateway through BEGIN IMMEDIATE.
     attempt(root, &mut db, ow_core::recovery::now())
 }
+/// Read-only worker inventory, outside the gateway mutex and every writer transaction.
+fn refresh(db: &Connection, now: u64, call: &impl Fn(&str) -> Result<Value>) -> Result<()> {
+    let nodes:Vec<(String,String)> = db.prepare("SELECT id,session FROM nodes WHERE revoked=0 AND heartbeat>=?1 AND heartbeat<=?2 AND session IS NOT NULL AND EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND node=nodes.id) ORDER BY id LIMIT 17")?
+        .query_map(params![now.saturating_sub(15) as i64,now as i64],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    ensure!(
+        nodes.len() <= 16,
+        "scaler observation runner limit exceeded"
+    );
+    for (node, session) in nodes {
+        let expected:Vec<(String,i64,bool,String,Option<i64>)> = db.prepare("SELECT r.physical,r.placement_epoch,r.placement_managed,r.metadata,(SELECT id FROM transfers t WHERE t.machine=r.physical AND t.epoch=r.placement_epoch AND t.target=r.node AND t.step='succeeded') FROM resources r WHERE r.kind='machine' AND r.node=?1 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=r.physical)")?
+            .query_map([&node],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
+        if expected.is_empty() {
+            continue;
+        }
+        let Ok(observation) = call(&node) else {
+            continue;
+        };
+        let machines = observation
+            .as_array()
+            .context("invalid scaler worker inventory")?;
+        ensure!(machines.len() <= 1024, "scaler worker inventory too large");
+        let mut ids = BTreeSet::new();
+        for m in machines {
+            ensure!(
+                ids.insert(m["id"].as_str().context("inventory machine ID required")?),
+                "duplicate inventory machine ID"
+            );
+        }
+        let tx =
+            rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+        for (physical, epoch, managed, metadata, transfer) in expected {
+            let Some(m) = machines.iter().find(|m| m["id"] == physical) else {
+                continue;
+            };
+            if managed {
+                let Some(transfer) = transfer else { continue };
+                let placement = common::Placement {
+                    node: node.clone(),
+                    epoch: epoch.try_into()?,
+                    transfer: format!("transfer-{transfer}"),
+                };
+                if m["placement"] != json!(placement) {
+                    continue;
+                }
+            } else if epoch != 0 || !m["placement"].is_null() {
+                continue;
+            }
+            // Preserve catalog shape, pins and policy. A concurrent move/session/reconcile wins.
+            tx.execute("UPDATE resources SET metadata=json_set(metadata,'$.state',json_extract(?1,'$.state'),'$.durability',json_extract(?1,'$.durability'),'$.vmm_running',json_extract(?1,'$.vmm_running')),updated_at=datetime(?2,'unixepoch') WHERE kind='machine' AND physical=?3 AND node=?4 AND placement_epoch=?5 AND placement_managed=?6 AND metadata=?7 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical) AND EXISTS(SELECT 1 FROM nodes WHERE id=?4 AND revoked=0 AND session=?8 AND heartbeat>=?2-15 AND heartbeat<=?2)",params![m.to_string(),now as i64,physical,node,epoch,managed,metadata,session])?;
+        }
+        tx.commit()?;
+    }
+    Ok(())
+}
 fn tick_on(root: &Path, db: &mut Connection, now: u64) -> Result<Value> {
     let config: Config = read_private(&root.join("scaler.json"))?;
     let Mode::Shadow = config.mode;
@@ -414,6 +469,13 @@ fn tick_on(root: &Path, db: &mut Connection, now: u64) -> Result<Value> {
         validate(p)?;
         ensure!(names.insert(&p.name), "duplicate scaler pool");
     }
+    let started = std::time::Instant::now();
+    refresh(db, now, &|node| {
+        let route = nodes::route(root, node)?;
+        nodes::operation_capable(root, node, "list")?;
+        Ok(crate::wire::connect_waiting(&route, &json!({"op":"list"}), Duration::from_secs(2))?.1)
+    })?;
+    let now = now.saturating_add(started.elapsed().as_secs());
     // No network or file access inside this writer transaction.
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let collected = inputs_on(&tx, &config.pools, &observed, now, hours, &retired_nodes)?;
@@ -439,16 +501,15 @@ pub(crate) fn start(shared: &Arc<Mutex<Catalog>>) {
     if !shared.lock().unwrap().root.join("scaler.json").exists() {
         return;
     }
+    let root = shared.lock().unwrap().root.clone();
     let weak = Arc::downgrade(shared);
     std::thread::spawn(move || {
         loop {
-            let Some(shared) = weak.upgrade() else { break };
-            {
-                let mut c = shared.lock().unwrap();
-                let root = c.root.clone();
-                let _ = attempt(&root, &mut c.db, ow_core::recovery::now());
+            if weak.upgrade().is_none() {
+                break;
             }
-            drop(shared);
+            // This connection serializes short writes with the gateway; polling never holds its mutex.
+            let _ = command(&root, true);
             if nodes::STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }

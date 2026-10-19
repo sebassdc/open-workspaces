@@ -507,3 +507,84 @@ fn shadow_replans_changed_demand_after_cooldown_and_uncertain_drain_cannot_join_
     });
     assert!(step(&p, &drain, &i).state.action.is_some());
 }
+
+#[test]
+fn expired_shadow_forecast_releases_before_cap_checks_and_replans_when_demand_fits() {
+    let p = pool();
+    let mut i = input();
+    i.queued = vec![demand("q", shape(1, 1024, 16))];
+    let cap = limits::Liability {
+        cents: 1000,
+        ..caps()
+    };
+    let first = plan(&p, &State::default(), &i, cap).unwrap();
+    assert_eq!(first.state.action.as_ref().unwrap().reservation.cents, 200);
+    i.now = 131;
+    i.liabilities.cents = 900;
+    let blocked = plan(&p, &first.state, &i, cap).unwrap();
+    assert!(
+        blocked.state.action.is_none(),
+        "expired shadow forecast must not count against new planning"
+    );
+    i.now = 10000;
+    i.runners = vec![runner("available", shape(2, 2048, 32), i.now)];
+    i.ready_instances = 1;
+    i.pool_instances = 1;
+    let later = plan(&p, &blocked.state, &i, cap).unwrap();
+    assert!(later.state.action.is_none());
+    assert!(later.queued.is_empty());
+    // A real or uncertain launch retains its reservation even beyond every timer.
+    for phase in [Phase::Launching, Phase::Joining, Phase::Uncertain] {
+        let mut effectful = first.state.clone();
+        effectful.action.as_mut().unwrap().phase = phase;
+        assert!(
+            plan(&p, &effectful, &i, cap)
+                .unwrap()
+                .state
+                .action
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn expired_other_pool_forecast_does_not_keep_global_headroom_but_effectful_actions_do() {
+    for phase in [Phase::ShadowLaunch, Phase::Launching, Phase::Uncertain] {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut i = input();
+        i.queued = vec![demand("q", shape(1, 1024, 16))];
+        let first = record(&db, &pool(), &i, caps()).unwrap();
+        let mut state = first.state;
+        state.action.as_mut().unwrap().phase = phase.clone();
+        db.execute(
+            "UPDATE scaler_state SET state=?1",
+            [serde_json::to_string(&state).unwrap()],
+        )
+        .unwrap();
+        let mut other = pool();
+        other.name = "other".into();
+        i.now = 131;
+        let next = record(
+            &db,
+            &other,
+            &i,
+            limits::Liability {
+                cents: 399,
+                ..caps()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            next.decision,
+            if phase == Phase::ShadowLaunch {
+                "launch"
+            } else {
+                "wait"
+            },
+            "{phase:?}"
+        );
+        db.execute_batch("COMMIT").unwrap();
+    }
+}

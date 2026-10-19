@@ -375,3 +375,149 @@ fn real_wake_admission_supplies_one_exact_shape_without_claiming_target_capacity
         0
     );
 }
+
+#[test]
+fn unattended_tick_refreshes_expired_durability_through_read_only_runner_inventory() {
+    use std::os::unix::net::UnixListener;
+    let f = Fixture::new();
+    f.configure();
+    let now = ow_core::recovery::now();
+    f.node("base", now);
+    f.c.db
+        .execute(
+            "INSERT INTO users(id,issuer,email) VALUES(1,'test','owner@example.test')",
+            [],
+        )
+        .unwrap();
+    let stale = json!({"state":"running","pinned":true,"memory_mib":1024,"durability":{"overdue":false,"current_state_durable":false,"last_durable_at":now-16,"error":null}});
+    f.c.db.execute("INSERT INTO resources(owner,kind,name,physical,node,metadata,updated_at) VALUES(1,'machine','box','physical','base',?1,datetime(?2,'unixepoch'))",params![stale.to_string(),(now-16) as i64]).unwrap();
+    let mut p = pool();
+    p.floor = 2;
+    f.write("scaler.json", json!({"mode":"shadow","pools":[p]}));
+    f.write("scaler-observations.json",json!({"hours":24,"observed_at":now,"complete":true,"retention_ok":true,"outcome_resolved":true,"instances":[instance("one","ready",Some("base"))],"disks":[],"receipts":{}}));
+    let node_root = f.c.root.join("nodes/base");
+    std::fs::create_dir_all(&node_root).unwrap();
+    let socket = UnixListener::bind(node_root.join("control.sock")).unwrap();
+    let worker = std::thread::spawn(move || {
+        for fail in [false, true] {
+            let (mut peer, _) = socket.accept().unwrap();
+            assert_eq!(crate::wire::line(&mut peer).unwrap(), json!({"op":"list"}));
+            let result = json!([{"id":"physical","state":"running","durability":{"overdue":false,"current_state_durable":false,"last_durable_at":now-16,"error":if fail {json!("upload failed")} else {Value::Null}}}]);
+            crate::wire::send(&mut peer, &json!({"ok":true,"result":result})).unwrap();
+        }
+    });
+    let result = command(&f.c.root, true).unwrap();
+    assert_eq!(
+        result["pools"][0]["decision"], "launch",
+        "healthy recovery age must not depend on client activity"
+    );
+    let metadata: String =
+        f.c.db
+            .query_row(
+                "SELECT metadata FROM resources WHERE physical='physical'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&metadata).unwrap()["pinned"],
+        true
+    );
+    let o: Observations = read_private(&f.c.root.join("scaler-observations.json")).unwrap();
+    assert!(
+        inputs_on(&f.c.db, &[pool()], &o, ow_core::recovery::now(), 24, &[]).unwrap()[0]
+            .durability_healthy
+    );
+    // The next poll must consume an upload failure, even without any client reconcile.
+    command(&f.c.root, true).unwrap();
+    assert!(
+        !inputs_on(&f.c.db, &[pool()], &o, ow_core::recovery::now(), 24, &[]).unwrap()[0]
+            .durability_healthy
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn periodic_observations_refresh_after_sixteen_seconds_but_stale_session_and_epoch_do_not() {
+    let f = Fixture::new();
+    f.node("base", 100);
+    f.c.db
+        .execute(
+            "INSERT INTO users(id,issuer,email) VALUES(1,'test','owner@example.test')",
+            [],
+        )
+        .unwrap();
+    let metadata = json!({"state":"running","durability":{"overdue":false,"last_durable_at":100,"error":null}});
+    f.c.db.execute("INSERT INTO resources(owner,kind,name,physical,node,metadata,updated_at) VALUES(1,'machine','box','physical','base',?1,datetime(100,'unixepoch'))",[metadata.to_string()]).unwrap();
+    f.c.db.execute("UPDATE nodes SET heartbeat=116,capabilities=json_set(capabilities,'$.disk_observed_unix_s',116)",[]).unwrap();
+    let mut o = observations(json!([instance("one", "ready", Some("base"))]), json!([]));
+    o.observed_at = 116;
+    assert!(!inputs_on(&f.c.db, &[pool()], &o, 116, 24, &[]).unwrap()[0].durability_healthy);
+    refresh(&f.c.db,116,&|_|Ok(json!([{"id":"physical","state":"running","durability":{"overdue":false,"last_durable_at":100,"error":null}}]))).unwrap();
+    assert!(inputs_on(&f.c.db, &[pool()], &o, 116, 24, &[]).unwrap()[0].durability_healthy);
+    for race in ["session", "epoch"] {
+        refresh(&f.c.db, 116, &|_| {
+            if race == "session" {
+                f.c.db
+                    .execute("UPDATE nodes SET session='replacement'", [])?;
+            } else {
+                f.c.db
+                    .execute("UPDATE resources SET placement_epoch=1", [])?;
+            }
+            Ok(json!([{"id":"physical","state":"stopped","durability":null}]))
+        })
+        .unwrap();
+        let state: String =
+            f.c.db
+                .query_row(
+                    "SELECT json_extract(metadata,'$.state') FROM resources",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(state, "running", "{race} raced a read-only observation");
+    }
+    f.c.db
+        .execute("UPDATE nodes SET heartbeat=100,session='test-session'", [])
+        .unwrap();
+    refresh(&f.c.db, 116, &|_| panic!("stale node must not be polled")).unwrap();
+    refresh(&f.c.db, 117, &|_| anyhow::bail!("offline")).unwrap();
+    assert!(!inputs_on(&f.c.db, &[pool()], &o, 132, 24, &[]).unwrap()[0].durability_healthy);
+}
+
+#[test]
+fn inventory_refresh_requires_exact_committed_managed_placement_and_no_transfer_lock() {
+    let f = Fixture::new();
+    f.node("base", 116);
+    f.c.db
+        .execute(
+            "INSERT INTO users(id,issuer,email) VALUES(1,'test','owner@example.test')",
+            [],
+        )
+        .unwrap();
+    f.c.db.execute("INSERT INTO resources(owner,kind,name,physical,node,metadata,placement_managed,placement_epoch,updated_at) VALUES(1,'machine','box','physical','base','{\"state\":\"running\"}',1,1,datetime(100,'unixepoch'))",[]).unwrap();
+    f.c.db.execute("INSERT INTO operations(id,owner,op,resource,state) VALUES(1,1,'restore','box','succeeded')",[]).unwrap();
+    f.c.db.execute("INSERT INTO transfers(id,operation,kind,source,machine,source_node,source_epoch,source_policy_generation,target,epoch,step) VALUES(1,1,'restore','physical','physical','',0,0,'base',1,'succeeded')",[]).unwrap();
+    let response = |epoch| json!([{"id":"physical","state":"hibernated","vmm_running":false,"durability":{"current_state_durable":true,"overdue":false,"error":null},"placement":{"node":"base","epoch":epoch,"transfer":"transfer-1"}}]);
+    let state = || {
+        f.c.db
+            .query_row(
+                "SELECT json_extract(metadata,'$.state') FROM resources",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    refresh(&f.c.db, 116, &|_| Ok(response(2))).unwrap();
+    assert_eq!(state(), "running");
+    refresh(&f.c.db, 116, &|_| Ok(response(1))).unwrap();
+    assert_eq!(state(), "hibernated");
+    f.c.db
+        .execute("INSERT INTO transfer_locks VALUES('physical',1)", [])
+        .unwrap();
+    refresh(&f.c.db, 117, &|_| {
+        panic!("an active transfer must not be polled")
+    })
+    .unwrap();
+    assert_eq!(state(), "hibernated");
+}

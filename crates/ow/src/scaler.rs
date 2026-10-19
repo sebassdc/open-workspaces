@@ -78,6 +78,19 @@ pub(crate) struct State {
     pub idle_since: Option<u64>,
     pub action: Option<Action>,
 }
+impl State {
+    fn discard_expired_shadow(&mut self, now: u64) {
+        if self.tick.is_none_or(|at| now > at)
+            && now >= self.cooldown_until
+            && self
+                .action
+                .as_ref()
+                .is_some_and(|a| matches!(a.phase, Phase::ShadowLaunch | Phase::ShadowDrain))
+        {
+            self.action = None;
+        }
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Phase {
@@ -250,6 +263,7 @@ pub(crate) fn plan(p: &Pool, old: &State, input: &Input, caps: limits::Liability
     if old.tick.is_some_and(|at| input.now <= at) {
         done!("duplicate or backward tick");
     }
+    result.state.discard_expired_shadow(input.now);
     result.state.tick = Some(input.now);
     if !input.queued.is_empty() {
         result.state.idle_since = None;
@@ -267,7 +281,7 @@ pub(crate) fn plan(p: &Pool, old: &State, input: &Input, caps: limits::Liability
         result.decision = "cancel_drain".into();
         done!("demand returned; cancel shadow soft drain");
     }
-    let mut held = result
+    let held = result
         .state
         .action
         .as_ref()
@@ -374,12 +388,7 @@ pub(crate) fn plan(p: &Pool, old: &State, input: &Input, caps: limits::Liability
         if !input.durability_healthy {
             done!("durability health missing, stale or overdue; actions disabled");
         }
-        if input.now < result.state.cooldown_until {
-            done!("shadow action recorded; no provider or drain effect dispatched");
-        }
-        // A shadow forecast has no effect to reconcile. Re-plan only after its cooldown.
-        result.state.action = None;
-        held = limits::Liability::default();
+        done!("shadow action recorded; no provider or drain effect dispatched");
     }
     if !input.liabilities.add(held)?.within(caps) {
         done!("liability cap violation; actions disabled");
@@ -581,7 +590,9 @@ fn record(db: &Connection, p: &Pool, input: &Input, caps: limits::Liability) -> 
         .query_map([&p.name], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for s in others {
-        if let Some(a) = serde_json::from_str::<State>(&s)?.action {
+        let mut other: State = serde_json::from_str(&s)?;
+        other.discard_expired_shadow(input.now);
+        if let Some(a) = other.action {
             adjusted.liabilities = adjusted.liabilities.add(a.reservation)?;
             if a.phase == Phase::Uncertain {
                 adjusted.outcome_resolved = false;
