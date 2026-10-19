@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Credential-free S3 HTTP fixture for the in-process chunk transfer.
+
+Serves path-style requests from ROOT/<bucket>/<key>, the layout fake_aws.py
+uses, and logs each request to ROOT/calls.jsonl. Prints its port on stdout.
+Fault files in ROOT: deny-head, fail-manifest, and put-budget (how many more
+chunk uploads succeed before the rest are refused).
+"""
+import base64
+import hashlib
+import json
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+from xml.sax.saxutils import escape
+
+root = Path(sys.argv[1])
+PAGE = 2  # small pages exercise continuation
+budget_lock = threading.Lock()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *args):
+        pass
+
+    def target(self):
+        url = urlparse(self.path)
+        query = parse_qs(url.query)
+        assert 'X-Amz-Signature' in query, 'unsigned request'
+        bucket, _, key = unquote(url.path).lstrip('/').partition('/')
+        with (root / 'calls.jsonl').open('a') as log:
+            log.write(json.dumps(['http', self.command, key, bucket]) + '\n')
+        return bucket, key, query
+
+    def reply(self, status, body=b'', headers=()):
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(body)
+
+    def error(self, status, code):
+        self.reply(status, f'<Error><Code>{code}</Code><Message>bucket and key</Message></Error>'.encode())
+
+    def do_HEAD(self):
+        bucket, key, _ = self.target()
+        if (root / 'deny-head').exists():
+            return self.reply(403)
+        self.reply(200 if (root / bucket / key).is_file() else 404)
+
+    def do_GET(self):
+        bucket, key, query = self.target()
+        if query.get('list-type') == ['2']:
+            prefix = query.get('prefix', [''])[0]
+            base = root / bucket
+            keys = sorted(str(f.relative_to(base)) for f in base.rglob('*') if f.is_file()) if base.exists() else []
+            keys = [k for k in keys if k.startswith(prefix)]
+            start = int(query.get('continuation-token', ['0'])[0])
+            page = keys[start:start + PAGE]
+            more = start + PAGE < len(keys)
+            contents = ''.join(f'<Contents><Key>{escape(k)}</Key><LastModified>2026-10-18T00:00:00.000Z</LastModified><ETag>"x"</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents>' for k in page)
+            token = f'<NextContinuationToken>{start + PAGE}</NextContinuationToken>' if more else ''
+            body = f'<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{bucket}</Name><Prefix>{escape(prefix)}</Prefix><KeyCount>{len(page)}</KeyCount><MaxKeys>{PAGE}</MaxKeys><IsTruncated>{str(more).lower()}</IsTruncated>{contents}{token}</ListBucketResult>'
+            return self.reply(200, body.encode())
+        path = root / bucket / key
+        if not path.is_file():
+            return self.error(404, 'NoSuchKey')
+        self.reply(200, path.read_bytes())
+
+    def do_PUT(self):
+        bucket, key, _ = self.target()
+        body = self.rfile.read(int(self.headers['Content-Length']))
+        assert self.headers['If-None-Match'] == '*'
+        checksum = base64.b64encode(hashlib.sha256(body).digest()).decode()
+        if self.headers['x-amz-checksum-sha256'] != checksum:
+            return self.error(400, 'BadDigest')
+        if (root / 'fail-manifest').exists() and key.endswith('manifest.json'):
+            return self.error(403, 'AccessDenied')
+        budget = root / 'put-budget'
+        with budget_lock:
+            if '/chunks/' in f'/{key}' and budget.exists():
+                left = int(budget.read_text())
+                if left <= 0:
+                    return self.error(403, 'AccessDenied')
+                budget.write_text(str(left - 1))
+        dest = root / bucket / key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with dest.open('xb') as output:
+                output.write(body)
+        except FileExistsError:
+            return self.error(412, 'PreconditionFailed')
+        self.reply(200)
+
+
+server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+print(server.server_address[1], flush=True)
+server.serve_forever()

@@ -23,6 +23,7 @@ pub mod network;
 pub mod recovery;
 #[cfg(target_os = "linux")]
 pub mod runtime;
+pub mod snapshot_digest;
 pub mod snapshot_store;
 #[cfg(target_os = "linux")]
 pub mod ssh_guest;

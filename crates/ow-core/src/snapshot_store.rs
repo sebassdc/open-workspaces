@@ -7,15 +7,16 @@
 //! used bytes) and write the manifest last, so a stored manifest means a
 //! complete snapshot. Downloads are checked against the manifest's hashes and
 //! written sparse.
-use anyhow::{Context, Result, bail, ensure};
-use serde_json::Value;
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::OnceLock,
 };
 
 pub const DATA_FILES: [&str; 3] = ["state", "memory", "disk.ext4"];
@@ -24,7 +25,8 @@ pub trait SnapshotStore {
     /// Names of the complete snapshots in the store.
     fn list(&self) -> Result<Vec<String>>;
     /// Uploads one sealed snapshot directory under `name`, manifest last.
-    fn push(&self, name: &str, directory: &Path) -> Result<()>;
+    /// Returns transfer details (null when there are none to report).
+    fn push(&self, name: &str, directory: &Path) -> Result<Value>;
     /// The sealed manifest of `name`, without store transport metadata; unchecked bytes.
     fn manifest(&self, name: &str) -> Result<Vec<u8>>;
     /// Downloads `name` into `directory`, which must not exist yet. Every file is
@@ -32,12 +34,15 @@ pub trait SnapshotStore {
     fn pull(&self, name: &str, directory: &Path) -> Result<()>;
 }
 
-/// S3 or an S3-compatible store (MinIO, R2), through the AWS CLI and its usual
-/// credential chain.
+/// S3 or an S3-compatible store (MinIO, R2), with the AWS CLI's usual
+/// credential chain. Chunk transfers sign their requests in process.
 pub struct S3Store {
     url: String,
     endpoint: Option<String>,
     incremental: bool,
+    index: Option<PathBuf>,
+    http: OnceLock<http::Http>,
+    retention: OnceLock<()>,
 }
 
 impl S3Store {
@@ -68,10 +73,13 @@ impl S3Store {
             url: url.trim_end_matches('/').to_owned(),
             endpoint: endpoint.map(str::to_owned),
             incremental: false,
+            index: None,
+            http: OnceLock::new(),
+            retention: OnceLock::new(),
         })
     }
 
-    fn push_full(&self, name: &str, directory: &Path) -> Result<()> {
+    fn push_full(&self, name: &str, directory: &Path) -> Result<Value> {
         crate::common::identifier(name)?;
         let manifest = read_manifest(&directory.join("manifest.json"), name)?;
         for file in DATA_FILES {
@@ -117,7 +125,7 @@ impl S3Store {
             .arg(self.key(name, "manifest.json"))
             .status()?;
         ensure!(status.success(), "uploading manifest failed ({status})");
-        Ok(())
+        Ok(Value::Null)
     }
 
     /// Opt-in chunk format for managed recovery. Existing manual backups keep
@@ -125,6 +133,20 @@ impl S3Store {
     pub fn incremental(mut self) -> Self {
         self.incremental = true;
         self
+    }
+
+    /// Keeps the index of chunks this store holds in `directory`, across runs.
+    pub fn index(mut self, directory: &Path) -> Self {
+        self.index = Some(directory.to_owned());
+        self
+    }
+
+    fn http(&self) -> Result<&http::Http> {
+        if let Some(http) = self.http.get() {
+            return Ok(http);
+        }
+        let _ = self.http.set(http::Http::new(self)?);
+        Ok(self.http.get().unwrap())
     }
 
     pub fn identity(&self) -> String {
@@ -140,17 +162,7 @@ impl S3Store {
     /// The AWS CLI with only the checked endpoint: it would otherwise also read
     /// AWS_ENDPOINT_URL* and a profile's `endpoint_url`, which are never checked.
     pub fn aws(&self) -> Command {
-        let mut command = Command::new("aws");
-        command.env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true");
-        for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("AWS_ENDPOINT_URL") {
-                command.env_remove(name);
-            }
-        }
-        if let Some(endpoint) = &self.endpoint {
-            command.args(["--endpoint-url", endpoint]);
-        }
-        command
+        aws(self.endpoint.as_deref())
     }
 
     fn get(&self, key: &str) -> Result<std::process::Child> {
@@ -160,6 +172,20 @@ impl S3Store {
             .spawn()
             .context("the AWS CLI (aws) is required for snapshot stores")
     }
+}
+
+fn aws(endpoint: Option<&str>) -> Command {
+    let mut command = Command::new("aws");
+    command.env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("AWS_ENDPOINT_URL") {
+            command.env_remove(name);
+        }
+    }
+    if let Some(endpoint) = endpoint {
+        command.args(["--endpoint-url", endpoint]);
+    }
+    command
 }
 
 fn finished(child: std::process::Child, what: &str) -> Result<()> {
@@ -191,9 +217,13 @@ impl SnapshotStore for S3Store {
         ))
     }
 
-    fn push(&self, name: &str, directory: &Path) -> Result<()> {
+    fn push(&self, name: &str, directory: &Path) -> Result<Value> {
         if self.incremental {
-            self.check_recovery_retention()?;
+            // Once per process: a run checks the bucket once, not once per box.
+            if self.retention.get().is_none() {
+                self.check_recovery_retention()?;
+                let _ = self.retention.set(());
+            }
             self.push_chunks(name, directory)
         } else {
             self.push_full(name, directory)
@@ -255,8 +285,10 @@ impl SnapshotStore for S3Store {
 
 #[path = "snapshot_chunks.rs"]
 mod chunks;
+#[path = "snapshot_http.rs"]
+mod http;
 
-fn valid_hash(hash: &str) -> bool {
+pub(crate) fn valid_hash(hash: &str) -> bool {
     hash.len() == 64
         && hash
             .bytes()
@@ -289,9 +321,7 @@ pub fn read_manifest(path: &Path, name: &str) -> Result<Value> {
     Ok(manifest)
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+use crate::snapshot_digest::hex;
 
 /// Copies `reader` into `output`, seeking over all-zero 4 KiB blocks so the file
 /// stays sparse. Returns the SHA-256 of all bytes.

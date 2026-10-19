@@ -64,7 +64,9 @@ pub fn run(base: Option<PathBuf>, action: BackupAction) -> Result<i32> {
                 Some(dir) => dir,
                 None => selfhost::base(base)?.join("runner"),
             };
-            let store = S3Store::new(&to, endpoint_url.as_deref())?.incremental();
+            let store = S3Store::new(&to, endpoint_url.as_deref())?
+                .incremental()
+                .index(&from.join("recovery-index"));
             recover(&store, &from, &store.identity())?;
             Ok(0)
         }
@@ -166,10 +168,11 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
             request["snapshot"] = json!(name);
             request["uploaded"] = json!(uploaded.is_ok());
             wire::request(runner, request)?;
-            uploaded?;
+            let transfer = uploaded?;
             println!(
                 "{}",
-                json!({"workspace":id,"snapshot":name,"last_durable_at":point["captured_at"]})
+                json!({"workspace":id,"snapshot":name,"last_durable_at":point["captured_at"],
+                       "capture":point["chunks"],"transfer":transfer})
             );
             Ok(())
         })();
@@ -658,12 +661,12 @@ mod tests {
             }
             Ok(names)
         }
-        fn push(&self, name: &str, directory: &Path) -> Result<()> {
+        fn push(&self, name: &str, directory: &Path) -> Result<Value> {
             fs::create_dir(self.0.join(name))?;
             for f in ["state", "memory", "disk.ext4", "manifest.json"] {
                 fs::copy(directory.join(f), self.0.join(name).join(f))?;
             }
-            Ok(())
+            Ok(Value::Null)
         }
         fn manifest(&self, name: &str) -> Result<Vec<u8>> {
             Ok(fs::read(self.0.join(name).join("manifest.json"))?)
@@ -725,7 +728,7 @@ mod tests {
             fn pull(&self, name: &str, directory: &Path) -> Result<()> {
                 self.0.pull(name, directory)
             }
-            fn push(&self, name: &str, directory: &Path) -> Result<()> {
+            fn push(&self, name: &str, directory: &Path) -> Result<Value> {
                 ensure!(name != "a", "injected upload failure");
                 self.0.push(name, directory)
             }

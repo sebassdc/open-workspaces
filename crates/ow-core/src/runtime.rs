@@ -247,6 +247,9 @@ struct Snapshot {
     cpu: String,
     kernel_sha256: String,
     files: BTreeMap<String, String>,
+    /// How `files` were hashed; absent is whole-file SHA-256 (see `snapshot_digest`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    digest: Option<String>,
 }
 
 impl Snapshot {
@@ -1050,7 +1053,7 @@ impl Runtime {
     /// Seals a RAM+disk snapshot. With `hibernate` the paused VM is dropped right after
     /// the capture, so nothing the guest does while the files are hashed is lost.
     fn capture(&mut self, id: &str, name: &str, hibernate: bool) -> Result<Value> {
-        self.capture_inner(id, name, hibernate, false)
+        self.capture_inner(id, name, hibernate, false, None)
     }
 
     fn capture_inner(
@@ -1059,6 +1062,7 @@ impl Runtime {
         name: &str,
         hibernate: bool,
         managed: bool,
+        previous: Option<&Path>,
     ) -> Result<Value> {
         let captured_at = crate::recovery::now();
         identifier(name)?;
@@ -1101,11 +1105,27 @@ impl Runtime {
                 self.state.workspaces.get_mut(id).unwrap().state = "stopped".into();
                 self.save()?;
             }
-            let mut files = BTreeMap::new();
-            for file in ["state", "memory", "disk.ext4"] {
-                files.insert(file.into(), hash(&staging.join(file))?);
-            }
+            // Recovery points are chunk-sealed so unchanged reflinked extents are not reread.
+            let (files, digest, stats) = if managed {
+                let (files, stats) = crate::snapshot_digest::seal_directory(
+                    &staging,
+                    &crate::snapshot_store::DATA_FILES,
+                    previous,
+                )?;
+                (
+                    files,
+                    Some(crate::snapshot_digest::CHUNKS_V1.into()),
+                    Some(stats),
+                )
+            } else {
+                let mut files = BTreeMap::new();
+                for file in ["state", "memory", "disk.ext4"] {
+                    files.insert(file.into(), hash(&staging.join(file))?);
+                }
+                (files, None, None)
+            };
             let snapshot = Snapshot {
+                digest,
                 managed_recovery: managed,
                 captured_at,
                 name: name.into(),
@@ -1128,7 +1148,11 @@ impl Runtime {
             File::open(self.root.join("snapshots"))?.sync_all()?;
             self.verified
                 .insert(name.into(), fingerprints(&destination)?);
-            Ok(snapshot.summary())
+            let mut summary = snapshot.summary();
+            if let Some(stats) = stats {
+                summary["chunks"] = json!(stats);
+            }
+            Ok(summary)
         })();
         if result.is_err() && staging.exists() {
             if let Err(error) = fs::remove_dir_all(&staging) {
@@ -1217,8 +1241,16 @@ impl Runtime {
             return Ok(directory);
         }
         for file in snapshot.files.keys() {
+            let path = directory.join(file);
+            let actual = match snapshot.digest.as_deref() {
+                None => hash(&path)?,
+                Some(crate::snapshot_digest::CHUNKS_V1) => crate::snapshot_digest::root(
+                    &crate::snapshot_digest::seal(&path, None)?.0.chunks,
+                ),
+                Some(other) => bail!("unsupported snapshot digest {other}"),
+            };
             ensure!(
-                snapshot.files.get(file) == Some(&hash(&directory.join(file))?),
+                snapshot.files.get(file) == Some(&actual),
                 "snapshot integrity failure: {file}"
             );
         }
@@ -1810,6 +1842,7 @@ mod disk_tests {
             cpu: "old host".into(),
             kernel_sha256: "old kernel".into(),
             files,
+            digest: None,
         };
         atomic_json(&sleep.join("manifest.json"), &snapshot).unwrap();
         let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
@@ -1852,7 +1885,24 @@ mod disk_tests {
         let retry = runtime
             .request(&json!({"op":"recovery-prepare","id":"legacy","store":store}))
             .unwrap();
-        assert_eq!(retry, point, "restart captured a different point");
+        assert_eq!(
+            (&retry["snapshot"], &retry["captured_at"]),
+            (&point["snapshot"], &point["captured_at"]),
+            "restart captured a different point"
+        );
+        assert!(retry.get("chunks").is_none(), "a sealed pin was rehashed");
+        assert_eq!(point["chunks"]["read"], 3);
+        let pinned: Snapshot = serde_json::from_slice(
+            &fs::read(runtime.snapshot_dir(name).join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pinned.digest.as_deref(),
+            Some(crate::snapshot_digest::CHUNKS_V1)
+        );
+        assert!(runtime.snapshot_dir(name).join("chunks.json").is_file());
+        runtime.verified.clear();
+        runtime.verify_snapshot(name, false).unwrap();
         assert!(runtime.request(&json!({"op":"recovery-result","id":"legacy","store":store,"snapshot":"other","uploaded":true})).is_err());
         for old in ["sleep-recovery-old", "manual", "recovery-manual"] {
             fs::create_dir(runtime.snapshot_dir(old)).unwrap();
@@ -1992,6 +2042,7 @@ mod disk_tests {
             cpu: String::new(),
             kernel_sha256: String::new(),
             files: BTreeMap::new(),
+            digest: None,
         };
         let directory = runtime.snapshot_dir("saved");
         fs::create_dir(&directory).unwrap();
@@ -2209,6 +2260,7 @@ mod disk_tests {
                 ("disk.ext4".into(), String::new()),
             ]
             .into(),
+            digest: None,
         };
         atomic_json(&saved.join("manifest.json"), &snapshot).unwrap();
         runtime
