@@ -68,7 +68,8 @@ copying a snapshot does not sanitize guest credentials.
 
 ## Migration and rollout
 
-Schema 5 has minimum reader schema 5. Schema-3 ownership/grants/operations and
+The placement migration introduced schema 5 / reader floor 5; explicit runner
+retirement advances the catalog to schema 6 / reader floor 6. Schema-3 ownership/grants/operations and
 schema-4 artifacts/copies/leases survive the additive migration. Foreign keys,
 private owned catalog permissions, WAL and FULL synchronous writes remain enabled.
 Old readers/writers are refused: they cannot safely ignore parked placement,
@@ -370,3 +371,9 @@ It checks real process/boot continuity, strict pinned-host-key OpenSSH, grants, 
 ownership, separate enrollment and independent disk writes on two disposable workers.
 Its execution record, rather than its presence or a successful API call, establishes
 hardware acceptance. Live cloud-store IAM/policy and fleet rollout remain separate.
+
+## Explicit runner retirement
+
+See [runner drain](DRAIN.md) for schema-6 controller states, protected eligibility,
+source-only cleanup and sealed, generation-bound empty certificates. Installation
+never drains a runner; provider destruction remains outside the controller slice.

@@ -232,6 +232,32 @@ fn ensure_awake_with_key(
     explicit: bool,
     caller_key: Option<&str>,
 ) -> Result<Option<Value>> {
+    let wait = std::time::Instant::now();
+    loop {
+        let pending = {
+            let mut c = shared.lock().unwrap();
+            let user = c.user(identity)?;
+            let physical = c.machine(user, address, permission)?;
+            let (node,state):(String,String)=c.db.query_row("SELECT node,COALESCE(json_extract(metadata,'$.state'),'unknown') FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            if node.is_empty() || !crate::drain::blocked(&c.db, &node)? || state == "running" {
+                false
+            } else {
+                ensure!(
+                    explicit || state != "stopped",
+                    "stopped box requires explicit start; drain preserves stopped state"
+                );
+                true
+            }
+        };
+        if !pending {
+            break;
+        }
+        ensure!(
+            wait.elapsed() < Duration::from_secs(25),
+            "runner draining; joined parking wait, reconnect to wake elsewhere"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let t = {
         let mut c = shared.lock().unwrap();
         let user = c.user(identity)?;

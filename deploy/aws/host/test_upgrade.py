@@ -559,3 +559,19 @@ class Staging(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DrainAuthorities(unittest.TestCase):
+    def test_upgrade_clear_preserves_the_retirement_seal(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seal = root / "drain-seal.json"
+            seal.write_text('{"seal":"fixture-retirement"}')
+            with patch.object(u, "p", side_effect=lambda _: root / "drain"), patch.object(h, "role", return_value="runner"):
+                ops = u.HostOps()
+                ops.drain(True)
+                self.assertTrue((root / "drain").exists())
+                ops.drain(False)
+            self.assertFalse((root / "drain").exists())
+            self.assertEqual(json.loads(seal.read_text()), {"seal": "fixture-retirement"})
