@@ -36,7 +36,8 @@ impl Http {
                 configured_region(store).unwrap_or_else(|| "us-east-1".into()),
             ),
             None => {
-                let region = bucket_region(&client, bucket)?;
+                let configured = configured_region(store).unwrap_or_else(|| "us-east-1".into());
+                let region = bucket_region(&client, bucket, &configured)?;
                 let endpoint = url::Url::parse(&format!("https://s3.{region}.amazonaws.com"))?;
                 // Dotted names do not match the wildcard certificate as virtual hosts.
                 let style = if bucket.contains('.') {
@@ -240,10 +241,22 @@ fn configured_region(store: &S3Store) -> Option<String> {
     (!region.is_empty()).then_some(region)
 }
 
-/// AWS answers any bucket request, even an unauthenticated one, with its region.
-fn bucket_region(client: &reqwest::blocking::Client, bucket: &str) -> Result<String> {
+/// AWS answers any bucket request, even an unauthenticated one to another
+/// region's endpoint, with the bucket's region.
+fn bucket_region(
+    client: &reqwest::blocking::Client,
+    bucket: &str,
+    probe: &str,
+) -> Result<String> {
+    ensure!(
+        !probe.is_empty()
+            && probe
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        "invalid AWS region"
+    );
     let response = client
-        .head(format!("https://s3.amazonaws.com/{bucket}"))
+        .head(format!("https://s3.{probe}.amazonaws.com/{bucket}"))
         .send()
         .context("finding the snapshot bucket's region")?;
     let region = response
