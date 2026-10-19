@@ -163,7 +163,7 @@ consistent, with these post-release checks explicitly reserved for planner.
 Reviewed scoped commit **`6a6e3d0cc3f70a5c0f16930a17c70a9917685b29`**
 on `work/host-core`. Independently read final `docs/HOSTS.md`, core interface,
 report/handoff and release scripts. Compared **committed blobs** against
-`/home/sebassdc/dev/open-workspaces/data/host-core-build/release-final2/build.json`:
+`/path/to/open-workspaces/data/host-core-build/release-final2/build.json`:
 all **32 compiled input hashes match**, zero mismatches; source-manifest digest
 valid. All **25 changed files** have no working-tree diff against this commit.
 AGENTS, .agent-protocol and taskboard are excluded. Commit whitespace check has

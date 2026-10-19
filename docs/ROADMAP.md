@@ -1,6 +1,6 @@
 # Roadmap and acceptance gates
 
-The runtime spike produced a runnable local Rust/Firecracker prototype; see
+The runtime spike produced a runnable local Firecracker prototype; see
 [usage](LOCAL_PROTOTYPE.md) and [evidence](experiments/runtime-spike.md).
 The broader acceptance gates remain open. Estimates are planning ranges for
 2–3 experienced engineers, not commitments; runtime, security, staffing, and
@@ -123,7 +123,7 @@ See [wake on connect, snapshot store and golden images](DAILY_USE.md).
 - Real guest boot, exec/exit status, binary file transfer and loopback HTTP access.
 - Persistent disk, immutable paired RAM/disk snapshots, independent full-state
   forks and hibernation/resume with HTTP process memory retained.
-- Rust CLI/worker/gateway with user-scoped authenticated control access, basic namespace
+- CLI/worker/gateway with user-scoped authenticated control access, basic namespace
   networking, conservative resource admission and live memory statistics.
 - Repeated operations, tampered artifacts, guest-root network attempts, cold
   restart and abrupt worker-loss recovery exercised by real-VM regression.
@@ -163,7 +163,7 @@ Gate: reproducible evidence and runtime decision, per HANDOFF.md.
 
 ## Phase 1 — Usable alpha (6–10 additional weeks)
 
-- Rust workspace, API/worker/guest-agent/CLI; reproducible local build and host setup.
+- API/worker/guest-agent/CLI workspace; reproducible local build and host setup.
 - One authenticated operator and one worker; persistent desired/observed state and idempotent operations.
 - Create/list/inspect/exec/files/start/stop/reboot/delete, streamed output, exit codes, readiness checks.
 - Initial local pilot includes named paired RAM+disk snapshots and independent full-state forks, with identity/entropy refresh and measured fan-out resource use. Validate the primitives in Phase 0 before productizing them.

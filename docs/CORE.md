@@ -180,7 +180,7 @@ Observed on 2026-10-16:
   yet shown.
 
 Not yet verified: `ow node add` end to end over `ssm://` or `tailscale://`
-(the transport is the only change from `ssh://`, which WRK-1 tested end to
+(the transport is the only change from `ssh://`, which the SSH runner acceptance tested end to
 end), a Tailscale SSH login, and no guest was booted in these tests. Both
 connect checks are in the morning test checklist.
 

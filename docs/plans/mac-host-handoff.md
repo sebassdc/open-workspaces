@@ -6,7 +6,7 @@ A native Mac node contributing real ARM64 Linux workspaces to the private pool;
 separate Tahoe guest support evaluated within owner-approved allocation.
 
 ## Where it stands
-- Done: original signed Swift helper, Rust local CLI entry point, pinned ARM64
+- Done: original signed Swift helper, local CLI entry point, pinned ARM64
   preparer, actual 15-check hardware acceptance and two native Rust tests.
 - Verified: disk persistence, paired RAM/disk recovery, corruption denials,
   independent disk writes and confirmed guest/helper cleanup. No guest is running.
@@ -26,7 +26,7 @@ None for the next independent Linux step. Dedicated invite needed later for
 pool acceptance; owner allocation/licensing review needed before Tahoe install.
 
 ## Files
-Worktree `/Users/sebassdc/dev/open-workspaces-mac-host`, branch `work/mac-host`,
+Worktree `/path/to/operator/dev/open-workspaces-mac-host`, branch `work/mac-host`,
 baseline `b1703f1b443c8380273eee3f9823e304170c95e5`.
 Brief `docs/plans/mac-host-brief.md`; runtime `native/macos/`;
 Rust `crates/ow/src/mac_host.rs`; scripts `scripts/*mac-host*`;

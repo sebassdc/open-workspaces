@@ -185,6 +185,17 @@ source/binary attribution, failures, cleanup and limitations. The ignored
 explicit fresh short root, binary, pristine template assets and a planner-granted
 exclusive host turn. They never adopt owner disks or use production credentials.
 
+Before running either SSH acceptance script, set `OW_SSH_PROTECTED_ROOT` to the
+existing shared checkout whose workers and owner disk must remain unchanged.
+Keep the same value for preparation and execution; this is separate from the
+test worktree and fresh fixture root. Missing or nonexistent paths are refused
+before fixture setup. For example:
+
+```sh
+export OW_SSH_PROTECTED_ROOT=/path/to/shared-checkout
+python3 scripts/test-ssh-acceptance.py  # preservation regression; no VM required
+```
+
 Configuration and trust behavior follow the official
 [OpenSSH server manual](https://man.openbsd.org/sshd_config),
 [client configuration manual](https://man.openbsd.org/ssh_config) and

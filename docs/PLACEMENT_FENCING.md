@@ -17,7 +17,7 @@ commit. That boolean is an authenticated controller assertion, not a replacement
 for the catalog transaction. Private local control remains an OS-owner capability.
 
 The worker checks ordinary start, implicit exec/files/key-update wake, SSH,
-terminal, and address/preview wake under its runtime lock. Existing direct Rust
+terminal, and address/preview wake under its runtime lock. Existing direct
 SSH/terminal/address methods accept unmanaged workspaces only; request-bearing
 methods validate managed authority. A deliberately stopped machine still requires
 explicit start. Managed incompatible RAM never silently cold boots; prepare with

@@ -6,4 +6,4 @@ resolver = "2"
 # Kept equal to deploy/aws/package.json, the release version (deploy/aws/test/version.test.mjs).
 version = "0.9.15"
 edition = "2024"
-license = "Apache-2.0"
+license = "MIT"

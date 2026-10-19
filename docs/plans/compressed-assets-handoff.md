@@ -7,7 +7,7 @@ Deliver the reviewed pristine Ubuntu image with measured compressed transfer and
 ## Where it stands
 - Done: product transport/decoder/gateway, codec pins, offline exact route intent, preparation and tests; branch `work/compressed-assets`, scoped commit at HEAD named `Implement bounded compressed Ubuntu asset delivery`.
 - Done: 15 native onboarding tests; 21 reviewed static CLI synthetic TLS cases; full pristine built-in TLS decode and sparse 8 GiB publication. Original SHA `87ba61583f33e129f08776d1a4b8c1557322f146a7de0ed44581e2000f3f3f6b`; encoded 442,888,634 bytes; full compression ran once.
-- Done: frozen outputs under `/home/sebassdc/dev/open-workspaces-lanes/compressed-assets/data/compressed-assets-build/`: `release-reviewed/ow-linux-amd64`, `bundle-reviewed/` (raw + compressed manifests/blobs, matching CLI/checksum/build). `final-checks.json` binds commit, source/artifacts/scripts/evidence.
+- Done: frozen outputs under `/path/to/worktrees/compressed-assets/data/compressed-assets-build/`: `release-reviewed/ow-linux-amd64`, `bundle-reviewed/` (raw + compressed manifests/blobs, matching CLI/checksum/build). `final-checks.json` binds commit, source/artifacts/scripts/evidence.
 - Not started by this lane: independent stable-commit clearance, deployment/public pins/headers and preservation checks. Parent owns them.
 
 ## Next step
@@ -17,7 +17,7 @@ Parent reviews stable commit + `docs/plans/compressed-assets-report.md` pins and
 None for lane completion. Parent review/publication is the remaining release gate.
 
 ## Files
-- Parent brief: `/home/sebassdc/dev/open-workspaces/docs/plans/compressed-assets-brief.md` (owner already authorized; do not ask for go again).
+- Parent brief: `/path/to/open-workspaces/docs/plans/compressed-assets-brief.md` (owner already authorized; do not ask for go again).
 - Report: `docs/plans/compressed-assets-report.md`; operator contract: `docs/HOSTS.md`.
 - Changed code/scripts: `crates/ow/src/onboarding.rs`, codec Cargo files, `scripts/prepare-compressed-host-bundle.py`, raw preparer directory fsync, ingress regex/legacy handling; focused experiments under `experiments/compressed-assets/`, existing source-check extensions.
 - Successful receipts/logs: `data/compressed-assets/tests-reviewed.log`, `benchmark.json`, `full.json`; `data/compressed-assets-build/build-reviewed.log`, `prepare-reviewed.log`, `tls-reviewed/`, `tls-pristine/`; `data/compressed-assets/source-checks-reviewed.log`.

@@ -46,7 +46,7 @@ Uncommitted objects remain until controller GC is implemented. There is no new
 eager snapshot upload, runner eviction, placement fencing or fleet scaling here.
 
 The implementation reuses the existing AWS CLI endpoint validation and credential
-chain, Rust SHA-256/zstd dependencies and sparse download writer. No credentials,
+chain, SHA-256/zstd dependencies and sparse download writer. No credentials,
 deployment values or host identifiers belong in manifests or repository config.
 
 ## Sources and acceptance

@@ -121,7 +121,7 @@ fn incremental_retry_integrity_and_legacy_restore() {
     // An existing name cannot be assigned to different sealed bytes.
     capture(&root.join("collision"), "two", b"other");
     assert!(store.push("two", &root.join("collision")).is_err());
-    // Original whole-file WRK-4 representation is still readable.
+    // Original whole-file representation is still readable.
     let legacy = remote.join("legacy");
     capture(&legacy, "legacy", b"old disk");
     for file in ["state", "memory", "disk.ext4"] {
