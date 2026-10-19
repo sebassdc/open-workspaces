@@ -1288,12 +1288,14 @@ impl Catalog {
         }
         if op == "create" {
             let selector = request["image"].as_str().unwrap_or("alpine").to_owned();
-            // An existing create retains the version first chosen, even if current changed.
+            // Keep the first image version without rewriting omitted legacy defaults in retry fingerprints.
             let previous: Option<String> = self.db.query_row("SELECT json_extract(metadata,'$.image') FROM resources WHERE owner=?1 AND kind='machine' AND name=?2", params![user,name], |r| r.get(0)).optional()?.flatten();
             if let Some(previous) =
                 previous.filter(|p| p == &selector || crate::image_catalog::same_name(p, &selector))
             {
-                request["image"] = json!(previous);
+                if previous != selector {
+                    request["image"] = json!(previous);
+                }
             } else if let Ok(image) = crate::image_catalog::resolve(&self.db, &selector) {
                 request["image"] = json!(format!("{}@{}", image.name, image.version));
             } else if selector.contains('@') {
