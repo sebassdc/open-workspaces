@@ -71,6 +71,8 @@ struct Pool {
     node_types: BTreeMap<String, String>,
     default_type: Option<String>,
     retired_nodes: Vec<String>,
+    /// Explicit elastic liability caps; absent configuration disables scaler proposals.
+    elastic: Option<Liability>,
 }
 impl Default for Pool {
     fn default() -> Self {
@@ -81,6 +83,7 @@ impl Default for Pool {
             node_types: BTreeMap::new(),
             default_type: None,
             retired_nodes: Vec::new(),
+            elastic: None,
         }
     }
 }
@@ -374,4 +377,61 @@ pub(crate) fn free_pool(root: &Path) {
         br#"{"pool":{"default_type":"test-self-hosted","hourly_cents":{"test-self-hosted":0}}}"#,
     )
     .unwrap();
+}
+
+/// Forecast horizon liability, not an elapsed-spend or provider-billing ledger.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Liability {
+    pub cents: u64,
+    pub instances: u64,
+    pub disk_bytes: u64,
+}
+impl Liability {
+    pub(crate) fn add(self, rhs: Self) -> Result<Self> {
+        Ok(Self {
+            cents: self
+                .cents
+                .checked_add(rhs.cents)
+                .context("cost liability overflow")?,
+            instances: self
+                .instances
+                .checked_add(rhs.instances)
+                .context("instance liability overflow")?,
+            disk_bytes: self
+                .disk_bytes
+                .checked_add(rhs.disk_bytes)
+                .context("disk liability overflow")?,
+        })
+    }
+    pub(crate) fn multiply(self, n: u64) -> Result<Self> {
+        Ok(Self {
+            cents: self
+                .cents
+                .checked_mul(n)
+                .context("cost liability overflow")?,
+            instances: self
+                .instances
+                .checked_mul(n)
+                .context("instance liability overflow")?,
+            disk_bytes: self
+                .disk_bytes
+                .checked_mul(n)
+                .context("disk liability overflow")?,
+        })
+    }
+    pub(crate) fn within(self, cap: Self) -> bool {
+        self.cents <= cap.cents
+            && self.instances <= cap.instances
+            && self.disk_bytes <= cap.disk_bytes
+    }
+}
+/// Shares the existing pool horizon and spend ceiling; no second spend policy.
+pub(crate) fn elastic_caps(root: &Path) -> Result<(u64, Liability, Vec<String>)> {
+    let p = load(root)?.pool;
+    let mut caps = p
+        .elastic
+        .context("configure limits.pool.elastic before shadow scaling")?;
+    caps.cents = caps.cents.min(p.max_estimated_cents);
+    Ok((p.hours, caps, p.retired_nodes))
 }

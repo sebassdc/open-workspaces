@@ -103,7 +103,7 @@ struct Authority {
 fn authority(db: &Connection, now: i64) -> Result<Authority> {
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     ensure!(
-        version == 6,
+        [6, 7].contains(&version),
         "GC root contract is not known for this catalog schema"
     );
     ensure!(

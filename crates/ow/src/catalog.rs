@@ -397,6 +397,10 @@ impl Catalog {
         db.execute_batch("CREATE TABLE IF NOT EXISTS node_usage(node TEXT PRIMARY KEY,extra_mib INTEGER NOT NULL DEFAULT 0,extra_cpus INTEGER NOT NULL DEFAULT 0,extra_slots INTEGER NOT NULL DEFAULT 0);")?;
         crate::drain::initialize(&db)?;
         crate::store_gc::initialize(&db)?;
+        crate::scaler::initialize(&db)?;
+        if version < 7 {
+            db.execute_batch("INSERT INTO settings(key,value) VALUES('min_reader_schema','7') ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),7);")?;
+        }
         if version < 6 {
             db.execute_batch("INSERT INTO settings(key,value) VALUES('min_reader_schema','6') ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),6);")?;
         }
