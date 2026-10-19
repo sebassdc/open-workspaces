@@ -202,6 +202,10 @@ instance lifecycle policy is required. See the official
 and [retention configuration](https://docs.aws.amazon.com/autoscaling/ec2/userguide/configure-instance-retention.html).
 This is documented upstream behavior, not a deployed-provider test.
 
+The opt-in AWS [`RunnerPool`](RUNNER_POOL.md) supplies the provider side: it
+writes this observation file and performs exact launch and removal actions when an
+operator runs them. The planner does not invoke it.
+
 **Live activation remains unavailable.** It requires the accepted replacement-
 controller recovery drill; complete durable/cap accounting; a concrete provider
 adapter whose rendered configuration and dedicated-fixture tests prove the total
