@@ -646,6 +646,20 @@ class Staging(unittest.TestCase):
         self.assertIn("from source: --from-source", self.log)
         self.assertEqual(self.seen, [])
 
+    def test_a_failed_download_is_refused_not_a_traceback(self):
+        def fail(*a, **k):
+            raise u.urllib.error.URLError("network unreachable")
+
+        with mock.patch.object(u.urllib.request, "urlopen", fail):
+            with self.assertRaisesRegex(Refused, "cannot download .*--from-source"):
+                u.download("https://github.com/o/r/releases/download/v1.2.3/SHA256SUMS")
+
+        def missing(*a, **k):
+            raise u.urllib.error.HTTPError(a[0], 404, "Not Found", None, None)
+
+        with mock.patch.object(u.urllib.request, "urlopen", missing):
+            self.assertIsNone(u.download("https://github.com/o/r/releases/download/v1.2.3/SHA256SUMS"))
+
     def test_release_urls_are_github_tags_only(self):
         self.assertEqual(u.release_url("https://github.com/o/r.git", "v1.2.3"),
                          "https://github.com/o/r/releases/download/v1.2.3")

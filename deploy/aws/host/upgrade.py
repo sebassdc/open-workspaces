@@ -248,10 +248,10 @@ def download(url):
     try:
         with urllib.request.urlopen(url, timeout=300) as response:
             return response.read()
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
+    except OSError as e:  # urllib's HTTP and network errors, and timeouts
+        if isinstance(e, urllib.error.HTTPError) and e.code == 404:
             return None
-        raise
+        raise Refused(f"cannot download {url}: {e}; retry, or pass --from-source")
 
 
 def released(target, role):
