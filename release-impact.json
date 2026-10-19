@@ -2,6 +2,46 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.0",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "component",
+        "config",
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "catalog": {
+        "schema": 4,
+        "min_reader": 3
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Opt-in write-once S3 artifacts, digest-pinned name@N images and controller-selected image builds. Additive catalog schema 4 retains schema 3 SQL read/write compatibility; copy the catalog before moving controller and dashboard. Worker selectors and image digest metadata require the normal class 2 hibernate/swap/resume cycle. Runtime, protocol, kernel, legacy SnapshotStore and stage 0 stay compatible. Preserve capture checks and explicit cold-memory-loss consent; no host replacement or automatic store activation."
+    },
+    {
       "version": "0.8.4",
       "class": 2,
       "changes": [

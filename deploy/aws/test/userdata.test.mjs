@@ -99,10 +99,13 @@ test("the config is validated in the component", () => {
     }
 });
 
-test("capability admission enables a dashboard without logins or user data changes", async () => {
+test("capability admission and store pins compose without user data changes", async () => {
     const before = await deploy({});
-    const after = await deploy({ tailscaleAuthKeySecretArn: secretArn, dashboardCapability: "example.test/cap/open-workspaces" });
+    const pins = { ubuntu: { version: 1, attempt: "a".repeat(32), digest: "b".repeat(64) } };
+    const after = await deploy({ tailscaleAuthKeySecretArn: secretArn, dashboardCapability: "example.test/cap/open-workspaces",
+        storeUrl: "s3://bucket/prefix", imageArtifacts: pins });
     assert.deepEqual(after.config.dashboard, { logins: [], capability: "example.test/cap/open-workspaces" });
+    assert.deepEqual(after.config.store, { url: "s3://bucket/prefix", images: pins });
     assert.equal(before.userData, after.userData);
 });
 

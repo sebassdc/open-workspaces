@@ -445,7 +445,7 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                     directInterface ? directInterface.macAddress : pulumi.output(""),
                     pulumi.all([args.storeUrl ?? "", args.imageArtifacts ?? {}]),
                 ])
-                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes], runner, directMac]) =>
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes], runner, directMac, [storeUrl, imageArtifacts]]) =>
                     JSON.stringify(hostConfig({
                         repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
                         dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, runner, directMac, storeUrl, imageArtifacts,

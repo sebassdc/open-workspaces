@@ -145,8 +145,10 @@ The additive catalog is schema 4 with reader floor 3. Schema 3 SQL readers/write
 can retain existing ownership/resource data and preserve artifact rows and schema
 version. They do not implement image administration; old controllers may refuse
 versioned node advertisements. This is not a promise that old workers implement
-new image selectors. A coordinated future release must declare the new catalog
-and worker impacts; do not rewrite an already published release entry.
+new image selectors. Release v0.9.0 declares the new catalog and worker impacts.
+The upgrader copies the catalog and moves both controller and dashboard around this schema change;
+the worker follows its normal class 2 capture gate. Published release entries
+remain immutable.
 
 ## Limits and acceptance
 
