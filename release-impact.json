@@ -37,6 +37,43 @@
       "notes": "Host staging (first install and ow-host upgrade) installs the pinned release's published Linux ow and, on worker hosts, the newly published ow-guest-linux-amd64, after checking them against the release's SHA256SUMS and source-commit.txt (exact tag and commit); a checksum or commit mismatch is refused before anything is written. A commit that is not the release tag, a missing asset, a non-GitHub repository or --from-source builds on the host as before, and the log names the path. Upgrades run by this or a later ow-host use it; an older ow-host staging this release still builds it. No unit, protocol, catalog, runtime, guest kernel or stage 0 change; no restart."
     },
     {
+      "version": "0.9.18",
+      "class": 1,
+      "changes": [
+        "component",
+        "host-layout",
+        "controller"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Opt-in RunnerPool component and controller-host adapter (ow-host pool). New infrastructure only: an unchanged consumer stack gets no new instance and no host replacement; bootstrap.sh, stage 0 and existing Host/Runner resources are unchanged. ow_host.py gains pool-runner identity (node from its data volume) and a join request through a per-instance secret; existing host and runner configs validate and render as before. The controller scaler accepts an opt-in live mode, refused unless a private recovery-drill attestation and a passing provider check for every pool exist; it then makes only newly recorded actions effectful for the adapter to execute and settle by receipt. Shadow configs behave as before. No agent, worker, catalog schema (7, reader floor 7), runtime or CPU ratio change."
+    },
+    {
       "version": "0.9.17",
       "class": 0,
       "changes": [

@@ -74,7 +74,7 @@ fn real_catalog_tick_restart_status_and_reader_floor_preserve_shadow_only_state(
         first["pools"][0]["live_blocked"]
             .as_str()
             .unwrap()
-            .contains("no provider executor")
+            .contains("nothing is dispatched")
     );
     assert_eq!(
         attempt(&root, &mut f.c.db, 100).unwrap()["pools"][0]["state"],
@@ -95,7 +95,7 @@ fn real_catalog_tick_restart_status_and_reader_floor_preserve_shadow_only_state(
     );
     assert_eq!(backup_count, std::fs::read_dir(&root).unwrap().count());
     assert_eq!(command(&root, false).unwrap()["config_present"], true);
-    f.write("scaler.json", json!({"mode":"live","pools":[pool()]}));
+    f.write("scaler.json", json!({"mode":"other","pools":[pool()]}));
     assert!(attempt(&root, &mut f.c.db, 101).is_err());
     assert!(
         status(&f.c.db).unwrap()["error"]
@@ -105,6 +105,224 @@ fn real_catalog_tick_restart_status_and_reader_floor_preserve_shadow_only_state(
     );
     assert_eq!(state(&f.c.db, "default").unwrap(), held);
 }
+#[test]
+fn live_mode_is_refused_without_activation_evidence_and_never_promotes_shadow_intent() {
+    let mut f = Fixture::new();
+    f.configure();
+    let root = f.c.root.clone();
+    let mut p = pool();
+    p.floor = 1;
+    f.write("scaler.json", json!({"mode":"live","pools":[p]}));
+    let error = |f: &Fixture| {
+        status(&f.c.db).unwrap()["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    assert!(attempt(&root, &mut f.c.db, 100).is_err());
+    assert!(
+        error(&f).contains("scaler-activation.json"),
+        "{}",
+        error(&f)
+    );
+    f.write(
+        "scaler-activation.json",
+        json!({"recovery_drill":"private drill record"}),
+    );
+    assert!(attempt(&root, &mut f.c.db, 100).is_err());
+    assert!(error(&f).contains("pool check"), "{}", error(&f));
+    f.write(
+        "scaler-provider-check.json",
+        json!({"pools":{"default": 101}}),
+    );
+    assert!(
+        attempt(&root, &mut f.c.db, 100).is_err(),
+        "a check from the future refuses"
+    );
+    f.write(
+        "scaler-provider-check.json",
+        json!({"pools":{"other": 100}}),
+    );
+    assert!(
+        attempt(&root, &mut f.c.db, 100).is_err(),
+        "every configured pool needs its own check"
+    );
+    assert!(
+        state(&f.c.db, "default").unwrap().action.is_none(),
+        "refused ticks record nothing"
+    );
+    f.write(
+        "scaler-provider-check.json",
+        json!({"pools":{"default": 90}}),
+    );
+    let live = attempt(&root, &mut f.c.db, 100).unwrap();
+    assert_eq!(live["mode"], "live");
+    let action = state(&f.c.db, "default").unwrap().action.unwrap();
+    assert_eq!(
+        action.phase,
+        Phase::Launching,
+        "a newly recorded launch is effectful"
+    );
+    let now = ow_core::recovery::now();
+    f.write(
+        "scaler-provider-check.json",
+        json!({"pools":{"default": now}}),
+    );
+    let current = command(&root, false).unwrap();
+    assert_eq!(current["mode"], "live");
+    assert!(current["error"].is_null());
+    assert_eq!(current["pools"][0]["state"]["action"], json!(action));
+    // Revoking or expiring evidence must take effect before another tick runs.
+    for check in [json!({"pools":{}}), json!({"pools":{"default":now-86401}})] {
+        f.write("scaler-provider-check.json", check);
+        assert!(
+            command(&root, false).unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("no passing provider check")
+        );
+    }
+    std::fs::remove_file(root.join("scaler-activation.json")).unwrap();
+    assert!(
+        command(&root, false).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("scaler-activation.json")
+    );
+    f.write("scaler.json", json!({"mode":"shadow","pools":[pool()]}));
+    let shadow = command(&root, false).unwrap();
+    assert_eq!(shadow["mode"], "shadow");
+    assert_eq!(shadow["pools"][0]["state"]["action"], json!(action));
+    assert!(
+        live["pools"][0]["live_blocked"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+}
+#[test]
+fn delayed_aws_hook_round_trips_through_the_real_planner_and_adapter() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    let script = r#"
+import contextlib, io, json, sys
+from unittest.mock import patch
+from test_pool import Executor, NODE_A, VOL_A, rp
+f = Executor()
+f.setUp()
+try:
+    f.as_controller()
+    f.aws.nodes = [{'id': NODE_A, 'online': True, 'capabilities': {'vcpus': 4}}]
+    f.aws.drain[NODE_A] = 'removed'
+    f.aws.launch('i-0a', VOL_A)
+    f.aws.group['DesiredCapacity'] = 1
+    f.aws.termination_state = 'Terminating'
+    for turn in range(3):
+        f.aws.scaler = json.loads(sys.stdin.readline())
+        assert f.aws.scaler['pools'][0]['execution_allowed'] is True
+        if turn == 1:
+            f.aws.member('i-0a')['LifecycleState'] = 'Terminating:Wait'
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(rp.h, 'chown'):
+            rp.sync(['dev'])
+        assert f.aws.group['DesiredCapacity'] == 0
+        if turn == 0:
+            assert not any('complete-lifecycle-action' in c for c in f.aws.calls)
+        print(json.dumps(f.observed()), flush=True)
+    completed = [c for c in f.aws.calls if 'complete-lifecycle-action' in c]
+    assert len(completed) == 1 and completed[0][completed[0].index('--instance-id') + 1] == 'i-0a'
+    assert f.aws.group['Instances'] == []
+finally:
+    f.tearDown()
+"#;
+    let mut child = Command::new("python3")
+        .args(["-c", script])
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/aws/host"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let db = Connection::open_in_memory().unwrap();
+    initialize(&db).unwrap();
+    let mut p = pool();
+    p.name = "dev".into();
+    p.idle_seconds = 0;
+    let mut i = super::super::tests::input();
+    let mut runner =
+        super::super::tests::runner("dev-0aaaaaaaaaaaaaaaa", p.presets[0].capacity, i.now);
+    runner.candidate.pool = p.name.clone();
+    i.runners = vec![runner];
+    i.ready_instances = 1;
+    i.pool_instances = 1;
+    let mut plan = record_mode(&db, &p, &i, super::super::tests::caps(), true).unwrap();
+    for turn in 0..3 {
+        let mut value = json!(plan);
+        value["stale"] = json!(false);
+        writeln!(
+            stdin,
+            "{}",
+            json!({"mode":"live","error":null,"pools":[value]})
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        assert!(stdout.read_line(&mut line).unwrap() > 0);
+        let observed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(observed["outcome_resolved"], true);
+        i.now += 1;
+        i.inventory_fresh = observed["complete"] == true;
+        i.retention_ok = observed["retention_ok"] == true;
+        i.outcome_resolved = observed["outcome_resolved"] == true;
+        i.receipt = Some(serde_json::from_value(observed["receipts"]["dev"].clone()).unwrap());
+        plan = record_mode(&db, &p, &i, super::super::tests::caps(), true).unwrap();
+        assert_eq!(plan.execution_allowed, turn < 2);
+    }
+    assert!(plan.state.action.is_none());
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn stale_inventory_revokes_execution_without_discarding_a_live_launch() {
+    let mut f = Fixture::new();
+    f.configure();
+    let root = f.c.root.clone();
+    let now = ow_core::recovery::now();
+    let mut p = pool();
+    p.floor = 1;
+    f.write("scaler.json", json!({"mode":"live","pools":[p]}));
+    f.write(
+        "scaler-activation.json",
+        json!({"recovery_drill":"accepted fixture"}),
+    );
+    f.write(
+        "scaler-provider-check.json",
+        json!({"pools":{"default":now-2}}),
+    );
+    let mut observed = json!({"hours":24,"observed_at":now-1,"complete":true,"retention_ok":true,"outcome_resolved":true,"instances":[],"disks":[],"receipts":{}});
+    f.write("scaler-observations.json", observed.clone());
+    let launched = attempt(&root, &mut f.c.db, now - 1).unwrap();
+    assert_eq!(launched["pools"][0]["execution_allowed"], true);
+    observed["observed_at"] = json!(now - 100);
+    f.write("scaler-observations.json", observed);
+    attempt(&root, &mut f.c.db, now).unwrap();
+    let current = command(&root, false).unwrap();
+    assert_eq!(current["mode"], "live");
+    assert!(current["error"].is_null());
+    let plan = &current["pools"][0];
+    assert_eq!(plan["stale"], false);
+    assert_eq!(
+        plan["reason"],
+        "provider inventory missing, incomplete or stale; actions disabled"
+    );
+    assert_eq!(
+        plan["state"]["action"],
+        launched["pools"][0]["state"]["action"]
+    );
+    assert_eq!(plan["execution_allowed"], false);
+}
+
 #[test]
 fn retained_pending_orphaned_instances_and_all_disks_remain_billable_liabilities() {
     let f = Fixture::new();

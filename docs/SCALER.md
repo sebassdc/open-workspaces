@@ -2,8 +2,9 @@
 
 The controller can opt in to a small planner. It records at most one launch or
 soft-drain recommendation per pool per iteration, with its reason, queued shapes,
-progress and maximum forecast liability in SQLite. **There is no live executor,
-cloud API call, automatic drain, termination or enrollment in this release.**
+progress and maximum forecast liability in SQLite. The controller itself never
+calls a cloud API. Only the gated [live mode](#live-mode) lets the AWS RunnerPool
+adapter execute a recorded action; shadow mode, the default, dispatches nothing.
 Installation alone starts no scaler loop. Existing workers, boxes and CPU budgets
 keep their current configuration.
 
@@ -180,9 +181,8 @@ other pools' expired forecasts. They can be cancelled without a provider receipt
 because nothing was dispatched. Effectful and uncertain reservations never expire
 this way. History remains in `scaler_actions`.
 
-Effectful launch/join/drain phases are dormant reconciliation contracts exercised
-by tests. There is no command that enters them or promotes shadow intent to live.
-If a future executor enters one, an unknown reply or join timeout retains its
+In live mode (below) a newly recorded launch or drain enters `launching` or
+`draining`; intent recorded in shadow is never promoted. An unknown reply or join timeout retains its
 reservation and prohibits another action. Only exact-action positive absence or
 a fresh capable enrolled runner correlated to one provider instance can settle
 a launch. A heartbeat or desired-capacity value alone is insufficient. A matching
@@ -202,7 +202,26 @@ instance lifecycle policy is required. See the official
 and [retention configuration](https://docs.aws.amazon.com/autoscaling/ec2/userguide/configure-instance-retention.html).
 This is documented upstream behavior, not a deployed-provider test.
 
-**Live activation remains unavailable.** It requires the accepted replacement-
+The opt-in AWS [`RunnerPool`](RUNNER_POOL.md) is the provider executor: its
+`ow-host pool sync` writes this observation file, performs the in-flight live action
+exactly once and reports the action's receipt.
+
+### Live mode
+
+`"mode": "live"` in `scaler.json` makes each newly recorded action effectful. The
+controller refuses every live tick (keeping its prior state and reporting the error)
+unless the data directory also holds two private files:
+
+```json
+{"recovery_drill": "reference to the accepted replacement-controller drill record"}
+```
+
+as `scaler-activation.json` (an operator attestation), and `scaler-provider-check.json`,
+written by `ow-host pool check` with a pass for **every** configured pool in the last
+day. Removing either file, or a failed check, stops further actions; an action already
+in flight keeps its reservation until its receipt or deadline.
+
+**Do not enable live mode yet.** It requires the accepted replacement-
 controller recovery drill; complete durable/cap accounting; a concrete provider
 adapter whose rendered configuration and dedicated-fixture tests prove the total
 replacement bound; and the existing sealed drain/dev-disk salvage gates. If ASG
