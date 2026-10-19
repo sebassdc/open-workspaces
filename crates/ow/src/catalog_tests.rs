@@ -2723,7 +2723,7 @@ fn transfer_schema_four_keeps_store_roots_and_failed_preparation_rolls_back() {
     c.db.execute("INSERT INTO leases(artifact,holder,purpose,expires) VALUES('capture','fixture','pull',9999999999)",[]).unwrap();
     let triggers: Vec<String> =
         c.db.prepare(
-            "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'cache_guard_%'",
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'cache_guard_%' OR name LIKE 'gc_%')",
         )
         .unwrap()
         .query_map([], |r| r.get(0))

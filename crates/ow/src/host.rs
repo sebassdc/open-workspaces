@@ -801,6 +801,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         | Action::Host { .. }
         | Action::Node { .. }
         | Action::Backup { .. }
+        | Action::Store { .. }
         | Action::Image { .. }
         | Action::Share { .. }
         | Action::Unshare { .. } => unreachable!(),

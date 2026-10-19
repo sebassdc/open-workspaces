@@ -394,6 +394,7 @@ impl Catalog {
 
         // Additive guards are enforced by SQLite even for prior schema-5 writers.
         crate::cache_catalog::initialize(&db)?;
+        crate::store_gc::initialize(&db)?;
 
         // A newer catalog this binary may read (its floor allows it) keeps its version.
         db.execute_batch(&format!("UPDATE resources SET reserved_mib=COALESCE(json_extract(metadata,'$.memory_mib'),0) WHERE kind='machine' AND placement_managed=0 AND reserved_mib=0 AND json_extract(metadata,'$.state')='running'; PRAGMA user_version={}; COMMIT;", version.max(nodes::SCHEMA)))?;
@@ -2809,7 +2810,7 @@ mod tests {
         let physical = c.reserve(user, "machine", "demo").unwrap();
         let triggers: Vec<String> =
             c.db.prepare(
-                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'cache_guard_%'",
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'cache_guard_%' OR name LIKE 'gc_%')",
             )
             .unwrap()
             .query_map([], |r| r.get(0))

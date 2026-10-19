@@ -84,6 +84,22 @@ export function storeRunnerPolicy(partition: string, url: string): string {
     ] });
 }
 
+/** Opt-in controller collector: candidate listing and current-version deletes only. */
+export function storeGcPolicy(partition: string, url: string): string {
+    storeRunnerPolicy(partition, url);
+    const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(url)!;
+    const bucket = `arn:${partition}:s3:::${match[1]}`;
+    const root = `${storePrefix(match[2])}/store/v1`;
+    return JSON.stringify({ Version: "2012-10-17", Statement: [
+        { Effect: "Allow", Action: ["s3:GetBucketVersioning", "s3:GetLifecycleConfiguration", "s3:GetBucketPolicy"], Resource: bucket },
+        { Effect: "Allow", Action: "s3:ListBucket", Resource: bucket,
+            Condition: { StringLike: { "s3:prefix": `${root}/u/*` } } },
+        { Effect: "Allow", Action: ["s3:GetObject", "s3:DeleteObject"], Resource: `${bucket}/${root}/u/*` },
+        { Effect: "Allow", Action: ["s3:PutObject", "s3:GetObject"], Resource: `${bucket}/${root}/gc/runs/*` },
+        { Effect: "Deny", Action: "s3:DeleteObjectVersion", Resource: `${bucket}/*` },
+    ] });
+}
+
 /**
  * A private S3 bucket for backups (and later a content store): public access blocked,
  * versioning on, TLS only, write-once store objects, and age expiry on `PREFIX/catalog/`
