@@ -25,6 +25,15 @@ pub struct Catalog {
 }
 
 #[derive(Debug)]
+pub struct ResourceNotFound(String);
+impl std::fmt::Display for ResourceNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} was not found.", self.0)
+    }
+}
+impl std::error::Error for ResourceNotFound {}
+
+#[derive(Debug)]
 pub struct OperationFailure(pub Value);
 impl OperationFailure {
     pub fn message(&self) -> &str {
@@ -479,7 +488,7 @@ impl Catalog {
                 |r| r.get(0),
             )
             .optional()?
-            .context("resource not found")
+            .ok_or_else(|| ResourceNotFound(format!("{kind} '{name}'")).into())
     }
     fn logical(&self, user: i64, kind: &str, physical: &str) -> Result<Option<String>> {
         Ok(self
@@ -506,7 +515,7 @@ impl Catalog {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?
-            .context("resource not found")?;
+            .ok_or_else(|| ResourceNotFound(format!("machine '{address}'")))?;
         ensure!(
             permitted(&role, op),
             "{op} is not allowed on a machine shared with you as {role}"
