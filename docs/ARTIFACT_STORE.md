@@ -145,9 +145,10 @@ class 0: pull and atomically install, with no box restart. Preserve per-unit pin
 and the normal hibernate/resume and explicit cold-loss gates in
 [UPGRADES.md](UPGRADES.md). No release or deployment is performed by these docs.
 
-The additive catalog is schema 4 with reader floor 3. Schema 3 SQL readers/writers
-can retain existing ownership/resource data and preserve artifact rows and schema
-version. They do not implement image administration; old controllers may refuse
+The artifact foundation introduced schema 4 with reader floor 3. Its schema-3
+SQL readers/writers could retain existing ownership/resource data and preserve
+artifact rows and schema version. The subsequent [placement catalog](LIFECYCLE.md)
+requires schema 5 / reader floor 5; older writers are refused there. They do not implement image administration; old controllers may refuse
 versioned node advertisements. This is not a promise that old workers implement
 new image selectors. Release v0.9.0 declares the new catalog and worker impacts,
 retaining v0.8.6's worker interface 2 (agent readers 1–2). Managed disk/RAM

@@ -39,6 +39,8 @@ mod ssh_client;
 mod ssh_gateway;
 #[cfg(target_os = "linux")]
 mod terminal;
+#[cfg(target_os = "linux")]
+mod transfers;
 mod wire;
 
 // Firecracker runtime and shared limits live in ow-core; keep their `crate::` paths.
