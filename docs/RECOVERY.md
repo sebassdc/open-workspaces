@@ -64,7 +64,7 @@ unique managed name. That observation is journaled, so worker restarts preserve
 the delay; capture/hash time is not counted as time spent hibernated. A wake may delete the sleep directory while the upload
 continues; the pinned file inodes remain valid. Each sleep is uploaded once.
 Legacy sleep captures without a capture-start timestamp report zero (unknown) rather than claiming a measured durable age.
-Stopped boxes do not create new points, but an already pending upload is retried.
+Stopped boxes do not create new points, but an already sealed pending upload is retried.
 
 The worker records intent before capture. The same pending name survives capture
 failure, interrupted uploads, worker restart and lost acknowledgments. Failed
@@ -73,6 +73,10 @@ least a minute. The timer retries after a run exits. A later success clears its
 error. A destination change clears the old store's durable claim. Managed names
 start with `sleep-recovery-`, are excluded from the user snapshot list/limit, and
 cannot be used by a user snapshot request.
+If a running capture failed before sealing and the box is no longer running,
+its unusable intent is retired; any replacement uses a fresh name. A later hibernation follows
+its own ten-minute sealed delay without inheriting the old attempt's backoff.
+Sealed pending captures retain their identity and remain retryable.
 
 The 30-minute interval leaves a provisional 30-minute capture/transfer budget.
 A durable point matching the current frozen sleep state stays protected even

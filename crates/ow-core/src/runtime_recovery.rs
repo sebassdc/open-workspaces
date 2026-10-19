@@ -87,18 +87,22 @@ impl Runtime {
             })
             .transpose()?;
         if recovery.pending.as_ref().is_some_and(|p| {
-            p.source.as_ref().is_some_and(|source| {
-                !self.snapshot_dir(source).join("manifest.json").exists()
-                    && !self
-                        .snapshot_dir(&p.snapshot)
-                        .join("manifest.json")
-                        .exists()
-            })
+            !self
+                .snapshot_dir(&p.snapshot)
+                .join("manifest.json")
+                .exists()
+                && p.source
+                    .as_ref()
+                    .map_or(workspace.state != "running", |source| {
+                        !self.snapshot_dir(source).join("manifest.json").exists()
+                    })
         }) {
-            // A wake after failed pinning removed the source; never recycle a possibly uploaded name.
+            // An unsealed intent has lost its source; never recycle a possibly uploaded name.
             recovery.pending = None;
+            recovery.attempted_at = 0;
             recovery.error = Some(
-                "Sleep capture unavailable; a new point will be taken when the box runs.".into(),
+                "Pending capture unavailable; waiting for a new running or hibernated point."
+                    .into(),
             );
         }
         if !recovery.due(
@@ -199,5 +203,133 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_running_intent_yields_to_sleep_but_sealed_uploads_survive() {
+        for (sealed, sleep_age, recent_failure, state) in [
+            (false, 0, false, "hibernated"),
+            (false, 601, true, "hibernated"),
+            (true, 601, false, "hibernated"),
+            (false, 601, false, "stopped"),
+            (false, 601, false, "running"),
+        ] {
+            let mut runtime = super::super::disk_tests::fixture();
+            let at = now();
+            let sleep_name = "sleep-fixture";
+            let old_name = "sleep-recovery-obsolete";
+            let sleep = runtime.snapshot_dir(sleep_name);
+            fs::create_dir(&sleep).unwrap();
+            fs::create_dir(runtime.root.join("recovery")).unwrap();
+            let mut files = BTreeMap::new();
+            for file in crate::snapshot_store::DATA_FILES {
+                fs::write(sleep.join(file), file).unwrap();
+                files.insert(file.to_owned(), hash(&sleep.join(file)).unwrap());
+            }
+            let snapshot = Snapshot {
+                captured_at: at - 900,
+                managed_recovery: false,
+                name: sleep_name.into(),
+                workspace: "legacy".into(),
+                managed: false,
+                memory_mib: 1024,
+                vcpu_count: 2,
+                image: "alpine".into(),
+                image_digest: None,
+                runtime: crate::common::RUNTIME.into(),
+                cpu: "fixture".into(),
+                kernel_sha256: "fixture".into(),
+                files,
+            };
+            atomic_json(&sleep.join("manifest.json"), &snapshot).unwrap();
+            if sealed {
+                let old = runtime.snapshot_dir(old_name);
+                fs::create_dir(&old).unwrap();
+                for file in crate::snapshot_store::DATA_FILES {
+                    fs::hard_link(sleep.join(file), old.join(file)).unwrap();
+                }
+                let mut manifest = serde_json::to_value(&snapshot).unwrap();
+                manifest["name"] = json!(old_name);
+                manifest["managed_recovery"] = json!(true);
+                atomic_json(&old.join("manifest.json"), &manifest).unwrap();
+            }
+            let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
+            workspace.state = state.into();
+            workspace.hibernation = (state == "hibernated").then(|| sleep_name.into());
+            let store = "a".repeat(64);
+            let journal = runtime.root.join("recovery/legacy.json");
+            let saved = Recovery {
+                store: store.clone(),
+                sleep: Some(sleep_name.into()),
+                sleep_observed_at: at - sleep_age,
+                pending: Some(Point {
+                    snapshot: old_name.into(),
+                    captured_at: snapshot.captured_at,
+                    source: None,
+                }),
+                attempted_at: if recent_failure { at } else { at - 301 },
+                failures: 4,
+                error: Some("Capture failed; retry scheduled.".into()),
+                ..Recovery::default()
+            };
+            atomic_json(&journal, &saved).unwrap();
+            let prepare = json!({"op":"recovery-prepare","id":"legacy","store":store});
+            if state == "running" {
+                assert!(runtime.request(&prepare).is_err());
+                let saved: Recovery = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+                assert_eq!(saved.pending.unwrap().snapshot, old_name);
+                fs::remove_dir_all(runtime.root).unwrap();
+                continue;
+            }
+            let mut point = runtime.request(&prepare).unwrap();
+            if state == "stopped" {
+                assert!(point.is_null());
+                let saved: Recovery = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+                assert!(saved.pending.is_none() && saved.durable.is_none());
+                fs::remove_dir_all(runtime.root).unwrap();
+                continue;
+            }
+            if sleep_age == 0 {
+                assert!(
+                    point.is_null(),
+                    "an obsolete running intent bypassed the sleep delay"
+                );
+                let mut saved: Recovery =
+                    serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+                assert!(saved.pending.is_none());
+                saved.sleep_observed_at = at - 601;
+                atomic_json(&journal, &saved).unwrap();
+                point = runtime.request(&prepare).unwrap();
+            }
+            let name = point["snapshot"]
+                .as_str()
+                .expect("due sleep was blocked by obsolete intent");
+            assert_eq!(
+                name == old_name,
+                sealed,
+                "sealed uploads must retain their name; unsealed intents must not"
+            );
+            assert_eq!(point["captured_at"], snapshot.captured_at);
+            let saved: Recovery = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+            assert_eq!(
+                saved.pending.as_ref().unwrap().source.as_deref(),
+                (!sealed).then_some(sleep_name)
+            );
+            assert!(saved.durable.is_none());
+            if !sealed {
+                assert!(runtime.request(&json!({"op":"recovery-result","id":"legacy","store":store,"snapshot":old_name,"uploaded":true})).is_err());
+            }
+            runtime.request(&json!({"op":"recovery-result","id":"legacy","store":store,"snapshot":name,"uploaded":true})).unwrap();
+            let saved: Recovery = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+            assert_eq!(saved.durable.unwrap().snapshot, name);
+            assert_eq!(saved.failures, 0);
+            assert!(saved.pending.is_none() && saved.error.is_none());
+            fs::remove_dir_all(runtime.root).unwrap();
+        }
     }
 }
