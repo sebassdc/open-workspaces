@@ -204,7 +204,8 @@ case $command in
     find_instance
     remote 300 ow backup catalog-check "$@" ;;
   recovery-runner)
-    (( $# == 6 )) && [[ $1 == --config && $3 == --controller && $5 == --ca ]] || usage
+    (( $# == 6 )) || usage
+    [[ $1 == --config && $3 == --controller && $5 == --ca ]] || usage
     find_instance
     remote 300 ow_host recovery-runner "$@" ;;
   shell) find_instance; exec aws ssm start-session --target "$instance" ;;
