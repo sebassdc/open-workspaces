@@ -3,7 +3,7 @@
 //! does not have to read data the previous point already hashed: a chunk is
 //! taken from the previous seal only when both files map it to the same
 //! physical extents (Btrfs/XFS reflinks) and the previous file is still the one
-//! that seal describes. Holes are zero chunks. Everything else is read.
+//! that seal describes; there, holes are zero chunks. Everything else is read.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -134,7 +134,10 @@ pub fn write_sidecar(directory: &Path, sealed: &BTreeMap<String, Sealed>) -> Res
     Ok(())
 }
 
-/// Seals `directory`'s `files`, reusing unchanged chunks of the snapshot at
+/// Files a capture reflinks; RAM and device state are written whole every time.
+const REFLINKED: [&str; 1] = ["disk.ext4"];
+
+/// Seals `directory`'s `files`, reusing unchanged disk chunks of the snapshot at
 /// `previous` (if it has a sidecar), and writes the sidecar. Returns the seals.
 pub fn seal_directory(
     directory: &Path,
@@ -148,6 +151,7 @@ pub fn seal_directory(
     for file in files {
         let prior = earlier
             .as_ref()
+            .filter(|_| REFLINKED.contains(file))
             .and_then(|(path, s)| Some((path.join(file), s.get(*file)?)));
         let (seal, counted) = seal(
             &directory.join(file),
@@ -175,8 +179,6 @@ fn seal_with(
     map: &Map,
 ) -> Result<(Sealed, Stats)> {
     let file = File::open(path)?;
-    // Delayed allocation has no final extents; flush before reading the map.
-    file.sync_all()?;
     let before = file.metadata()?;
     let size = before.len();
     let count = size.div_ceil(CHUNK as u64) as usize;
@@ -190,6 +192,16 @@ fn seal_with(
             && check(&sealed.chunks).ok() == Some(sealed.size))
         .then_some((file, sealed))
     });
+    // Extents are only compared with an earlier seal. Pending writes are not in the
+    // map yet (an overwritten range still shows its old shared extent): flush both.
+    let mapped = match &previous {
+        Some((earlier, _)) => {
+            file.sync_all()?;
+            earlier.sync_all()?;
+            true
+        }
+        None => false,
+    };
     let next = AtomicUsize::new(0);
     let chunks = Mutex::new(vec![None; count]);
     let stats = Mutex::new(Stats::default());
@@ -210,7 +222,7 @@ fn seal_with(
                         }
                         let offset = i as u64 * CHUNK as u64;
                         let length = (size - offset).min(CHUNK as u64) as usize;
-                        let mapped = map(&file, offset, length as u64);
+                        let mapped = mapped.then(|| map(&file, offset, length as u64)).flatten();
                         let earlier = previous.as_ref().and_then(|(file, sealed)| {
                             let chunk = sealed.chunks.get(i)?;
                             (chunk.length == length
@@ -503,6 +515,7 @@ mod tests {
             fs::remove_dir_all(dir).unwrap();
             return;
         }
+        // Left unflushed on purpose: until writeback the map still shows the shared extent.
         data[CHUNK + 5] ^= 0xff;
         File::options()
             .write(true)

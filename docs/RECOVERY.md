@@ -111,18 +111,21 @@ Since 0.9.20 the worker seals each managed recovery point while capturing it:
 it writes the chunk list of every file to `chunks.json` beside the manifest and
 seals each file under the SHA-256 of that ordered list (`"digest":
 "sha256-chunks-8m-v1"` in the manifest; without that field a file hash is its
-whole-file SHA-256, as for every other snapshot). A chunk is not read when:
+whole-file SHA-256, as for every other snapshot). The disk is a reflink of the
+live disk, so after both disk files are flushed (pending writes are not in the
+extent map until then) a disk chunk is not read when:
 
-- the file maps it to no extent (a hole): it is a zero chunk; or
-- the file and the last durable point's file map it to exactly the same physical
-  extents (Btrfs/XFS reflinks: a capture reflinks the live disk), and that
-  earlier file still has the device, inode, size and modification time recorded
-  in its `chunks.json`. Its hash is taken from that seal.
+- the new disk maps it to no extent (a hole): it is a zero chunk; or
+- the new disk and the last durable point's disk map it to exactly the same
+  physical extents (Btrfs/XFS reflinks), and that earlier file still has the
+  device, inode, size and modification time recorded in its `chunks.json`. Its
+  hash is taken from that seal.
 
-Anything else is read and hashed in parallel: changed disk ranges, the fresh RAM
-file, and every range whose mapping is unknown, delayed, compressed, encrypted or
-inline. There is no earlier seal (first point, a changed destination, or a
-durable point from an older worker) means a full read. This trusts the
+Anything else is read and hashed in parallel: changed disk ranges, the RAM and
+device state files (written whole by every capture), and every range whose
+mapping is unknown, delayed, compressed, encrypted or inline. Without an earlier
+seal (first point, a changed destination, or a durable point from an older
+worker) every chunk is read; zero chunks are still recognized without hashing. This trusts the
 filesystem's extent sharing, as changed-block tracking does; a worker that
 verifies such a snapshot again (after a restart, or for import) reads every byte
 and compares the result with the seal.
