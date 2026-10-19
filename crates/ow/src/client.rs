@@ -505,7 +505,18 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         Action::Delete { id } => json!({"op":"delete","id":id}),
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),
         Action::Snapshot { id, name } => json!({"op":"snapshot","id":id,"name":name}),
-        Action::Restore { id, name } => json!({"op":"restore","id":id,"name":name}),
+        Action::Restore {
+            id,
+            name,
+            artifact,
+            node,
+            accept_cold,
+        } => match artifact {
+            Some(artifact) => {
+                json!({"op":"restore","id":id,"artifact":artifact,"node":node,"accept_cold":accept_cold})
+            }
+            None => json!({"op":"restore","id":id,"name":name}),
+        },
         Action::Fork {
             id,
             child,

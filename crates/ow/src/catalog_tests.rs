@@ -3178,3 +3178,324 @@ fn transfer_target_rechecks_controller_drain_independently_of_worker_drain() {
     drop(c);
     drop(fake);
 }
+
+#[test]
+fn adopted_restore_preserves_owner_grants_and_routes_exec_and_streams_with_epoch() {
+    use crate::transfers::*;
+    let (mut fake, mut c, user, physical, mut intent) = transfer_fixture();
+    intent.kind = Kind::Restore;
+    c.db.execute("DELETE FROM nodes WHERE id='beta'", [])
+        .unwrap();
+    fake.worker("beta");
+    c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.guest_ssh_v1',json('true')) WHERE id='beta'",[]).unwrap();
+    let grantee = c.user(&identity("guest")).unwrap();
+    c.db.execute(
+        "INSERT INTO grants(physical,grantee,role) VALUES(?1,?2,'use')",
+        params![physical, grantee],
+    )
+    .unwrap();
+    let t = c.begin_transfer(user, "restore", &intent).unwrap();
+    prepare_transfer(&c, &t);
+    c.commit_transfer(t.id, t.epoch).unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Committed,
+        Step::Started,
+        &Evidence::default(),
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Started,
+        Step::Succeeded,
+        &Evidence::default(),
+    )
+    .unwrap();
+    let placement = c.managed_placement(&physical).unwrap().unwrap();
+    assert_eq!(placement.node, "beta");
+    assert_eq!(placement.epoch, t.epoch as u64);
+    let address = "owner@example.test/box";
+    assert_eq!(c.state(user).unwrap()["workspaces"][0]["id"], "box");
+    assert_eq!(c.state(grantee).unwrap()["shared"][0]["id"], address);
+    let result = c
+        .operation(
+            grantee,
+            json!({"op":"exec","id":address,"command":"true","operation_key":"exec-restored"}),
+        )
+        .unwrap();
+    assert_eq!(result["exit_code"], 0);
+    let request:String=c.db.query_row("SELECT json_extract(request,'$.request.placement') FROM operations WHERE retry_key='exec-restored'",[],|r|r.get(0)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&request).unwrap(),
+        json!(placement)
+    );
+    assert_eq!(c.ssh_target(grantee, address).unwrap().1, physical);
+    assert_eq!(c.terminal_target(grantee, address).unwrap().1, physical);
+    assert!(
+        c.operation(grantee, json!({"op":"exec","id":physical,"command":"true"}))
+            .is_err()
+    );
+    c.operation(
+        user,
+        json!({"op":"unshare","id":"box","with":"guest@example.test"}),
+    )
+    .unwrap();
+    assert!(c.ssh_target(grantee, address).is_err());
+}
+
+fn completed_restore_fixture() -> (Fake, Catalog, i64, String, common::Placement) {
+    use crate::transfers::*;
+    let (fake, c, user, physical, mut intent) = transfer_fixture();
+    intent.kind = Kind::Restore;
+    c.db.execute(
+        "UPDATE nodes SET capabilities=json_set(capabilities,'$.images',json('[\"alpine\"]'))",
+        [],
+    )
+    .unwrap();
+    let t = c.begin_transfer(user, "restored", &intent).unwrap();
+    prepare_transfer(&c, &t);
+    c.commit_transfer(t.id, t.epoch).unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Committed,
+        Step::Started,
+        &Evidence::default(),
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Started,
+        Step::Succeeded,
+        &Evidence::default(),
+    )
+    .unwrap();
+    let placement = c.managed_placement(&physical).unwrap().unwrap();
+    (fake, c, user, physical, placement)
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")] // Runtime host fingerprinting requires an x86 Firecracker host.
+fn adopted_real_runtime_stop_reply_completes_and_refreshes_metadata() {
+    let (mut fake, mut c, user, physical, placement) = completed_restore_fixture();
+    let root = fake.root.join("nodes/beta");
+    let assets = fake.root.join("assets");
+    std::fs::create_dir_all(root.join("machines").join(&physical)).unwrap();
+    std::fs::create_dir_all(assets.join("downloads")).unwrap();
+    std::fs::write(assets.join("downloads/vmlinux-6.1.186"), b"fixture kernel").unwrap();
+    std::fs::write(
+        root.join("machines").join(&physical).join("disk.ext4"),
+        b"disk",
+    )
+    .unwrap();
+    std::fs::write(root.join("state.json"), json!({"next_index":2,"workspaces":{physical.clone():{"id":physical,"index":1,"state":"stopped","memory_mib":256,"vcpu_count":1,"image":"alpine","source":null,"hibernation":null}}}).to_string()).unwrap();
+    let mut runtime = ow_core::runtime::Runtime::new(root.clone(), assets).unwrap();
+    runtime.request(&json!({"op":"placement-register","id":physical,"placement":placement,"committed":true})).unwrap();
+    let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = fake.stopped.clone();
+    fake._thread = Some(std::thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            let (mut socket, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+            };
+            let request = wire::line(&mut socket).unwrap();
+            let result = runtime.request(&request);
+            if request["op"] == "stop" {
+                assert!(
+                    result.as_ref().unwrap()["workspace"]
+                        .get("placement")
+                        .is_none(),
+                    "exercise the real unadorned worker reply"
+                );
+            }
+            wire::send(&mut socket, &wire::response(result)).unwrap();
+        }
+    }));
+    let result = c
+        .operation(
+            user,
+            json!({"op":"stop","id":"box","operation_key":"stop-restored"}),
+        )
+        .unwrap();
+    assert_eq!(result["operation"]["state"], "succeeded");
+    let state = c.state(user).unwrap();
+    assert_eq!(state["workspaces"][0]["state"], "stopped");
+    assert_eq!(state["workspaces"][0]["vmm_running"], false);
+    assert_eq!(state["workspaces"][0]["placement"], json!(placement));
+    let operation: String =
+        c.db.query_row(
+            "SELECT state FROM operations WHERE retry_key='stop-restored'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(operation, "succeeded");
+}
+
+#[test]
+fn adopted_inventory_refreshes_only_exact_committed_node_and_epoch() {
+    let (mut fake, mut c, user, physical, placement) = completed_restore_fixture();
+    let root = fake.root.join("nodes/beta");
+    std::fs::create_dir_all(&root).unwrap();
+    let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let observation = Arc::new(Mutex::new(
+        json!({"id":physical,"state":"failed","vmm_running":false,"memory_mib":256,"vcpu_count":1,"placement":placement,"lifecycle":{"phase":"active"}}),
+    ));
+    let alpha_root = fake.root.join("nodes/alpha");
+    std::fs::create_dir_all(&alpha_root).unwrap();
+    let alpha_listener = UnixListener::bind(alpha_root.join("control.sock")).unwrap();
+    alpha_listener.set_nonblocking(true).unwrap();
+    let (observed, stop) = (observation.clone(), fake.stopped.clone());
+    fake._thread = Some(std::thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            let (mut socket, _) = match [listener.accept(), alpha_listener.accept()]
+                .into_iter()
+                .find_map(Result::ok)
+            {
+                Some(pair) => pair,
+                None => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+            };
+            let request = wire::line(&mut socket).unwrap();
+            let result = match request["op"].as_str().unwrap() {
+                "list" => json!([observed.lock().unwrap().clone()]),
+                "snapshots" => json!([]),
+                "stats" => json!({"running":{}}),
+                op => panic!("unexpected {op}"),
+            };
+            wire::send(&mut socket, &json!({"ok":true,"result":result})).unwrap();
+        }
+    }));
+    let state = c.state(user).unwrap();
+    assert_eq!(state["workspaces"][0]["state"], "failed");
+    assert_eq!(state["workspaces"][0]["vmm_running"], false);
+    observation.lock().unwrap()["state"] = json!("stopped");
+    assert_eq!(
+        c.state(user).unwrap()["workspaces"][0]["state"],
+        "stopped",
+        "worker restart is positively observed"
+    );
+    observation.lock().unwrap()["placement"]["epoch"] = json!(placement.epoch + 1);
+    observation.lock().unwrap()["state"] = json!("running");
+    observation.lock().unwrap()["vmm_running"] = json!(true);
+    assert_eq!(
+        c.state(user).unwrap()["workspaces"][0]["state"],
+        "stopped",
+        "future epoch cannot overwrite authority"
+    );
+    observation.lock().unwrap()["placement"] = json!(placement);
+    observation.lock().unwrap()["placement"]["node"] = json!("alpha");
+    assert_eq!(
+        c.state(user).unwrap()["workspaces"][0]["state"],
+        "stopped",
+        "wrong-node inventory cannot overwrite authority"
+    );
+    observation.lock().unwrap()["placement"] = json!(placement);
+    c.db.execute("UPDATE nodes SET heartbeat=0 WHERE id='beta'", [])
+        .unwrap();
+    assert_eq!(
+        c.state(user).unwrap()["workspaces"][0]["observed_state"],
+        "stopped",
+        "a source runner claiming target's exact epoch cannot refresh metadata"
+    );
+    assert_eq!(c.managed_placement(&physical).unwrap(), Some(placement));
+}
+
+#[test]
+fn adopted_unadorned_start_and_hibernate_replies_are_verified_after_effect() {
+    for (op, fail_inspect) in [("start", false), ("hibernate", false), ("stop", true)] {
+        let (mut fake, mut c, user, physical, placement) = completed_restore_fixture();
+        let root = fake.root.join("nodes/beta");
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (stop, id, p) = (fake.stopped.clone(), physical.clone(), placement.clone());
+        fake._thread = Some(std::thread::spawn(move || {
+            let mut state = if op == "start" { "stopped" } else { "running" };
+            let mut effected = false;
+            while !stop.load(Ordering::SeqCst) {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                };
+                let request = wire::line(&mut socket).unwrap();
+                let mut summary = json!({"id":id,"state":state,"memory_mib":256,"vcpu_count":1,"disk_bytes":8*common::GIB,"image":"alpine","vmm_running":state=="running","placement":p,"lifecycle":{"phase":"active"}});
+                let result = match request["op"].as_str().unwrap() {
+                    "list" => json!([summary]),
+                    "snapshots" => json!([]),
+                    "stats" => json!({"running":{}}),
+                    "inspect" => {
+                        assert!(effected);
+                        if fail_inspect {
+                            summary["placement"]["epoch"] = json!(p.epoch + 1);
+                        }
+                        summary
+                    }
+                    effect if effect == op => {
+                        assert_eq!(request["placement"], json!(p));
+                        effected = true;
+                        state = match effect {
+                            "start" => "running",
+                            "hibernate" => "hibernated",
+                            _ => "stopped",
+                        };
+                        summary["state"] = json!(state);
+                        summary.as_object_mut().unwrap().remove("placement");
+                        if effect == "stop" {
+                            json!({"workspace":summary,"sync_error":null})
+                        } else {
+                            summary
+                        }
+                    }
+                    other => panic!("unexpected {other}"),
+                };
+                wire::send(&mut socket, &json!({"ok":true,"result":result})).unwrap();
+            }
+        }));
+        let result = c.operation(
+            user,
+            json!({"op":op,"id":"box","operation_key":"lifecycle-after-restore"}),
+        );
+        let persisted: String =
+            c.db.query_row(
+                "SELECT state FROM operations WHERE retry_key='lifecycle-after-restore'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if fail_inspect {
+            assert!(result.is_err());
+            assert_eq!(
+                persisted, "uncertain",
+                "post-effect failure must never leave pending"
+            );
+        } else {
+            assert!(result.is_ok(), "{op}: {result:?}");
+            assert_eq!(persisted, "succeeded");
+            let state = c.state(user).unwrap();
+            assert_eq!(
+                state["workspaces"][0]["state"],
+                if op == "start" {
+                    "running"
+                } else {
+                    "hibernated"
+                }
+            );
+            assert_eq!(state["workspaces"][0]["placement"], json!(placement));
+        }
+    }
+}

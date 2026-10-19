@@ -107,6 +107,51 @@ refused rather than restored. Restore is runner-local: the box is not added to a
 catalog, so reach it with `ow --local --data-dir RUNNER_DIR`. SSH keys are kept
 outside snapshots: run `ow ssh-authorize` on the restored box again.
 
+### Managed remote restore
+
+For an **existing catalog-owned box and a committed format-1 catalog artifact**:
+
+```sh
+ow --server https://workspaces.example.test --operation-key restore-01 \
+  restore BOX --artifact ARTIFACT_ID --node TARGET_NODE
+ow --server https://workspaces.example.test status
+```
+
+This returns immediately with a durable operation ID. `status.operations` reports
+its transfer ID, placement epoch and current step. Reuse the same operation key
+and parameters after a lost response; controller restart also resumes unfinished
+operations. A different request under that key is rejected.
+
+The source must be reachable and positively stopped or hibernated; an unmanaged
+source must be stopped before it can be registered. Running boxes are refused.
+The target needs the updated Linux agent and an already-upgraded protocol-2
+placement-fencing worker, configured artifact store, fresh disk headroom and
+reserved CPU/RAM/slot capacity. Target import cannot replace an existing disk.
+After a verified pull and unstarted import, the catalog conditionally switches
+placement, then activates the target. The original logical name, owner and grants
+remain; remote list, exec, shell, SSH and previews use the committed epoch.
+Public SSH policy is copied separately from the artifact. A guest host-key mismatch
+fails closed during boot. Managed resize/delete/snapshot/fork and public-key changes
+remain refused until their lifecycle coordination is implemented.
+
+Saved RAM must match the target runtime, CPU/host-kernel identity and guest-kernel
+hash. An incompatible capture stays stored and the operation fails before import.
+Only an explicit new request with a **new operation key** and `--accept-cold` can
+discard that RAM; the previously exported source remains fenced throughout.
+No missing heartbeat or expired job lease permits starting another copy. Unknown
+or contradictory outcomes retain their reservations for reconciliation. Agent
+pull retries wait for the old lease to expire and use a new attempt; worker retries
+keep the original key. A lost activation reply is inspected before any action.
+An active but nonrunning copy requires explicit operator reconciliation.
+
+Artifact IDs come from the trusted controller artifact catalog, never `backup list`
+or an S3 manifest's owner field. This path does not create owners, discover arbitrary
+objects or convert legacy `SnapshotStore` backups into catalog authority. Existing
+backup publication/retention stays separate. `backup restore` remains the explicit
+operator-local command and refuses managed-provenance captures; it does not adopt
+anything into a controller. Source exports and durable artifacts are retained;
+this slice does not delete the old source disk or enable automatic failover.
+
 Snapshots hold guest memory and disks, including any credentials in them. Use a
 private bucket with encryption at rest (default on AWS S3) and credentials that
 may write only that bucket.
