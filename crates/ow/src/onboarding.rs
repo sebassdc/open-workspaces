@@ -166,9 +166,15 @@ struct Config {
     slots: u32,
     cpus: u32,
     storage_gib: u32,
+    #[serde(default = "one")]
+    vcpu_overcommit: u32,
     policy: String,
     #[serde(default)]
     ca_cert: Option<PathBuf>,
+}
+
+fn one() -> u32 {
+    1
 }
 
 fn private_dir(path: &Path) -> Result<()> {
@@ -221,6 +227,7 @@ fn read_config(root: &Path) -> Result<Config> {
         c.version == 1 && c.policy == nodes::POOL_POLICY,
         "unsupported host config/consent"
     );
+    common::vcpu_budget(1, c.vcpu_overcommit)?;
     nodes::origin(&c.controller, false)?;
     limits(c.memory, c.slots, c.cpus, c.storage_gib)?;
     if let Some(path) = &c.ca_cert {
@@ -1592,12 +1599,14 @@ fn recover_asset_update(root: &Path) -> Result<()> {
     fs::File::open(root)?.sync_all()?;
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 fn configure(
     root: &Path,
     memory: u32,
     slots: u32,
     cpus: u32,
     storage: Option<u32>,
+    vcpu_overcommit: u32,
     consent: bool,
 ) -> Result<()> {
     require_stopped(root)?;
@@ -1609,6 +1618,14 @@ fn configure(
     c.memory = memory;
     c.slots = slots;
     c.cpus = cpus;
+    c.vcpu_overcommit = vcpu_overcommit;
+    ensure!(
+        cpus <= common::vcpu_budget(
+            std::thread::available_parallelism()?.get() as u32,
+            vcpu_overcommit
+        )?,
+        "CPU budget exceeds host overcommit limit"
+    );
     if let Some(storage) = storage {
         c.storage_gib = storage;
     }
@@ -1662,6 +1679,7 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
             slots,
             cpus,
             storage_gib,
+            vcpu_overcommit,
             accept_shared_pool,
             no_start,
             ubuntu_dev,
@@ -1726,6 +1744,10 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
             );
             let available = mem_available()?.saturating_sub(1024).min(cap_ram as u64) as u32;
             ensure!(available >= 256, "not enough measured memory headroom");
+            let cpu_ceiling = cap_cpu.min(common::vcpu_budget(
+                std::thread::available_parallelism()?.get() as u32,
+                vcpu_overcommit,
+            )?);
             let c = Config {
                 version: 1,
                 controller: origin,
@@ -1740,9 +1762,8 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
                 cpus: choose(
                     cpus,
                     "Guest vCPU budget",
-                    2.min(cap_cpu)
-                        .min(std::thread::available_parallelism()?.get() as u32),
-                    cap_cpu.min(std::thread::available_parallelism()?.get() as u32),
+                    2.min(cpu_ceiling),
+                    cpu_ceiling,
                     1,
                 )?,
                 storage_gib: choose(
@@ -1752,6 +1773,7 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
                     1024,
                     1,
                 )?,
+                vcpu_overcommit,
                 policy: nodes::POOL_POLICY.to_owned(),
                 ca_cert,
             };
@@ -1806,8 +1828,17 @@ pub fn run(explicit: Option<PathBuf>, action: HostAction) -> Result<i32> {
             slots,
             cpus,
             storage_gib,
+            vcpu_overcommit,
             accept_shared_pool,
-        } => configure(&root, memory, slots, cpus, storage_gib, accept_shared_pool)?,
+        } => configure(
+            &root,
+            memory,
+            slots,
+            cpus,
+            storage_gib,
+            vcpu_overcommit,
+            accept_shared_pool,
+        )?,
         HostAction::UpdateAssets { ubuntu_dev } => {
             require_stopped(&root)?;
             let c = read_config(&root)?;
@@ -2388,10 +2419,30 @@ mod tests {
             slots: 2,
             cpus: 2,
             storage_gib: 2,
+            vcpu_overcommit: 1,
             policy: nodes::POOL_POLICY.into(),
             ca_cert: None,
         };
         (root, c)
+    }
+    #[test]
+    fn overcommit_config_is_explicit_and_legacy_defaults_to_one() {
+        let (_, mut c) = fixture();
+        let mut value = serde_json::to_value(&c).unwrap();
+        value.as_object_mut().unwrap().remove("vcpu_overcommit");
+        assert_eq!(
+            serde_json::from_value::<Config>(value)
+                .unwrap()
+                .vcpu_overcommit,
+            1
+        );
+        c.vcpu_overcommit = 2;
+        let saved: Config = serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
+        assert_eq!(saved.vcpu_overcommit, 2);
+        assert_eq!(
+            saved.cpus, 2,
+            "ratio never multiplies an explicit effective budget twice"
+        );
     }
     #[test]
     fn queued_verified_cache_hit_rechecks_opened_file_identity() {
@@ -2651,7 +2702,7 @@ mod tests {
         )
         .unwrap();
         let before = fs::read(root.join("host.json")).unwrap();
-        assert!(configure(&root, 4096, 2, 2, None, false).is_err());
+        assert!(configure(&root, 4096, 2, 2, None, 1, false).is_err());
         let listener = std::os::unix::net::UnixListener::bind(root.join("control.sock")).unwrap();
         assert!(require_stopped(&root).is_err());
         drop(listener);
