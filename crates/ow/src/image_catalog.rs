@@ -165,8 +165,8 @@ pub fn reserve(
     let parent: Option<String> = if kind == "image" {
         Some(
             tx.query_row(
-                "SELECT id FROM artifacts WHERE digest=?1 AND state='stored'",
-                [base_digest],
+                "SELECT id FROM artifacts WHERE digest=?1 AND rtrim(store_url,'/')=rtrim(?2,'/') AND state='stored'",
+                params![base_digest, store_url],
                 |r| r.get(0),
             )
             .optional()?
@@ -243,6 +243,7 @@ pub fn commit(
         current.status == "building" && current.expires > now,
         "push lease expired or build is no longer current"
     );
+    ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM artifacts a JOIN leases l ON l.artifact=a.id AND l.token=a.attempt AND l.purpose='push' WHERE a.id=?1 AND l.expires>?2 AND l.parent IS a.parent AND (a.parent IS NULL OR EXISTS(SELECT 1 FROM artifacts p WHERE p.id=a.parent AND p.state='stored' AND rtrim(p.store_url,'/')=rtrim(a.store_url,'/') AND p.digest=?3)))",params![image.artifact,now,image.base_digest],|r|r.get::<_,bool>(0))?, "push lease or approved parent is no longer valid");
     ensure!(tx.execute("UPDATE artifacts SET digest=?1,state='stored',logical_bytes=?2,stored_at=CURRENT_TIMESTAMP WHERE id=?3 AND state='uploading' AND attempt=?4", params![reference.digest,i64::try_from(manifest.files.values().map(|f| f.size).sum::<u64>())?,image.artifact,reference.attempt])? == 1, "artifact is not uploading");
     tx.execute(
         "UPDATE images SET status='kept' WHERE name=?1 AND status='current'",

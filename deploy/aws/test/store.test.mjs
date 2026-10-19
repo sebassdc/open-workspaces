@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { storeLifecycleRules, tlsOnlyPolicy, storeBucketPolicy, storeRunnerPolicy } from "../store.ts";
+import { storeLifecycleRules, tlsOnlyPolicy, storeBucketPolicy, storeRunnerPolicy, storeGcPolicy } from "../store.ts";
 
 test("only catalog backups expire by age; data keeps seven-day noncurrent undo", () => {
     const rules = storeLifecycleRules("ow-host/", 30, 7);
@@ -74,4 +74,17 @@ test("store creation is conditional and image roles cannot list or delete", () =
     assert.ok(!actions.some((a) => /Delete|List/.test(a)));
     assert.ok(actions.includes("s3:AbortMultipartUpload") && actions.includes("s3:GetBucketVersioning"));
     for (const url of ["s3://bucket", "s3://bucket/a/../b", "s3://bucket/a//b"]) assert.throws(() => storeRunnerPolicy("aws", url));
+});
+
+test("GC role can only enumerate upload keys and create delete markers in that prefix", () => {
+    const policy = JSON.parse(storeGcPolicy("aws", "s3://bucket/root"));
+    const list = policy.Statement.find(s => s.Action === "s3:ListBucket");
+    assert.deepEqual(list.Condition, { StringLike: { "s3:prefix": "root/store/v1/u/*" } });
+    const deletion = policy.Statement.find(s => s.Effect === "Allow" && s.Action.includes("s3:DeleteObject"));
+    assert.equal(deletion.Resource, "arn:aws:s3:::bucket/root/store/v1/u/*");
+    assert.deepEqual(policy.Statement.find(s => s.Effect === "Deny"), {
+        Effect: "Deny", Action: "s3:DeleteObjectVersion", Resource: "arn:aws:s3:::bucket/*",
+    });
+    assert.ok(!policy.Statement.filter(s => s.Effect === "Allow").some(s => s.Action.includes("DeleteObjectVersion")));
+    assert.throws(() => storeGcPolicy("aws", "s3://bucket/root/../other"));
 });
