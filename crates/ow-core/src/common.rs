@@ -252,7 +252,7 @@ pub const RUNTIMES: &[&str] = &["firecracker-v1.17.0"];
 /// The runtime this release's worker runs and resumes captures with.
 pub const RUNTIME: &str = "firecracker-v1.17.0";
 /// Agent-worker protocol (control.sock) and the oldest worker the agent still drives.
-pub const WORKER_PROTOCOL: u64 = 2;
+pub const WORKER_PROTOCOL: u64 = 3;
 pub const WORKER_PROTOCOL_MIN: u64 = 1;
 
 /// Placement authority comes from a committed controller record, never worker inventory.
@@ -289,6 +289,9 @@ pub const PLACEMENT_OPERATIONS: &[&str] = &[
     "seal-disk",
     "export",
     "import-prepare",
+    "fork-prepare",
+    "import-discard",
+    "policy-prepare",
     "activate",
     "export-cleanup",
 ];
@@ -363,6 +366,16 @@ pub fn node_operation(v: &serde_json::Value, op: &str) -> Result<()> {
         ensure!(
             v["cache_eviction_v1"] == true && v["backend"] != "apple-virtualization",
             "worker lacks cache eviction support"
+        );
+    }
+    if matches!(op, "fork-prepare" | "import-discard" | "policy-prepare") {
+        ensure!(
+            v["move_fork_v1"] == true
+                && v["worker_protocol"]
+                    .as_u64()
+                    .or_else(|| v["worker"]["protocol"].as_u64())
+                    .is_some_and(|p| p >= 3),
+            "worker lacks move/fork support"
         );
     }
     if PLACEMENT_OPERATIONS.contains(&op) {
@@ -620,13 +633,21 @@ mod placement_tests {
         for op in PLACEMENT_OPERATIONS {
             assert!(node_operation(&legacy, op).is_err());
         }
-        let capable =
-            json!({"backend":"firecracker","worker_protocol":2,"placement_fencing_v1":true});
+        let capable = json!({"backend":"firecracker","worker_protocol":3,"placement_fencing_v1":true,"move_fork_v1":true});
         for op in PLACEMENT_OPERATIONS {
             assert!(node_operation(&capable, op).is_ok());
         }
         assert!(
             placement_capable(&json!({"worker_protocol":1,"placement_fencing_v1":true})).is_err()
+        );
+        let node = json!({"backend":"firecracker","worker":{"protocol":3},"placement_fencing_v1":true,"move_fork_v1":true});
+        assert!(node_operation(&node, "fork-prepare").is_ok());
+        assert!(
+            node_operation(
+                &json!({"worker":{"protocol":2},"move_fork_v1":true,"placement_fencing_v1":true}),
+                "fork-prepare"
+            )
+            .is_err()
         );
         assert!(worker_compatible(&legacy).is_ok());
     }

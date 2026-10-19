@@ -12,6 +12,7 @@ pub(super) enum Phase {
     Captured,
     Exported,
     Cleaned,
+    Discarded,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -21,6 +22,8 @@ pub(super) struct Managed {
     pub intent: Option<Export>,
     pub import: Option<Import>,
     pub capture_ram: Option<bool>,
+    #[serde(default)]
+    pub fork_initialized: bool,
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct Export {
@@ -33,6 +36,8 @@ pub(super) struct Import {
     snapshot: String,
     manifest_sha256: String,
     cold: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) fork_source: Option<String>,
 }
 
 impl Runtime {
@@ -44,7 +49,7 @@ impl Runtime {
                 self.state
                     .placements
                     .get(*id)
-                    .is_none_or(|m| m.phase != Phase::Cleaned)
+                    .is_none_or(|m| !matches!(m.phase, Phase::Cleaned | Phase::Discarded))
             })
             .count()
     }
@@ -77,13 +82,19 @@ impl Runtime {
                     Phase::Exporting | Phase::Captured => "exporting",
                     Phase::Exported => "exported",
                     Phase::Cleaned => "exported-cleaned",
+                    Phase::Discarded => "discarded",
                 }
                 .into();
             } else if workspace.state != "hibernated" {
                 ensure!(
                     !matches!(
                         workspace.state.as_str(),
-                        "importing" | "prepared" | "exporting" | "exported" | "exported-cleaned"
+                        "importing"
+                            | "prepared"
+                            | "exporting"
+                            | "exported"
+                            | "exported-cleaned"
+                            | "discarded"
                     ),
                     "lifecycle state is missing managed placement: {id}"
                 );
@@ -174,7 +185,11 @@ impl Runtime {
                     "different export intent"
                 );
             }
-            "import-prepare" => {
+            "import-discard" => ensure!(
+                managed.phase == Phase::Discarded,
+                "target no longer excluded"
+            ),
+            "import-prepare" | "fork-prepare" => {
                 ensure!(
                     managed.import.as_ref() == Some(&Self::import_intent(original)?),
                     "different import intent"
@@ -210,9 +225,11 @@ impl Runtime {
                 let workspace = self.workspace(id)?;
                 ensure!(
                     !workspace.managed
-                        && workspace.state == "stopped"
-                        && !self.machines.contains_key(id),
-                    "only an unmanaged stopped copy may be registered"
+                        && matches!(
+                            workspace.state.as_str(),
+                            "stopped" | "hibernated" | "running"
+                        ),
+                    "only an ordinary unmanaged copy may be registered"
                 );
                 self.state.workspaces.get_mut(id).unwrap().managed = true;
                 self.state.placements.insert(
@@ -223,12 +240,23 @@ impl Runtime {
                         intent: None,
                         import: None,
                         capture_ram: None,
+                        fork_initialized: false,
                     },
                 );
                 self.save()?;
             }
             "export" | "seal-disk" => return self.export_copy(request),
-            "import-prepare" => return self.prepare_import(request, authority),
+            "import-prepare" | "fork-prepare" => return self.prepare_import(request, authority),
+            "import-discard" => return self.discard_import(request, authority),
+            "policy-prepare" => {
+                self.authorize(request, false)?;
+                ensure!(
+                    self.state.placements[id].phase == Phase::Prepared
+                        && !self.machines.contains_key(id),
+                    "policy install requires exact prepared copy"
+                );
+                crate::ssh_guest::install_public(&self.root, id, &request["policy"])?;
+            }
             "activate" => {
                 self.authorize(request, false)?;
                 ensure!(
@@ -525,7 +553,19 @@ impl Runtime {
             None => false,
             Some(v) => v.as_bool().context("invalid cold consent")?,
         };
+        let fork_source = request
+            .get("fork_source")
+            .map(|v| v.as_str().context("invalid fork source").map(str::to_owned))
+            .transpose()?;
+        if let Some(source) = &fork_source {
+            identifier(source)?;
+        }
+        ensure!(
+            (request["op"] == "fork-prepare") == fork_source.is_some(),
+            "fork preparation requires source identity"
+        );
         Ok(Import {
+            fork_source,
             snapshot,
             manifest_sha256,
             cold,
@@ -542,7 +582,8 @@ impl Runtime {
         let snapshot: Snapshot =
             serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
         ensure!(
-            snapshot.workspace == id,
+            snapshot.workspace == intent.fork_source.as_deref().unwrap_or(id)
+                && intent.fork_source.as_deref() != Some(id),
             "artifact subject differs from reserved workspace"
         );
         resources(snapshot.memory_mib, snapshot.vcpu_count)?;
@@ -552,11 +593,10 @@ impl Runtime {
             intent.cold || !ram || snapshot.resumable(&self.cpu, &self.kernel_hash),
             "incompatible RAM requires explicit cold consent"
         );
-        let replacing_cleaned = self
-            .state
-            .placements
-            .get(id)
-            .is_some_and(|m| m.phase == Phase::Cleaned && authority.epoch > m.authority.epoch);
+        let replacing_cleaned = self.state.placements.get(id).is_some_and(|m| {
+            matches!(m.phase, Phase::Cleaned | Phase::Discarded)
+                && authority.epoch > m.authority.epoch
+        });
         if let Some(managed) = self.state.placements.get(id).filter(|_| !replacing_cleaned) {
             ensure!(
                 managed.authority == authority && managed.import.as_ref() == Some(&intent),
@@ -591,7 +631,7 @@ impl Runtime {
                 vcpu_count: snapshot.vcpu_count,
                 image: snapshot.image,
                 image_digest: snapshot.image_digest,
-                source: None,
+                source: intent.fork_source.clone(),
                 hibernation: (ram && !intent.cold).then(|| intent.snapshot.clone()),
                 managed: true,
             };
@@ -605,6 +645,7 @@ impl Runtime {
                     intent: None,
                     import: Some(intent.clone()),
                     capture_ram: None,
+                    fork_initialized: false,
                 },
             );
             self.save()?;
@@ -626,6 +667,63 @@ impl Runtime {
         self.state.workspaces.get_mut(id).unwrap().state = "prepared".into();
         self.save()?;
         self.lifecycle_checkpoint("import-registry")?;
+        self.placement_summary(id)
+    }
+
+    // Persist exclusion before removing bytes: a delayed prepare at this epoch can never start.
+    fn discard_import(&mut self, request: &Value, authority: Placement) -> Result<Value> {
+        let id = request["id"].as_str().context("missing ID")?;
+        if let Some(m) = self.state.placements.get(id) {
+            ensure!(
+                m.authority == authority
+                    && matches!(
+                        m.phase,
+                        Phase::Importing | Phase::Prepared | Phase::Discarded
+                    ),
+                "target may be active or belongs to another attempt"
+            );
+            ensure!(!self.machines.contains_key(id), "target is running");
+            self.state.placements.get_mut(id).unwrap().phase = Phase::Discarded;
+        } else {
+            ensure!(
+                !self.state.workspaces.contains_key(id) && !self.machine_dir(id).exists(),
+                "unmanaged target cannot be excluded"
+            );
+            self.state.workspaces.insert(
+                id.into(),
+                Workspace {
+                    id: id.into(),
+                    index: 0,
+                    state: "discarded".into(),
+                    memory_mib: 0,
+                    vcpu_count: 0,
+                    image: "alpine".into(),
+                    image_digest: None,
+                    source: None,
+                    hibernation: None,
+                    managed: true,
+                },
+            );
+            self.state.placements.insert(
+                id.into(),
+                Managed {
+                    authority,
+                    phase: Phase::Discarded,
+                    intent: None,
+                    import: None,
+                    capture_ram: None,
+                    fork_initialized: false,
+                },
+            );
+        }
+        self.state.workspaces.get_mut(id).unwrap().state = "discarded".into();
+        self.save()?;
+        self.lifecycle_checkpoint("discard-fence")?;
+        match fs::remove_dir_all(self.machine_dir(id)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
+        }
+        File::open(self.root.join("machines"))?.sync_all()?;
         self.placement_summary(id)
     }
 
@@ -679,6 +777,70 @@ mod tests {
         runtime.cleanup_pending_snapshots().unwrap();
         runtime.save().unwrap();
     }
+    #[test]
+    fn fork_preparation_preserves_parent_disk_and_needs_commit_and_fresh_ssh_enrollment() {
+        let mut runtime = fixture();
+        register(&mut runtime);
+        runtime.request(&export()).unwrap();
+        let digest = hash(&runtime.snapshot_dir("capture1/manifest.json")).unwrap();
+        let fork = json!({"op":"fork-prepare","id":"child","fork_source":"legacy","placement":authority(8),"snapshot":"capture1","manifest_sha256":digest});
+        let before = fs::read(runtime.machine_dir("legacy/disk.ext4")).unwrap();
+        let prepared = runtime.request(&fork).unwrap();
+        assert_eq!(prepared["state"], "prepared");
+        assert_eq!(prepared["source"], "legacy");
+        assert!(!crate::ssh_guest::path(&runtime.root, "child").exists());
+        assert!(
+            runtime
+                .request(&json!({"op":"start","id":"child","placement":authority(8)}))
+                .is_err()
+        );
+        fs::write(runtime.machine_dir("child/disk.ext4"), b"independent child").unwrap();
+        assert_eq!(
+            fs::read(runtime.machine_dir("legacy/disk.ext4")).unwrap(),
+            before
+        );
+        assert_eq!(runtime.state.value()["worker_state_schema"], 3);
+        restart(&mut runtime);
+        assert_eq!(runtime.request(&fork).unwrap()["state"], "prepared");
+        assert!(!runtime.state.placements["child"].fork_initialized);
+        let mut invalid = fork.clone();
+        invalid["fork_source"] = json!("other");
+        assert!(runtime.request(&invalid).is_err());
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
+    fn discard_before_or_after_import_permanently_excludes_the_old_epoch_across_restart() {
+        for imported in [false, true] {
+            for checkpoint in [None, Some("discard-fence")] {
+                let mut runtime = fixture();
+                register(&mut runtime);
+                runtime.request(&export()).unwrap();
+                let fork = json!({"op":"fork-prepare","id":"child","fork_source":"legacy","placement":authority(8),"snapshot":"capture1","manifest_sha256":hash(&runtime.snapshot_dir("capture1/manifest.json")).unwrap()});
+                if imported {
+                    runtime.request(&fork).unwrap();
+                }
+                let discard = json!({"op":"import-discard","id":"child","placement":authority(8)});
+                runtime.crash = checkpoint;
+                let result = runtime.request(&discard);
+                assert_eq!(result.is_err(), checkpoint.is_some());
+                restart(&mut runtime);
+                assert!(runtime.request(&fork).is_err());
+                assert!(runtime.request(&json!({"op":"activate","id":"child","placement":authority(8),"committed":true,"start":true})).is_err());
+                assert_eq!(
+                    runtime.request(&discard).unwrap()["lifecycle"]["phase"],
+                    "discarded"
+                );
+                assert!(!runtime.machine_dir("child").exists());
+                let mut next = fork;
+                next["placement"] = authority(9);
+                assert_eq!(runtime.request(&next).unwrap()["state"], "prepared");
+                assert!(runtime.request(&discard).is_err());
+                fs::remove_dir_all(runtime.root).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn recovery_preserves_managed_authority_and_durability_summary() {
         let mut runtime = fixture();

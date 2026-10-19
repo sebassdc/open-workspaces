@@ -70,18 +70,20 @@ pub(super) fn job(root: &Path, request: &Value) -> Result<Value> {
     if cached["present"] == true {
         return Ok(cached);
     }
-    let seen = wire::request(root, json!({"op":"inspect","id":a.machine}))?;
-    ensure!(
-        seen["vmm_running"] == false
-            && seen["lifecycle"]["phase"] == "exported"
-            && seen["lifecycle"]["intent"]["capture"] == a.snapshot,
-        "publication requires exact fenced export"
-    );
+    if request["fork"] != true {
+        let seen = wire::request(root, json!({"op":"inspect","id":a.machine}))?;
+        ensure!(
+            seen["vmm_running"] == false
+                && seen["lifecycle"]["phase"] == "exported"
+                && seen["lifecycle"]["intent"]["capture"] == a.snapshot,
+            "publication requires exact fenced export"
+        );
+    }
     let objects = store::S3Objects::new(&a.store_url, None)?;
     objects.verify_configuration()?;
     publish(&objects, root, &a)
 }
-fn publish(objects: &dyn Objects, root: &Path, a: &Artifact) -> Result<Value> {
+pub(super) fn publish(objects: &dyn Objects, root: &Path, a: &Artifact) -> Result<Value> {
     let path = root.join("snapshots").join(&a.snapshot);
     ensure!(
         fs::symlink_metadata(&path)?.is_dir(),
@@ -91,9 +93,7 @@ fn publish(objects: &dyn Objects, root: &Path, a: &Artifact) -> Result<Value> {
     ensure!(raw.len() <= 65536, "native manifest too large");
     let metadata: Value = serde_json::from_slice(&raw)?;
     ensure!(
-        metadata["workspace"] == a.machine
-            && metadata["name"] == a.snapshot
-            && metadata["managed"] == true,
+        metadata["workspace"] == a.machine && metadata["name"] == a.snapshot,
         "capture lineage differs"
     );
     let hashes = metadata["files"]

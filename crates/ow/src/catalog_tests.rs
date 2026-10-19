@@ -2436,8 +2436,12 @@ fn transfer_commit_is_atomic_and_terminal_transitions_are_forward_only() {
     );
     assert!(c.commit_transfer(t.id, t.epoch).is_err());
     assert!(c.operation(user, json!({"op":"start","id":"box"})).is_err());
-    assert!(c.terminal_target(user, "box").is_err());
-    assert!(c.ssh_target(user, "box").is_err());
+    assert_eq!(c.terminal_target(user, "box").unwrap().1, t.machine);
+    assert_eq!(
+        c.managed_placement(&t.machine).unwrap().unwrap().epoch,
+        t.epoch as u64
+    );
+    assert!(c.ssh_target(user, "box").is_err()); // The fixture does not advertise guest SSH.
 }
 #[test]
 fn transfer_fork_reserves_child_identity_and_releases_only_its_attempt() {
@@ -3086,7 +3090,7 @@ fn aborted_fork_cleanup_rolls_back_with_an_uncertain_target() {
     )
     .unwrap();
     c.db.execute(
-        "INSERT INTO owner_allocations VALUES('m-cleanup',1,256,8)",
+        "UPDATE owner_allocations SET cpus=1,memory_mib=256,disk_gib=8 WHERE physical='m-cleanup'",
         [],
     )
     .unwrap();

@@ -1,7 +1,7 @@
-# Dormant worker placement fencing
+# Worker placement fencing
 
-Linux workers provide private lifecycle primitives for a future controller transfer
-runner. The fixed-placement catalog and public API do not invoke them. Existing
+Linux workers provide private lifecycle primitives used by the durable controller
+transfer runner for explicit restore, park, wake, move and fork. Existing
 unmanaged machines retain standalone behavior. No installation automatically
 registers a managed machine, transfers a workspace, or upgrades a running worker.
 
@@ -97,7 +97,7 @@ authority by itself.
 
 ## Compatibility and remaining integration
 
-Worker interface **2**, agents accept **1–2**; host/node transport remains **1**.
+Worker interface **3**, agents accept **1–3**; host/node transport remains **1**.
 A managed `state.json` uses worker state schema **2** and a null legacy
 `next_index`, with the real index in `managed_next_index`. Old workers require an
 integer there and refuse the registry; workspaces remain an object for operator
@@ -134,3 +134,20 @@ checks observed exit before export acknowledgment. Unit tests substitute byte
 copy only when the test filesystem refuses reflink; production still requires
 reflink. These fixtures prove state and retry behavior, not Firecracker RAM
 portability, real host reflinks, physical host isolation or cross-node migration.
+
+## Move/fork worker extension
+
+`move_fork_v1` is advertised by interface-3 workers, not inferred from an agent
+upgrade. `placement-register` may bind an ordinary running/hibernated source without
+starting or stopping it; export still supplies the positive execution fence.
+`fork-prepare` binds the pinned source snapshot to a different reserved child ID
+and remains unstarted. Activation refreshes guest/network/SSH identity once and
+requires independent enrollment. `import-discard` durably excludes an unstarted
+attempt before removing its directory, including an attempt whose prepare reply
+was lost. Equal/older epochs can never prepare or activate afterward; a fresh epoch
+may prepare a new copy. Active copies cannot be discarded. `policy-prepare`
+serializes policy installation against activation and rejects a different generation.
+Child/exclusion state uses reader-guarded worker schema 3. Existing schema-2 fences
+remain readable; older workers cannot read schema 3. Source-only cleanup retains
+captures and the old execution fence. These are class-2 changes, requiring the
+existing explicit eligible-runner upgrade protocol.

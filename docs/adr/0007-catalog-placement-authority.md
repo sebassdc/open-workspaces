@@ -1,6 +1,6 @@
 # ADR 0007: durable placement authority and transfer reservations
 
-Status: implemented catalog contract with explicit verified restore, park and wake execution.
+Status: implemented catalog contract with explicit verified restore, park, wake, move and fork execution.
 Pattern: ADR 0002's single-controller SQLite intents, ADR 0005's per-unit upgrade boundary,
 and ADR 0006's existing artifact references.
 
@@ -62,6 +62,6 @@ worker RPCs and waits must occur outside them, with results supplied as explicit
 evidence. The transition API is controller-internal; evidence flags are attestations
 by the orchestrator after checking worker proof, never public caller parameters.
 Explicit managed restore now executes these contracts through the transfer runner;
-park/wake now reuse this runner; move/fork remain dormant. No automatic movement policy is activated.
+park/wake/move/targeted fork now reuse this runner. Explicit pre-commit target exclusion and fresh-epoch source return preserve the original authority until a conditional commit. No automatic movement policy is activated.
 
 See [lifecycle contract](../LIFECYCLE.md) for phases, permissions and rollout gates.

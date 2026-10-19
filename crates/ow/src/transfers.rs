@@ -63,7 +63,9 @@ impl Step {
     }
     pub fn permits(self, kind: Kind, next: Self) -> bool {
         match (self, next) {
-            (Self::Preparing, Self::Exported) => kind.needs_fence() || kind == Kind::Wake,
+            (Self::Preparing, Self::Exported) => {
+                kind.needs_fence() || matches!(kind, Kind::Wake | Kind::Fork)
+            }
             (Self::Preparing, Self::Importing) => !kind.needs_fence(),
             (Self::Exported, Self::Prepared) => kind == Kind::Park,
             (Self::Exported, Self::Importing) => kind != Kind::Park,
@@ -159,6 +161,16 @@ fn now() -> i64 {
 fn name(t: &Transfer) -> String {
     format!("transfer-{}", t.id)
 }
+fn step_key(t: &Transfer, op: &str) -> String {
+    if matches!(t.kind, Kind::Move | Kind::Fork) {
+        format!(
+            "t-{}",
+            &store::sha256(format!("{}:{}:{op}", t.id, t.epoch).as_bytes())[..30]
+        )
+    } else {
+        format!("{}-{op}", name(t))
+    }
+}
 fn authority(t: &Transfer, node: &str) -> common::Placement {
     common::Placement {
         epoch: t.epoch as u64,
@@ -207,6 +219,15 @@ fn authorized(c: &Catalog, t: &Transfer) -> Result<()> {
         [t.operation],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    if t.kind == Kind::Fork
+        && matches!(
+            t.step,
+            Step::Committed | Step::StartUncertain | Step::Started | Step::Succeeded
+        )
+    {
+        ensure!(c.db.query_row("SELECT owner=?2 AND placement_epoch=?3 AND node=?4 FROM resources WHERE kind='machine' AND physical=?1",params![t.machine,user,t.epoch,t.target],|r|r.get::<_,bool>(0))?,"committed child ownership changed");
+        return Ok(());
+    }
     ensure!(
         c.machine(user, &address, t.kind.permission())? == t.source,
         "transfer authorization changed"
@@ -384,7 +405,7 @@ pub(crate) fn recover(shared: &Shared) {
             let Some(shared) = weak.upgrade() else { break };
             let ids = (|| -> Result<Vec<i64>> {
                 let c = shared.lock().unwrap();
-                Ok(c.db.prepare("SELECT id FROM transfers WHERE kind IN ('restore','park','wake') AND step NOT IN ('succeeded','aborted','failed')")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?)
+                Ok(c.db.prepare("SELECT id FROM transfers WHERE kind IN ('restore','park','wake','move','fork') AND (step NOT IN ('succeeded','aborted','failed') OR (kind='move' AND step='succeeded' AND json_extract((SELECT response FROM operations WHERE id=transfers.operation),'$.cleanup_pending')=1))")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?)
             })();
             if let Ok(ids) = ids {
                 for id in ids {
@@ -479,14 +500,16 @@ fn source_fence(
         .parse::<i64>()?;
     let previous = c.transfer(id)?;
     ensure!(
-        matches!(previous.kind, Kind::Restore | Kind::Park)
+        matches!(previous.kind, Kind::Restore | Kind::Park | Kind::Move)
             && previous.source == t.source
             && previous.source_node == t.source_node
             && previous.source_epoch == t.source_epoch
             && previous.epoch <= t.epoch,
         "source export belongs to another intent"
     );
-    let expected = if t.source_epoch == 0 {
+    let expected = if previous.kind == Kind::Move {
+        movement::source_authority(c, &previous)?
+    } else if t.source_epoch == 0 {
         authority(&previous, &t.source_node)
     } else {
         original.clone()
@@ -506,7 +529,7 @@ fn export_source(
     source_authority: &common::Placement,
     call: &impl Fn(&str, Value) -> Result<Value>,
 ) -> Result<bool> {
-    let inspect = |node: &str| call(node, json!({"op":"inspect","id":t.machine}));
+    let inspect = |node: &str| call(node, json!({"op":"inspect","id":t.source}));
     let step_request = |op: &str, auth: &common::Placement| json!({"op":op,"id":t.machine,"placement":auth,"operation_key":format!("{}-{op}",name(t))});
     let advance = |next, proof| {
         shared
@@ -524,6 +547,16 @@ fn export_source(
             && seen["disk_bytes"] == input.disk_bytes,
         "source identity or disk shape differs from catalog intent"
     );
+    if t.kind == Kind::Move
+        && matches!(
+            seen["state"].as_str(),
+            Some("running" | "hibernated" | "stopped")
+        )
+    {
+        let c = shared.lock().unwrap();
+        authorized(&c, t)?;
+        c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.source_state',?1) WHERE id=?2 AND json_extract(response,'$.source_state') IS NULL",params![seen["state"].as_str(),t.operation])?;
+    }
     let resuming = matches!(
         seen["lifecycle"]["phase"].as_str(),
         Some("exporting" | "captured")
@@ -531,7 +564,7 @@ fn export_source(
     if resuming {
         ensure!(
             seen["state"] == "exporting"
-                && seen["vmm_running"] == false
+                && (t.kind == Kind::Move || seen["vmm_running"] == false)
                 && seen["placement"] == json!(source_authority)
                 && seen["lifecycle"]["intent"]["transfer"] == name(t)
                 && seen["lifecycle"]["intent"]["capture"] == format!("{}-source", name(t))
@@ -542,9 +575,9 @@ fn export_source(
     ensure!(
         (matches!(
             seen["state"].as_str(),
-            Some("stopped" | "hibernated" | "exported")
+            Some("stopped" | "hibernated" | "exported" | "running")
         ) || resuming)
-            && seen["vmm_running"] != true,
+            && (t.kind == Kind::Move || seen["vmm_running"] != true),
         "running or unknown source is ineligible for transfer"
     );
     if matches!(
@@ -562,7 +595,7 @@ fn export_source(
     }
     if seen.get("placement").is_none() {
         ensure!(
-            t.source_epoch == 0 && seen["state"] == "stopped",
+            t.source_epoch == 0 && (seen["state"] == "stopped" || t.kind == Kind::Move),
             "unmanaged source must be stopped"
         );
         let mut register = step_request("placement-register", &source_authority);
@@ -604,6 +637,11 @@ fn tick(
     if initial.kind == Kind::Park {
         return parking::tick(shared, &initial, at, call);
     }
+    if matches!(initial.kind, Kind::Move | Kind::Fork) {
+        if let Some(result) = movement::prepare(shared, &initial, at, call)? {
+            return Ok(result);
+        }
+    }
     if initial.kind == Kind::Wake && initial.step == Step::Preparing {
         return parking::reserve_wake(shared, &initial);
     }
@@ -616,12 +654,18 @@ fn tick(
         authorized(&c, &t)?;
         let a = artifact(&c, &t)?;
         let input = intent(&c, &t)?;
-        let policy: Value = serde_json::from_str(&c.db.query_row(
-            "SELECT ssh_policy FROM resources WHERE kind='machine' AND physical=?1",
-            [&t.source],
-            |r| r.get::<_, String>(0),
-        )?)?;
-        let source_authority = if t.source_epoch == 0 {
+        let policy: Value = if t.kind == Kind::Fork {
+            json!("disabled")
+        } else {
+            serde_json::from_str(&c.db.query_row(
+                "SELECT ssh_policy FROM resources WHERE kind='machine' AND physical=?1",
+                [&t.source],
+                |r| r.get::<_, String>(0),
+            )?)?
+        };
+        let source_authority = if t.kind == Kind::Move {
+            movement::source_authority(&c, &t)?
+        } else if t.source_epoch == 0 {
             authority(&t, &t.source_node)
         } else {
             let previous: i64 = c.db.query_row(
@@ -639,6 +683,11 @@ fn tick(
     };
     let target = t.target.as_deref().context("target missing")?;
     let placement = authority(&t, target);
+    let should_start = if t.kind == Kind::Move {
+        shared.lock().unwrap().db.query_row("SELECT COALESCE(json_extract(response,'$.source_state')='running',?2) FROM operations WHERE id=?1",params![t.operation,input.explicit_start],|r|r.get::<_,bool>(0))?
+    } else {
+        true
+    };
     let advance = |next, proof| {
         shared
             .lock()
@@ -647,7 +696,7 @@ fn tick(
             .map(|_| true)
     };
     let inspect = |node: &str| call(node, json!({"op":"inspect","id":t.machine}));
-    let step_request = |op: &str, auth: &common::Placement| json!({"op":op,"id":t.machine,"placement":auth,"operation_key":format!("{}-{op}",name(&t))});
+    let step_request = |op: &str, auth: &common::Placement| json!({"op":op,"id":t.machine,"placement":auth,"operation_key":step_key(&t,op)});
     match t.step {
         Step::Preparing => export_source(shared, &t, &input, &policy, &source_authority, call),
         Step::Exported => {
@@ -687,9 +736,21 @@ fn tick(
                 cached["present"] == true && cached["digest"] == a.reference.digest,
                 "verified target cache unavailable"
             );
+            if t.kind == Kind::Move && !input.accept_cold {
+                let c = shared.lock().unwrap();
+                let required:bool=c.db.query_row("SELECT COALESCE(json_extract(o.response,'$.source_state'),json_extract(r.metadata,'$.state')) IN ('running','hibernated') FROM operations o JOIN resources r ON r.kind='machine' AND r.physical=?2 WHERE o.id=?1",params![t.operation,t.source],|r|r.get(0))?;
+                ensure!(
+                    !required || cached["ram"] == true,
+                    "source RAM was not durably captured; explicit cold recovery consent required"
+                );
+            }
             if cached["ram"] == true && !input.accept_cold {
                 let status = call(target, json!({"op":"status"}))?;
                 if status["compat"] != cached["compat"] {
+                    ensure!(
+                        !matches!(t.kind, Kind::Move | Kind::Fork),
+                        "incompatible stored RAM; abort to restore source authority or explicitly retarget a compatible runner"
+                    );
                     let c = shared.lock().unwrap();
                     c.advance_transfer(t.id, t.epoch, t.step, Step::Failed, &Evidence::default())?;
                     c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.error',?1) WHERE id=?2",params!["incompatible stored RAM; retry with a new operation key and explicit --accept-cold consent",t.operation])?;
@@ -711,13 +772,23 @@ fn tick(
                 cache["present"] == true && cache["digest"] == a.reference.digest,
                 "verified target cache unavailable"
             );
-            let mut request = step_request("import-prepare", &placement);
+            let mut request = step_request(
+                if t.kind == Kind::Fork {
+                    "fork-prepare"
+                } else {
+                    "import-prepare"
+                },
+                &placement,
+            );
+            if t.kind == Kind::Fork {
+                request["fork_source"] = json!(t.source);
+            }
             request["snapshot"] = json!(a.snapshot);
             request["manifest_sha256"] = cache["manifest_sha256"].clone();
             request["cold"] = json!(input.accept_cold);
             // T2 journal replays only the same immutable key/fingerprint and reconciles partial imports.
             let mut inventory = call(target, json!({"op":"list"}))?;
-            if t.kind == Kind::Wake {
+            if matches!(t.kind, Kind::Wake | Kind::Move) {
                 if let Some(seen) = inventory
                     .as_array()
                     .context("invalid target inventory")?
@@ -728,7 +799,15 @@ fn tick(
                         seen["lifecycle"]["phase"].as_str(),
                         Some("exported" | "cleaned")
                     ) {
-                        parking::clean_cached_source(shared, &t, target, seen, call)?;
+                        if t.kind == Kind::Move && target == t.source_node {
+                            source_fence(&shared.lock().unwrap(), &t, seen, &source_authority)?;
+                            call(
+                                target,
+                                json!({"op":"export-cleanup","id":t.machine,"placement":seen["placement"],"transfer":seen["lifecycle"]["intent"]["transfer"],"capture":seen["lifecycle"]["intent"]["capture"],"operation_key":step_key(&t,"return-cleanup")}),
+                            )?;
+                        } else {
+                            parking::clean_cached_source(shared, &t, target, seen, call)?;
+                        }
                         inventory
                             .as_array_mut()
                             .unwrap()
@@ -736,6 +815,16 @@ fn tick(
                     }
                 }
             }
+            inventory
+                .as_array_mut()
+                .context("invalid target inventory")?
+                .retain(|v| {
+                    !(v["id"] == t.machine
+                        && v["lifecycle"]["phase"] == "discarded"
+                        && v["placement"]["epoch"]
+                            .as_u64()
+                            .is_some_and(|e| e < t.epoch as u64))
+                });
             let existing = inventory
                 .as_array()
                 .context("invalid target inventory")?
@@ -748,6 +837,8 @@ fn tick(
                         && existing["lifecycle"]["import"]["manifest_sha256"]
                             == cache["manifest_sha256"]
                         && existing["lifecycle"]["import"]["cold"] == input.accept_cold
+                        && (t.kind != Kind::Fork
+                            || existing["lifecycle"]["import"]["fork_source"] == t.source)
                         && existing["vmm_running"] == false
                         && matches!(
                             existing["lifecycle"]["phase"].as_str(),
@@ -770,7 +861,7 @@ fn tick(
             );
             call(
                 target,
-                json!({"op":"restore-policy","id":t.machine,"placement":placement,"policy":policy}),
+                json!({"op":"restore-policy","id":t.machine,"placement":placement,"policy":policy,"strict":matches!(t.kind, Kind::Move|Kind::Fork)}),
             )?;
             advance(
                 Step::Prepared,
@@ -782,6 +873,7 @@ fn tick(
         }
         Step::Prepared => {
             if t.kind.needs_fence()
+                && t.target.as_deref() != Some(&t.source_node)
                 && let Ok(source) = inspect(&t.source_node)
             {
                 source_fence(&shared.lock().unwrap(), &t, &source, &source_authority)?;
@@ -802,6 +894,7 @@ fn tick(
         Step::Committed => advance(Step::StartUncertain, Evidence::default()),
         Step::StartUncertain => {
             if t.kind.needs_fence()
+                && t.target.as_deref() != Some(&t.source_node)
                 && let Ok(source) = inspect(&t.source_node)
             {
                 source_fence(&shared.lock().unwrap(), &t, &source, &source_authority)?;
@@ -813,7 +906,10 @@ fn tick(
             );
             if seen["lifecycle"]["phase"] == "active" {
                 ensure!(
-                    seen["state"] == "running" && seen["vmm_running"] == true,
+                    (should_start && seen["state"] == "running" && seen["vmm_running"] == true)
+                        || (!should_start
+                            && matches!(seen["state"].as_str(), Some("stopped" | "hibernated"))
+                            && seen["vmm_running"] == false),
                     "activation outcome needs explicit reconciliation; refusing another start"
                 );
             } else {
@@ -823,13 +919,17 @@ fn tick(
                 );
                 let mut request = step_request("activate", &placement);
                 request["committed"] = json!(true);
-                request["start"] = json!(true);
+                request["start"] = json!(should_start);
                 call(target, request)?;
                 let seen = inspect(target)?;
                 ensure!(
                     seen["placement"] == json!(placement)
-                        && seen["state"] == "running"
-                        && seen["vmm_running"] == true,
+                        && (if should_start {
+                            seen["state"] == "running" && seen["vmm_running"] == true
+                        } else {
+                            matches!(seen["state"].as_str(), Some("stopped" | "hibernated"))
+                                && seen["vmm_running"] == false
+                        }),
                     "activation not confirmed"
                 );
             }
@@ -841,6 +941,10 @@ fn tick(
                 seen["placement"] == json!(placement) && seen["lifecycle"]["phase"] == "active",
                 "target authority changed"
             );
+            if t.kind == Kind::Move {
+                let complete = movement::cleanup(shared, &t, call)?;
+                shared.lock().unwrap().db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.cleanup_pending',json(?1)) WHERE id=?2",params![json!(!complete).to_string(),t.operation])?;
+            }
             let c = shared.lock().unwrap();
             c.db.execute("UPDATE resources SET metadata=?1 WHERE kind='machine' AND physical=?2 AND placement_epoch=?3 AND node=?4",params![seen.to_string(),t.machine,t.epoch,target])?;
             c.advance_transfer(t.id, t.epoch, t.step, Step::Succeeded, &Evidence::default())?;
@@ -1005,20 +1109,28 @@ pub(crate) fn job(root: &Path, request: &Value) -> Result<Value> {
         let id = request["id"].as_str().context("machine required")?;
         common::identifier(id)?;
         let seen = wire::request(root, json!({"op":"inspect","id":id}))?;
-        ensure!(
-            seen["vmm_running"] != true
-                && matches!(
-                    seen["state"].as_str(),
-                    Some("stopped" | "hibernated" | "prepared" | "exported")
-                ),
-            "public policy requires a fenced or stopped copy"
-        );
+        if request.get("policy").is_some() {
+            ensure!(
+                seen["vmm_running"] != true
+                    && matches!(
+                        seen["state"].as_str(),
+                        Some("stopped" | "hibernated" | "prepared" | "exported")
+                    ),
+                "public policy requires a fenced or stopped copy"
+            );
+        }
         if let Some(value) = request.get("policy") {
             let placement = common::Placement::from_request(request)?;
             ensure!(
                 seen["placement"] == json!(placement) && seen["lifecycle"]["phase"] == "prepared",
                 "policy install requires exact unstarted import"
             );
+            if request["strict"] == true {
+                return wire::request(
+                    root,
+                    json!({"op":"policy-prepare","id":id,"placement":placement,"policy":value}),
+                );
+            }
             let policy: PublicSshPolicy = serde_json::from_value(value.clone())?;
             let path = ow_core::ssh_guest::path(root, id);
             match policy {
@@ -1086,3 +1198,11 @@ pub(crate) use parking::{ensure_awake, ensure_started, park, wake, wake_status};
 
 #[path = "capture_upload.rs"]
 mod capture_upload;
+
+#[path = "movement.rs"]
+mod movement;
+pub(crate) use movement::{control, relocate};
+
+#[cfg(test)]
+#[path = "movement_vm_tests.rs"]
+mod vm_tests;

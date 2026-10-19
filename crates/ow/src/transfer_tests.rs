@@ -146,11 +146,12 @@ impl Peers {
                 self.pulls.push(request["attempt"].as_str().unwrap().into());
                 json!({"present":true,"digest":"b".repeat(64)})
             }
-            "import-prepare" => {
+            "import-prepare" | "fork-prepare" => {
                 assert!(self.cached);
                 *seen = Some(
-                    json!({"id":"physical","placement":request["placement"],"state":"prepared","vmm_running":false,"lifecycle":{"phase":"prepared","import":{"snapshot":request["snapshot"],"manifest_sha256":request["manifest_sha256"],"cold":request["cold"]}}}),
+                    json!({"id":request["id"],"placement":request["placement"],"state":"prepared","vmm_running":false,"lifecycle":{"phase":"prepared","import":{"snapshot":request["snapshot"],"manifest_sha256":request["manifest_sha256"],"cold":request["cold"]}}}),
                 );
+                if request["op"] == "fork-prepare" {seen.as_mut().unwrap()["lifecycle"]["import"]["fork_source"]=request["fork_source"].clone();}
                 seen.clone().unwrap()
             }
             "activate" => {
@@ -160,8 +161,8 @@ impl Peers {
                 assert_eq!(t.step, Step::StartUncertain);
                 let epoch: i64 =
                     c.db.query_row(
-                        "SELECT placement_epoch FROM resources WHERE physical='physical'",
-                        [],
+                        "SELECT placement_epoch FROM resources WHERE physical=?1",
+                        [&t.machine],
                         |r| r.get(0),
                     )
                     .unwrap();
@@ -169,7 +170,7 @@ impl Peers {
                 drop(c);
                 self.starts += 1;
                 *seen = Some(
-                    json!({"id":"physical","placement":request["placement"],"state":"running","memory_mib":256,"vcpu_count":1,"disk_bytes":4,"vmm_running":true,"lifecycle":{"phase":"active"}}),
+                    json!({"id":request["id"],"placement":request["placement"],"state":"running","memory_mib":256,"vcpu_count":1,"disk_bytes":4,"vmm_running":true,"lifecycle":{"phase":"active"}}),
                 );
                 seen.clone().unwrap()
             }
@@ -1418,3 +1419,566 @@ fn park_denies_a_shared_admin_before_any_runner_contact() {
 
 #[path = "parking_review_tests.rs"]
 mod review;
+
+fn moving_fixture(kind: Kind) -> (Fixture, RefCell<Peers>) {
+    let (mut f, peers) = parked_fixture("running");
+    {
+        let c = f.shared.lock().unwrap();
+        c.advance_transfer(
+            f.transfer.id,
+            f.transfer.epoch,
+            Step::Preparing,
+            Step::Aborted,
+            &Evidence::default(),
+        )
+        .unwrap();
+        c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.move_fork_v1',json('true'),'$.worker_protocol',3)",[]).unwrap();
+        let mut input = parking::shape(&c, "physical", kind, "box").unwrap();
+        input.target = Some("target".into());
+        if kind == Kind::Fork {
+            input.child = Some(Child {
+                id: "child-id".into(),
+                name: "child".into(),
+            });
+        }
+        f.transfer = c.begin_transfer(f.user, "move-or-fork", &input).unwrap();
+        if kind == Kind::Fork {
+            c.db.execute(
+                "UPDATE operations SET response=json_object('fork_snapshot',?1) WHERE id=?2",
+                params![format!("{}-fork", name(&f.transfer)), f.transfer.operation],
+            )
+            .unwrap();
+        }
+    }
+    peers.borrow_mut().source.as_mut().unwrap()["vmm_running"] = json!(true);
+    (f, peers)
+}
+fn moving_call(f: &Fixture, peers: &RefCell<Peers>, node: &str, request: Value) -> Result<Value> {
+    match request["op"].as_str().unwrap() {
+        "capture-published" => Ok(json!({"present":false})),
+        "capture-push" => Ok(publication(&request, true)),
+        "snapshot" => Ok(json!({"name":request["name"],"workspace":request["id"]})),
+        "import-discard" => {
+            let mut p = peers.borrow_mut();
+            let seen = if node == "source" {
+                &mut p.source
+            } else {
+                &mut p.target
+            };
+            ensure!(
+                seen.as_ref().is_none_or(|v| v["vmm_running"] != true),
+                "cannot exclude running target"
+            );
+            *seen = Some(
+                json!({"id":request["id"],"placement":request["placement"],"vmm_running":false,"lifecycle":{"phase":"discarded"}}),
+            );
+            Ok(seen.clone().unwrap())
+        }
+        _ => wake_call(f, peers, true, node, request),
+    }
+}
+fn move_tick(f: &Fixture, peers: &RefCell<Peers>, at: i64) -> Result<bool> {
+    tick(&f.shared, f.transfer.id, at, &|node, r| {
+        moving_call(f, peers, node, r)
+    })
+}
+#[test]
+fn move_and_fork_restart_or_lost_reply_at_every_effect() {
+    for kind in [Kind::Move, Kind::Fork] {
+        let ops = if kind == Kind::Move {
+            vec![
+                "export",
+                "capture-published",
+                "capture-push",
+                "capture-pull",
+                "import-prepare",
+                "restore-policy",
+                "activate",
+                "export-cleanup",
+            ]
+        } else {
+            vec![
+                "snapshot",
+                "capture-published",
+                "capture-push",
+                "capture-pull",
+                "fork-prepare",
+                "restore-policy",
+                "activate",
+            ]
+        };
+        for op in ops {
+            for after in [false, true] {
+                let (mut f, peers) = moving_fixture(kind);
+                let failed = std::cell::Cell::new(false);
+                let mut at = now();
+                for _ in 0..30 {
+                    let r = tick(&f.shared, f.transfer.id, at, &|node, r| {
+                        let hit = r["op"] == op && !failed.get();
+                        if hit && !after {
+                            failed.set(true);
+                            anyhow::bail!("lost request");
+                        }
+                        let result = moving_call(&f, &peers, node, r)?;
+                        if hit {
+                            failed.set(true);
+                            anyhow::bail!("lost reply");
+                        }
+                        Ok(result)
+                    });
+                    if r.is_err() {
+                        at += 7201;
+                    }
+                    f.restart();
+                    if f.step() == Step::Succeeded {
+                        break;
+                    }
+                }
+                assert!(failed.get(), "{kind:?}/{op}/{after}");
+                assert_eq!(f.step(), Step::Succeeded, "{kind:?}/{op}/{after}");
+                assert_eq!(peers.borrow().starts, 1);
+                let c = f.shared.lock().unwrap();
+                assert_eq!(
+                    c.managed_placement(&f.transfer.machine)
+                        .unwrap()
+                        .unwrap()
+                        .node,
+                    "target"
+                );
+                if kind == Kind::Move {
+                    assert_eq!(
+                        peers.borrow().source.as_ref().unwrap()["lifecycle"]["phase"],
+                        "cleaned"
+                    );
+                } else {
+                    assert_eq!(peers.borrow().source.as_ref().unwrap()["vmm_running"], true);
+                    assert_eq!(
+                        c.db.query_row(
+                            "SELECT owner FROM resources WHERE physical='child-id'",
+                            [],
+                            |r| r.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                        f.user
+                    );
+                    assert_eq!(
+                        c.db.query_row(
+                            "SELECT ssh_policy FROM resources WHERE physical='child-id'",
+                            [],
+                            |r| r.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                        "\"disabled\""
+                    );
+                }
+            }
+        }
+    }
+}
+#[test]
+fn move_source_loss_never_fences_by_timeout_and_durable_export_continues() {
+    for stop in [
+        Step::Preparing,
+        Step::Exported,
+        Step::Importing,
+        Step::StartUncertain,
+    ] {
+        let (mut f, peers) = moving_fixture(Kind::Move);
+        while f.step() != stop {
+            move_tick(&f, &peers, now()).unwrap();
+        }
+        // Every source request fails: only a durable publication can make progress.
+        for _ in 0..10 {
+            let _ = tick(&f.shared, f.transfer.id, now() + 100000, &|node, r| {
+                ensure!(node != "source", "source offline");
+                moving_call(&f, &peers, node, r)
+            });
+            f.restart();
+        }
+        if matches!(stop, Step::Preparing | Step::Exported) {
+            assert_eq!(peers.borrow().starts, 0);
+            assert_eq!(f.step(), stop);
+        } else {
+            assert_eq!(f.step(), Step::Succeeded);
+            assert_eq!(peers.borrow().starts, 1);
+        }
+    }
+}
+#[test]
+fn move_retarget_excludes_uncertain_import_and_allocates_fresh_epoch() {
+    let (mut f, peers) = moving_fixture(Kind::Move);
+    while f.step() != Step::Importing {
+        move_tick(&f, &peers, now()).unwrap();
+    }
+    let _ = tick(&f.shared, f.transfer.id, now(), &|node, r| {
+        let hit = r["op"] == "import-prepare";
+        let v = moving_call(&f, &peers, node, r)?;
+        ensure!(!hit, "lost import reply");
+        Ok(v)
+    });
+    let old = f.shared.lock().unwrap().transfer(f.transfer.id).unwrap();
+    f.shared.lock().unwrap().db.execute("UPDATE operations SET response=json_set(response,'$.intervention',json(?1)) WHERE id=?2",params![json!({"epoch":old.epoch,"abort":true,"node":null}).to_string(),old.operation]).unwrap();
+    move_tick(&f, &peers, now()).unwrap();
+    let next = f.shared.lock().unwrap().transfer(f.transfer.id).unwrap();
+    assert!(next.epoch > old.epoch);
+    assert_eq!(next.target.as_deref(), Some("source"));
+    assert_eq!(
+        peers.borrow().target.as_ref().unwrap()["lifecycle"]["phase"],
+        "discarded"
+    );
+    peers.borrow_mut().cached = true;
+    for _ in 0..10 {
+        if !move_tick(&f, &peers, now()).unwrap() {
+            break;
+        }
+        f.restart();
+    }
+    assert_eq!(f.step(), Step::Succeeded);
+    assert_eq!(peers.borrow().starts, 1);
+    assert_eq!(
+        f.shared
+            .lock()
+            .unwrap()
+            .managed_placement("physical")
+            .unwrap()
+            .unwrap()
+            .node,
+        "source"
+    );
+    // A start may have happened: further cancellation/retargeting is forbidden.
+    let c = f.shared.lock().unwrap();
+    let input = intent(&c, &next).unwrap();
+    assert!(
+        c.retarget_transfer(next.id, next.epoch, "target", &input, &json!({}))
+            .is_err()
+    );
+}
+#[test]
+fn move_policy_change_or_contradictory_running_source_stops_activation() {
+    for changed_policy in [true, false] {
+        let (f, peers) = moving_fixture(Kind::Move);
+        while f.step() != Step::Prepared {
+            move_tick(&f, &peers, now()).unwrap();
+        }
+        if changed_policy {
+            f.shared.lock().unwrap().db.execute("UPDATE resources SET ssh_policy_generation=ssh_policy_generation+1 WHERE physical='physical'",[]).unwrap();
+        } else {
+            peers.borrow_mut().source.as_mut().unwrap()["vmm_running"] = json!(true);
+        }
+        assert!(move_tick(&f, &peers, now()).is_err());
+        assert_eq!(f.step(), Step::Prepared);
+        assert_eq!(peers.borrow().starts, 0);
+    }
+}
+
+#[test]
+fn transfer_locks_block_conflicting_mutations_and_shared_fork_keeps_requester_ownership() {
+    let (f, _) = moving_fixture(Kind::Move);
+    let mut c = f.shared.lock().unwrap();
+    for request in [
+        json!({"op":"delete","id":"box"}),
+        json!({"op":"resize","id":"box","memory_mib":512}),
+        json!({"op":"snapshot","id":"box","name":"conflict"}),
+        json!({"op":"ssh-keys","id":"box","keys":[]}),
+    ] {
+        let error = c.operation(f.user, request).unwrap_err();
+        assert!(
+            error.to_string().contains("transfer-aware routing"),
+            "{error:#}"
+        );
+    }
+    let t = c.transfer(f.transfer.id).unwrap();
+    c.advance_transfer(t.id, t.epoch, t.step, Step::Aborted, &Evidence::default())
+        .unwrap();
+    let other = c
+        .user(&Identity {
+            issuer: "test".into(),
+            subject: "forker".into(),
+            email: "forker@example.test".into(),
+        })
+        .unwrap();
+    c.db.execute(
+        "INSERT INTO grants(physical,grantee,role) VALUES('physical',?1,'use')",
+        [other],
+    )
+    .unwrap();
+    let mut input = parking::shape(&c, "physical", Kind::Fork, "owner@example.test/box").unwrap();
+    input.target = Some("target".into());
+    input.child = Some(Child {
+        id: "requester-child".into(),
+        name: "mine".into(),
+    });
+    let fork = c.begin_transfer(other, "shared-fork", &input).unwrap();
+    assert_eq!(
+        c.db.query_row(
+            "SELECT owner FROM resources WHERE physical='requester-child'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        other
+    );
+    assert_eq!(c.machine(other, "mine", "exec").unwrap(), fork.machine);
+    input.kind = Kind::Move;
+    input.child = None;
+    assert!(c.begin_transfer(other, "shared-move", &input).is_err());
+}
+
+#[test]
+fn queued_recovery_blocks_a_racing_commit_and_post_commit_timeout_never_retargets() {
+    let (f, peers) = moving_fixture(Kind::Move);
+    while f.step() != Step::Prepared {
+        move_tick(&f, &peers, now()).unwrap();
+    }
+    let c = f.shared.lock().unwrap();
+    let t = c.transfer(f.transfer.id).unwrap();
+    c.db.execute(
+        "UPDATE operations SET response=json_set(response,'$.intervention',json(?1)) WHERE id=?2",
+        params![
+            json!({"epoch":t.epoch,"abort":true}).to_string(),
+            t.operation
+        ],
+    )
+    .unwrap();
+    assert!(c.commit_transfer(t.id, t.epoch).is_err());
+    c.db.execute(
+        "UPDATE operations SET response=json_remove(response,'$.intervention') WHERE id=?1",
+        [t.operation],
+    )
+    .unwrap();
+    c.commit_transfer(t.id, t.epoch).unwrap();
+    let input = intent(&c, &t).unwrap();
+    assert!(
+        c.retarget_transfer(t.id, t.epoch, "source", &input, &json!({}))
+            .is_err()
+    );
+    assert_eq!(c.transfer(t.id).unwrap().target.as_deref(), Some("target"));
+}
+
+#[test]
+fn a_running_move_never_silently_cold_boots_an_incomplete_ram_export() {
+    let (f, peers) = moving_fixture(Kind::Move);
+    while f.step() != Step::Exported {
+        move_tick(&f, &peers, now()).unwrap();
+    }
+    // The worker recovered an incomplete RAM seal as disk-only. This cannot imply cold consent.
+    tick(
+        &f.shared,
+        f.transfer.id,
+        now(),
+        &|node, r| match r["op"].as_str().unwrap() {
+            "capture-push" => Ok(publication(&r, false)),
+            _ => moving_call(&f, &peers, node, r),
+        },
+    )
+    .unwrap();
+    let result = tick(
+        &f.shared,
+        f.transfer.id,
+        now(),
+        &|node, r| match r["op"].as_str().unwrap() {
+            "capture-cache" => Ok(
+                json!({"present":true,"digest":r["artifact"]["reference"]["digest"],"ram":false}),
+            ),
+            _ => moving_call(&f, &peers, node, r),
+        },
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("cold recovery consent")
+    );
+    assert_eq!(f.step(), Step::Exported);
+    assert_eq!(peers.borrow().starts, 0);
+}
+#[test]
+fn offline_cleanup_does_not_hide_a_running_contradiction_when_the_source_returns() {
+    let (f, peers) = moving_fixture(Kind::Move);
+    while f.step() != Step::Started {
+        move_tick(&f, &peers, now()).unwrap();
+    }
+    tick(&f.shared, f.transfer.id, now(), &|node, r| {
+        ensure!(node != "source", "offline");
+        moving_call(&f, &peers, node, r)
+    })
+    .unwrap();
+    assert_eq!(f.step(), Step::Succeeded);
+    peers.borrow_mut().source.as_mut().unwrap()["vmm_running"] = json!(true);
+    assert!(move_tick(&f, &peers, now()).is_err());
+    assert_eq!(f.step(), Step::Started);
+    assert!(
+        f.shared
+            .lock()
+            .unwrap()
+            .managed_placement("physical")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn stopped_move_preserves_stopped_state_without_an_implicit_start() {
+    let (f, peers) = moving_fixture(Kind::Move);
+    peers.borrow_mut().source.as_mut().unwrap()["state"] = json!("stopped");
+    peers.borrow_mut().source.as_mut().unwrap()["vmm_running"] = json!(false);
+    for _ in 0..15 {
+        let more = tick(&f.shared, f.transfer.id, now(), &|node, r| {
+            if r["op"] == "activate" {
+                assert_eq!(r["start"], false);
+                let mut p = peers.borrow_mut();
+                let seen = p.target.as_mut().unwrap();
+                seen["state"] = json!("stopped");
+                seen["vmm_running"] = json!(false);
+                seen["lifecycle"]["phase"] = json!("active");
+                return Ok(seen.clone());
+            }
+            moving_call(&f, &peers, node, r)
+        })
+        .unwrap();
+        if !more {
+            break;
+        }
+    }
+    assert_eq!(f.step(), Step::Succeeded);
+    assert_eq!(peers.borrow().starts, 0);
+    assert_eq!(peers.borrow().target.as_ref().unwrap()["state"], "stopped");
+}
+
+#[test]
+fn source_owner_can_exclude_and_abort_a_revoked_requesters_fork_without_restoring_the_grant() {
+    let (f, peers) = moving_fixture(Kind::Fork);
+    let mut c = f.shared.lock().unwrap();
+    let requester = c
+        .user(&Identity {
+            issuer: "test".into(),
+            subject: "requester".into(),
+            email: "requester@example.test".into(),
+        })
+        .unwrap();
+    let t = c.transfer(f.transfer.id).unwrap();
+    c.db.execute("UPDATE operations SET owner=?1,request=json_set(request,'$.transfer.machine','owner@example.test/box') WHERE id=?2",params![requester,t.operation]).unwrap();
+    c.db.execute(
+        "UPDATE resources SET owner=?1 WHERE physical='child-id'",
+        [requester],
+    )
+    .unwrap();
+    // A source owner was authenticated by control(); the attestation is never accepted from public JSON.
+    c.db.execute(
+        "UPDATE operations SET response=json_set(response,'$.intervention',json(?1)) WHERE id=?2",
+        params![
+            json!({"epoch":t.epoch,"abort":true,"node":null,"owner_abort":true}).to_string(),
+            t.operation
+        ],
+    )
+    .unwrap();
+    drop(c);
+    move_tick(&f, &peers, now()).unwrap();
+    assert_eq!(f.step(), Step::Aborted);
+    let c = f.shared.lock().unwrap();
+    assert!(
+        c.machine(requester, "owner@example.test/box", "fork")
+            .is_err()
+    );
+    assert_eq!(
+        c.db.query_row(
+            "SELECT COUNT(*) FROM resources WHERE physical='child-id'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(peers.borrow().source.as_ref().unwrap()["vmm_running"], true);
+}
+
+#[test]
+fn shared_admin_move_is_denied_before_runner_contact() {
+    let f = Fixture::new();
+    let admin = Identity {
+        issuer: "test".into(),
+        subject: "admin".into(),
+        email: "admin@example.test".into(),
+    };
+    {
+        let mut c = f.shared.lock().unwrap();
+        let user = c.user(&admin).unwrap();
+        c.db.execute(
+            "INSERT INTO grants(physical,grantee,role) VALUES('physical',?1,'admin')",
+            [user],
+        )
+        .unwrap();
+    }
+    let error=relocate(f.shared.clone(),&admin,&json!({"op":"move","id":"owner@example.test/box","node":"missing-runner","operation_key":"denied"})).unwrap_err();
+    assert!(
+        error.to_string().contains("move requires the owner"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_committed_fork_forward_recovers_as_the_child_owner_after_source_sharing_is_revoked() {
+    let (f, peers) = moving_fixture(Kind::Fork);
+    let requester = {
+        let mut c = f.shared.lock().unwrap();
+        let requester = c
+            .user(&Identity {
+                issuer: "test".into(),
+                subject: "committed-forker".into(),
+                email: "committed@example.test".into(),
+            })
+            .unwrap();
+        c.db.execute(
+            "INSERT INTO grants(physical,grantee,role) VALUES('physical',?1,'use')",
+            [requester],
+        )
+        .unwrap();
+        c.db.execute("UPDATE operations SET owner=?1,request=json_set(request,'$.transfer.machine','owner@example.test/box') WHERE id=?2",params![requester,f.transfer.operation]).unwrap();
+        c.db.execute(
+            "UPDATE resources SET owner=?1 WHERE physical='child-id'",
+            [requester],
+        )
+        .unwrap();
+        requester
+    };
+    while f.step() != Step::Committed {
+        move_tick(&f, &peers, now()).unwrap();
+    }
+    f.shared
+        .lock()
+        .unwrap()
+        .db
+        .execute("DELETE FROM grants WHERE grantee=?1", [requester])
+        .unwrap();
+    for _ in 0..5 {
+        if !move_tick(&f, &peers, now()).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(f.step(), Step::Succeeded);
+    let c = f.shared.lock().unwrap();
+    assert!(
+        c.machine(requester, "owner@example.test/box", "exec")
+            .is_err()
+    );
+    assert!(c.managed_placement("child-id").unwrap().is_some());
+    assert_eq!(peers.borrow().starts, 1);
+}
+
+#[test]
+fn lost_retarget_reply_joins_the_fresh_epoch_instead_of_excluding_it_again() {
+    let (f, _) = moving_fixture(Kind::Move);
+    let original = f.transfer.epoch;
+    {
+        let c = f.shared.lock().unwrap();
+        c.db.execute(
+            "UPDATE transfers SET epoch=epoch+1 WHERE id=?1",
+            [f.transfer.id],
+        )
+        .unwrap();
+        c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.last_intervention',json(?1)) WHERE id=?2",params![json!({"epoch":original,"node":"target","abort":false,"owner_abort":false}).to_string(),f.transfer.operation]).unwrap();
+    }
+    let result=control(f.shared.clone(),&Identity{issuer:"test".into(),subject:"owner".into(),email:"owner@example.test".into()},&json!({"op":"transfer-control","id":"box","transfer":f.transfer.id,"epoch":original,"node":"target"})).unwrap();
+    assert_eq!(result["transfer"]["epoch"], original + 1);
+    assert_eq!(f.shared.lock().unwrap().db.query_row("SELECT json_extract(response,'$.intervention') IS NULL FROM operations WHERE id=?1",[f.transfer.operation],|r|r.get::<_,bool>(0)).unwrap(),true);
+}

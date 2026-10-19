@@ -1,6 +1,6 @@
 //! Actual controller/agent SIGKILL with real publication/pull jobs and durable worker fixtures.
 use super::*;
-fn park_fixture(ram: bool) -> (Processes, i64, i64) {
+pub(super) fn park_fixture(ram: bool) -> (Processes, i64, i64) {
     let p = fixture();
     let ctl = p.root.join("controller");
     fs::write(ctl.join("store-url"), "s3://bucket/root").unwrap();
@@ -95,7 +95,7 @@ fn wait_transfer(p: &Processes, id: i64) {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
-fn killed_phases(p: &mut Processes, id: i64, phases: &[&str]) {
+pub(super) fn killed_phases(p: &mut Processes, id: i64, phases: &[&str]) {
     let ctl = p.root.join("controller");
     for phase in phases {
         fs::write(ctl.join(format!("hold-controller-{phase}")), b"").unwrap();

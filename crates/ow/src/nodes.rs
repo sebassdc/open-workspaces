@@ -1248,6 +1248,14 @@ pub fn agent(
                     #[cfg(target_os = "linux")]
                     cache_extension(&mut beat, &status, root, cache_negotiated)?;
                     beat["disk_resize_v1"] = json!(status["disk_resize_v1"] == true);
+                    #[cfg(target_os = "linux")]
+                    {
+                        beat["move_fork_v1"] = json!(
+                            status["move_fork_v1"] == true
+                                && status["worker_protocol"].as_u64().is_some_and(|p| p >= 3)
+                                && crate::image_store::configured_url(root).is_ok()
+                        );
+                    }
                     beat["placement_fencing_v1"] =
                         json!(common::placement_capable(&status).is_ok());
                     for field in [

@@ -356,6 +356,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Create { .. }
                 | Action::Resize { .. }
                 | Action::Start { .. }
+                | Action::Move { .. }
                 | Action::Park { .. }
                 | Action::Wake { .. }
                 | Action::Stop { .. }
@@ -502,6 +503,19 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         }
         Action::Share { id, with, role } => json!({"op":"share","id":id,"with":with,"role":role}),
         Action::Unshare { id, with } => json!({"op":"unshare","id":id,"with":with}),
+        Action::Move {
+            id,
+            node,
+            accept_cold,
+            transfer,
+            epoch,
+            abort,
+        } => match transfer {
+            Some(transfer) => {
+                json!({"op":"transfer-control","id":id,"node":node,"transfer":transfer,"epoch":epoch,"abort":abort})
+            }
+            None => json!({"op":"move","id":id,"node":node,"accept_cold":accept_cold}),
+        },
         Action::Park { id } => json!({"op":"park","id":id}),
         Action::Wake { id, accept_cold } => json!({"op":"wake","id":id,"accept_cold":accept_cold}),
         Action::Start { id } => json!({"op":"start","id":id}),
@@ -525,8 +539,14 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             id,
             child,
             snapshot,
+            node,
+            accept_cold,
         } => {
             let mut v = json!({"op":"fork","id":id,"child":child});
+            if let Some(node) = node {
+                v["node"] = json!(node);
+                v["accept_cold"] = json!(accept_cold);
+            }
             if let Some(snapshot) = snapshot {
                 v["snapshot"] = json!(snapshot);
             }

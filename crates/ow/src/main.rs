@@ -246,6 +246,22 @@ enum Action {
     Start { id: String },
     /// Publish a stopped/hibernated box and release its runner (remote only).
     Park { id: String },
+    /// Move a box to another runner, or explicitly recover an unfinished transfer (remote only).
+    Move {
+        id: String,
+        #[arg(long, required_unless_present = "abort")]
+        node: Option<String>,
+        #[arg(long, conflicts_with = "transfer")]
+        accept_cold: bool,
+        /// Recover this transfer using its current epoch from status.
+        #[arg(long, requires = "epoch")]
+        transfer: Option<i64>,
+        #[arg(long, requires = "transfer")]
+        epoch: Option<i64>,
+        /// Exclude the target and restore the source with a fresh placement epoch.
+        #[arg(long, requires = "transfer", conflicts_with = "node")]
+        abort: bool,
+    },
     /// Place and start a parked box; cold RAM loss requires explicit consent (remote only).
     Wake {
         id: String,
@@ -304,6 +320,11 @@ enum Action {
     Fork {
         id: String,
         child: String,
+        /// Explicit target runner; uses the durable cross-runner child preparation path.
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, requires = "node")]
+        accept_cold: bool,
         #[arg(long)]
         snapshot: Option<String>,
     },
@@ -961,6 +982,54 @@ mod capability_tests {
             }
         ));
         assert!(Cli::try_parse_from(["ow", "publish", "demo", "--port", "65536"]).is_err());
+    }
+    #[test]
+    fn move_recovery_requires_a_target_or_explicit_abort_and_current_epoch() {
+        for args in [
+            vec!["ow", "move", "box", "--node", "target"],
+            vec![
+                "ow",
+                "move",
+                "box",
+                "--transfer",
+                "17",
+                "--epoch",
+                "23",
+                "--node",
+                "target",
+            ],
+            vec![
+                "ow",
+                "move",
+                "box",
+                "--transfer",
+                "17",
+                "--epoch",
+                "23",
+                "--abort",
+            ],
+            vec!["ow", "fork", "box", "child", "--node", "target"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["ow", "move", "box"],
+            vec!["ow", "move", "box", "--abort"],
+            vec!["ow", "move", "box", "--transfer", "17", "--node", "target"],
+            vec![
+                "ow",
+                "move",
+                "box",
+                "--transfer",
+                "17",
+                "--epoch",
+                "23",
+                "--abort",
+                "--accept-cold",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
     #[test]
     fn commands_need_their_flags() {

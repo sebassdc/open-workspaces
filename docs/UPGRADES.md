@@ -376,3 +376,14 @@ The additive catalog guards retain schema/read floor 5. The v0.9.7 entry moves
 controller, dashboard, agent and worker pins; its class-2 worker action retains
 capture compatibility and explicit cold-memory-loss gates. Protocol windows,
 runtime, guest kernel, host layout and stage 0 are unchanged from v0.9.4.
+
+### Move/fork worker interface 3
+
+Version 0.9.12 is class 2. Move/fork needs interface-3 worker enforcement of
+unstarted child preparation, durable target exclusion and serialized SSH-policy
+installation. An agent upgrade alone cannot advertise this capability. Agents
+accept workers 1–3; older workers remain fixed-placement. New child/exclusion
+registries use worker state schema 3 and refuse older readers. Catalog schema and
+reader floor remain 5. Use the existing dedicated-runner quiesce/swap/resume
+procedure, full RAM compatibility tuple and explicit cold-loss consent. Existing
+worker pins and boxes are not changed merely by installing a controller release.
