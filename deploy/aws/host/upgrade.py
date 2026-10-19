@@ -16,6 +16,8 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 import ow_host as h
 from ow_host import Refused, p, say
@@ -181,7 +183,8 @@ def fetch(config, ref=None):
         raise Refused(f"{ref}: no workspace version in Cargo.toml")
     v = found.group(1)
     version(v)
-    return {"ref": ref, "commit": commit, "version": v, "manifest": manifest, "release": f"{v}-{commit[:12]}"}
+    return {"ref": ref, "commit": commit, "version": v, "manifest": manifest, "release": f"{v}-{commit[:12]}",
+            "repository": repository}
 
 
 def migrate_layout_v1():
@@ -197,7 +200,7 @@ def migrate_layout_v1():
 
 
 STAGE = r"""
-rel=$1 src=$2 commit=$3 seed=$4 target=$5 role=$6
+rel=$1 src=$2 commit=$3 seed=$4 target=$5 role=$6 prebuilt=$7
 mkdir -p "$rel" "$target"
 git -C "$src" worktree prune
 git -C "$src" worktree add -q --detach "$rel/src" "$commit"
@@ -212,19 +215,87 @@ ln -s ../../assets "$rel/src/data/runtime-spike"
 ln -s "$target" "$rel/src/target"
 cd "$rel/src"
 # Tests swap the build for a stand-in; on a host (root) the environment is reset.
-if [ "$role" = controller ]; then
+if [ -n "$prebuilt" ]; then
+  # Released binaries the upgrader verified: a runner still fetches its pinned downloads.
+  if [ "$role" != controller ]; then
+    export OW_PREBUILT_GUEST="$prebuilt/ow-guest"
+    eval "${OW_HOST_BUILD:-bash scripts/setup-local.sh}"
+  fi
+  # The same static binary is the one the dashboard offers as the Linux CLI.
+  mkdir -p "$rel/assets/bin"
+  cp "$prebuilt/ow" "$rel/assets/bin/ow-linux-amd64"
+  sha256sum "$rel/assets/bin/ow-linux-amd64" | cut -d ' ' -f 1 > "$rel/assets/bin/ow-linux-amd64.sha256"
+  cp "$prebuilt/ow" "$rel/bin/ow.tmp"
+elif [ "$role" = controller ]; then
   eval "${OW_HOST_BUILD:-bash scripts/setup-local.sh --controller-only}"
+  cp target/release/ow "$rel/bin/ow.tmp"
 else
   eval "${OW_HOST_BUILD:-bash scripts/setup-local.sh}"
+  cp target/release/ow "$rel/bin/ow.tmp"
 fi
-cp target/release/ow "$rel/bin/ow.tmp"
 mv "$rel/bin/ow.tmp" "$rel/bin/ow"
 """
 
 
-def stage(target):
-    """Builds the release into its own directory next to the running ones; reuses a
-    complete one. Nothing running reads it until a pin moves."""
+def release_url(repository, tag):
+    """Where a GitHub repository's release assets download from; None for any other repository."""
+    found = re.fullmatch(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?", repository)
+    return found and f"https://github.com/{found[1]}/{found[2]}/releases/download/{tag}"
+
+
+def download(url):
+    """The bytes at url, or None when it does not exist."""
+    try:
+        with urllib.request.urlopen(url, timeout=300) as response:
+            return response.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def released(target, role):
+    """The pinned release's published binaries ({"ow": bytes[, "ow-guest": bytes]}), verified
+    against its SHA256SUMS and source-commit.txt; None, saying why, when it has none to use.
+    Refused on any mismatch: nothing is installed."""
+    tag, commit = f"v{target['version']}", target["commit"]
+    url = release_url(target["repository"], tag)
+    files = {"ow": "ow-linux-amd64"} if role == "controller" else {"ow": "ow-linux-amd64",
+                                                                    "ow-guest": "ow-guest-linux-amd64"}
+    if git("rev-parse", "--verify", "-q", f"refs/tags/{tag}^{{commit}}", check=False).strip() != commit:
+        why = f"{commit[:12]} is not the release tag {tag}"
+    elif not url:
+        why = f"{target['repository']} publishes no release assets"
+    elif os.uname().machine != "x86_64":
+        why = f"no released binary for {os.uname().machine}"
+    else:
+        sums = download(f"{url}/SHA256SUMS")
+        sums = dict(line.split()[::-1] for line in (sums or b"").decode().splitlines() if len(line.split()) == 2)
+        missing = [asset for asset in files.values() if asset not in sums]
+        why = missing and f"release {tag} publishes no {', '.join(missing)}"
+    if why:
+        say(f"building {target['release']} from source: {why}")
+        return None
+
+    def fetched(asset):
+        data = download(f"{url}/{asset}")
+        if data is None or hashlib.sha256(data).hexdigest() != sums.get(asset):
+            raise Refused(f"release {tag}: {asset} does not match its SHA256SUMS")
+        return data
+
+    source = fetched("source-commit.txt").decode().strip()
+    if source != commit:
+        raise Refused(f"release {tag} was built from {source[:40]!r}, not the pinned {commit}")
+    got = {name: fetched(asset) for name, asset in files.items()}
+    say(f"installing {target['release']} from the released binaries of {tag} ({', '.join(files.values())}; "
+        "verified against SHA256SUMS and source-commit.txt)")
+    return got
+
+
+def stage(target, from_source=False):
+    """Installs the release into its own directory next to the running ones, from its
+    verified released binaries or else built from source; reuses a complete one.
+    Nothing running reads it until a pin moves."""
     name = target["release"]
     done = h.staged(name)
     if done and done.get("commit") == target["commit"]:
@@ -241,11 +312,23 @@ def stage(target):
         free = shutil.disk_usage(p(h.SRV)).free
         if free < 4 << 30:
             raise Refused(f"only {free >> 20} MiB free on {h.SRV}; staging needs 4 GiB")
+        if from_source:
+            say(f"building {name} from source: --from-source")
+        got = None if from_source else released(target, h.role())
+        prebuilt = p(f"{h.SRV}/build/prebuilt")
+        shutil.rmtree(prebuilt, ignore_errors=True)
+        for file, data in (got or {}).items():
+            prebuilt.mkdir(exist_ok=True)
+            (prebuilt / file).write_bytes(data)
+            (prebuilt / file).chmod(0o755)
+            h.chown(prebuilt / file, "ow")
+        if got:
+            h.chown(prebuilt, "ow")
         asset_pin = "agent" if h.role() == "controller" else "worker"
         seed = next((str(s) for s in (p(f"{h.SRV}/run/{asset_pin}/assets"), p(f"{h.SRV}/src/data/runtime-spike"))
                      if s.is_dir()), "")
         cmd = ["bash", "-euo", "pipefail", "-c", STAGE, "stage", str(rel), str(p(f"{h.SRV}/src")),
-               target["commit"], seed, str(p(f"{h.SRV}/build/target")), h.role()]
+               target["commit"], seed, str(p(f"{h.SRV}/build/target")), h.role(), str(prebuilt) if got else ""]
         env = None
         if os.geteuid() == 0:
             # Niced and CPU-weighted: running boxes keep their vCPUs while it builds.
@@ -254,7 +337,7 @@ def stage(target):
             env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
         log = p(LOG)
         log.parent.mkdir(parents=True, exist_ok=True)
-        say(f"staging {name} (building on the host; output in {LOG})")
+        say(f"staging {name} ({'released binaries' if got else 'building on the host'}; output in {LOG})")
         started = time.monotonic()
         with open(log, "a") as out:
             code = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT, env=env).returncode
@@ -267,7 +350,9 @@ def stage(target):
         digest = hashlib.sha256((rel / "bin/ow").read_bytes()).hexdigest()
         h.write_json(f"{h.SRV}/releases/{name}/STAGED", {
             "version": target["version"], "commit": target["commit"], "ref": target["ref"], "ow_sha256": digest,
-            "staged": int(time.time()), "seconds": round(time.monotonic() - started)}, mode=0o644)
+            "staged": int(time.time()), "seconds": round(time.monotonic() - started),
+            "source": "release" if got else "build"}, mode=0o644)
+        shutil.rmtree(prebuilt, ignore_errors=True)
     return name
 
 
@@ -685,7 +770,7 @@ def recover(ops=None, boot=False):
         finish(j, ops)
 
 
-def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None, controller=None):
+def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None, controller=None, from_source=False):
     ops = ops or HostOps()
     with locked():
         recover(ops)
@@ -726,7 +811,7 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
         if not result["move"] and not result["restart"] and frm["current"] == target["release"]:
             say("nothing to do")
             return 0
-        release = stage(target)
+        release = stage(target, from_source)
         if "worker" in result["move"]:
             # The gate again: the staged kernel and the boxes as they are now.
             kernels = {hashlib.sha256(k.read_bytes()).hexdigest()

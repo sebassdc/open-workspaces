@@ -75,7 +75,7 @@ export const instanceId = host.instanceId;
 | `amiId` | Canonical Ubuntu 24.04 x86-64 from SSM | Pin it to avoid host replacement when Canonical publishes a new image. |
 | `dataVolumeSizeGib` | `100` | Btrfs volume at `/srv/ow`. Grow it in place: EBS modifies the volume online and the next `ow-aws apply` (or `ci-post-up`) grows the filesystem. EBS refuses shrinking. |
 | `dataVolumeIops` / `dataVolumeThroughput` | gp3 defaults (`3000`, `125` MiB/s) | Data volume performance; gp3 allows 3000-16000 IOPS and 125-1000 MiB/s. Applied online, no restart. |
-| `repository` / `ref` | upstream repo / this package's tag | The release the host builds and runs; a change is applied in place by `ow-host upgrade` (see below). |
+| `repository` / `ref` | upstream repo / this package's tag | The release the host installs and runs; a change is applied in place by `ow-host upgrade` (see below). |
 | `tags` | `{}` | Applied to every resource. |
 | `tailscaleAuthKeySecretArn` | none | Full secret ARN; the secret string is the raw auth key. |
 | `tailscaleHostname` | component name | |
@@ -237,8 +237,10 @@ User data (`bootstrap.sh`, stage 0) runs once per instance:
 4. fetches the config parameter (keeping the last good copy on the volume),
    clones `repository` into `/srv/ow/src` and checks out `ref`;
 5. runs that release's `deploy/aws/host/ow_host.py boot`, which stages the
-   release (`scripts/setup-local.sh`: pinned Rust, Firecracker and guest assets,
-   then a release build) into `/srv/ow/releases/`, pins every unit to it,
+   release into `/srv/ow/releases/` (the release's verified published binaries
+   plus `scripts/setup-local.sh` for Firecracker and guest assets, or a source
+   build where no binaries match: see
+   [Upgrades](../../docs/UPGRADES.md#ow-host-upgrade)), pins every unit to it,
    renders the units and files (an AppArmor profile lets only release binaries
    create user namespaces), joins Tailscale, starts the worker, the control
    plane and the dashboard, then the developer-image build and the backup
@@ -277,8 +279,8 @@ x86-64 Ubuntu instance/AMI for your control-plane load. Creating it is a separat
 infrastructure/spend action, never a side effect of upgrading this package.
 
 It retains the same data volume, Tailscale state mount, private CA, SSM config,
-node invitation helpers and dashboard/gateway. The release builds only the
-controller binary. There is no worker socket/unit/pin, local node credential,
+node invitation helpers and dashboard/gateway. The release installs (or builds)
+only the controller binary. There is no worker socket/unit/pin, local node credential,
 guest image build or recovery-point timer. `developerImages`, `imageArtifacts`
 and `recoveryPoints` belong on runners and are refused here. `storeUrl` may
 still identify the catalog's artifact store. No GC or scaler loop is enabled.
@@ -369,8 +371,9 @@ sudo ow-host upgrade v0.5.1 --max-class 1
 sudo ow-host status                  # pins per unit, pending restarts, last journal
 ```
 
-It fetches the ref, plans from its `release-impact.json`, builds it next to the
-running releases, and moves only the units the release changed:
+It fetches the ref, plans from its `release-impact.json`, stages it next to the
+running releases (its verified released binaries, else a build; `--from-source`
+forces the build), and moves only the units the release changed:
 
 - a control-plane release restarts `open-workspaces.service` and the dashboard;
   boxes keep running (open SSH and terminal streams reconnect);
@@ -415,9 +418,11 @@ the run and the stack is still destroyed.
 
 - The controller runs on a Host, optionally without a local runner using
   `role: "controller"`. Controller replacement/cutover is a separate procedure.
-- The host builds each release from source (first boot and every upgrade,
-  about 4 minutes incremental on 4 vCPUs); there are no prebuilt release
-  binaries yet.
+- Released binaries exist for x86-64 Linux only, and only a GitHub
+  `repository` publishes them. Another architecture, a mirror, or a ref that is
+  not a release tag builds from source (first boot and every upgrade, about
+  4 minutes incremental on 4 vCPUs). An `ow-host` older than 0.9.19 still builds
+  every release it stages.
 - RAM checkpoints only restore on the same host kernel and CPU. Replacing the
   instance with a new AMI keeps disks; hibernated machines then boot their disk
   cold (their processes do not survive).

@@ -1244,6 +1244,7 @@ def main(argv):
     u.add_argument("--accept-cold", action="store_true", help="allow boxes whose captures cannot resume to boot cold")
     u.add_argument("--max-class", type=int, choices=range(4), default=2)
     u.add_argument("--controller-version", help="runner hosts: the release the controller's agent runs")
+    u.add_argument("--from-source", action="store_true", help="build the release on the host even if it has released binaries")
     render_cmd = sub.add_parser("render", help=argparse.SUPPRESS)
     render_cmd.add_argument("--config", required=True)
     args = parser.parse_args(argv)
@@ -1294,7 +1295,7 @@ def main(argv):
                 return 0
             return upgrade.restart_worker()
         return upgrade.upgrade(args.ref, plan_only=args.plan, accept_cold=args.accept_cold, max_class=args.max_class,
-                               controller=args.controller_version)
+                               controller=args.controller_version, from_source=args.from_source)
     except Refused as e:
         print(f"refused: {e}", file=sys.stderr)
         return 3
