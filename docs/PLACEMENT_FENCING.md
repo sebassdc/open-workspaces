@@ -73,12 +73,17 @@ Import intent precedes machine-directory creation. Replay rebuilds only a direct
 owned by that same intent; prepared/activated retries do not allocate another
 network index or register again. Cleanup is idempotent after directory removal.
 The worker keeps a cleaned fence rather than allowing a legacy create/import to
-recreate the old incarnation.
+recreate the old incarnation. Cleaned fences remain inspectable but do not consume
+live workspace slots. Create, legacy import, staged import and status share that
+live count; a returning cleaned subject still needs a free slot. Ordinary captures
+respect names reserved by lifecycle intents and imports, even before publication.
 
 The node effect journal retries these tested steps, plus epoch-bearing start.
 Arbitrary exec remains uncertain after a lost effect reply. Cached managed replies
 are rechecked against current worker authority; on fencing workers this also
-covers cached legacy requests without an epoch. Controller completion must still
+covers cached legacy requests without an epoch. Revalidation acknowledges authority
+without requiring a machine summary, so a completed unmanaged delete remains
+replayable after its record is gone. Controller completion must still
 conditionally match its transfer and epoch: a worker reply never changes catalog
 authority by itself.
 

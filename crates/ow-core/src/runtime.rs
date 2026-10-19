@@ -823,7 +823,7 @@ impl Runtime {
         self.capacity(memory, cpus)?;
         self.storage_headroom(0)?;
         ensure!(
-            self.state.workspaces.len() < MAX_WORKSPACES,
+            self.workspace_count() < MAX_WORKSPACES,
             "workspace limit ({MAX_WORKSPACES}) reached"
         );
         ensure!(
@@ -991,6 +991,10 @@ impl Runtime {
     /// the capture, so nothing the guest does while the files are hashed is lost.
     fn capture(&mut self, id: &str, name: &str, hibernate: bool) -> Result<Value> {
         identifier(name)?;
+        ensure!(
+            !self.lifecycle_capture(name),
+            "snapshot name is reserved by a lifecycle operation"
+        );
         let workspace = self.workspace(id)?;
         let destination = self.snapshot_dir(name);
         if destination.join("manifest.json").exists() {
@@ -1166,7 +1170,7 @@ impl Runtime {
             "workspace {id} already exists on this runner; start or delete it"
         );
         ensure!(
-            self.state.workspaces.len() < MAX_WORKSPACES,
+            self.workspace_count() < MAX_WORKSPACES,
             "workspace limit ({MAX_WORKSPACES}) reached"
         );
         ensure!(
@@ -1304,7 +1308,7 @@ impl Runtime {
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
                 "worker_pid":std::process::id(),"placement_fencing_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
-                "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.state.workspaces.len(),
+                "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
@@ -1357,7 +1361,7 @@ impl Runtime {
             "inspect" => self.placement_summary(id),
             "placement-check" => {
                 self.check_replay(request)?;
-                self.placement_summary(id)
+                Ok(json!({}))
             }
             "create" => self.create(
                 id,

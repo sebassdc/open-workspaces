@@ -552,7 +552,7 @@ mod clock_tests {
 
 /// A real child and the real capture API/serial protocol, without KVM or host networking.
 #[cfg(test)]
-pub(crate) fn capture_fixture(directory: &Path) -> (Vm, std::thread::JoinHandle<()>) {
+pub(crate) fn capture_fixture(directory: &Path, resume: bool) -> (Vm, std::thread::JoinHandle<()>) {
     use std::{
         io::{BufRead, BufReader},
         os::unix::net::{UnixListener, UnixStream},
@@ -562,19 +562,32 @@ pub(crate) fn capture_fixture(directory: &Path) -> (Vm, std::thread::JoinHandle<
     let (master, serial) = UnixStream::pair().unwrap();
     let fixture = std::thread::spawn(move || {
         let mut serial = BufReader::new(serial);
-        let mut command = String::new();
-        serial.read_line(&mut command).unwrap();
-        assert!(command.starts_with("sync;"));
-        let suffix = command
-            .split_once("OW_DONE_")
-            .unwrap()
-            .1
-            .split(':')
-            .next()
-            .unwrap();
-        let marker = format!("OW_DONE_{suffix}");
-        write!(serial.get_mut(), "\n{marker}:0:{marker}\n").unwrap();
-        for endpoint in ["/vm", "/snapshot/create"] {
+        let mut reply = |prefix: &str| {
+            let mut command = String::new();
+            if serial.read_line(&mut command).unwrap() == 0 {
+                return false;
+            }
+            assert!(command.starts_with(prefix), "{command}");
+            let suffix = command
+                .split_once("OW_DONE_")
+                .unwrap()
+                .1
+                .split(':')
+                .next()
+                .unwrap();
+            let marker = format!("OW_DONE_{suffix}");
+            write!(serial.get_mut(), "\n{marker}:0:{marker}\n").unwrap();
+            true
+        };
+        if !reply("sync;") {
+            return;
+        }
+        let endpoints = if resume {
+            vec!["/vm", "/snapshot/create", "/vm"]
+        } else {
+            vec!["/vm", "/snapshot/create"]
+        };
+        for (step, endpoint) in endpoints.into_iter().enumerate() {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
@@ -598,13 +611,16 @@ pub(crate) fn capture_fixture(directory: &Path) -> (Vm, std::thread::JoinHandle<
                 std::fs::write(body["snapshot_path"].as_str().unwrap(), b"VM state").unwrap();
                 std::fs::write(body["mem_file_path"].as_str().unwrap(), b"VM memory").unwrap();
             } else {
-                assert_eq!(body["state"], "Paused");
+                assert_eq!(body["state"], if step == 0 { "Paused" } else { "Resumed" });
             }
             write!(
                 stream,
                 "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
+        }
+        if resume {
+            assert!(reply("date -u -s "));
         }
     });
     (

@@ -1442,3 +1442,41 @@ fn managed_stream_envelopes_reach_only_the_named_capable_worker() {
     runtime.join().unwrap();
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn review_cached_unmanaged_delete_keeps_its_success_on_a_fencing_worker() {
+    use std::os::unix::net::UnixListener;
+    let root = root();
+    let assets = root.join("assets");
+    fs::create_dir_all(assets.join("downloads")).unwrap();
+    fs::write(assets.join("downloads/vmlinux-6.1.186"), b"fixture kernel").unwrap();
+    fs::create_dir_all(root.join("machines/legacy")).unwrap();
+    fs::write(root.join("machines/legacy/disk.ext4"), b"fixture disk").unwrap();
+    fs::write(root.join("state.json"), json!({"next_index":2,"workspaces":{"legacy":{
+        "id":"legacy","index":1,"state":"stopped","memory_mib":256,"source":null,"hibernation":null
+    }}}).to_string()).unwrap();
+    let mut runtime = ow_core::runtime::Runtime::new(root.clone(), assets).unwrap();
+    let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+    let worker = std::thread::spawn(move || {
+        for op in ["delete", "placement-check"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = wire::line(&mut stream).unwrap();
+            assert_eq!(request["op"], op);
+            wire::send(&mut stream, &wire::response(runtime.request(&request))).unwrap();
+        }
+    });
+    let request = json!({"op":"delete","id":"legacy","operation_key":"delete-once"});
+    let first = journal_request(&root, &request, true).unwrap();
+    let cached = journal_request(&root, &request, true).unwrap();
+    worker.join().unwrap();
+    assert_eq!(
+        first,
+        json!({"ok":true,"result":{"deleted":"legacy","snapshots":[]}})
+    );
+    assert_eq!(
+        cached, first,
+        "revalidation must preserve the durable successful delete reply"
+    );
+    assert!(!root.join("machines/legacy").exists());
+    fs::remove_dir_all(root).unwrap();
+}

@@ -36,6 +36,19 @@ pub(super) struct Import {
 }
 
 impl Runtime {
+    pub(super) fn workspace_count(&self) -> usize {
+        self.state
+            .workspaces
+            .keys()
+            .filter(|id| {
+                self.state
+                    .placements
+                    .get(*id)
+                    .is_none_or(|m| m.phase != Phase::Cleaned)
+            })
+            .count()
+    }
+
     pub(super) fn lifecycle_capture(&self, name: &str) -> bool {
         self.state.placements.values().any(|m| {
             m.intent.as_ref().is_some_and(|i| i.capture == name)
@@ -557,8 +570,7 @@ impl Runtime {
                 "existing copy cannot be overwritten"
             );
             ensure!(
-                (self.state.workspaces.len() < MAX_WORKSPACES || replacing_cleaned)
-                    && self.state.next_index < 8192,
+                self.workspace_count() < MAX_WORKSPACES && self.state.next_index < 8192,
                 "workspace capacity exhausted"
             );
             self.reserve_disk(directory.join("disk.ext4").metadata()?.len())?;
@@ -993,6 +1005,200 @@ mod tests {
     }
 
     #[test]
+    fn review_cached_unmanaged_delete_validation_survives_the_missing_record() {
+        let mut runtime = fixture();
+        let delete = json!({"op":"delete","id":"legacy"});
+        assert_eq!(
+            runtime.request(&delete).unwrap(),
+            json!({"deleted":"legacy","snapshots":[]})
+        );
+        let check = json!({"op":"placement-check","id":"legacy","request":delete});
+        assert!(
+            runtime.request(&check).is_ok(),
+            "a completed unmanaged delete must remain replayable"
+        );
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
+    fn review_ordinary_snapshot_respects_an_interrupted_export_reservation() {
+        for reserved in [false, true] {
+            let mut runtime = fixture();
+            let mut other = runtime.workspace("legacy").unwrap();
+            other.id = "other".into();
+            other.memory_mib = 256;
+            other.state = "running".into();
+            runtime.state.workspaces.insert("other".into(), other);
+            fs::create_dir(runtime.machine_dir("other")).unwrap();
+            fs::write(runtime.machine_dir("other/disk.ext4"), b"other disk").unwrap();
+            if reserved {
+                register(&mut runtime);
+                runtime.crash = Some("intent");
+                runtime.request(&export()).unwrap_err();
+                runtime.crash = None;
+            }
+            let (machine, server) = vm::capture_fixture(&runtime.machine_dir("other"), true);
+            runtime.machines.insert("other".into(), machine);
+            let snapshot =
+                runtime.request(&json!({"op":"snapshot","id":"other","name":"capture1"}));
+            let replay = reserved.then(|| runtime.request(&export()));
+            runtime.machines.remove("other");
+            server.join().unwrap();
+            if reserved {
+                assert!(
+                    snapshot.is_err(),
+                    "ordinary snapshot stole the export reservation: {snapshot:?}"
+                );
+                assert_eq!(
+                    replay.unwrap().unwrap()["capture"]["metadata"]["workspace"],
+                    "legacy"
+                );
+            } else {
+                assert_eq!(snapshot.unwrap()["workspace"], "other");
+            }
+            fs::remove_dir_all(runtime.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn review_cleaned_fences_release_capacity_without_losing_admission_or_epoch_guards() {
+        fn incoming(runtime: &Runtime, subject: &str, name: &str) -> Value {
+            let mut snapshot: Snapshot = serde_json::from_slice(
+                &fs::read(runtime.snapshot_dir("sealed0/manifest.json")).unwrap(),
+            )
+            .unwrap();
+            snapshot.name = name.into();
+            snapshot.workspace = subject.into();
+            let directory = runtime.snapshot_dir(name);
+            fs::create_dir(&directory).unwrap();
+            fs::copy(
+                runtime.snapshot_dir("sealed0/disk.ext4"),
+                directory.join("disk.ext4"),
+            )
+            .unwrap();
+            atomic_json(&directory.join("manifest.json"), &snapshot).unwrap();
+            json!({"op":"import-prepare","id":subject,"placement":authority(8),"snapshot":name,
+                "manifest_sha256":hash(&directory.join("manifest.json")).unwrap()})
+        }
+        let mut runtime = fixture();
+        let template = runtime.workspace("legacy").unwrap();
+        runtime
+            .request(&json!({"op":"delete","id":"legacy"}))
+            .unwrap();
+        for i in 0..MAX_WORKSPACES {
+            let id = format!("source{i}");
+            let mut workspace = template.clone();
+            workspace.id = id.clone();
+            workspace.index = i as u32 + 1;
+            fs::create_dir(runtime.machine_dir(&id)).unwrap();
+            fs::write(runtime.machine_dir(&id).join("disk.ext4"), b"source disk").unwrap();
+            runtime.state.workspaces.insert(id.clone(), workspace);
+            let mut register = request("placement-register");
+            register["id"] = json!(id);
+            runtime.request(&register).unwrap();
+            let export = json!({"op":"export","id":id,"placement":authority(7),"transfer":format!("move{i}"),"capture":format!("sealed{i}")});
+            runtime.request(&export).unwrap();
+            let mut cleanup = export;
+            cleanup["op"] = json!("export-cleanup");
+            runtime.request(&cleanup).unwrap();
+        }
+        assert_eq!(
+            fs::read_dir(runtime.root.join("machines")).unwrap().count(),
+            0
+        );
+        restart(&mut runtime);
+        let count = runtime.request(&json!({"op":"status"})).unwrap()["workspace_count"].clone();
+        let import = incoming(&runtime, "target0", "incoming0");
+        let prepared = runtime.request(&import);
+        assert!(
+            prepared.is_ok(),
+            "empty runner after {MAX_WORKSPACES} cleanups rejected a new subject: {prepared:?}"
+        );
+        assert_eq!(count, 0);
+        assert_eq!(runtime.state.placements.len(), MAX_WORKSPACES + 1);
+        let legacy = incoming(&runtime, "legacy-target", "legacy-import");
+        // Exercise legacy registration while quiesce prevents any guest boot.
+        runtime.closing = true;
+        let result = runtime
+            .request(&json!({"op":"import","snapshot":legacy["snapshot"],"cold":true}))
+            .unwrap_err();
+        assert!(
+            result.to_string().contains("worker is shutting down"),
+            "legacy import still counts tombstones: {result:#}"
+        );
+        assert!(runtime.workspace("legacy-target").is_ok());
+        assert!(runtime.machines.is_empty());
+        runtime.closing = false;
+        runtime
+            .request(&json!({"op":"delete","id":"legacy-target"}))
+            .unwrap();
+        assert!(
+            runtime
+                .request(&json!({"op":"start","id":"source0"}))
+                .is_err()
+        );
+        assert_eq!(
+            runtime
+                .request(&json!({"op":"inspect","id":"source0"}))
+                .unwrap()["state"],
+            "exported-cleaned"
+        );
+        let create = runtime
+            .request(&json!({"op":"create","id":"fresh"}))
+            .unwrap_err();
+        assert!(
+            create.to_string().contains("image profile is not prepared"),
+            "ordinary create still counts tombstones: {create:#}"
+        );
+        for i in 1..MAX_WORKSPACES {
+            let import = incoming(&runtime, &format!("target{i}"), &format!("incoming{i}"));
+            runtime.request(&import).unwrap();
+        }
+        assert_eq!(
+            runtime.request(&json!({"op":"status"})).unwrap()["workspace_count"],
+            MAX_WORKSPACES
+        );
+        assert!(
+            runtime.request(&import).is_ok(),
+            "a prepared retry does not need another slot"
+        );
+        let overflow = incoming(&runtime, "overflow", "incoming-overflow");
+        assert!(
+            runtime
+                .request(&overflow)
+                .unwrap_err()
+                .to_string()
+                .contains("capacity exhausted")
+        );
+        assert!(
+            runtime
+                .request(&json!({"op":"create","id":"fresh"}))
+                .unwrap_err()
+                .to_string()
+                .contains("workspace limit")
+        );
+        assert!(
+            runtime
+                .request(&json!({"op":"import","snapshot":"incoming-overflow","cold":true}))
+                .unwrap_err()
+                .to_string()
+                .contains("workspace limit")
+        );
+        let returning = json!({"op":"import-prepare","id":"source0","placement":authority(8),"snapshot":"sealed0",
+            "manifest_sha256":hash(&runtime.snapshot_dir("sealed0/manifest.json")).unwrap()});
+        assert!(
+            runtime
+                .request(&returning)
+                .unwrap_err()
+                .to_string()
+                .contains("capacity exhausted"),
+            "returning subjects need a live slot too"
+        );
+        assert!(runtime.machines.is_empty());
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
     fn interrupted_export_reserves_its_capture_name_and_missing_markers_fail_closed() {
         let mut runtime = fixture();
         let mut other = runtime.workspace("legacy").unwrap();
@@ -1045,7 +1251,7 @@ mod execution_tests {
             .get_mut("legacy")
             .unwrap()
             .memory_mib = 256;
-        let (machine, fixture) = vm::capture_fixture(&runtime.root);
+        let (machine, fixture) = vm::capture_fixture(&runtime.root, false);
         let pid = machine.child.id();
         runtime.machines.insert("legacy".into(), machine);
         runtime.state.workspaces.get_mut("legacy").unwrap().state = "running".into();
