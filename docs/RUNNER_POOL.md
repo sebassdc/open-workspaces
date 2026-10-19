@@ -174,6 +174,27 @@ group yourself.
 
 Mock and component tests: `cd deploy/aws && npm run check` (Pulumi mocks in
 `test/pool.test.mjs`, the package schema in `test/schema.test.mjs`, the host side
-in `host/test_pool.py`). Dedicated-fixture results, with what could not be run,
-are recorded with the release that introduced the component. Live scaler
+in `host/test_pool.py`). They cover the pinned AMI and release, unchanged stage 0,
+no inbound rules, no secret in Pulumi, the exact rights, compare-and-set launch,
+duplicate and failed launches, join requests and retries, exact removal, retained
+instances, observations, preflight refusals and disk cleanup.
+
+On a dedicated disposable fixture (release 0.9.17 candidate, `@pulumi/aws` 7.48.0,
+Ubuntu 24.04 `m8i-flex.xlarge`, Firecracker v1.17.0) the following was observed:
+adding the component to an existing Host stack previewed only creations (no update,
+replacement or instance); a launch-template instance found its data volume, derived
+its node ID, asked for and redeemed a join and came online (cold launch to online
+6 min 0 s, n=1); the instance could read and answer only the secret tagged with its
+own session, and the controller's secret and disk rights refused untagged, foreign
+or extra-tag requests; terminated instances left their data volumes available (n=3);
+a stopped Alpine box's 1 MiB random file survived instance loss and came back through
+a salvage replacement as the same runner, cold-booted, with an identical SHA-256
+(replacement boot 34 s, n=1); detached and orphaned resources appeared in the
+observation; and `pool check` refused when the controller's rights were removed and
+passed when present.
+
+Not yet run on real AWS: the fixture account's organization policy denies
+`CreateAutoScalingGroup`, so a hook-timeout retention, exact removal through the
+group, desired-capacity changes and replacement accounting remain to be proven
+before activation. Cold image pulls and warm moves were not measured. Live scaler
 activation stays blocked as described in [SCALER.md](SCALER.md).
