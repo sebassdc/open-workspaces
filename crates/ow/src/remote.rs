@@ -2121,7 +2121,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(root.join("control.sock")).unwrap();
         let terminals = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicUsize::new(0));
-        // A "slow" exec holds its reply (and so the gateway's catalog lock) until released.
+        // A slow worker exec remains in flight while the owner revokes the grant.
         let slow = Arc::new(AtomicUsize::new(0));
         let (opened, ended, held) = (terminals.clone(), closed.clone(), slow.clone());
         std::thread::spawn(move || {
@@ -2250,7 +2250,10 @@ mod tests {
         assert_eq!(state(bob.clone()).await["result"]["host_controls"], false);
         let exec = json!({"op":"exec","id":shared,"command":"id"});
         assert!(terminal(bob.clone()).await.unwrap().is_err());
-        assert_eq!(api(bob.clone(), exec.clone()).await.0, StatusCode::CONFLICT);
+        assert_eq!(
+            api(bob.clone(), exec.clone()).await.0,
+            StatusCode::NOT_FOUND
+        );
         let (code, value) = api(
             alice.clone(),
             json!({"op":"share","id":"legacy","with":"bob@example.test"}),
@@ -2269,7 +2272,7 @@ mod tests {
         while terminals.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // Bob's slow exec holds the catalog lock while the owner unshares.
+        // Revocation must close the live terminal without waiting for Bob's slow exec.
         let pending = tokio::spawn(api(
             bob.clone(),
             json!({"op":"exec","id":shared,"command":"slow"}),
@@ -2277,6 +2280,12 @@ mod tests {
         while slow.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert_eq!(terminals.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            closed.load(Ordering::SeqCst),
+            0,
+            "terminal closed before revocation"
+        );
         let started = Instant::now();
         let (code, value) = tokio::time::timeout(
             Duration::from_secs(3),
@@ -2315,7 +2324,7 @@ mod tests {
         );
         slow.store(2, Ordering::SeqCst);
         pending.await.unwrap();
-        assert_eq!(api(bob.clone(), exec).await.0, StatusCode::CONFLICT);
+        assert_eq!(api(bob.clone(), exec).await.0, StatusCode::NOT_FOUND);
         assert!(terminal(bob).await.unwrap().is_err());
         server.abort();
         let _ = fs::remove_dir_all(&root);

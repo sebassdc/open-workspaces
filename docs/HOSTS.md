@@ -249,6 +249,13 @@ Compare both served and installed Linux hashes to the accepted build receipt;
 retain existing macOS files and prior Linux artifacts. Core has prepared these
 bytes in ignored storage and has not changed any live selection.
 
+Public bundle downloads verify the SHA-256 and length of each opened raw or
+compressed asset before returning GET or HEAD headers. File metadata is checked
+around hashing but does not substitute for checking bytes: some filesystems can
+retain identical timestamps after a same-length rewrite. Verification is serialized
+to bound concurrent hashing. Repeat requests therefore also pay the full hashing
+cost; large-bundle header latency on the deployed host needs separate measurement.
+
 Mixed worker versions use protocol-v1 optional `max_guest_memory_mib` and
 `max_guest_vcpus` capabilities. Missing fields mean the legacy per-guest ceiling
 of 2048 MiB / 4 CPU, even when the enrolled host advertises a larger total budget.
