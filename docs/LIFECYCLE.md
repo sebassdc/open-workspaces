@@ -34,7 +34,11 @@ is allowed only before commit. Before import begins it can release unused target
 capacity; afterward positive target exclusion is mandatory, including after an
 uncertain reply. Exported sources remain managed and fenced after abort until an
 explicit future source-reactivation protocol succeeds. Terminal rows cannot be
-advanced, committed again or used to release another attempt's capacity.
+advanced, committed again or used to release another attempt's capacity. Releasing
+a fork child removes its grants and quota allocation, disables its publications,
+and retires its operation-name binding atomically with the child reservation.
+Reusing an ID or logical name cannot inherit the released child's authorization
+or pin a new create to its old placement.
 
 Stopped and hibernated remain different user states. Parking a stopped disk capture
 preserves stopped state. Connection-triggered wake accepts only a parked hibernated

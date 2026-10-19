@@ -2835,3 +2835,222 @@ fn transfer_target_budget_clamps_operator_caps_and_rejects_stale_or_future_beats
         0
     );
 }
+
+#[test]
+fn aborted_fork_does_not_leak_grants_to_reused_id() {
+    use crate::transfers::*;
+    for terminal in [Step::Aborted, Step::Failed] {
+        let (_fake, mut c, user, _physical, mut intent) = transfer_fixture();
+        let guest = c.user(&identity("guest")).unwrap();
+        let other_owner = c.user(&identity("other-owner")).unwrap();
+        c.operation(
+            user,
+            json!({"op":"share","id":"box","with":"other-owner@example.test","role":"use"}),
+        )
+        .unwrap();
+        intent.kind = Kind::Fork;
+        intent.child = Some(Child {
+            id: "m-reused".into(),
+            name: "first-child".into(),
+        });
+        let first = c.begin_transfer(user, "first-fork", &intent).unwrap();
+        c.operation(
+            user,
+            json!({"op":"share","id":"first-child","with":"guest@example.test","role":"use"}),
+        )
+        .unwrap();
+        c.advance_transfer(
+            first.id,
+            first.epoch,
+            Step::Preparing,
+            terminal,
+            &Evidence::default(),
+        )
+        .unwrap();
+        let grants: i64 =
+            c.db.query_row(
+                "SELECT COUNT(*) FROM grants WHERE physical='m-reused'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        println!(
+            "After aborted fork: child absent={}, dangling grants={grants}",
+            c.physical(user, "machine", "first-child").is_err()
+        );
+        intent.child = Some(Child {
+            id: "m-reused".into(),
+            name: "different-child".into(),
+        });
+        intent.machine = "owner@example.test/box".into();
+        let second = c
+            .begin_transfer(other_owner, "second-fork", &intent)
+            .unwrap();
+        prepare_transfer(&c, &second);
+        c.commit_transfer(second.id, second.epoch).unwrap();
+        let access = c.machine(guest, "other-owner@example.test/different-child", "fork");
+        println!(
+            "Guest authorized to another owner's new unshared child: {}",
+            access.is_ok()
+        );
+        c.advance_transfer(
+            second.id,
+            second.epoch,
+            Step::Committed,
+            Step::Started,
+            &Evidence::default(),
+        )
+        .unwrap();
+        c.advance_transfer(
+            second.id,
+            second.epoch,
+            Step::Started,
+            Step::Succeeded,
+            &Evidence::default(),
+        )
+        .unwrap();
+        c.db.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,digest,store_url) VALUES('replacement-capture','capture',?1,'m-reused','replacement','stored',?2,'fixture://store')",params![other_owner,"b".repeat(64)]).unwrap();
+        let illicit = c.begin_transfer(
+            guest,
+            "unshared-fork",
+            &Intent {
+                machine: "other-owner@example.test/different-child".into(),
+                capture: Some("replacement-capture".into()),
+                child: Some(Child {
+                    id: "m-unshared-copy".into(),
+                    name: "unshared-copy".into(),
+                }),
+                ..intent.clone()
+            },
+        );
+        println!(
+            "Uninvited guest admitted a fork of replacement owner's capture: {}",
+            illicit.is_ok()
+        );
+        assert!(
+            illicit.is_err(),
+            "aborted child's grant authorized a different owner's replacement"
+        );
+    }
+}
+
+#[test]
+fn aborted_fork_name_is_reusable_by_legacy_create() {
+    use crate::transfers::*;
+    for terminal in [Step::Aborted, Step::Failed] {
+        let (mut fake, mut c, user, _physical, mut intent) = transfer_fixture();
+        c.db.execute("DELETE FROM nodes WHERE id='alpha'", [])
+            .unwrap();
+        fake.worker("alpha");
+        intent.kind = Kind::Fork;
+        intent.child = Some(Child {
+            id: "m-aborted".into(),
+            name: "child".into(),
+        });
+        let t = c.begin_transfer(user, "fork-abort", &intent).unwrap();
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            Step::Preparing,
+            terminal,
+            &Evidence::default(),
+        )
+        .unwrap();
+        let result = c.operation(user,json!({"op":"create","id":"child","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"}));
+        println!("Legacy create using released child name: {result:?}");
+        let control = c.operation(user,json!({"op":"create","id":"fresh-name","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"}));
+        println!(
+            "Legacy create using fresh name: success={}",
+            control.is_ok()
+        );
+        assert!(control.is_ok());
+        assert!(
+            result.is_ok(),
+            "aborted fork left child name unusable to legacy create"
+        );
+    }
+}
+
+#[test]
+fn aborted_fork_cleanup_rolls_back_with_an_uncertain_target() {
+    use crate::transfers::*;
+    let (_fake, mut c, user, _physical, mut intent) = transfer_fixture();
+    let guest = c.user(&identity("guest")).unwrap();
+    intent.kind = Kind::Fork;
+    intent.child = Some(Child {
+        id: "m-cleanup".into(),
+        name: "child".into(),
+    });
+    let t = c.begin_transfer(user, "fork-cleanup", &intent).unwrap();
+    c.operation(
+        user,
+        json!({"op":"share","id":"child","with":"guest@example.test","role":"use"}),
+    )
+    .unwrap();
+    c.db.execute(
+        "INSERT INTO owner_allocations VALUES('m-cleanup',1,256,8)",
+        [],
+    )
+    .unwrap();
+    c.db.execute("INSERT INTO publications(https_port,physical,guest_port,active) VALUES(11000,'m-cleanup',80,1)",[]).unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Preparing,
+        Step::Importing,
+        &Evidence::default(),
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Importing,
+        Step::ImportUncertain,
+        &Evidence::default(),
+    )
+    .unwrap();
+    let metadata = || {
+        c.db.query_row("SELECT (SELECT COUNT(*) FROM grants WHERE physical='m-cleanup'),(SELECT COUNT(*) FROM owner_allocations WHERE physical='m-cleanup'),(SELECT active FROM publications WHERE physical='m-cleanup'),(SELECT resource FROM operations WHERE id=?1)",[t.operation],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).unwrap()
+    };
+    assert!(
+        c.advance_transfer(
+            t.id,
+            t.epoch,
+            Step::ImportUncertain,
+            Step::Failed,
+            &Evidence::default()
+        )
+        .is_err()
+    );
+    assert_eq!(metadata(), (1, 1, 1, "child".into()));
+    c.db.execute_batch("CREATE TRIGGER fail_child_delete BEFORE DELETE ON resources WHEN OLD.kind='machine' AND OLD.physical='m-cleanup' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    let proof = Evidence {
+        target_excluded: true,
+        ..Default::default()
+    };
+    assert!(
+        c.advance_transfer(t.id, t.epoch, Step::ImportUncertain, Step::Failed, &proof)
+            .is_err()
+    );
+    assert_eq!(metadata(), (1, 1, 1, "child".into()));
+    assert_eq!(c.physical(user, "machine", "child").unwrap(), "m-cleanup");
+    assert_eq!(c.transfer(t.id).unwrap().step, Step::ImportUncertain);
+    assert_eq!(c.extra_usage("beta").unwrap(), (256, 1, 1));
+    c.db.execute_batch("DROP TRIGGER fail_child_delete")
+        .unwrap();
+    c.advance_transfer(t.id, t.epoch, Step::ImportUncertain, Step::Failed, &proof)
+        .unwrap();
+    assert_eq!(metadata(), (0, 0, 0, "deleted:child".into()));
+    assert!(c.physical(user, "machine", "child").is_err());
+    assert_eq!(c.extra_usage("beta").unwrap(), (0, 0, 0));
+    assert_eq!(
+        c.begin_transfer(user, "fork-cleanup", &intent)
+            .unwrap()
+            .step,
+        Step::Failed
+    );
+    assert!(
+        c.machine(guest, "owner@example.test/child", "fork")
+            .is_err()
+    );
+}

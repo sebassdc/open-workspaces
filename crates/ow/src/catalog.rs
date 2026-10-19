@@ -188,7 +188,14 @@ fn shared_with(db: &Connection, physical: &str) -> Result<Value> {
 fn share_on(db: &mut Connection, user: i64, op: &str, request: &Value) -> Result<Value> {
     let name = request["id"].as_str().context("id")?;
     common::identifier(name)?;
-    let physical: String = db
+    let email = request["with"]
+        .as_str()
+        .context("teammate email required")?
+        .to_ascii_lowercase();
+    common::email(&email)?;
+    // Resolve ownership under the grant writer lock so deletion cannot leave a late grant.
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let physical: String = tx
         .query_row(
             "SELECT physical FROM resources WHERE owner=?1 AND kind='machine' AND name=?2",
             params![user, name],
@@ -196,12 +203,6 @@ fn share_on(db: &mut Connection, user: i64, op: &str, request: &Value) -> Result
         )
         .optional()?
         .context("resource not found")?;
-    let email = request["with"]
-        .as_str()
-        .context("teammate email required")?
-        .to_ascii_lowercase();
-    common::email(&email)?;
-    let tx = db.transaction()?;
     let issuer: String =
         tx.query_row("SELECT issuer FROM users WHERE id=?1", [user], |r| r.get(0))?;
     if op == "share" {
@@ -738,7 +739,12 @@ impl Catalog {
                 ensure!(matches!(expected,Step::Preparing | Step::Exported) || proof.target_excluded,"uncertain target retains capacity until positively excluded");
                 c.db.execute("DELETE FROM transfer_reservations WHERE transfer=?1 AND epoch=?2",params![id,epoch])?;
                 if t.kind == Kind::Fork {
-                    c.db.execute("DELETE FROM resources WHERE kind='machine' AND physical=?1 AND placement_epoch=0 AND node=''",[&t.machine])?;
+                    // Retire the child's identity and name together, as ordinary deletion does.
+                    c.db.execute("UPDATE operations SET resource='deleted:'||resource WHERE op<>'snapshot' AND (owner,resource) IN (SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1)",[&t.machine])?;
+                    c.db.execute("UPDATE publications SET active=0 WHERE physical=?1",[&t.machine])?;
+                    c.db.execute("DELETE FROM grants WHERE physical=?1",[&t.machine])?;
+                    c.db.execute("DELETE FROM owner_allocations WHERE physical=?1",[&t.machine])?;
+                    ensure!(c.db.execute("DELETE FROM resources WHERE kind='machine' AND physical=?1 AND placement_epoch=0 AND node='' AND owner=(SELECT owner FROM operations WHERE id=?2) AND EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1 AND transfer=?3)",params![t.machine,t.operation,id])? == 1,"fork child authority changed");
                 }
             }
             let step = serde_json::to_value(next)?.as_str().unwrap().to_owned();
