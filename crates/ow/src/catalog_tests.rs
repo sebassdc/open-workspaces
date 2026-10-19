@@ -3627,3 +3627,45 @@ fn controller_private_backup_preserves_all_authority_and_artifact_roots() {
     assert_eq!(copy.placement("machine", &physical).unwrap(), "alpha");
     assert!(!restored.root.join("control.sock").exists());
 }
+
+#[test]
+fn legacy_key_replacement_invalidates_a_concurrent_transfer_policy_read() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let user = c.user(&identity("owner")).unwrap();
+    fake.worker("alpha");
+    c.operation(user, json!({"op":"create","id":"box","node":"alpha"}))
+        .unwrap();
+    let physical = c.physical(user, "machine", "box").unwrap();
+    c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.guest_ssh_v1',json('true')) WHERE id='alpha'",[]).unwrap();
+    c.db.execute(
+        "UPDATE resources SET ssh_policy='\"disabled\"' WHERE physical=?1",
+        [&physical],
+    )
+    .unwrap();
+    c.operation(
+        user,
+        json!({"op":"ssh-keys","id":"box","keys":[],"operation_key":"revoke"}),
+    )
+    .unwrap();
+    let (policy, generation): (Option<String>, i64) =
+        c.db.query_row(
+            "SELECT ssh_policy,ssh_policy_generation FROM resources WHERE physical=?1",
+            [&physical],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(policy.is_none());
+    assert_eq!(generation, 1);
+    assert!(
+        c.set_transfer_ssh_policy(user, "box", 0, &crate::transfers::PublicSshPolicy::Disabled)
+            .is_err()
+    );
+    c.set_transfer_ssh_policy(
+        user,
+        "box",
+        generation,
+        &crate::transfers::PublicSshPolicy::Disabled,
+    )
+    .unwrap();
+}

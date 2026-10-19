@@ -342,7 +342,10 @@ Delete, resize, snapshot and SSH-key mutations are blocked while transfer locks 
 held. Sharing revocation stays available and is rechecked before effects/commit and
 access. Prepared SSH-policy installation runs under the worker lock and refuses a
 different persisted policy generation. Subsequent managed key replacement updates
-the catalog generation before another transfer can be admitted. Managed delete,
+the catalog generation before another transfer can be admitted. Legacy key changes
+also advance that generation and invalidate cached policy, so an admission read
+cannot survive a concurrent revocation. Export replay rechecks the source policy
+before reusing an acknowledged fence. Managed delete,
 resize and ordinary restore remain unsupported; cold resize is a later slice.
 Managed fork uses its own locked snapshot path.
 

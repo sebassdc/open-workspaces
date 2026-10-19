@@ -1982,3 +1982,34 @@ fn lost_retarget_reply_joins_the_fresh_epoch_instead_of_excluding_it_again() {
     assert_eq!(result["transfer"]["epoch"], original + 1);
     assert_eq!(f.shared.lock().unwrap().db.query_row("SELECT json_extract(response,'$.intervention') IS NULL FROM operations WHERE id=?1",[f.transfer.operation],|r|r.get::<_,bool>(0)).unwrap(),true);
 }
+
+#[test]
+fn lost_export_reply_rechecks_public_policy_before_reusing_the_fence() {
+    let (f, peers) = moving_fixture(Kind::Move);
+    assert!(
+        tick(&f.shared, f.transfer.id, now(), &|node, r| {
+            ensure!(r["op"] != "restore-policy", "policy read reply lost");
+            moving_call(&f, &peers, node, r)
+        })
+        .is_err()
+    );
+    assert_eq!(f.step(), Step::Preparing);
+    assert_eq!(
+        peers.borrow().source.as_ref().unwrap()["lifecycle"]["phase"],
+        "exported"
+    );
+    let result = tick(&f.shared, f.transfer.id, now(), &|node, r| {
+        if r["op"] == "restore-policy" {
+            return Ok(json!({"enrolled":{"keys":[]}}));
+        }
+        moving_call(&f, &peers, node, r)
+    });
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("SSH policy changed")
+    );
+    assert_eq!(f.step(), Step::Preparing);
+    assert_eq!(peers.borrow().starts, 0);
+}

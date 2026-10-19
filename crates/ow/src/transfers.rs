@@ -585,6 +585,11 @@ fn export_source(
         Some("exported" | "cleaned")
     ) {
         source_fence(&shared.lock().unwrap(), &t, &seen, &source_authority)?;
+        let current = call(&t.source_node, json!({"op":"restore-policy","id":t.source}))?;
+        ensure!(
+            same_policy(policy, &current),
+            "source SSH policy changed before export acknowledgment"
+        );
         return advance(
             Step::Exported,
             Evidence {

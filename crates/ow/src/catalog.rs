@@ -2203,6 +2203,10 @@ impl Catalog {
             )?;
             self.set_transfer_ssh_policy(user, &name, generation, &policy)?;
         }
+        if op == "ssh-keys" && request.get("placement").is_none() {
+            // A concurrent legacy key change invalidates a transfer admission's policy read.
+            self.db.execute("UPDATE resources SET ssh_policy=NULL,ssh_policy_generation=ssh_policy_generation+1 WHERE kind='machine' AND physical=?1",[&physical])?;
+        }
         let mut value = envelope["result"].clone();
         let correlated = if matches!(
             op.as_str(),
