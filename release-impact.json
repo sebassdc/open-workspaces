@@ -39,7 +39,47 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "Opt-in controller-only host reuses the node listener, persistent catalog, dashboard and catalog backup without KVM, a local worker or implicit local capacity. Dormant dashboard pins follow catalog-reader upgrades while only installed services restart. Class 1 new-role packaging; class 0 component/config impact on unaffected existing hosts. Catalog schema and reader floor 5, node protocol 1, worker interface 2, runtime, guest kernel, host layout 2 and stage 0 are unchanged from v0.9.4. Existing combined host and runner defaults, credentials, Tailscale state and worker pins are preserved. No worker restart, automatic movement, failover or infrastructure creation."
+      "notes": "Opt-in controller-only host reuses the node listener, persistent catalog, dashboard and catalog backup without KVM, a local worker or implicit local capacity. Dormant dashboard pins follow catalog-reader upgrades while only installed services restart. Class 1 new-role packaging; class 0 component/config impact on unaffected existing hosts. Catalog schema and reader floor 5, node protocol 1, worker interface 2, runtime, guest kernel, host layout 2 and stage 0 are unchanged from v0.9.5. Existing combined host and runner defaults, credentials, Tailscale state and worker pins are preserved. No worker restart, automatic movement, failover or infrastructure creation."
+    },
+    {
+      "version": "0.9.5",
+      "class": 1,
+      "changes": [
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 2,
+        "accepts": [
+          1,
+          2
+        ]
+      },
+      "catalog": {
+        "schema": 5,
+        "min_reader": 5
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Durable managed restore of catalog-authorized artifacts with digest and lineage validation, reserved capacity, unstarted import, conditional placement commit and activation. Controller, agent and remote client update; requires the existing worker interface 2 placement fences. Catalog schema 5 and reader floor 5, protocols, runtime, guest kernel and host layout are unchanged from v0.9.4. Retain running worker pins; no worker restart, host replacement, automatic movement, source-loss takeover or implicit cold-memory loss. Managed lifecycle replies and inventory reconcile only with the committed placement; durable transfer recovery is covered by controller and agent process-kill tests.",
+      "waivers": {
+        "worker": "crates/ow/src/host.rs only rejects managed artifact restore in the operator-local CLI path; worker dispatch, runtime and lifecycle behavior are unchanged."
+      }
     },
     {
       "version": "0.9.4",

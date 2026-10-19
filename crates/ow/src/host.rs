@@ -942,7 +942,15 @@ pub fn run(cli: Cli) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(0);
         }
-        Action::Restore { id, name } => json!({"op":"restore","id":id,"name":name}),
+        Action::Restore {
+            id, name, artifact, ..
+        } => {
+            ensure!(
+                artifact.is_none(),
+                "managed artifact restore requires --server; backup restore is operator-local"
+            );
+            json!({"op":"restore","id":id,"name":name})
+        }
         Action::Publish { id, port } => {
             let result = publish(&root, &id, port)?;
             println!("{}", result["url"].as_str().context("missing URL")?);

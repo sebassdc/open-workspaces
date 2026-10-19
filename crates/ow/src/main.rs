@@ -312,7 +312,19 @@ enum Action {
     /// remote server: owner only; a machine the runner no longer has just leaves the list).
     Delete { id: String },
     /// Rewind a workspace to its named snapshot (later changes are replaced).
-    Restore { id: String, name: String },
+    Restore {
+        id: String,
+        #[arg(required_unless_present = "artifact", conflicts_with = "artifact")]
+        name: Option<String>,
+        /// Restore a committed catalog artifact through a durable managed transfer.
+        #[arg(long, requires = "node")]
+        artifact: Option<String>,
+        #[arg(long, requires = "artifact")]
+        node: Option<String>,
+        /// Explicitly discard incompatible saved RAM; keep the stored artifact.
+        #[arg(long, requires = "artifact")]
+        accept_cold: bool,
+    },
     /// Open a guest HTTP preview (remote availability depends on the server).
     Publish {
         id: String,

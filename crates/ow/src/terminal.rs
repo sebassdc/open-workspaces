@@ -187,6 +187,12 @@ pub async fn upgrade(
                 .into_response();
         }
     };
+    // Revocation may arrive while the worker opens/wakes the stream.
+    tokio::select! {
+        biased;
+        _ = revoked.notified() => return StatusCode::FORBIDDEN.into_response(),
+        _ = tokio::time::sleep(Duration::ZERO) => {}
+    }
     if stream.set_nonblocking(true).is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }

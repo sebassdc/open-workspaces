@@ -19,8 +19,8 @@ pub struct Identity {
     pub email: String,
 }
 pub struct Catalog {
-    db: Connection,
-    root: PathBuf,
+    pub(crate) db: Connection,
+    pub(crate) root: PathBuf,
     _lock: std::fs::File,
 }
 
@@ -77,6 +77,7 @@ fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
         {
             diagnostic
         }
+        (_, "incompatible stored RAM; retry with a new operation key and explicit --accept-cold consent") => diagnostic,
         (_, "snapshot limit (24) reached") => {
             "Named snapshot limit (24) reached. Remove unneeded snapshots on the host before retrying with a new operation key."
         }
@@ -502,7 +503,7 @@ impl Catalog {
     }
     /// Physical ID of a machine the user owns (`name`) or that was shared with them
     /// (`owner@example.com/name`), when their role allows `op`.
-    fn machine(&self, user: i64, address: &str, op: &str) -> Result<String> {
+    pub(crate) fn machine(&self, user: i64, address: &str, op: &str) -> Result<String> {
         let Some((owner, name)) = address.split_once('/') else {
             return self.physical(user, "machine", address);
         };
@@ -599,7 +600,6 @@ impl Catalog {
     }
 
     // SQLite-only transitions: transport and artifact verification happen before entry.
-    #[allow(dead_code)] // Dormant until transfer orchestration is activated.
     fn transfer_write<T>(&self, write: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
@@ -799,10 +799,18 @@ impl Catalog {
     }
     fn legacy_access(&self, physical: &str) -> Result<()> {
         ensure!(
-            self.legacy_machine(physical)?,
+            self.legacy_machine(physical)? || self.managed_placement(physical)?.is_some(),
             "managed placement requires transfer-aware routing"
         );
         Ok(())
+    }
+    pub(crate) fn managed_placement(&self, physical: &str) -> Result<Option<common::Placement>> {
+        let placement: Option<(i64,String,i64)> = self.db.query_row("SELECT r.placement_epoch,r.node,t.id FROM resources r JOIN transfers t ON t.machine=r.physical AND t.epoch=r.placement_epoch AND t.target=r.node AND t.step='succeeded' AND t.kind='restore' WHERE r.kind='machine' AND r.physical=?1 AND r.placement_managed=1 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=r.physical)",[physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        Ok(placement.map(|(epoch, node, id)| common::Placement {
+            epoch: epoch as u64,
+            node,
+            transfer: format!("transfer-{id}"),
+        }))
     }
     fn placement(&self, kind: &str, physical: &str) -> Result<String> {
         Ok(self.db.query_row(
@@ -812,13 +820,24 @@ impl Catalog {
         )?)
     }
     fn save_node(&mut self, node: &str, kind: &str, physical: &str, value: &Value) -> Result<()> {
-        let updated = self.db.execute("UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE kind=?2 AND physical=?3 AND node=?4 AND (kind<>'machine' OR (placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical)))",params![value.to_string(),kind,physical,node])?;
+        let mut updated = self.db.execute("UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE kind=?2 AND physical=?3 AND node=?4 AND (kind<>'machine' OR (placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical)))",params![value.to_string(),kind,physical,node])?;
+        if kind == "machine" && updated == 0 {
+            if let Some(placement) = self.managed_placement(physical)? {
+                ensure!(
+                    node == placement.node
+                        && value["id"] == physical
+                        && value["placement"] == json!(placement),
+                    "worker result has contradictory placement"
+                );
+                updated = self.db.execute("UPDATE resources SET metadata=?1,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND physical=?2 AND node=?3 AND placement_epoch=?4",params![value.to_string(),physical,node,placement.epoch as i64])?;
+            }
+        }
         if kind == "machine" && updated == 1 {
             limits::observe(&self.db, physical, value)?;
         }
         Ok(())
     }
-    fn operation_info(&self, user: i64, operation: i64) -> Result<Value> {
+    pub(crate) fn operation_info(&self, user: i64, operation: i64) -> Result<Value> {
         let (mut info, response): (Value, Option<String>) = self.db.query_row("SELECT id,op,resource,state,node,retry_key,response FROM operations WHERE owner=?1 AND id=?2",params![user,operation],|r|Ok((json!({"id":r.get::<_,i64>(0)?,"op":r.get::<_,String>(1)?,"resource":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"node":r.get::<_,String>(4)?,"retry_key":r.get::<_,Option<String>>(5)?}),r.get(6)?)))?;
         if matches!(
             info["state"].as_str(),
@@ -834,6 +853,23 @@ impl Catalog {
             if let Some((code, _)) = first_use_error(response["error"].as_str().unwrap_or("")) {
                 info["error_code"] = json!(code);
             }
+        }
+        if let Some((id, epoch, step)) = self
+            .db
+            .query_row(
+                "SELECT id,epoch,step FROM transfers WHERE operation=?1",
+                [operation],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            info["transfer"] = json!({"id":id,"epoch":epoch,"step":step});
         }
         Ok(info)
     }
@@ -885,7 +921,12 @@ impl Catalog {
                     extra_cpus += m["vcpu_count"].as_i64().unwrap_or(16);
                     extra_slots += 1;
                 }
-                if !self.legacy_machine(physical)? {
+                let managed = self.managed_placement(physical)?;
+                if !self.legacy_machine(physical)?
+                    && !managed
+                        .as_ref()
+                        .is_some_and(|p| p.node == node && m["placement"] == json!(p))
+                {
                     all_machines.push(m.clone());
                     continue;
                 }
@@ -900,7 +941,8 @@ impl Catalog {
                 if matches!(
                     m["state"].as_str(),
                     Some("stopped" | "hibernated" | "failed")
-                ) {
+                ) && (managed.is_none() || m["vmm_running"] == false)
+                {
                     self.db.execute("UPDATE resources SET reserved_mib=0,reserved_cpus=0 WHERE kind='machine' AND physical=?1 AND node=?2 AND NOT EXISTS(SELECT 1 FROM operations WHERE resource=resources.name AND owner=resources.owner AND state IN ('pending','uncertain') AND op IN ('create','start','fork','restore'))",params![physical,node])?;
                 }
                 all_machines.push(m.clone());
@@ -1549,6 +1591,16 @@ impl Catalog {
         if op != "create" {
             let physical = self.machine(user, &name, &op)?;
             self.legacy_access(&physical)?;
+            if let Some(placement) = self.managed_placement(&physical)? {
+                ensure!(
+                    matches!(
+                        op.as_str(),
+                        "start" | "stop" | "exec" | "ssh-info" | "put" | "get" | "hibernate"
+                    ),
+                    "managed mutation requires lifecycle coordination"
+                );
+                request["placement"] = json!(placement);
+            }
             // Confirmed gone from its runner: only the row is left. A runner that is online now
             // may have it back, so it must still not list it; an unreachable one refuses.
             if op == "delete" && self.missing(&physical)? {
@@ -1944,6 +1996,41 @@ impl Catalog {
             );
             return Err(self.outcome_error(user, operation));
         }
+        if request.get("placement").is_some()
+            && matches!(op.as_str(), "start" | "stop" | "hibernate")
+        {
+            // Lifecycle replies predate placement fields; observe the actual current copy.
+            let observed = (|| -> Result<Value> {
+                let observed = wire::request(
+                    &root,
+                    json!({"op":"inspect","id":physical,"placement":request["placement"]}),
+                )?;
+                ensure!(
+                    observed["id"] == physical && observed["placement"] == request["placement"],
+                    "post-effect inspect has contradictory placement"
+                );
+                Ok(observed)
+            })();
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    self.db.execute(
+                        "UPDATE operations SET state='uncertain',response=?1 WHERE id=?2",
+                        params![
+                            json!({"error":format!("post-effect observation failed: {error:#}")})
+                                .to_string(),
+                            operation
+                        ],
+                    )?;
+                    return Err(self.outcome_error(user, operation));
+                }
+            };
+            if op == "stop" {
+                value["workspace"] = observed;
+            } else {
+                value = observed;
+            }
+        }
         if matches!(
             op.as_str(),
             "exec" | "put" | "get" | "ssh-keys" | "ssh-info"
@@ -2048,8 +2135,8 @@ impl Catalog {
         let revoked = self.watched(user, &name, "preview", &physical)?;
         Ok(crate::preview::Target {
             root: nodes::route(&self.root, &node)?,
-            id: physical,
-            placement: None, // Managed placements stay blocked until transfer-aware routing lands.
+            id: physical.clone(),
+            placement: self.managed_placement(&physical)?,
             port,
             revoked,
             unpublished: session(user, &format!("preview:{https}")),

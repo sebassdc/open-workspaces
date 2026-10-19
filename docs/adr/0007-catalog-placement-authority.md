@@ -1,6 +1,6 @@
 # ADR 0007: durable placement authority and transfer reservations
 
-Status: implemented catalog contract; transfer execution and activation remain dormant.
+Status: implemented catalog contract with explicit verified restore execution.
 Pattern: ADR 0002's single-controller SQLite intents, ADR 0005's per-unit upgrade boundary,
 and ADR 0006's existing artifact references.
 
@@ -60,7 +60,8 @@ fails closed for these resources until epoch-bearing orchestration is connected.
 All new writer transactions perform SQLite work only. Store transfer, verification,
 worker RPCs and waits must occur outside them, with results supplied as explicit
 evidence. The transition API is controller-internal; evidence flags are attestations
-by the future orchestrator, not public caller parameters or worker execution proof.
-No new CLI/API lifecycle operation, background timer or network action is activated.
+by the orchestrator after checking worker proof, never public caller parameters.
+Explicit managed restore now executes these contracts through the transfer runner;
+other transfer kinds remain dormant. No automatic movement policy is activated.
 
 See [lifecycle contract](../LIFECYCLE.md) for phases, permissions and rollout gates.
