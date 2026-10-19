@@ -21,6 +21,13 @@ pub fn reflink(source: &Path, destination: &Path) -> Result<()> {
         .create_new(true)
         .open(destination)?;
     let rc = unsafe { libc::ioctl(dst.as_raw_fd(), 0x40049409, src.as_raw_fd()) };
+    // Unit fixtures use byte copies on tmpfs; real VM acceptance requires host reflinks.
+    #[cfg(test)]
+    if rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EOPNOTSUPP) {
+        std::fs::copy(source, destination)?;
+        dst.sync_all()?;
+        return Ok(());
+    }
     if rc < 0 {
         return Err(std::io::Error::last_os_error()).context("disk reflink failed");
     }
@@ -354,6 +361,15 @@ impl Vm {
     pub fn alive(&mut self) -> bool {
         self.child.try_wait().ok().flatten().is_none()
     }
+
+    /// Export acknowledgment requires observed child exit, not a best-effort Drop.
+    pub fn terminate(&mut self) -> Result<()> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+        }
+        self.child.wait()?;
+        Ok(())
+    }
 }
 
 impl Drop for Vm {
@@ -532,4 +548,76 @@ mod clock_tests {
     fn failed_capture_still_resyncs_the_resumed_parent() {
         clock_after_resume(true, 0);
     }
+}
+
+/// A real child and the real capture API/serial protocol, without KVM or host networking.
+#[cfg(test)]
+pub(crate) fn capture_fixture(directory: &Path) -> (Vm, std::thread::JoinHandle<()>) {
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::net::{UnixListener, UnixStream},
+    };
+    let socket = directory.join("fixture-api.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (master, serial) = UnixStream::pair().unwrap();
+    let fixture = std::thread::spawn(move || {
+        let mut serial = BufReader::new(serial);
+        let mut command = String::new();
+        serial.read_line(&mut command).unwrap();
+        assert!(command.starts_with("sync;"));
+        let suffix = command
+            .split_once("OW_DONE_")
+            .unwrap()
+            .1
+            .split(':')
+            .next()
+            .unwrap();
+        let marker = format!("OW_DONE_{suffix}");
+        write!(serial.get_mut(), "\n{marker}:0:{marker}\n").unwrap();
+        for endpoint in ["/vm", "/snapshot/create"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line.split_whitespace().nth(1), Some(endpoint));
+            let mut length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = n.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            if endpoint == "/snapshot/create" {
+                std::fs::write(body["snapshot_path"].as_str().unwrap(), b"VM state").unwrap();
+                std::fs::write(body["mem_file_path"].as_str().unwrap(), b"VM memory").unwrap();
+            } else {
+                assert_eq!(body["state"], "Paused");
+            }
+            write!(
+                stream,
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        }
+    });
+    (
+        Vm {
+            child: Command::new("sleep").arg("60").spawn().unwrap(),
+            master: std::os::fd::OwnedFd::from(master).into(),
+            log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
+            diagnostics: None,
+            buffer: Vec::new(),
+            socket,
+            tap: "fixture-no-host-interface".into(),
+            address: String::new(),
+        },
+        fixture,
+    )
 }

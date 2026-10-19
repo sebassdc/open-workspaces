@@ -213,7 +213,13 @@ fn agent_refuses_a_worker_outside_its_protocol_window() {
     let error = agent(&root, "http://127.0.0.1:9", &credential, None, None, true)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("worker protocol 99 unsupported"), "{error}");
+    assert!(
+        error.contains(&format!(
+            "worker protocol {} unsupported",
+            common::WORKER_PROTOCOL + 98
+        )),
+        "{error}"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
@@ -232,12 +238,12 @@ fn durable_journal_duplicate_conflict_and_unknown_exec() {
         .unwrap();
     });
     let req = json!({"op":"exec","id":"m-test","command":"effect","operation_key":"test"});
-    let first = journal_request(&root, &req).unwrap();
+    let first = journal_request(&root, &req, false).unwrap();
     server.join().unwrap();
-    assert_eq!(journal_request(&root, &req).unwrap(), first);
+    assert_eq!(journal_request(&root, &req, false).unwrap(), first);
     let mut changed = req.clone();
     changed["command"] = json!("changed");
-    assert!(journal_request(&root, &changed).is_err());
+    assert!(journal_request(&root, &changed, false).is_err());
     let mut unknown = req.clone();
     unknown["operation_key"] = json!("unknown");
     let db = Connection::open(root.join("node-operations.sqlite3")).unwrap();
@@ -246,7 +252,10 @@ fn durable_journal_duplicate_conflict_and_unknown_exec() {
         [unknown.to_string()],
     )
     .unwrap();
-    assert_eq!(journal_request(&root, &unknown).unwrap()["uncertain"], true);
+    assert_eq!(
+        journal_request(&root, &unknown, false).unwrap()["uncertain"],
+        true
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -792,7 +801,7 @@ async fn worker_accepted_lost_reply_reopens_with_one_create_and_one_exec() {
                 }
             }
             let req: Value = serde_json::from_slice(&bytes).unwrap();
-            let result = journal_request(&worker, &req).unwrap();
+            let result = journal_request(&worker, &req, false).unwrap();
             if matches!(req["op"].as_str(), Some("create" | "exec"))
                 && lost.insert(req["operation_key"].as_str().unwrap().to_owned())
             {
@@ -1275,5 +1284,161 @@ fn pool_spend_concurrent_invitations_have_one_winner_and_overflow_refuses() {
             .contains("overflow")
     );
     assert_eq!(inventory(&root).unwrap().as_array().unwrap().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn placement_steps_reconcile_effect_before_reply_and_recheck_cached_authority() {
+    use std::os::unix::net::UnixListener;
+    for op in common::PLACEMENT_OPERATIONS
+        .iter()
+        .copied()
+        .chain(std::iter::once("start"))
+    {
+        let root = root();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        let request = json!({"op":op,"id":"box","placement":{"epoch":7,"node":"alpha","transfer":"incarnation"},"operation_key":"step"});
+        // Lose the worker reply after the effect: the journal must remain uncertain.
+        let worker = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let req = wire::line(&mut first).unwrap();
+            assert_eq!(req["op"], op);
+            drop(first);
+            let (mut retry, _) = listener.accept().unwrap();
+            assert_eq!(wire::line(&mut retry).unwrap(), req);
+            wire::send(
+                &mut retry,
+                &json!({"ok":true,"result":{"logical_effects":1,"epoch":7}}),
+            )
+            .unwrap();
+            drop(retry);
+            // A cached reply is usable only after checking current worker authority.
+            for current in [true, false] {
+                let (mut cached, _) = listener.accept().unwrap();
+                let check = wire::line(&mut cached).unwrap();
+                assert_eq!(check["op"], "placement-check");
+                assert_eq!(check["request"], req);
+                let reply = if current {
+                    json!({"ok":true,"result":{}})
+                } else {
+                    json!({"ok":false,"error":"stale placement epoch"})
+                };
+                wire::send(&mut cached, &reply).unwrap();
+            }
+        });
+        assert_eq!(
+            journal_request(&root, &request, true).unwrap()["uncertain"],
+            true
+        );
+        let result = journal_request(&root, &request, true).unwrap();
+        assert_eq!(result["result"]["logical_effects"], 1);
+        assert_eq!(journal_request(&root, &request, true).unwrap(), result);
+        let stale = journal_request(&root, &request, true).unwrap();
+        assert_eq!(stale["ok"], false);
+        assert!(stale["error"].as_str().unwrap().contains("stale"));
+        worker.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn a_legacy_cached_reply_cannot_bypass_a_new_managed_fence() {
+    use std::os::unix::net::UnixListener;
+    let root = root();
+    let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+    let worker = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let req = wire::line(&mut first).unwrap();
+        assert!(req.get("placement").is_none());
+        wire::send(&mut first, &json!({"ok":true,"result":{"state":"running"}})).unwrap();
+        drop(first);
+        let (mut cached, _) = listener.accept().unwrap();
+        let req = wire::line(&mut cached).unwrap();
+        assert_eq!(req["op"], "placement-check");
+        assert!(req["request"].get("placement").is_none());
+        wire::send(
+            &mut cached,
+            &json!({"ok":false,"error":"missing placement epoch for managed workspace"}),
+        )
+        .unwrap();
+    });
+    let req = json!({"op":"start","id":"box","operation_key":"old"});
+    assert_eq!(journal_request(&root, &req, false).unwrap()["ok"], true);
+    assert_eq!(journal_request(&root, &req, true).unwrap()["ok"], false);
+    worker.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn managed_stream_envelopes_reach_only_the_named_capable_worker() {
+    use std::{net::TcpListener, os::unix::net::UnixListener};
+    let root = root();
+    let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+    let runtime = std::thread::spawn(move || {
+        for op in ["ssh", "terminal", "tunnel"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = wire::line(&mut stream).unwrap();
+            assert_eq!(request["op"], op);
+            assert_eq!(request["placement"]["epoch"], 7);
+            assert_eq!(request["placement"]["node"], "alpha");
+            wire::send(&mut stream, &json!({"ok":true,"result":{}})).unwrap();
+        }
+    });
+    for op in ["ssh", "terminal", "tunnel"] {
+        for eligible in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let path = root.clone();
+            let agent = std::thread::spawn(move || {
+                agent_job(
+                    &path,
+                    &origin,
+                    "alpha",
+                    "job",
+                    "fixture",
+                    None,
+                    Busy::new(),
+                    &Mutex::new(Some(
+                        json!({"worker_protocol":2,"placement_fencing_v1":true,"worker_pid":std::process::id()}),
+                    )),
+                )
+            });
+            let (tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut socket = tungstenite::accept(tcp).unwrap();
+            let authority = common::Placement {
+                epoch: 7,
+                node: if eligible { "alpha" } else { "beta" }.into(),
+                transfer: "move1".into(),
+            };
+            let mut request = wire::workspace_request(op, "box", Some(&authority));
+            if op == "tunnel" {
+                request["port"] = json!(3000);
+            }
+            socket
+                .send(tungstenite::Message::Binary(
+                    format!("{request}\n").into_bytes().into(),
+                ))
+                .unwrap();
+            if eligible {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&socket.read().unwrap().into_data()).unwrap()["ok"],
+                    true
+                );
+                drop(socket);
+                agent.join().unwrap().unwrap();
+            } else {
+                assert!(
+                    agent
+                        .join()
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("another node")
+                );
+            }
+        }
+    }
+    runtime.join().unwrap();
     fs::remove_dir_all(root).unwrap();
 }

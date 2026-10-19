@@ -1692,6 +1692,7 @@ impl Catalog {
         Ok(crate::preview::Target {
             root: nodes::route(&self.root, &node)?,
             id: physical,
+            placement: None, // T1 supplies committed authority before managed routing is enabled.
             port,
             revoked,
             unpublished: session(user, &format!("preview:{https}")),

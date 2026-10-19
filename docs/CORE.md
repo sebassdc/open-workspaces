@@ -12,6 +12,10 @@ temporary AWS sessions and write-only Secrets Manager uploads. It installs no
 runtime endpoint; live adapters, lifecycle fencing and IAM/secret approval remain
 activation gates.
 
+The dormant [worker placement fence](PLACEMENT_FENCING.md) adds epoch-checked
+lifecycle primitives and replay rules; catalog/store integration and rollout remain
+explicit activation gates.
+
 ## ComputeProvider
 
 A machine backend behind the worker's JSON operation protocol

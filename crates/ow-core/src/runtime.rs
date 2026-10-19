@@ -156,13 +156,60 @@ pub struct Workspace {
     pub image: String,
     pub source: Option<String>,
     pub hibernation: Option<String>,
+    #[serde(default)]
+    pub managed: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     next_index: u32,
     workspaces: BTreeMap<String, Workspace>,
+    #[serde(default)]
+    placements: BTreeMap<String, Managed>,
 }
+
+impl State {
+    fn read(bytes: &[u8]) -> Result<Self> {
+        let mut value: Value = serde_json::from_slice(bytes)?;
+        if let Some(schema) = value.get("worker_state_schema") {
+            ensure!(
+                schema == 2 && value["next_index"].is_null(),
+                "unsupported worker state schema"
+            );
+            let index = value
+                .get("managed_next_index")
+                .context("missing managed address allocation")?
+                .clone();
+            value["next_index"] = index;
+            let state: Self = serde_json::from_value(value)?;
+            ensure!(
+                !state.placements.is_empty(),
+                "managed state has lost its fences"
+            );
+            Ok(state)
+        } else {
+            let state: Self = serde_json::from_value(value)?;
+            ensure!(
+                state.placements.is_empty(),
+                "managed state is missing its reader guard"
+            );
+            Ok(state)
+        }
+    }
+    fn value(&self) -> Value {
+        let mut value = json!(self);
+        if !self.placements.is_empty() {
+            value["worker_state_schema"] = json!(2);
+            value["managed_next_index"] = json!(self.next_index);
+            // Old workers require a u32 here and must refuse the entire managed registry.
+            value["next_index"] = Value::Null;
+        }
+        value
+    }
+}
+
+mod lifecycle;
+use lifecycle::Managed;
 
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
@@ -204,8 +251,9 @@ struct Fingerprint {
 }
 
 fn fingerprints(directory: &Path) -> Result<Vec<Fingerprint>> {
-    ["manifest.json", "state", "memory", "disk.ext4"]
-        .iter()
+    let snapshot: Snapshot = serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+    std::iter::once("manifest.json")
+        .chain(snapshot.files.keys().map(String::as_str))
         .map(|name| {
             let metadata = fs::symlink_metadata(directory.join(name))?;
             ensure!(
@@ -362,10 +410,20 @@ pub struct Runtime {
     /// Set by `quiesce` when the worker is going down: no machine may start
     /// (a wake would consume a hibernation the shutdown just captured).
     closing: bool,
+    /// Completed capture in this process; never persist Captured before its files are synced.
+    capture_ready: BTreeMap<String, bool>,
+    #[cfg(test)]
+    crash: Option<&'static str>,
 }
 
 impl Runtime {
     pub fn ssh(&mut self, id: &str) -> Result<(std::net::TcpStream, String)> {
+        self.require_unmanaged(id)?;
+        self.ssh_request(&json!({"op":"ssh","id":id}))
+    }
+    pub fn ssh_request(&mut self, request: &Value) -> Result<(std::net::TcpStream, String)> {
+        let id = request["id"].as_str().context("missing ID")?;
+        self.authorize(request, true)?;
         identifier(id)?;
         // Waking first: resuming replaces the stream generation in the policy.
         self.wake(id)?;
@@ -374,7 +432,7 @@ impl Runtime {
             policy.ready && !policy.keys.is_empty(),
             "SSH has no active registered keys"
         );
-        let address = self.address(id)?;
+        let address = self.address_authorized(id)?;
         let tcp = std::net::TcpStream::connect_timeout(
             &format!("{address}:22").parse()?,
             std::time::Duration::from_secs(5),
@@ -384,9 +442,15 @@ impl Runtime {
     }
     /// A dedicated guest PTY; never attach an interactive client to management serial.
     pub fn terminal(&mut self, id: &str) -> Result<std::net::TcpStream> {
+        self.require_unmanaged(id)?;
+        self.terminal_request(&json!({"op":"terminal","id":id}))
+    }
+    pub fn terminal_request(&mut self, request: &Value) -> Result<std::net::TcpStream> {
         use std::{net::TcpStream, time::Duration};
+        let id = request["id"].as_str().context("missing ID")?;
+        self.authorize(request, true)?;
         identifier(id)?;
-        let address = self.address(id)?;
+        let address = self.address_authorized(id)?;
         let mut host: std::net::Ipv4Addr = address.parse()?;
         let mut octets = host.octets();
         octets[3] -= 1;
@@ -436,16 +500,11 @@ impl Runtime {
             fs::create_dir_all(root.join(directory))?;
         }
         let mut state: State = if root.join("state.json").exists() {
-            serde_json::from_slice(&fs::read(root.join("state.json"))?)?
+            State::read(&fs::read(root.join("state.json"))?)?
         } else {
             State::default()
         };
-        // VM children die with their worker. Preserve hibernation; reconcile everything else to stopped.
-        for workspace in state.workspaces.values_mut() {
-            if workspace.state != "hibernated" {
-                workspace.state = "stopped".into();
-            }
-        }
+        Self::recover_state(&mut state)?;
         let cpuinfo = fs::read_to_string("/proc/cpuinfo")?;
         let model = cpuinfo
             .lines()
@@ -470,6 +529,9 @@ impl Runtime {
             verified: BTreeMap::new(),
             idle: crate::idle::Idle::from_env()?,
             closing: false,
+            capture_ready: BTreeMap::new(),
+            #[cfg(test)]
+            crash: None,
         };
         runtime.cleanup_pending_snapshots()?;
         runtime.save()?;
@@ -477,7 +539,7 @@ impl Runtime {
     }
 
     fn save(&self) -> Result<()> {
-        atomic_json(&self.root.join("state.json"), &self.state)
+        atomic_json(&self.root.join("state.json"), &self.state.value())
     }
     fn machine_dir(&self, id: &str) -> PathBuf {
         self.root.join("machines").join(id)
@@ -539,6 +601,16 @@ impl Runtime {
     }
 
     pub fn address(&mut self, id: &str) -> Result<String> {
+        self.require_unmanaged(id)?;
+        self.address_authorized(id)
+    }
+
+    pub fn address_request(&mut self, request: &Value) -> Result<String> {
+        self.authorize(request, true)?;
+        self.address_authorized(request["id"].as_str().context("missing ID")?)
+    }
+
+    fn address_authorized(&mut self, id: &str) -> Result<String> {
         self.wake(id)?;
         Ok(self.running(id)?.address.clone())
     }
@@ -546,6 +618,7 @@ impl Runtime {
     /// Wake on connect: a connection or command resumes a hibernated machine.
     /// A stopped machine stays stopped.
     fn wake(&mut self, id: &str) -> Result<()> {
+        self.require_active(id)?;
         if !self.machines.contains_key(id) && self.workspace(id)?.state == "hibernated" {
             self.start(id).context("waking hibernated workspace")?;
         }
@@ -573,7 +646,11 @@ impl Runtime {
         }
         due.into_iter()
             .map(|id| {
-                let result = self.request(&json!({"op":"hibernate","id":id}));
+                let mut request = json!({"op":"hibernate","id":id});
+                if let Some(managed) = self.state.placements.get(&id) {
+                    request["placement"] = json!(managed.authority);
+                }
+                let result = self.request(&request);
                 if result.is_err() {
                     // Retry after another full timeout, not every check.
                     self.idle.touch(&id, now);
@@ -797,6 +874,7 @@ impl Runtime {
             image: image.into(),
             source,
             hibernation: None,
+            managed: false,
         };
         self.state.next_index += 1;
         self.state.workspaces.insert(id.into(), workspace.clone());
@@ -857,6 +935,7 @@ impl Runtime {
     }
 
     fn start(&mut self, id: &str) -> Result<Value> {
+        self.require_active(id)?;
         let workspace = self.workspace(id)?;
         if self.machines.contains_key(id) {
             return Ok(json!(workspace));
@@ -870,6 +949,10 @@ impl Runtime {
                     self.snapshot_dir(name).join("manifest.json"),
                 )?)?;
                 resume = manifest.resumable(&self.cpu, &self.kernel_hash);
+                ensure!(
+                    resume || !workspace.managed,
+                    "managed RAM capture is incompatible; explicit cold preparation required"
+                );
                 if !resume {
                     eprintln!(
                         "{id} was hibernated on another host kernel or CPU; booting its disk cold"
@@ -893,7 +976,7 @@ impl Runtime {
         self.save()?;
         // A resumed hibernation capture is spent; keeping it would leak one per sleep.
         // The running VMM keeps its mapped memory file until it exits.
-        if let Some(name) = slept.filter(|n| n.starts_with(SLEEP))
+        if let Some(name) = slept.filter(|n| n.starts_with(SLEEP) && !self.lifecycle_capture(n))
             && let Some(directory) = snapshot
         {
             self.verified.remove(&name);
@@ -995,10 +1078,20 @@ impl Runtime {
     // Called only at startup: the exclusive worker lock and dead VM children make
     // unpublished staging directories unreachable by any running capture or guest.
     fn cleanup_pending_snapshots(&self) -> Result<()> {
+        let preserved: Vec<_> = self
+            .state
+            .placements
+            .values()
+            .filter_map(|m| m.intent.as_ref())
+            .map(|i| format!(".pending-export-{}", i.capture))
+            .collect();
         for entry in fs::read_dir(self.root.join("snapshots"))? {
             let entry = entry?;
             if entry.file_name().to_string_lossy().starts_with(".pending-")
                 && entry.file_type()?.is_dir()
+                && !preserved
+                    .iter()
+                    .any(|name| entry.file_name() == name.as_str())
             {
                 fs::remove_dir_all(entry.path()).context("removing abandoned snapshot staging")?;
             }
@@ -1017,16 +1110,30 @@ impl Runtime {
         let directory = self.snapshot_dir(name);
         let snapshot: Snapshot =
             serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+        ensure!(snapshot.name == name, "snapshot manifest name mismatch");
         ensure!(
             !resume || snapshot.resumable(&self.cpu, &self.kernel_hash),
             "snapshot runtime, CPU or guest kernel is incompatible; restore it with --cold to boot its disk"
         );
-        ensure!(snapshot.files.len() == 3, "snapshot manifest is incomplete");
+        let expected = if resume {
+            vec!["disk.ext4", "memory", "state"]
+        } else {
+            vec!["disk.ext4"]
+        };
+        ensure!(
+            snapshot
+                .files
+                .keys()
+                .all(|k| ["disk.ext4", "memory", "state"].contains(&k.as_str()))
+                && expected.iter().all(|k| snapshot.files.contains_key(*k))
+                && (snapshot.files.len() == 1 || snapshot.files.len() == 3),
+            "snapshot manifest is incomplete"
+        );
         let before = fingerprints(&directory)?;
         if self.verified.get(name) == Some(&before) {
             return Ok(directory);
         }
-        for file in ["state", "memory", "disk.ext4"] {
+        for file in snapshot.files.keys() {
             ensure!(
                 snapshot.files.get(file) == Some(&hash(&directory.join(file))?),
                 "snapshot integrity failure: {file}"
@@ -1049,6 +1156,10 @@ impl Runtime {
         let snapshot: Snapshot =
             serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
         let id = snapshot.workspace.clone();
+        ensure!(
+            !self.state.placements.contains_key(&id),
+            "managed ID requires import-prepare"
+        );
         identifier(&id)?;
         ensure!(
             !self.state.workspaces.contains_key(&id),
@@ -1079,6 +1190,7 @@ impl Runtime {
             image: snapshot.image,
             source: None,
             hibernation: (!cold).then(|| name.to_owned()),
+            managed: false,
         };
         self.state.next_index += 1;
         self.state.workspaces.insert(id.clone(), workspace);
@@ -1168,6 +1280,17 @@ impl Runtime {
         }
         let op = request["op"].as_str().context("missing operation")?;
         let id = request["id"].as_str().unwrap_or("");
+        if crate::common::PLACEMENT_OPERATIONS.contains(&op) {
+            return self.lifecycle_request(request);
+        }
+        if !id.is_empty() && !matches!(op, "inspect" | "placement-check") {
+            self.authorize(request, true)?;
+            ensure!(
+                !self.state.placements.contains_key(id)
+                    || !matches!(op, "delete" | "restore" | "fork" | "image-save"),
+                "managed operation requires lifecycle coordination"
+            );
+        }
         if !id.is_empty() && op != "hibernate" {
             self.idle.touch(id, std::time::Instant::now());
         }
@@ -1180,7 +1303,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.state.workspaces.len(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
@@ -1189,7 +1312,7 @@ impl Runtime {
                 self.state
                     .workspaces
                     .keys()
-                    .map(|id| self.workspace_summary(id))
+                    .map(|id| self.placement_summary(id))
                     .collect::<Result<Vec<_>>>()?
             )),
             "quiesce" => {
@@ -1231,7 +1354,11 @@ impl Runtime {
                     "limit_memory_mib":max_memory(),"note":"PSS is process memory; excludes additional host page cache and kernel overhead"}),
                 )
             }
-            "inspect" => self.workspace_summary(id),
+            "inspect" => self.placement_summary(id),
+            "placement-check" => {
+                self.check_replay(request)?;
+                self.placement_summary(id)
+            }
             "create" => self.create(
                 id,
                 u32::try_from(request["memory_mib"].as_u64().unwrap_or(256))?,
@@ -1479,7 +1606,7 @@ impl Runtime {
 mod disk_tests {
     use super::*;
 
-    fn fixture() -> Runtime {
+    pub(super) fn fixture() -> Runtime {
         let root = std::env::temp_dir().join(format!("ow-disk-runtime-{}", vm::nonce().unwrap()));
         fs::create_dir_all(root.join("machines/legacy")).unwrap();
         fs::create_dir_all(root.join("snapshots")).unwrap();
@@ -1500,6 +1627,8 @@ mod disk_tests {
             verified: BTreeMap::new(),
             idle: crate::idle::Idle::from_env().unwrap(),
             closing: false,
+            capture_ready: BTreeMap::new(),
+            crash: None,
         }
     }
 

@@ -577,7 +577,7 @@ async fn handle(app: &App, mut request: Request) -> Response {
             )
                 .into_response();
         };
-        return crate::ssh_gateway::upgrade(&root, request, expires, id, revoked).await;
+        return crate::ssh_gateway::upgrade(&root, request, expires, id, None, revoked).await;
     }
     if let Some(_root) = &app.dashboard
         && request.uri().path().starts_with("/api/terminal/")
@@ -607,7 +607,7 @@ async fn handle(app: &App, mut request: Request) -> Response {
         let Ok((target_root, id, revoked)) = id else {
             return (StatusCode::NOT_FOUND, "Machine not found").into_response();
         };
-        return crate::terminal::upgrade(&target_root, request, expires, id, revoked).await;
+        return crate::terminal::upgrade(&target_root, request, expires, id, None, revoked).await;
     }
     if !matches!(
         *request.method(),
