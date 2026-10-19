@@ -36,6 +36,9 @@
 #                                single-use join through RUNNER's secret (already enrolled:
 #                                only checks that it is online)
 #   runner-remove RUNNER         revoke RUNNER on this host's controller (refused while online)
+#   pool check|sync|launch|remove|disks|delete-disk ARGS
+#                                a RunnerPool's adapter on this controller host (ow-host pool;
+#                                see docs/RUNNER_POOL.md): exact launches and removals only
 #   ci-preflight --stack S       before `pulumi up`: if the preview replaces the host, hibernate
 #                                its boxes and stop the service
 #   ci-post-up --stack S [--image RECIPE].. [--max-class N]
@@ -347,6 +350,11 @@ EOF
       [[ -z $controller ]] || extra=(--controller-version "$(agent_release "$controller")")
     fi
     remote 3600 ow_host "$command" "$@" ${extra[@]+"${extra[@]}"} ;;
+  pool)
+    (( $# >= 2 )) || die "usage: ow-aws --host CONTROLLER pool COMMAND POOL [ARGS]"
+    for arg in "$@"; do [[ $arg =~ ^[A-Za-z0-9._:=-]+$ ]] || die "bad argument: $arg"; done
+    find_instance
+    remote 900 ow_host pool "$@" ;;
   runner-add | runner-remove)
     if (( $# != 1 )) || ! [[ $1 =~ ^[A-Za-z0-9_-]{1,32}$ && $1 != "$host" ]]; then die "usage: ow-aws --host CONTROLLER $command RUNNER"; fi
     find_instance

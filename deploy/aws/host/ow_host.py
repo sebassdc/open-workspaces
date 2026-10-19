@@ -8,6 +8,7 @@ it; /usr/local/sbin/ow-host runs the copy in /srv/ow/current.
   invite-runner NODE --memory M --slots S --cpus C
                         (controller) mint NODE's single-use join into its Secrets Manager secret
   enrol [--wait S]      (runner) read that join, start the node agent, wait until online
+  pool ...              (controller) a RunnerPool's adapter: see runner_pool.py
   setup                 render units and files from the stored config; print what changed
   apply                 fetch the SSM config, validate, store, set up, act on class 0; report the rest
   ready [--wait S] [--images]
@@ -73,6 +74,9 @@ REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 REPOSITORY = re.compile(r"^(https://[A-Za-z0-9._~:/@%+-]+|/[A-Za-z0-9._/-]+)$")
 SECRET = re.compile(r"^(arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:[A-Za-z0-9/_+=.@-]+)?$")
 NODE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+POOL = re.compile(r"^[a-z][a-z0-9-]{0,13}$")
+# A pool runner waits this long for its controller to answer its join request.
+POOL_JOIN_WAIT = 1800
 
 
 class Refused(Exception):
@@ -241,6 +245,13 @@ def validate(config):
     extra = {}
     if role == "runner":
         runner = config.get("runner") or {}
+        if config.get("pool") is not None:
+            # A RunnerPool instance: one shared config; the node is its data volume's.
+            pool = check_pool(config["pool"])
+            node = pool_node(pool["name"])
+            runner = {"node": node, "controller": pool["controller"], "joinSecretArn": pool["joinSecretPrefix"] + node}
+            tailscale["hostname"] = node
+            extra["pool"] = pool
         if not NODE.match(str(runner.get("node", ""))) or runner["node"] == "local":
             raise Refused(f"config: runner.node {runner.get('node')!r} is not a node ID")
         if not HOSTNAME.match(str(runner.get("controller", ""))):
@@ -1080,8 +1091,8 @@ def boot():
         services()
         ready(600, booting=True)
         if config["role"] == "runner" and not p(f"{RUNNER}/node.json").exists():
-            try:  # a join left waiting before this host was ready
-                enrol()
+            try:  # a join left waiting before this host was ready; a pool runner asks for one
+                enrol(POOL_JOIN_WAIT if config.get("pool") else 120)
             except Refused as e:
                 say(f"not enrolled yet: {e}")
         with upgrade.locked():
@@ -1094,6 +1105,63 @@ def boot():
         p(STATUS).parent.mkdir(parents=True, exist_ok=True)
         p(STATUS).write_text("failed\n")
         raise
+
+
+# ---------------------------------------------------------------- runner pools
+
+POOL_KEYS = {"name", "controller", "group", "roleId", "joinSecretPrefix", "hook", "instanceHourlyCents", "diskMonthlyCentsPerGib"}
+
+
+def check_pool(pool):
+    """A RunnerPool's shared settings (untrusted input), as the component writes them."""
+    def cents(value, high):
+        return type(value) is int and 1 <= value <= high
+    if (not isinstance(pool, dict) or set(pool) != POOL_KEYS or not POOL.match(str(pool["name"]))
+            or not HOSTNAME.match(str(pool["controller"])) or pool["group"] != f"open-workspaces-{pool['name']}"
+            or not re.fullmatch(r"AROA[A-Z0-9]{8,64}", str(pool["roleId"]))
+            or not re.fullmatch(r"arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:open-workspaces/pool/"
+                                + re.escape(str(pool["name"])) + "/", str(pool["joinSecretPrefix"]))
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,255}", str(pool["hook"]))
+            or not cents(pool["instanceHourlyCents"], 100000) or not cents(pool["diskMonthlyCentsPerGib"], 1000)):
+        raise Refused("config: invalid pool")
+    return dict(pool)
+
+
+def pool_node(pool):
+    """POOL-VOLUME: the data volume mounted at /srv/ow names the runner, so a volume
+    salvaged onto a replacement instance comes back as the same node."""
+    source = run(["findmnt", "-no", "SOURCE", SRV], check=False).strip().split("[")[0]
+    serial = run(["lsblk", "-dno", "SERIAL", source], check=False).strip() if source.startswith("/dev/") else ""
+    match = re.fullmatch(r"vol([0-9a-f]{17})", serial)
+    if not match:
+        raise Refused(f"config: a pool runner needs its EBS data volume at {SRV}")
+    return f"{pool}-{match.group(1)}"
+
+
+def await_pool_join(me, config, wait):
+    """Asks the controller for a join through this runner's secret (the controller
+    creates it, tagged with this instance's session) and waits for the answer."""
+    budget = budgets(config)
+    budget["cpus"] = min(budget["cpus"] * config["vcpuOvercommit"], 64)
+    request = {"ready": me["node"], "budget": {k: int(budget[k]) for k in ("memory", "slots", "cpus")}}
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        raw = secret(me["joinSecretArn"], me["joinSecretArn"].split(":")[3])
+        try:
+            value = json.loads(raw) if raw else None
+        except ValueError:
+            value = None
+        join = value.get("join") if isinstance(value, dict) else None
+        if isinstance(join, dict) and isinstance(join.get("expires"), (int, float)) and join["expires"] > time.time() + 15:
+            return value
+        if isinstance(value, dict) and value.get("ready") != me["node"]:
+            try:
+                put_secret(me["joinSecretArn"], {**request, "at": int(time.time())}, me["joinSecretArn"].split(":")[3])
+                say(f"asked controller {me['controller']} for a join")
+            except RuntimeError as e:
+                say(f"join request not written yet: {str(e)[-200:]}")
+        time.sleep(5)
+    raise Refused(f"no join from {me['controller']} in {wait} s")
 
 
 # ---------------------------------------------------------------- runner enrolment
@@ -1121,7 +1189,7 @@ def region():
     return env["OW_REGION"]
 
 
-def invite_runner(node, memory, slots, cpus):
+def invite_runner(node, memory, slots, cpus, secret_id=None):
     """On the controller host: mints NODE's single-use join (10 minutes) and writes it,
     with the controller's CA, into NODE's join secret. The Runner component lets only
     this host write it and only NODE's host read it. An enrolled node is left alone."""
@@ -1146,7 +1214,7 @@ def invite_runner(node, memory, slots, cpus):
         join = json.loads(p(out).read_text())
     finally:
         p(out).unlink(missing_ok=True)
-    put_secret(f"open-workspaces/{node}/join", {"join": join, "ca": p(f"{DATA}/tls/ca.pem").read_text()}, region())
+    put_secret(secret_id or f"open-workspaces/{node}/join", {"join": join, "ca": p(f"{DATA}/tls/ca.pem").read_text()}, region())
     say(f"join for {node} written to its secret; it expires in {JOIN_TTL // 60} minutes")
     return 0
 
@@ -1168,6 +1236,9 @@ def enrol(wait=120):
     except ValueError:
         value = {}
     join = value.get("join") or {}
+    if not join and config.get("pool"):
+        value = await_pool_join(me, config, wait)
+        join = value["join"]
     if not join:
         raise Refused(f"no join waiting in {me['joinSecretArn']}: run ow-aws --host {me['controller']} "
                       f"runner-add {me['node']}")
@@ -1225,6 +1296,8 @@ def main(argv):
     rr.add_argument("--config", required=True)
     rr.add_argument("--controller", required=True)
     rr.add_argument("--ca", required=True)
+    pool_cmd = sub.add_parser("pool", help="RunnerPool adapter on the controller host")
+    pool_cmd.add_argument("args", nargs=argparse.REMAINDER)
     invite = sub.add_parser("invite-runner")
     invite.add_argument("node")
     for limit in ("--memory", "--slots", "--cpus"):
@@ -1249,6 +1322,9 @@ def main(argv):
     args = parser.parse_args(argv)
     try:
         import controller_recovery as recovery
+        if args.command == "pool":
+            import runner_pool
+            return runner_pool.main(args.args)
         if args.command == "recovery-status":
             return recovery.status()
         if args.command == "recovery-freeze":
