@@ -524,11 +524,27 @@ fn export_source(
             && seen["disk_bytes"] == input.disk_bytes,
         "source identity or disk shape differs from catalog intent"
     );
+    let resuming = matches!(
+        seen["lifecycle"]["phase"].as_str(),
+        Some("exporting" | "captured")
+    );
+    if resuming {
+        ensure!(
+            seen["state"] == "exporting"
+                && seen["vmm_running"] == false
+                && seen["placement"] == json!(source_authority)
+                && seen["lifecycle"]["intent"]["transfer"] == name(t)
+                && seen["lifecycle"]["intent"]["capture"] == format!("{}-source", name(t))
+                && seen["lifecycle"]["intent"]["disk_only"] == false,
+            "interrupted source export differs from catalog intent"
+        );
+    }
     ensure!(
-        matches!(
+        (matches!(
             seen["state"].as_str(),
             Some("stopped" | "hibernated" | "exported")
-        ) && seen["vmm_running"] != true,
+        ) || resuming)
+            && seen["vmm_running"] != true,
         "running or unknown source is ineligible for transfer"
     );
     if matches!(
@@ -1066,7 +1082,7 @@ pub(crate) mod process_tests;
 
 #[path = "parking.rs"]
 mod parking;
-pub(crate) use parking::{ensure_awake, park, wake};
+pub(crate) use parking::{ensure_awake, ensure_started, park, wake, wake_status};
 
 #[path = "capture_upload.rs"]
 mod capture_upload;

@@ -34,10 +34,15 @@ pub(super) fn admission(c: &Catalog, user: i64, request: &Value, kind: Kind) -> 
     common::identifier(key)?;
     let address = request["id"].as_str().context("machine required")?;
     let physical = c.machine(user, address, kind.permission())?;
-    if let Some(id) = c.db.query_row("SELECT t.id FROM transfers t JOIN operations o ON o.id=t.operation WHERE o.owner=?1 AND o.retry_key=?2",params![user,key],|r|r.get::<_,i64>(0)).optional()? {
+    if let Some((operation,raw,state,id)) = c.db.query_row("SELECT o.id,o.request,o.state,t.id FROM operations o JOIN transfers t ON t.operation=o.id OR (o.state='joined' AND t.id=json_extract(o.response,'$.wake_transfer')) WHERE o.owner=?1 AND o.retry_key=?2",params![user,key],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?))).optional()? {
         let t = c.transfer(id)?;
-        let previous = intent(c,&t)?;
-        ensure!(t.kind == kind && previous.machine == address && previous.accept_cold == request["accept_cold"].as_bool().unwrap_or(false) && previous.explicit_start == (request["op"] == "start" || request["op"] == "wake"), "operation key conflicts with original parameters");
+        let previous:Intent = serde_json::from_value(serde_json::from_str::<Value>(&raw)?["transfer"].take())?;
+        ensure!(previous.kind == kind && previous.machine == address && previous.accept_cold == request["accept_cold"].as_bool().unwrap_or(false) && previous.explicit_start == (request["op"] == "start" || request["op"] == "wake"), "operation key conflicts with original parameters");
+        if state == "joined" {
+            ensure!(t.source == physical, "wake source changed");
+            return if !t.step.terminal() && !initiator_authorized(c,&t)? { join_wake(c,user,request,t) } else { Ok(t) };
+        }
+        ensure!(operation == t.operation,"operation no longer owns this transfer");
         return c.begin_transfer(user,key,&previous);
     }
     let mut input = shape(c, &physical, kind, address)?;
@@ -73,6 +78,14 @@ fn join_wake(c: &Catalog, user: i64, request: &Value, t: Transfer) -> Result<Tra
             cold,
         )
     } else {
+        if matches!(request["op"].as_str(), Some("start" | "wake")) {
+            let mut input = intent(c, &t)?;
+            input.machine = request["id"].as_str().context("machine required")?.into();
+            input.explicit_start = true;
+            input.accept_cold = cold;
+            // A joined caller key remains bound to this execution after future park cycles.
+            c.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,response) VALUES(?1,'wake',?2,'joined',?3,?4,?5,?6)",params![user,input.machine,t.target.as_deref().unwrap_or(""),request["operation_key"].as_str(),json!({"transfer":input}).to_string(),json!({"wake_transfer":t.id}).to_string()])?;
+        }
         Ok(t)
     }
 }
@@ -176,13 +189,62 @@ pub(crate) fn ensure_awake(
     permission: &str,
     explicit: bool,
 ) -> Result<Option<Value>> {
+    ensure_awake_with_key(shared, identity, address, permission, explicit, None)
+}
+pub(crate) fn ensure_started(
+    shared: Shared,
+    identity: &Identity,
+    request: &Value,
+) -> Result<Option<Value>> {
+    let key = match request["operation_key"].as_str() {
+        Some(key) => key.to_owned(),
+        None => common::nonce()?,
+    };
+    {
+        let mut c = shared.lock().unwrap();
+        let user = c.user(identity)?;
+        if let Some((id,raw,state,response))=c.db.query_row("SELECT id,request,state,response FROM operations WHERE owner=?1 AND retry_key=?2 AND op='start'",params![user,key],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?))).optional()? {
+            let physical=c.machine(user,request["id"].as_str().context("machine required")?,"start")?;
+            let original:Value=serde_json::from_str(&raw)?;
+            ensure!(original["request"]["id"]==physical && request["node"].as_str().is_none_or(|node|original["node"]==node),"operation key conflicts with original parameters");
+            if state=="succeeded" {return Ok(Some(serde_json::from_str(response.as_deref().context("missing start result")?)?));}
+            if c.db.query_row("SELECT node='' OR EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1) FROM resources WHERE kind='machine' AND physical=?1",[physical],|r|r.get::<_,bool>(0))? {
+                return Err(crate::catalog::OperationFailure(c.operation_info(user,id)?).into());
+            }
+            return Ok(None);
+        }
+    }
+    ensure_awake_with_key(
+        shared,
+        identity,
+        request["id"].as_str().context("machine required")?,
+        "start",
+        true,
+        Some(&key),
+    )
+}
+fn ensure_awake_with_key(
+    shared: Shared,
+    identity: &Identity,
+    address: &str,
+    permission: &str,
+    explicit: bool,
+    caller_key: Option<&str>,
+) -> Result<Option<Value>> {
     let t = {
         let mut c = shared.lock().unwrap();
         let user = c.user(identity)?;
         let physical = c.machine(user, address, permission)?;
         let locked:Option<i64>=c.db.query_row("SELECT t.id FROM transfer_locks l JOIN transfers t ON t.id=l.transfer WHERE l.machine=?1 AND t.kind='wake'",[&physical],|r|r.get(0)).optional()?;
         let parked:bool=c.db.query_row("SELECT node='' AND placement_managed=1 FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|r.get(0))?;
-        if !parked && locked.is_none() {
+        let replay = explicit
+            && caller_key.is_some()
+            && c.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE owner=?1 AND retry_key=?2)",
+                params![user, caller_key],
+                |r| r.get::<_, bool>(0),
+            )?;
+        if !parked && locked.is_none() && !replay {
             return Ok(None);
         }
         let epoch: i64 = c.db.query_row(
@@ -190,16 +252,15 @@ pub(crate) fn ensure_awake(
             [&physical],
             |r| r.get(0),
         )?;
-        let key = format!(
-            "w-{}",
-            &store::sha256(format!("{physical}:{epoch}").as_bytes())[..30]
-        );
+        let key = caller_key.map(str::to_owned).unwrap_or_else(|| {
+            format!(
+                "w-{}",
+                &store::sha256(format!("{physical}:{epoch}").as_bytes())[..30]
+            )
+        });
         let request =
             json!({"op":if explicit {"start"}else{"connect"},"id":address,"operation_key":key});
-        match locked {
-            Some(id) => join_wake(&c, user, &request, c.transfer(id)?)?,
-            None => admission(&c, user, &request, Kind::Wake)?,
-        }
+        admission(&c, user, &request, Kind::Wake)?
     };
     launch(shared.clone(), t.id);
     wait_awake(
@@ -240,6 +301,9 @@ pub(super) fn wait_awake(
         drop(c);
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+pub(crate) fn wake_status(c: &Catalog, id: i64) -> Result<Value> {
+    public_status(c, &c.transfer(id)?)
 }
 fn public_status(c: &Catalog, t: &Transfer) -> Result<Value> {
     let mut value = json!({"id":t.operation,"op":t.kind.operation(),"state":"pending","transfer":{"id":t.id,"epoch":t.epoch,"step":t.step},"error":"Wake is pending; reconnect to join the same operation."});

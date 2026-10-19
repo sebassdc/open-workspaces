@@ -792,8 +792,15 @@ impl Catalog {
             intent.machine=address.into();intent.explicit_start=explicit_start;
             let mut progress:serde_json::Value=response.and_then(|s|serde_json::from_str(&s).ok()).unwrap_or(json!({}));
             progress.as_object_mut().context("invalid operation response")?.remove("error");
-            c.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,response) VALUES(?1,'wake',?2,'pending',?3,?4,?5,?6)",params![user,address,t.target.as_deref().unwrap_or(""),key,json!({"transfer":intent}).to_string(),progress.to_string()])?;
-            let operation=c.db.last_insert_rowid();
+            let fingerprint=json!({"transfer":intent}).to_string();
+            let joined:Option<i64>=c.db.query_row("SELECT id FROM operations WHERE owner=?1 AND retry_key=?2 AND state='joined' AND request=?3 AND json_extract(response,'$.wake_transfer')=?4",params![user,key,fingerprint,id],|r|r.get(0)).optional()?;
+            let operation=if let Some(operation)=joined {
+                c.db.execute("UPDATE operations SET state='pending',node=?1,response=?2 WHERE id=?3",params![t.target.as_deref().unwrap_or(""),progress.to_string(),operation])?;
+                operation
+            } else {
+                c.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,response) VALUES(?1,'wake',?2,'pending',?3,?4,?5,?6)",params![user,address,t.target.as_deref().unwrap_or(""),key,fingerprint,progress.to_string()])?;
+                c.db.last_insert_rowid()
+            };
             c.db.execute("UPDATE operations SET state='failed',finished_at=CURRENT_TIMESTAMP,response=json_set(COALESCE(response,'{}'),'$.error','Wake authorization revoked; owner resumed the transfer.','$.resumed_by',?1) WHERE id=?2",params![operation,t.operation])?;
             ensure!(c.db.execute("UPDATE transfers SET operation=?1 WHERE id=?2 AND operation=?3 AND EXISTS(SELECT 1 FROM transfer_locks WHERE transfer=?2 AND machine=?4)",params![operation,id,t.operation,t.machine])?==1,"wake authority changed");
             c.transfer(id)
@@ -927,6 +934,20 @@ impl Catalog {
     }
     pub(crate) fn operation_info(&self, user: i64, operation: i64) -> Result<Value> {
         let (mut info, response): (Value, Option<String>) = self.db.query_row("SELECT id,op,resource,state,node,retry_key,response FROM operations WHERE owner=?1 AND id=?2",params![user,operation],|r|Ok((json!({"id":r.get::<_,i64>(0)?,"op":r.get::<_,String>(1)?,"resource":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"node":r.get::<_,String>(4)?,"retry_key":r.get::<_,Option<String>>(5)?}),r.get(6)?)))?;
+        if info["state"] == "joined" {
+            let response: Value =
+                serde_json::from_str(response.as_deref().context("missing wake join")?)?;
+            let mut status = crate::transfers::wake_status(
+                self,
+                response["wake_transfer"]
+                    .as_i64()
+                    .context("missing joined transfer")?,
+            )?;
+            for field in ["id", "op", "resource", "retry_key"] {
+                status[field] = info[field].clone();
+            }
+            return Ok(status);
+        }
         if let Some(value) = response
             .as_deref()
             .and_then(|s| serde_json::from_str::<Value>(s).ok())

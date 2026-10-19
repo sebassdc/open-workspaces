@@ -127,6 +127,11 @@ copy is never activated before conditional catalog commit. Activation first pers
 `start_uncertain`; a matching running copy confirms a lost reply, while contradictory
 or active-but-nonrunning state stops for reconciliation rather than replaying start.
 A responding source is checked for contradictory execution before commit/activation.
+A restarted worker may report `exporting` with an `exporting` or `captured`
+lifecycle phase. The controller replays export only when the nonrunning source,
+placement, transfer ID, capture name and export mode match its persisted intent.
+It uses the original worker step key and waits for positive completed fencing;
+a partial capture alone never permits publication, import or placement commit.
 Source absence before positive fencing never allows progress. An offline source after
 its acknowledged durable export cannot restart through legacy requests.
 
@@ -202,6 +207,15 @@ parked box. `start BOX` also wakes a parked box, including a deliberately stoppe
 one. SSH, exec, files, terminal and preview connections wake parked **hibernated**
 boxes; connecting to a stopped box refuses until explicit start/wake. List,
 inspect, SSH config/key lookup and name resolution never initiate placement.
+
+Explicit start preserves the caller's operation key. Retrying it resolves the
+original outcome before examining current placement, including after a later stop
+and park. An explicit start/wake that joins another caller's wake records its own
+key as a durable `joined` operation pointing to the same transfer; status follows
+that execution without creating another reservation. Joined keys keep their
+original input and cannot authorize a later park/wake cycle. Owner recovery after
+sharing revocation can promote an existing matching join within the same recovery
+transaction, preserving the transfer, epoch and uncertain effects.
 
 All connection types/users join one wake under the physical machine's transfer
 lock. Queued wake has no target reservation. Fresh, nonrevoked, nondraining fencing

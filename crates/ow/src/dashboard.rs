@@ -492,13 +492,18 @@ pub async fn handle(
             Some(catalog) => tokio::task::spawn_blocking(move || {
                 let op = operation["op"].as_str().unwrap_or("");
                 if matches!(op, "start" | "exec" | "put" | "get") {
-                    if let Some(info) = crate::transfers::ensure_awake(
-                        catalog.clone(),
-                        &identity,
-                        operation["id"].as_str().unwrap(),
-                        op,
-                        op == "start",
-                    )? {
+                    let wake = if op == "start" {
+                        crate::transfers::ensure_started(catalog.clone(), &identity, &operation)?
+                    } else {
+                        crate::transfers::ensure_awake(
+                            catalog.clone(),
+                            &identity,
+                            operation["id"].as_str().unwrap(),
+                            op,
+                            false,
+                        )?
+                    };
+                    if let Some(info) = wake {
                         if op == "start" {
                             return Ok(info);
                         }
