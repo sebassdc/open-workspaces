@@ -30,6 +30,7 @@ pub(super) fn park_fixture(ram: bool) -> (Processes, i64, i64) {
         target: None,
         capture: None,
         child: None,
+        snapshot: None,
         memory_mib: 256,
         cpus: 1,
         disk_bytes: 4,

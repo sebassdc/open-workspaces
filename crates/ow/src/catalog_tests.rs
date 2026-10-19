@@ -2013,6 +2013,7 @@ fn transfer_fixture() -> (Fake, Catalog, i64, String, crate::transfers::Intent) 
         target: Some("beta".into()),
         capture: Some("capture".into()),
         child: None,
+        snapshot: None,
         memory_mib: 256,
         cpus: 1,
         disk_bytes: 8 * common::GIB,
@@ -3668,4 +3669,51 @@ fn legacy_key_replacement_invalidates_a_concurrent_transfer_policy_read() {
         &crate::transfers::PublicSshPolicy::Disabled,
     )
     .unwrap();
+}
+
+#[test]
+fn named_fork_shape_is_rechecked_before_atomic_admission() {
+    use crate::transfers::*;
+    let (fake, c, user, physical, mut input) = transfer_fixture();
+    c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'snapshot','saved','saved-id',?2,'alpha')",params![user,json!({"workspace":physical,"memory_mib":256,"vcpu_count":1,"disk_bytes":input.disk_bytes}).to_string()]).unwrap();
+    input.kind = Kind::Fork;
+    input.capture = None;
+    input.snapshot = Some("saved".into());
+    input.child = Some(Child {
+        id: "child-id".into(),
+        name: "child".into(),
+    });
+    input.memory_mib = 512;
+    assert!(
+        c.begin_transfer(user, "named-fork", &input)
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot identity or shape changed")
+    );
+    assert!(c.physical(user, "machine", "child").is_err());
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM transfer_locks", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    input.memory_mib = 256;
+    let t = c.begin_transfer(user, "named-fork", &input).unwrap();
+    drop(c);
+    let c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(
+        c.db.query_row(
+            "SELECT json_extract(response,'$.fork_snapshot') FROM operations WHERE id=?1",
+            [t.operation],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "saved-id"
+    );
+    assert_eq!(
+        c.begin_transfer(user, "named-fork", &input).unwrap().id,
+        t.id
+    );
+    input.snapshot = None;
+    assert!(c.begin_transfer(user, "named-fork", &input).is_err());
 }

@@ -299,6 +299,10 @@ tuple. Moving a stopped or hibernated copy preserves that state; move is not an
 implicit start. `--accept-cold` is an explicit disk-only execution decision and keeps
 the stored RAM artifact recoverable. No live resize is included.
 
+A named `--snapshot` uses the saved snapshot's RAM, CPU and disk shape, including
+a snapshot taken before the parent was resized. Snapshot selection and its target
+reservation commit with admission before any worker effect.
+
 Targeted fork snapshots the source, publishes and verifies the artifact, prepares a
 new unstarted child, commits its reserved ID/name and requester ownership, then
 activates it. Existing admin/use sharing roles retain fork permission. Ordinary

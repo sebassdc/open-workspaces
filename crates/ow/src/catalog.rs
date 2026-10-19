@@ -668,6 +668,10 @@ impl Catalog {
             intent.memory_mib > 0 && intent.cpus > 0 && intent.disk_bytes <= i64::MAX as u64,
             "invalid target shape"
         );
+        ensure!(
+            intent.snapshot.is_none() || intent.kind == Kind::Fork,
+            "only fork selects a snapshot"
+        );
         let fingerprint = json!({"transfer":intent}).to_string();
         self.transfer_write(|c| {
             // Recheck current ownership/sharing even for a joined operation.
@@ -692,6 +696,10 @@ impl Catalog {
                 c.transfer_capture(capture, owner, &source)?;
             }
             ensure!(intent.kind.needs_fence() || intent.kind == Kind::Fork || intent.capture.is_some(), "stored capture required");
+            let fork_snapshot = if let Some(snapshot) = &intent.snapshot {
+                common::identifier(snapshot)?;
+                Some(c.db.query_row("SELECT physical FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4 AND json_extract(metadata,'$.memory_mib')=?5 AND json_extract(metadata,'$.vcpu_count')=?6 AND json_extract(metadata,'$.disk_bytes')=?7",params![user,snapshot,source_node,source,intent.memory_mib,intent.cpus,intent.disk_bytes as i64],|r|r.get::<_,String>(0)).context("snapshot identity or shape changed during admission")?)
+            } else { None };
             // Global high-watermark survives aborts, deleted children and controller restarts.
             c.db.execute("INSERT INTO settings(key,value) VALUES('transfer_epoch','0') ON CONFLICT(key) DO NOTHING",[])?;
             let high = c.db.query_row("SELECT value FROM settings WHERE key='transfer_epoch'",[],|r|r.get::<_,String>(0))?.parse::<i64>().context("invalid epoch high-watermark")?;
@@ -711,6 +719,10 @@ impl Catalog {
             let operation = c.db.last_insert_rowid();
             c.db.execute("INSERT INTO transfers(operation,kind,source,machine,source_node,source_epoch,source_capture,source_policy_generation,target,epoch,capture,step) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'preparing')",params![operation,intent.kind.operation(),source,machine,source_node,source_epoch,source_capture,policy_generation,intent.target,epoch,intent.capture])?;
             let id = c.db.last_insert_rowid();
+            if intent.kind == Kind::Fork {
+                let snapshot = fork_snapshot.unwrap_or_else(|| format!("transfer-{id}-fork"));
+                c.db.execute("UPDATE operations SET response=json_object('fork_snapshot',?1,'requested_snapshot',?2) WHERE id=?3",params![snapshot,intent.snapshot,operation])?;
+            }
             for affected in if machine == source { vec![&source] } else { vec![&source,&machine] } {
                 c.db.execute("INSERT INTO transfer_locks(machine,transfer) VALUES(?1,?2)",params![affected,id])?;
             }

@@ -488,6 +488,7 @@ fn fixture() -> Processes {
             target: Some("target".into()),
             capture: Some("capture".into()),
             child: None,
+            snapshot: None,
             memory_mib: 256,
             cpus: 1,
             disk_bytes: 4,

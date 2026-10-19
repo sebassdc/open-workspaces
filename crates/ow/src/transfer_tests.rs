@@ -35,6 +35,7 @@ impl Fixture {
                     target: Some("target".into()),
                     capture: Some("capture".into()),
                     child: None,
+                    snapshot: None,
                     memory_mib: 256,
                     cpus: 1,
                     disk_bytes: 4,
@@ -790,6 +791,7 @@ fn parked_fixture(state: &str) -> (Fixture, RefCell<Peers>) {
             target: None,
             capture: None,
             child: None,
+            snapshot: None,
             memory_mib: 256,
             cpus: 1,
             disk_bytes: 4,
@@ -1442,13 +1444,6 @@ fn moving_fixture(kind: Kind) -> (Fixture, RefCell<Peers>) {
             });
         }
         f.transfer = c.begin_transfer(f.user, "move-or-fork", &input).unwrap();
-        if kind == Kind::Fork {
-            c.db.execute(
-                "UPDATE operations SET response=json_object('fork_snapshot',?1) WHERE id=?2",
-                params![format!("{}-fork", name(&f.transfer)), f.transfer.operation],
-            )
-            .unwrap();
-        }
     }
     peers.borrow_mut().source.as_mut().unwrap()["vmm_running"] = json!(true);
     (f, peers)
@@ -2012,4 +2007,272 @@ fn lost_export_reply_rechecks_public_policy_before_reusing_the_fence() {
     );
     assert_eq!(f.step(), Step::Preparing);
     assert_eq!(peers.borrow().starts, 0);
+}
+// Regressions from interrupted admission, legacy key changes and resized parents.
+
+#[test]
+fn fork_recovers_legacy_admission_without_snapshot_binding() {
+    let (mut f, peers) = moving_fixture(Kind::Fork);
+    {
+        let c = f.shared.lock().unwrap();
+        // Exact durable state after begin_transfer commits, before relocate's next UPDATE.
+        c.db.execute(
+            "UPDATE operations SET response=NULL WHERE id=?1",
+            [f.transfer.operation],
+        )
+        .unwrap();
+    }
+    f.restart();
+    move_tick(&f, &peers, now()).unwrap();
+    assert_eq!(f.step(), Step::Exported);
+    for _ in 0..8 {
+        f.restart();
+        if !move_tick(&f, &peers, now()).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(f.step(), Step::Succeeded);
+    assert_eq!(peers.borrow().starts, 1);
+    let c = f.shared.lock().unwrap();
+    assert_eq!(
+        c.db.query_row(
+            "SELECT COUNT(*) FROM transfer_locks WHERE transfer=?1",
+            [f.transfer.id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn park_after_legacy_ssh_change() {
+    legacy_ssh_admission("park", false);
+}
+#[test]
+fn restore_after_legacy_ssh_change() {
+    legacy_ssh_admission("restore", false);
+}
+#[test]
+fn park_rejects_a_key_change_during_policy_read() {
+    legacy_ssh_admission("park", true);
+}
+#[test]
+fn restore_rejects_a_key_change_during_policy_read() {
+    legacy_ssh_admission("restore", true);
+}
+fn legacy_ssh_admission(op: &str, concurrent_change: bool) {
+    use std::os::unix::net::UnixListener;
+    let (f, _) = parked_fixture("stopped");
+    {
+        let c = f.shared.lock().unwrap();
+        let t = c.transfer(f.transfer.id).unwrap();
+        c.advance_transfer(t.id, t.epoch, t.step, Step::Aborted, &Evidence::default())
+            .unwrap();
+        c.db.execute(
+            "UPDATE resources SET placement_managed=0,placement_epoch=0 WHERE physical='physical'",
+            [],
+        )
+        .unwrap();
+        c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.park_wake_v1',json('true')) WHERE id='source'",[]).unwrap();
+    }
+    let route = f.root.join("nodes/source");
+    fs::create_dir_all(&route).unwrap();
+    let listener = UnixListener::bind(route.join("control.sock")).unwrap();
+    let shared = f.shared.clone();
+    let worker = std::thread::spawn(move || {
+        loop {
+            let (mut socket, _) = listener.accept().unwrap();
+            let r = wire::line(&mut socket).unwrap();
+            let result = match r["op"].as_str().unwrap() {
+                "list" => {
+                    json!([{"id":"physical","state":"stopped","memory_mib":256,"vcpu_count":1,"disk_bytes":4}])
+                }
+                "snapshots" => json!([]),
+                "ssh-keys" => json!({"updated":true}),
+                "restore-policy" => json!("disabled"),
+                op => panic!("unexpected fixture operation {op}"),
+            };
+            if r["op"] == "restore-policy" && concurrent_change {
+                shared.lock().unwrap().db.execute("UPDATE resources SET ssh_policy=NULL,ssh_policy_generation=ssh_policy_generation+1 WHERE physical='physical'",[]).unwrap();
+            }
+            wire::send(&mut socket, &json!({"ok":true,"result":result})).unwrap();
+            if r["op"] == "restore-policy" {
+                break;
+            }
+        }
+    });
+    let identity = Identity {
+        issuer: "test".into(),
+        subject: "owner".into(),
+        email: "owner@example.test".into(),
+    };
+    {
+        let mut c = f.shared.lock().unwrap();
+        c.operation(
+            f.user,
+            json!({"op":"ssh-keys","id":"box","keys":[],"operation_key":"replace-keys"}),
+        )
+        .unwrap();
+        let generation: i64 =
+            c.db.query_row(
+                "SELECT ssh_policy_generation FROM resources WHERE physical='physical'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        println!("actual catalog ssh-keys succeeded; policy generation={generation}");
+    }
+    let request = json!({"op":op,"id":"box","operation_key":"after-key-change","node":"target","artifact":"capture"});
+    let result = if op == "park" {
+        park(f.shared.clone(), &identity, &request)
+    } else {
+        restore(f.shared.clone(), &identity, &request)
+    };
+    worker.join().unwrap();
+    let c = f.shared.lock().unwrap();
+    if concurrent_change {
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("SSH policy changed")
+        );
+        assert!(c.db.query_row("SELECT ssh_policy IS NULL AND ssh_policy_generation=2 FROM resources WHERE physical='physical'",[],|r|r.get::<_,bool>(0)).unwrap());
+    } else {
+        result.unwrap();
+        assert!(c.db.query_row("SELECT ssh_policy IS NOT NULL AND ssh_policy_generation=2 FROM resources WHERE physical='physical'",[],|r|r.get::<_,bool>(0)).unwrap());
+    }
+}
+
+#[test]
+fn targeted_fork_preserves_the_older_snapshot_shape_after_parent_resize() {
+    let (mut f, peers) = moving_fixture(Kind::Fork);
+    let next_id = {
+        let c = f.shared.lock().unwrap();
+        let t = c.transfer(f.transfer.id).unwrap();
+        c.advance_transfer(t.id, t.epoch, t.step, Step::Aborted, &Evidence::default())
+            .unwrap();
+        c.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.memory_mib',512,'$.vcpu_count',2,'$.disk_bytes',8) WHERE physical='physical'",[]).unwrap();
+        c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'snapshot','saved','snapshot-id',?2,'source')",params![f.user,json!({"name":"snapshot-id","workspace":"physical","memory_mib":256,"vcpu_count":1,"disk_bytes":4,"state":"ready"}).to_string()]).unwrap();
+        c.db.query_row("SELECT MAX(id)+1 FROM transfers", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(f.root.join(format!("transfer-{next_id}.lock")))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let identity = Identity {
+        issuer: "test".into(),
+        subject: "owner".into(),
+        email: "owner@example.test".into(),
+    };
+    let result=relocate(f.shared.clone(),&identity,&json!({"op":"fork","id":"box","child":"snapshot-child","snapshot":"saved","node":"target","operation_key":"snapshot-shape"})).unwrap();
+    println!("targeted fork admission: {result}");
+    f.transfer = f.shared.lock().unwrap().transfer(next_id).unwrap();
+    f.restart();
+    {
+        let c = f.shared.lock().unwrap();
+        let shape: (i64, i64, i64) =
+            c.db.query_row(
+                "SELECT memory_mib,cpus,disk_bytes FROM transfer_reservations WHERE transfer=?1",
+                [next_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(shape, (256, 1, 4));
+        assert_eq!(
+            intent(&c, &f.transfer).unwrap().snapshot.as_deref(),
+            Some("saved")
+        );
+        assert_eq!(
+            c.db.query_row(
+                "SELECT json_extract(response,'$.fork_snapshot') FROM operations WHERE id=?1",
+                [f.transfer.operation],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "snapshot-id"
+        );
+    }
+    let joined=relocate(f.shared.clone(),&identity,&json!({"op":"fork","id":"box","child":"snapshot-child","snapshot":"saved","node":"target","operation_key":"snapshot-shape"})).unwrap();
+    assert_eq!(joined["transfer"]["id"], next_id);
+    let source = f.root.join("old-snapshot");
+    let snap = source.join("snapshots/snapshot-id");
+    fs::create_dir_all(&snap).unwrap();
+    fs::write(snap.join("disk.ext4"), b"disk").unwrap();
+    let hash = store::hash_file(&snap.join("disk.ext4")).unwrap();
+    ow_core::runtime::atomic_json(&snap.join("manifest.json"),&json!({"name":"snapshot-id","workspace":"physical","managed":false,"memory_mib":256,"vcpu_count":1,"image":"alpine","runtime":common::RUNTIME,"cpu":"fixture","kernel_sha256":"a".repeat(64),"files":{"disk.ext4":hash}})).unwrap();
+    move_tick(&f, &peers, now()).unwrap();
+    let objects = store::DirectoryObjects(f.root.join("snapshot-objects"));
+    let published = tick(
+        &f.shared,
+        next_id,
+        now(),
+        &|node, r| match r["op"].as_str().unwrap() {
+            "capture-published" => Ok(json!({"present":false})),
+            "capture-push" => capture_upload::publish(
+                &objects,
+                &source,
+                &serde_json::from_value(r["artifact"].clone())?,
+            ),
+            _ => moving_call(&f, &peers, node, r),
+        },
+    );
+    println!("publishing saved 256 MiB snapshot of parent resized to 512 MiB: {published:?}");
+    assert!(
+        published.is_ok(),
+        "fork must use the named snapshot resource shape"
+    );
+}
+
+#[test]
+fn fork_admission_binds_snapshot_before_restart_and_replays_a_lost_reply() {
+    let (mut f, peers) = moving_fixture(Kind::Fork);
+    f.restart();
+    let expected = format!("{}-fork", name(&f.transfer));
+    let c = f.shared.lock().unwrap();
+    let binding: String =
+        c.db.query_row(
+            "SELECT json_extract(response,'$.fork_snapshot') FROM operations WHERE id=?1",
+            [f.transfer.operation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(binding, expected);
+    drop(c);
+    let requests = RefCell::new(Vec::new());
+    assert!(
+        tick(&f.shared, f.transfer.id, now(), &|node, r| {
+            if r["op"] == "snapshot" {
+                requests.borrow_mut().push(r.clone());
+                moving_call(&f, &peers, node, r)?;
+                anyhow::bail!("lost snapshot reply");
+            }
+            moving_call(&f, &peers, node, r)
+        })
+        .is_err()
+    );
+    assert_eq!(f.step(), Step::Preparing);
+    f.restart();
+    tick(&f.shared, f.transfer.id, now(), &|node, r| {
+        if r["op"] == "snapshot" {
+            requests.borrow_mut().push(r.clone());
+        }
+        moving_call(&f, &peers, node, r)
+    })
+    .unwrap();
+    assert_eq!(f.step(), Step::Exported);
+    let seen = requests.borrow();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(seen[0]["name"], expected);
 }

@@ -94,6 +94,8 @@ pub(crate) struct Intent {
     pub target: Option<String>, // None means parked, not an inferred local runner
     pub capture: Option<String>, // existing F-store artifact ID
     pub child: Option<Child>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>, // named source snapshot; absent means capture at admission
     pub memory_mib: u32,
     pub cpus: u32,
     pub disk_bytes: u64,
@@ -297,11 +299,11 @@ pub(crate) fn restore(shared: Shared, identity: &Identity, request: &Value) -> R
         common::identifier(value)?;
     }
     common::address(address)?;
-    let (user, root, physical, source, epoch, mut proposed, joined) = {
+    let (user, root, physical, source, epoch, generation, mut proposed, joined) = {
         let mut c = shared.lock().unwrap();
         let user = c.user(identity)?;
         let physical = c.machine(user, address, "restore")?;
-        let (owner,source,epoch,metadata):(i64,String,i64,String) = c.db.query_row("SELECT owner,node,placement_epoch,metadata FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        let (owner,source,epoch,generation,metadata):(i64,String,i64,i64,String) = c.db.query_row("SELECT owner,node,placement_epoch,ssh_policy_generation,metadata FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
         ensure!(owner == user, "managed restore requires owner");
         ensure!(c.db.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE id=?1 AND owner=?2 AND machine=?3 AND state='stored' AND kind IN ('capture','snapshot') AND digest IS NOT NULL)",params![capture,user,physical],|r|r.get::<_,bool>(0))?,"capture is not a committed artifact of this machine and owner");
 
@@ -312,6 +314,7 @@ pub(crate) fn restore(shared: Shared, identity: &Identity, request: &Value) -> R
             target: Some(target.into()),
             capture: Some(capture.into()),
             child: None,
+            snapshot: None,
             memory_mib: meta["memory_mib"]
                 .as_u64()
                 .context("unknown source memory")?
@@ -333,6 +336,7 @@ pub(crate) fn restore(shared: Shared, identity: &Identity, request: &Value) -> R
             physical,
             source,
             epoch,
+            generation,
             proposed,
             joined,
         )
@@ -357,7 +361,7 @@ pub(crate) fn restore(shared: Shared, identity: &Identity, request: &Value) -> R
             c.machine(user, address, "restore")? == physical,
             "source changed"
         );
-        ensure!(c.db.query_row("SELECT node=?2 AND placement_epoch=?3 FROM resources WHERE kind='machine' AND physical=?1",params![physical,source,epoch],|r|r.get::<_,bool>(0))?,"source authority changed");
+        ensure!(c.db.query_row("SELECT node=?2 AND placement_epoch=?3 AND ssh_policy_generation=?4 FROM resources WHERE kind='machine' AND physical=?1",params![physical,source,epoch,generation],|r|r.get::<_,bool>(0))?,"source authority or SSH policy changed");
         capable(&c, target, proposed.disk_bytes.saturating_mul(2))?;
         let stored: Option<String> = c.db.query_row(
             "SELECT ssh_policy FROM resources WHERE kind='machine' AND physical=?1",
@@ -366,7 +370,7 @@ pub(crate) fn restore(shared: Shared, identity: &Identity, request: &Value) -> R
         )?;
         let policy: PublicSshPolicy = serde_json::from_value(policy)?;
         if stored.is_none() {
-            c.set_transfer_ssh_policy(user, address, 0, &policy)?;
+            c.set_transfer_ssh_policy(user, address, generation, &policy)?;
         } else {
             ensure!(
                 same_policy(

@@ -16,9 +16,12 @@ committed node, epoch, capture and CPU/RAM reservations together.
 
 A single `BEGIN IMMEDIATE` transaction admits an owner-scoped operation key and
 canonical input fingerprint, a globally increasing attempt epoch, affected-machine
-locks, the optional fork child's physical ID and owner-scoped name, and target
-capacity. Same key and input joins the original operation, including its terminal
-outcome; changed input rejects. A new deliberate retry uses a new operation key.
+locks, the optional fork child's physical ID and owner-scoped name, the selected
+fork snapshot and target capacity. Named forks reserve the snapshot's RAM, CPU and
+disk shape. Generated snapshot names are durable before any capture RPC, so a
+controller restart replays the same capture. Same key and input joins the original
+operation, including its terminal outcome; changed input rejects. A new deliberate
+retry uses a new operation key.
 The committed high-watermark survives abort and child deletion. An allocated epoch
 whose transaction was committed is never reused, even if import is uncertain.
 

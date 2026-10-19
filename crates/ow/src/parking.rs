@@ -14,6 +14,7 @@ pub(super) fn shape(c: &Catalog, physical: &str, kind: Kind, address: &str) -> R
         target: None,
         capture: None,
         child: None,
+        snapshot: None,
         memory_mib: meta["memory_mib"]
             .as_u64()
             .context("unknown memory")?
@@ -90,7 +91,7 @@ fn join_wake(c: &Catalog, user: i64, request: &Value, t: Transfer) -> Result<Tra
     }
 }
 pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> {
-    let (user, physical, node, epoch, root) = {
+    let (user, physical, node, epoch, generation, root) = {
         let mut c = shared.lock().unwrap();
         let user = c.user(identity)?;
         let address = request["id"].as_str().context("machine required")?;
@@ -103,10 +104,10 @@ pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Resu
             )?,
             "park requires the owner"
         );
-        let (node, epoch): (String, i64) = c.db.query_row(
-            "SELECT node,placement_epoch FROM resources WHERE kind='machine' AND physical=?1",
+        let (node, epoch, generation): (String, i64, i64) = c.db.query_row(
+            "SELECT node,placement_epoch,ssh_policy_generation FROM resources WHERE kind='machine' AND physical=?1",
             [&physical],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         // Retry terminal history even though its placement is now empty.
         if c.db.query_row(
@@ -120,7 +121,7 @@ pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Resu
             launch(shared, t.id);
             return Ok(info);
         }
-        (user, physical, node, epoch, c.root.clone())
+        (user, physical, node, epoch, generation, c.root.clone())
     };
     {
         let c = shared.lock().unwrap();
@@ -142,7 +143,7 @@ pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Resu
         json!({"op":"restore-policy","id":physical}),
     )?)?;
     let c = shared.lock().unwrap();
-    ensure!(c.db.query_row("SELECT node=?2 AND placement_epoch=?3 FROM resources WHERE kind='machine' AND physical=?1",params![physical,node,epoch],|r|r.get::<_,bool>(0))?,"source authority changed");
+    ensure!(c.db.query_row("SELECT node=?2 AND placement_epoch=?3 AND ssh_policy_generation=?4 FROM resources WHERE kind='machine' AND physical=?1",params![physical,node,epoch,generation],|r|r.get::<_,bool>(0))?,"source authority or SSH policy changed");
     let stored: Option<String> = c.db.query_row(
         "SELECT ssh_policy FROM resources WHERE kind='machine' AND physical=?1",
         [&physical],
@@ -154,7 +155,7 @@ pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Resu
             "source public policy differs from catalog"
         );
     } else {
-        c.set_transfer_ssh_policy(user, request["id"].as_str().unwrap(), 0, &policy)?;
+        c.set_transfer_ssh_policy(user, request["id"].as_str().unwrap(), generation, &policy)?;
     }
     let t = admission(&c, user, request, Kind::Park)?;
     let info = c.operation_info(user, t.operation)?;

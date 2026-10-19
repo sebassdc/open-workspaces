@@ -66,6 +66,23 @@ pub(crate) fn relocate(shared: Shared, identity: &Identity, request: &Value) -> 
                 id: format!("m-{}", &common::nonce()?[..24]),
                 name: child.into(),
             });
+            if let Some(snapshot) = request["snapshot"].as_str() {
+                common::identifier(snapshot)?;
+                let metadata: String = c.db.query_row("SELECT metadata FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4",params![user,snapshot,node,physical],|r|r.get(0)).context("snapshot must belong to source on its current runner")?;
+                let meta: Value = serde_json::from_str(&metadata)?;
+                input.memory_mib = meta["memory_mib"]
+                    .as_u64()
+                    .context("unknown snapshot memory")?
+                    .try_into()?;
+                input.cpus = meta["vcpu_count"]
+                    .as_u64()
+                    .context("unknown snapshot CPUs")?
+                    .try_into()?;
+                input.disk_bytes = meta["disk_bytes"]
+                    .as_u64()
+                    .context("unknown snapshot disk size")?;
+                input.snapshot = Some(snapshot.into());
+            }
         }
         capable_move(&c, &node, 0)?;
         capable_move(&c, target, input.disk_bytes.saturating_mul(2))?;
@@ -114,18 +131,8 @@ pub(crate) fn relocate(shared: Shared, identity: &Identity, request: &Value) -> 
             c.set_transfer_ssh_policy(user, address, generation, &policy)?;
         }
     }
-    let snapshot = if let Some(name) = request["snapshot"].as_str() {
-        common::identifier(name)?;
-        Some(c.db.query_row("SELECT physical FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4",params![user,name,node,physical],|r|r.get::<_,String>(0)).context("snapshot must belong to source on its current runner")?)
-    } else {
-        None
-    };
-    // Admission owns both source and child locks before any snapshot/export effects.
+    // Snapshot binding, source/child locks and reservations commit together.
     let t = c.begin_transfer(user, key, &input)?;
-    if kind == Kind::Fork {
-        let snapshot = snapshot.unwrap_or_else(|| format!("{}-fork", name(&t)));
-        c.db.execute("UPDATE operations SET response=json_object('fork_snapshot',?1,'requested_snapshot',?2) WHERE id=?3",params![snapshot,request["snapshot"].as_str(),t.operation])?;
-    }
     let info = c.operation_info(user, t.operation)?;
     drop(c);
     launch(shared, t.id);
@@ -198,11 +205,18 @@ pub(super) fn prepare(
             return export_source(shared, t, &input, &policy, &auth, call).map(Some);
         }
         let c = shared.lock().unwrap();
-        let snapshot: String = c.db.query_row(
+        let snapshot: Option<String> = c.db.query_row(
             "SELECT json_extract(response,'$.fork_snapshot') FROM operations WHERE id=?1",
             [t.operation],
             |r| r.get(0),
         )?;
+        ensure!(
+            input.snapshot.is_none() || snapshot.is_some(),
+            "named fork snapshot binding missing"
+        );
+        // Recover generated captures admitted by older controllers before their response write.
+        let snapshot = snapshot.unwrap_or_else(|| format!("{}-fork", name(t)));
+        c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.fork_snapshot',?1) WHERE id=?2",params![snapshot,t.operation])?;
         let managed = c.managed_placement(&t.source)?;
         // Source is locked by this fork, so managed_placement intentionally cannot route it.
         let source_managed: bool = c.db.query_row(

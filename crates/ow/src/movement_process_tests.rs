@@ -21,13 +21,6 @@ fn sigkill_move_and_fork_at_every_durable_phase() {
             });
         }
         let t = c.begin_transfer(user, "process-move-fork", &input).unwrap();
-        if kind == Kind::Fork {
-            c.db.execute(
-                "UPDATE operations SET response=json_object('fork_snapshot',?1) WHERE id=?2",
-                params![format!("{}-fork", name(&t)), t.operation],
-            )
-            .unwrap();
-        }
         drop(c);
         let path = p.root.join("source/fixture-state.json");
         let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
