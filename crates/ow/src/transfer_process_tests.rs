@@ -58,6 +58,14 @@ fn subprocess_entry() {
             )
             .unwrap();
         }
+        "transport" => nodes::controller(
+            &root,
+            origin.strip_prefix("http://").unwrap().parse().unwrap(),
+            None,
+            None,
+            true,
+        )
+        .unwrap(),
         "agent" => nodes::agent(
             &root,
             &origin,
@@ -84,6 +92,11 @@ fn worker(root: &Path) -> Result<()> {
         let mut socket = socket?;
         let request = wire::line(&mut socket)?;
         let result = worker_request(root, &request);
+        let drop_reply = root.join("drop-ssh-policy-reply");
+        if request["op"] == "ssh-policy" && drop_reply.exists() {
+            fs::remove_file(drop_reply)?;
+            continue;
+        }
         let _ = wire::send(&mut socket, &wire::response(result));
     }
     Ok(())
@@ -108,6 +121,20 @@ fn worker_request(root: &Path, request: &Value) -> Result<Value> {
             } else {
                 json!([state["workspace"]])
             });
+        }
+        "ssh-policy" => {
+            ensure!(
+                state["workspace"]["id"] == request["id"]
+                    && state["workspace"]["placement"] == request["placement"]
+                    && state["workspace"]["lifecycle"]["phase"] == "active",
+                "stale policy read"
+            );
+            state["counts"][op] = json!(state["counts"][op].as_u64().unwrap_or(0) + 1);
+            ow_core::runtime::atomic_json(&path, &state)?;
+            return Ok(state
+                .get("ssh_policy")
+                .cloned()
+                .unwrap_or(json!("disabled")));
         }
         "snapshots" => return Ok(json!([])),
         "stats" => return Ok(json!({"running":{}})),
@@ -212,6 +239,21 @@ fn worker_request(root: &Path, request: &Value) -> Result<Value> {
                 state["workspace"]["lifecycle"]["import"]["fork_source"] =
                     request["fork_source"].clone();
             }
+        }
+        "ssh-keys" => {
+            ensure!(
+                state["workspace"]["id"] == request["id"]
+                    && state["workspace"]["placement"] == json!(placement)
+                    && state["workspace"]["lifecycle"]["phase"] == "active",
+                "stale key change"
+            );
+            let keys = ow_core::ssh_guest::validate_keys(&request["keys"])?;
+            let host_key = state["ssh_policy"]["enrolled"]["host_key"]
+                .as_str()
+                .or_else(|| keys.first().map(String::as_str))
+                .context("enrollment needs a key")?
+                .to_owned();
+            state["ssh_policy"] = json!({"enrolled":{"identity":"fixture-ssh","generation":format!("keys-{}",state["counts"][op].as_u64().unwrap_or(0)+1),"host_key":host_key,"keys":keys,"ready":true}});
         }
         "export-cleanup" => {
             ensure!(

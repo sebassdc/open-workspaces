@@ -1432,6 +1432,7 @@ fn agent_job(
             "ssh",
             "ssh-info",
             "ssh-keys",
+            "ssh-policy",
             "delete"
         ]
         .contains(&op)

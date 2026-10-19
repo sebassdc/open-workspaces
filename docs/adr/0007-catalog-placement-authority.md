@@ -60,6 +60,10 @@ attempt's reservation. Legacy epochless results, stopped/missing inventories and
 snapshot discovery cannot mutate managed or transferring resources. Legacy routing
 fails closed for these resources until epoch-bearing orchestration is connected.
 
+Managed SSH-key changes read back the active worker's public policy through the
+node agent before completing the catalog operation. Retrying a journaled change
+reads the current policy, including later revocations.
+
 All new writer transactions perform SQLite work only. Store transfer, verification,
 worker RPCs and waits must occur outside them, with results supplied as explicit
 evidence. The transition API is controller-internal; evidence flags are attestations
