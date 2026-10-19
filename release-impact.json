@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.8.6",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 2,
+        "accepts": [
+          1,
+          2
+        ]
+      },
+      "catalog": {
+        "schema": 3,
+        "min_reader": 3
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Dormant managed-workspace placement fences and replay-safe local export, prepared import, activation and source-only cleanup. Worker interface 2; new agents accept workers 1-2 and legacy workers remain fixed-placement. Managed worker state refuses legacy readers; catalog schema, host transport, runtime, guest kernel and host layout are unchanged. Use class-2 quiesce/swap/resume with compatibility and explicit cold-loss gates; controller and agent envelope changes are class 1. Movement remains inactive pending catalog authority and artifact-store integration. Snapshot reservations, cached delete replies and cleaned-copy admission retain their tested replay and compatibility boundaries."
+    },
+    {
       "version": "0.8.5",
       "class": 2,
       "changes": [

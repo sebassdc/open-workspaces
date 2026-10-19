@@ -22,6 +22,7 @@ pub async fn upgrade(
     request: Request,
     expires: u64,
     id: String,
+    placement: Option<crate::common::Placement>,
     revoked: Arc<Notify>,
 ) -> Response {
     if request.uri().query().is_some()
@@ -46,7 +47,10 @@ pub async fn upgrade(
     };
     let root = root.to_path_buf();
     let stream = match tokio::task::spawn_blocking(move || {
-        crate::wire::connect(&root, &serde_json::json!({"op":"ssh","id":id}))
+        crate::wire::connect(
+            &root,
+            &crate::wire::workspace_request("ssh", &id, placement.as_ref()),
+        )
     })
     .await
     {

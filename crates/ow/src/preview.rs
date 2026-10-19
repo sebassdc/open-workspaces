@@ -17,6 +17,7 @@ use tokio::sync::{Notify, Semaphore};
 pub struct Target {
     pub root: PathBuf,
     pub id: String,
+    pub placement: Option<crate::common::Placement>,
     pub port: u16,
     pub revoked: Arc<Notify>,
     pub unpublished: Arc<Notify>,
@@ -104,11 +105,11 @@ pub async fn proxy(target: Target, mut request: Request, expires: u64, host: &st
     let root = target.root.clone();
     let id = target.id.clone();
     let port = target.port;
+    let placement = target.placement.clone();
     let stream = tokio::task::spawn_blocking(move || {
-        crate::wire::connect(
-            &root,
-            &serde_json::json!({"op":"tunnel","id":id,"port":port}),
-        )
+        let mut envelope = crate::wire::workspace_request("tunnel", &id, placement.as_ref());
+        envelope["port"] = serde_json::json!(port);
+        crate::wire::connect(&root, &envelope)
     })
     .await;
     let Ok(Ok((stream, _))) = stream else {

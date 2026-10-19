@@ -252,8 +252,92 @@ pub const RUNTIMES: &[&str] = &["firecracker-v1.17.0"];
 /// The runtime this release's worker runs and resumes captures with.
 pub const RUNTIME: &str = "firecracker-v1.17.0";
 /// Agent-worker protocol (control.sock) and the oldest worker the agent still drives.
-pub const WORKER_PROTOCOL: u64 = 1;
+pub const WORKER_PROTOCOL: u64 = 2;
 pub const WORKER_PROTOCOL_MIN: u64 = 1;
+
+/// Placement authority comes from a committed controller record, never worker inventory.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Placement {
+    pub epoch: u64,
+    pub node: String,
+    pub transfer: String,
+}
+impl Placement {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.epoch > 0 && self.epoch <= i64::MAX as u64,
+            "invalid placement epoch"
+        );
+        identifier(&self.node)?;
+        identifier(&self.transfer)
+    }
+    pub fn from_request(request: &serde_json::Value) -> Result<Self> {
+        let placement: Self = serde_json::from_value(
+            request
+                .get("placement")
+                .context("missing placement epoch")?
+                .clone(),
+        )?;
+        placement.validate()?;
+        Ok(placement)
+    }
+}
+
+pub const PLACEMENT_OPERATIONS: &[&str] = &[
+    "placement-register",
+    "seal-disk",
+    "export",
+    "import-prepare",
+    "activate",
+    "export-cleanup",
+];
+
+/// Bounded stream control envelope shared by the node agent and local worker.
+pub fn stream_request(request: &serde_json::Value) -> Result<()> {
+    let op = request["op"].as_str().context("missing stream operation")?;
+    ensure!(
+        matches!(op, "ssh" | "terminal" | "tunnel"),
+        "invalid stream operation"
+    );
+    identifier(request["id"].as_str().context("missing stream ID")?)?;
+    ensure!(
+        request.as_object().is_some_and(|o| o
+            .keys()
+            .all(|k| matches!(k.as_str(), "op" | "id" | "placement")
+                || (op == "tunnel" && k == "port"))),
+        "invalid stream envelope"
+    );
+    if request.get("placement").is_some() {
+        Placement::from_request(request)?;
+    }
+    if op == "tunnel" {
+        ensure!(
+            request["port"]
+                .as_u64()
+                .is_some_and(|p| (1..=65535).contains(&p)),
+            "invalid tunnel port"
+        );
+    }
+    Ok(())
+}
+
+/// New operation names are opt-in even on legacy Linux workers without an operations list.
+pub fn placement_capable(status: &serde_json::Value) -> Result<()> {
+    ensure!(
+        status["placement_fencing_v1"] == true,
+        "worker lacks placement fencing"
+    );
+    let protocol = status["worker_protocol"]
+        .as_u64()
+        .or_else(|| status["worker"]["protocol"].as_u64())
+        .unwrap_or(0);
+    ensure!(
+        protocol >= 2,
+        "placement fencing requires worker protocol 2"
+    );
+    Ok(())
+}
 
 /// Whether this agent can drive a worker: its status's `worker_protocol` (absent from
 /// workers before 0.5.0, which speak 1) inside WORKER_PROTOCOL_MIN..=WORKER_PROTOCOL.
@@ -275,6 +359,9 @@ pub const MAC_OPERATIONS: &[&str] = &[
     "terminal",
 ];
 pub fn node_operation(v: &serde_json::Value, op: &str) -> Result<()> {
+    if PLACEMENT_OPERATIONS.contains(&op) {
+        placement_capable(v)?;
+    }
     if let Some(operations) = v.get("operations") {
         ensure!(
             operations
@@ -291,6 +378,16 @@ pub fn node_operation(v: &serde_json::Value, op: &str) -> Result<()> {
     Ok(())
 }
 pub fn node_capabilities(v: &serde_json::Value) -> Result<()> {
+    if let Some(cap) = v.get("placement_fencing_v1") {
+        ensure!(cap.is_boolean(), "invalid placement capability");
+        if cap == true {
+            placement_capable(v)?;
+            ensure!(
+                v["backend"] == "firecracker",
+                "placement fencing requires Linux worker"
+            );
+        }
+    }
     guest_limits(v)?;
     ensure!(v["type"] == "heartbeat", "invalid heartbeat");
     let protocol = v["protocol"].as_u64().unwrap_or(0);
@@ -453,5 +550,39 @@ mod disk_size_tests {
         ] {
             assert!(requested_disk(&json!({"disk_gib":bad})).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn placement_contract_and_legacy_capabilities_fail_closed() {
+        let placement = json!({"placement":{"epoch":1,"node":"alpha","transfer":"move1"}});
+        assert!(Placement::from_request(&placement).is_ok());
+        for v in [
+            json!({}),
+            json!({"placement":null}),
+            json!({"placement":{"node":"alpha","transfer":"move1"}}),
+            json!({"placement":{"epoch":0,"node":"alpha","transfer":"move1"}}),
+            json!({"placement":{"epoch":1,"node":"../alpha","transfer":"move1"}}),
+            json!({"placement":{"epoch":1,"node":"alpha","transfer":""}}),
+        ] {
+            assert!(Placement::from_request(&v).is_err(), "{v}");
+        }
+        let legacy = json!({"backend":"firecracker","worker_protocol":1});
+        for op in PLACEMENT_OPERATIONS {
+            assert!(node_operation(&legacy, op).is_err());
+        }
+        let capable =
+            json!({"backend":"firecracker","worker_protocol":2,"placement_fencing_v1":true});
+        for op in PLACEMENT_OPERATIONS {
+            assert!(node_operation(&capable, op).is_ok());
+        }
+        assert!(
+            placement_capable(&json!({"worker_protocol":1,"placement_fencing_v1":true})).is_err()
+        );
+        assert!(worker_compatible(&legacy).is_ok());
     }
 }

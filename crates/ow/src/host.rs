@@ -186,12 +186,7 @@ fn worker(root: PathBuf) -> Result<()> {
                     let operation = request["op"].as_str().unwrap_or("");
                     if operation == "ssh" {
                         let connection = (|| -> Result<_> {
-                            ensure!(
-                                request
-                                    .as_object()
-                                    .is_some_and(|o| o.len() == 2 && o.contains_key("id")),
-                                "invalid SSH request"
-                            );
+                            common::stream_request(&request)?;
                             terminals
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                                     (n < 16).then_some(n + 1)
@@ -208,7 +203,7 @@ fn worker(root: PathBuf) -> Result<()> {
                             let mut locked = runtime
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
-                            let (tcp, generation) = locked.ssh(id)?;
+                            let (tcp, generation) = locked.ssh_request(&request)?;
                             let awake = Awake::open(&runtime, locked, id);
                             Ok((
                                 tcp,
@@ -235,6 +230,7 @@ fn worker(root: PathBuf) -> Result<()> {
                             }
                         }
                         let connection = (|| -> Result<(TcpStream, (Slot, Awake<Runtime>))> {
+                            common::stream_request(&request)?;
                             terminals
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                                     (n < 16).then_some(n + 1)
@@ -245,7 +241,7 @@ fn worker(root: PathBuf) -> Result<()> {
                             let mut locked = runtime
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
-                            let tcp = locked.terminal(id)?;
+                            let tcp = locked.terminal_request(&request)?;
                             let awake = Awake::open(&runtime, locked, id);
                             Ok((tcp, (slot, awake)))
                         })();
@@ -261,13 +257,14 @@ fn worker(root: PathBuf) -> Result<()> {
                         }
                     } else if operation == "tunnel" {
                         let connection = (|| -> Result<(TcpStream, Awake<Runtime>)> {
+                            common::stream_request(&request)?;
                             let id = request["id"].as_str().context("missing ID")?;
                             let port = request["port"].as_u64().context("missing port")?;
                             ensure!((1..=65535).contains(&port), "invalid port");
                             let mut locked = runtime
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
-                            let address = locked.address(id)?;
+                            let address = locked.address_request(&request)?;
                             let awake = Awake::open(&runtime, locked, id);
                             Ok((
                                 TcpStream::connect_timeout(
@@ -431,15 +428,26 @@ fn hibernate_all(root: &Path) -> Result<()> {
         request(json!({"op":"quiesce"}))?;
         let list = request(json!({"op":"list"}))?;
         for workspace in list.as_array().context("workspace list")? {
-            let (Some(id), Some("running")) =
-                (workspace["id"].as_str(), workspace["state"].as_str())
-            else {
+            let Some(id) = workspace["id"].as_str() else {
                 continue;
             };
+            if workspace["state"] != "running" && workspace["vmm_running"] != true {
+                continue;
+            }
             let wait = deadline
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_secs(1));
-            match wire::connect_waiting(root, &json!({"op":"hibernate","id":id}), wait) {
+            // A local supervisor may stop its own current copy; this never authorizes a start.
+            let placement = workspace
+                .get("placement")
+                .map(|p| serde_json::from_value::<common::Placement>(p.clone()))
+                .transpose()?;
+            ensure!(
+                workspace["managed"] != true || placement.is_some(),
+                "managed copy is missing placement authority"
+            );
+            let hibernate = wire::workspace_request("hibernate", id, placement.as_ref());
+            match wire::connect_waiting(root, &hibernate, wait) {
                 Ok(_) => println!("hibernated {id}"),
                 Err(e) => eprintln!("could not hibernate {id}: {e:#}"),
             }
@@ -449,7 +457,7 @@ fn hibernate_all(root: &Path) -> Result<()> {
             .as_array()
             .context("workspace list")?
             .iter()
-            .filter(|w| w["state"] == "running")
+            .filter(|w| w["state"] == "running" || w["vmm_running"] == true)
             .filter_map(|w| w["id"].as_str())
             .collect();
         ensure!(
@@ -1104,5 +1112,53 @@ mod down_tests {
             "stopped machines are left alone"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod managed_shutdown_tests {
+    use super::*;
+    #[test]
+    fn quiesce_carries_current_copy_authority_and_refuses_unfinished_export() {
+        for exporting in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("ow-managed-down-{}", vm::nonce().unwrap()));
+            fs::create_dir(&root).unwrap();
+            let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+            let worker = std::thread::spawn(move || {
+                let placement = json!({"epoch":7,"node":"alpha","transfer":"move1"});
+                let mut lists = 0;
+                for op in if exporting {
+                    vec!["quiesce", "list", "hibernate", "list", "quiesce"]
+                } else {
+                    vec!["quiesce", "list", "hibernate", "list"]
+                } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let req = wire::line(&mut stream).unwrap();
+                    assert_eq!(req["op"], op);
+                    let result = match op {
+                        "list" => {
+                            lists += 1;
+                            let running = exporting || lists == 1;
+                            json!({"ok":true,"result":[{"id":"box","managed":true,"placement":placement,
+                                "state":if exporting {"exporting"} else if running {"running"} else {"hibernated"},"vmm_running":running}]})
+                        }
+                        "hibernate" => {
+                            assert_eq!(req["placement"], placement);
+                            if exporting {
+                                json!({"ok":false,"error":"copy is fenced"})
+                            } else {
+                                json!({"ok":true,"result":{}})
+                            }
+                        }
+                        _ => json!({"ok":true,"result":{}}),
+                    };
+                    wire::send(&mut stream, &result).unwrap();
+                }
+            });
+            assert_eq!(hibernate_all(&root).is_ok(), !exporting);
+            worker.join().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }
