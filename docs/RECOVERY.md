@@ -29,6 +29,9 @@ Setting the flag applies timer/config files without restarting the worker.
 Installing the new worker follows the normal class-2 hibernate/upgrade/resume
 path; an older worker is refused before capture. No release tag or live upgrade
 is implied by these source changes.
+The uploader carries the listed placement authority for managed workspaces and
+skips fenced or transferring copies. The worker validates that same authority
+for prepare and acknowledgment, so a transfer during upload rejects a stale result.
 
 `ow list` and `ow inspect BOX` expose `durability` in their existing JSON. The
 dashboard shows its last durable capture time, pending upload, failures and retry

@@ -133,20 +133,27 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
     });
     let mut failed = Vec::new();
     for machine in &machines {
+        if machine.get("lifecycle").is_some()
+            && (machine["lifecycle"]["phase"] != "active"
+                || !machine["lifecycle"]["intent"].is_null())
+        {
+            continue;
+        }
         let id = machine["id"].as_str().context("missing machine ID")?;
         let result = (|| -> Result<()> {
-            let point = wire::request(
-                runner,
-                json!({"op":"recovery-prepare","id":id,"store":store_id}),
-            )?;
+            let mut request = json!({"op":"recovery-prepare","id":id,"store":store_id});
+            if let Some(placement) = machine.get("placement") {
+                request["placement"] = placement.clone();
+            }
+            let point = wire::request(runner, request.clone())?;
             let Some(name) = point["snapshot"].as_str() else {
                 return Ok(());
             };
             let uploaded = store.push(name, &runner.join("snapshots").join(name));
-            wire::request(
-                runner,
-                json!({"op":"recovery-result","id":id,"snapshot":name,"uploaded":uploaded.is_ok(),"store":store_id}),
-            )?;
+            request["op"] = json!("recovery-result");
+            request["snapshot"] = json!(name);
+            request["uploaded"] = json!(uploaded.is_ok());
+            wire::request(runner, request)?;
             uploaded?;
             println!(
                 "{}",
@@ -512,7 +519,13 @@ mod tests {
                 let request = wire::line(&mut stream).unwrap();
                 let result = match request["op"].as_str().unwrap() {
                     "status" => json!({"recovery_points_v1":true}),
-                    "list" => json!([{"id":"a"},{"id":"b"}]),
+                    "list" => json!([
+                        {"id":"a","placement":{"epoch":7,"node":"alpha","transfer":"incarnation"},
+                         "lifecycle":{"phase":"active","intent":null}},
+                        {"id":"b"},
+                        {"id":"fenced","placement":{"epoch":7,"node":"alpha","transfer":"incarnation"},
+                         "lifecycle":{"phase":"exported","intent":null}}
+                    ]),
                     "recovery-prepare" => json!({"snapshot":request["id"],"captured_at":1000}),
                     "recovery-result" => json!({}),
                     _ => panic!("unexpected recovery request"),
@@ -548,6 +561,21 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0]["uploaded"], false);
         assert_eq!(results[1]["uploaded"], true);
+        for request in seen.iter().filter(|r| {
+            r["op"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("recovery-"))
+        }) {
+            if request["id"] == "a" {
+                assert_eq!(
+                    request["placement"],
+                    json!({"epoch":7,"node":"alpha","transfer":"incarnation"})
+                );
+            } else {
+                assert_eq!(request["id"], "b", "a fenced workspace was scheduled");
+                assert!(request.get("placement").is_none());
+            }
+        }
         assert!(remote.join("b/manifest.json").exists());
         for dir in [runner, remote] {
             fs::remove_dir_all(dir).unwrap();

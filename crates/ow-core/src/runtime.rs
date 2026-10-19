@@ -1766,6 +1766,7 @@ mod disk_tests {
             captured_at: now() - 601,
             name: "sleep-fixture".into(),
             workspace: "legacy".into(),
+            managed: false,
             memory_mib: 1024,
             vcpu_count: 2,
             image: "alpine".into(),
