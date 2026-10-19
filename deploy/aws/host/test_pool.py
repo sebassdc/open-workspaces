@@ -207,6 +207,21 @@ class Joins(PoolCase):
         self.assertEqual(json.loads(self.aws.secrets[secret])["used"], NODE_A)
         self.assertEqual(h.p(h.CA).read_text(), CA)
 
+    def test_a_join_never_redeemed_is_answered_again_and_one_failure_does_not_stop_sync(self):
+        self.as_controller()
+        self.aws.launch("i-0a", VOL_A)
+        self.aws.launch("i-0b", VOL_B)
+        self.aws.nodes = [{"id": NODE_A, "online": False, "revoked": False, "last_seen_unix_s": 0, "capabilities": {}}]  # minted, never used
+        secret = "open-workspaces/pool/dev/"
+        self.aws.denied = {"create-secret"}  # a new secret's rights still settling
+        rp.sync(["dev"])
+        self.aws.denied = set()
+        rp.sync(["dev"])
+        self.assertEqual(set(self.aws.tags), {secret + NODE_A, secret + NODE_B}, "both answered once rights settle")
+        self.aws.secrets[secret + NODE_A] = json.dumps({"ready": NODE_A, "budget": {"memory": 1024, "slots": 1, "cpus": 1}})
+        rp.sync(["dev"])
+        self.assertEqual(json.loads(self.aws.secrets[secret + NODE_A])["join"]["node"], NODE_A)
+
     def test_a_volume_salvaged_onto_a_new_instance_moves_its_secret_there(self):
         self.as_controller()
         self.aws.launch("i-0a", VOL_A)
@@ -227,7 +242,7 @@ class Joins(PoolCase):
             self.aws.secrets[secret] = json.dumps(bad)
             rp.sync(["dev"])
             self.assertFalse(any("node-join" in c for c in self.aws.calls), bad)
-        self.aws.nodes = [{"id": NODE_A, "online": True}]
+        self.aws.nodes = [{"id": NODE_A, "online": True, "capabilities": {"vcpus": 4}}]
         self.aws.launch("i-0b", VOL_B, state="Pending")
         before = len(self.aws.secrets)
         rp.sync(["dev"])
@@ -254,7 +269,7 @@ class Joins(PoolCase):
 class Observe(PoolCase):
     def test_every_instance_and_disk_counts_with_its_state(self):
         self.as_controller()
-        self.aws.nodes = [{"id": NODE_A, "online": True}, {"id": "ow-host", "online": True}]
+        self.aws.nodes = [{"id": NODE_A, "online": True, "capabilities": {"vcpus": 4}}, {"id": "ow-host", "online": True, "capabilities": {"vcpus": 4}}]
         self.aws.launch("i-0a", VOL_A)
         self.aws.launch("i-0b", VOL_B, state="Pending")
         self.aws.launch("i-0r", "vol-0cccccccccccccccc", state="Terminating:Retained")
@@ -293,7 +308,7 @@ class Observe(PoolCase):
 
     def test_fixed_hosts_count_and_a_failed_describe_writes_nothing(self):
         self.as_controller()
-        self.aws.nodes = [{"id": "ow-host", "online": True}]
+        self.aws.nodes = [{"id": "ow-host", "online": True, "capabilities": {"vcpus": 4}}]
         host = instance("i-0h", "vol-0hhhhhhhhhhhhhhhh".replace("h", "1"))
         self.aws.instances.append(host)
         orig = self.aws.__call__
@@ -345,7 +360,7 @@ class Actions(PoolCase):
 
     def test_remove_takes_exactly_the_drained_instance_and_keeps_its_disk(self):
         self.as_controller()
-        self.aws.nodes = [{"id": NODE_A, "online": False}, {"id": NODE_B, "online": True}]
+        self.aws.nodes = [{"id": NODE_A, "online": False, "capabilities": {"vcpus": 4}}, {"id": NODE_B, "online": True, "capabilities": {"vcpus": 4}}]
         self.aws.launch("i-0a", VOL_A)
         self.aws.launch("i-0b", VOL_B)
         self.aws.group["DesiredCapacity"] = 2
@@ -366,7 +381,7 @@ class Actions(PoolCase):
 
     def test_a_termination_the_controller_did_not_start_is_never_completed(self):
         self.as_controller()
-        self.aws.nodes = [{"id": NODE_A, "online": True}]
+        self.aws.nodes = [{"id": NODE_A, "online": True, "capabilities": {"vcpus": 4}}]
         self.aws.drain[NODE_A] = "removed"
         self.aws.launch("i-0a", VOL_A, state="Terminating:Wait")  # someone else's termination
         rp.sync(["dev"])
@@ -377,7 +392,7 @@ class Actions(PoolCase):
         self.aws.member("i-0a")["LifecycleState"] = "InService"
         rp.remove("dev", node=NODE_A)
         self.aws.launch("i-0b", VOL_B)
-        self.aws.nodes.append({"id": NODE_B, "online": True})
+        self.aws.nodes.append({"id": NODE_B, "online": True, "capabilities": {"vcpus": 4}})
         h.write_json(rp.REMOVALS, {"i-0b": {"node": NODE_B, "enrolled": True}})
         self.aws.member("i-0b")["LifecycleState"] = "Terminating:Wait"
         self.aws.drain[NODE_B] = "active"
@@ -421,7 +436,7 @@ class Actions(PoolCase):
 
     def test_only_a_detached_disk_of_a_removed_or_never_enrolled_runner_is_deleted(self):
         self.as_controller()
-        self.aws.nodes = [{"id": NODE_A, "online": False}]
+        self.aws.nodes = [{"id": NODE_A, "online": False, "capabilities": {"vcpus": 4}}]
         self.aws.launch("i-0a", VOL_A)
         with self.assertRaisesRegex(Refused, "in-use"):
             rp.delete_disk("dev", VOL_A)
@@ -429,6 +444,11 @@ class Actions(PoolCase):
         with self.assertRaisesRegex(Refused, "runner active: salvage it first"):
             rp.delete_disk("dev", VOL_A)
         self.assertFalse(any("delete-volume" in c for c in self.aws.calls))
+        drain = next(c for c in self.aws.calls if "drain" in c)
+        self.assertEqual(drain[drain.index("--data-dir") + 1], h.DATA, "ow node drain takes the base directory")
+        self.aws.nodes = [{"id": NODE_A, "online": False, "last_seen_unix_s": 0, "capabilities": {"vcpus": 4}}]
+        with self.assertRaisesRegex(Refused, "salvage it first"):  # offline runners report last_seen 0
+            rp.delete_disk("dev", VOL_A)
         self.aws.drain[NODE_A] = "removed"
         listed = rp.disks("dev", show=False)
         self.assertEqual((listed[0]["runner"], listed[0]["deletable"], listed[0]["monthly_cents"]), ("removed", True, 800))

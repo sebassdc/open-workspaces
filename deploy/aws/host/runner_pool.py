@@ -65,12 +65,16 @@ def node_of(pool, instance):
 
 
 def catalog():
-    """The controller's runners by ID, revoked ones included."""
-    return {entry["id"]: entry for entry in h.ow("node", "list", timeout=30)}
+    """The controller's runners that ever connected, by ID, revoked ones included. Offline
+    runners keep their reported capabilities; a join minted but never redeemed has none
+    (and may be asked for again)."""
+    return {entry["id"]: entry for entry in h.ow("node", "list", timeout=30)
+            if entry.get("revoked") or entry.get("capabilities")}
 
 
 def drain_state(node):
-    return h.ow("--data-dir", h.CONTROLLER, "node", "drain", node, "--action", "status", timeout=60).get("state")
+    # The base directory: `ow node drain` opens BASE/controller.
+    return h.ow("--data-dir", h.DATA, "node", "drain", node, "--action", "status", timeout=60).get("state")
 
 
 def describe(pool):
@@ -144,41 +148,47 @@ def answer_joins(pool, group, instances, known):
     """Each running group instance whose volume has no runner gets a join secret only it
     can read (tagged with its role session); a ready request there gets a join."""
     members = {i["InstanceId"]: i for i in group.get("Instances") or []}
-    prefix = f"open-workspaces/pool/{pool['name']}/"
     for instance in instances:
         iid, node = instance["InstanceId"], node_of(pool, instance)
         state = (members.get(iid) or {}).get("LifecycleState")
         if not node or node in known or state != "InService" or instance["State"]["Name"] != "running":
             continue
-        name, session = prefix + node, f"{pool['roleId']}:{iid}"
-        tags = [f"Key=ow-pool,Value={pool['name']}", f"Key=ow-session,Value={session}"]
         try:
-            described = aws("secretsmanager", "describe-secret", "--secret-id", name)
-        except RuntimeError as e:
-            if "ResourceNotFoundException" not in str(e):
-                raise
-            aws("secretsmanager", "create-secret", "--name", name, "--description",
-                f"Open Workspaces: join of pool runner {node}", "--secret-string", json.dumps({"pending": node}), "--tags",
-                *[f"Key={k},Value={v}" for k, v in (("ow-pool", pool["name"]), ("ow-session", session))])
-            h.say(f"{node}: join secret for {iid}")
-            continue
-        if {t["Key"]: t["Value"] for t in described.get("Tags") or []}.get("ow-session") != session:
-            # A volume back on a new instance that never enrolled: only the new one may read.
-            aws("secretsmanager", "tag-resource", "--secret-id", name, "--tags", *tags)
-            h.put_secret(name, {"pending": node}, h.region())
-            h.say(f"{node}: join secret moved to {iid}")
-            continue
-        try:
-            value = json.loads(h.secret(name, h.region()) or "{}")
-        except ValueError:
-            continue
-        if not isinstance(value, dict):
-            continue
-        budget = value.get("budget") if value.get("ready") == node else None
-        if not isinstance(budget, dict) or not all(type(budget.get(k)) is int and 1 <= budget[k] <= high
-                                                   for k, high in (("memory", 1048576), ("slots", 64), ("cpus", 64))):
-            continue
-        h.invite_runner(node, budget["memory"], budget["slots"], budget["cpus"], secret_id=name)
+            answer_join(pool, iid, node)
+        except RuntimeError as e:  # one instance's failure (new secrets settle slowly) waits for the next sync
+            h.say(f"{node}: join not answered yet: {str(e)[-300:]}")
+
+
+def answer_join(pool, iid, node):
+    name, session = f"open-workspaces/pool/{pool['name']}/{node}", f"{pool['roleId']}:{iid}"
+    tags = [f"Key=ow-pool,Value={pool['name']}", f"Key=ow-session,Value={session}"]
+    try:
+        described = aws("secretsmanager", "describe-secret", "--secret-id", name)
+    except RuntimeError as e:
+        if "ResourceNotFoundException" not in str(e):
+            raise
+        aws("secretsmanager", "create-secret", "--name", name, "--description",
+            f"Open Workspaces: join of pool runner {node}", "--secret-string", json.dumps({"pending": node}), "--tags",
+            *[f"Key={k},Value={v}" for k, v in (("ow-pool", pool["name"]), ("ow-session", session))])
+        h.say(f"{node}: join secret for {iid}")
+        return
+    if {t["Key"]: t["Value"] for t in described.get("Tags") or []}.get("ow-session") != session:
+        # A volume back on a new instance that never enrolled: only the new one may read.
+        aws("secretsmanager", "tag-resource", "--secret-id", name, "--tags", *tags)
+        h.put_secret(name, {"pending": node}, h.region())
+        h.say(f"{node}: join secret moved to {iid}")
+        return
+    try:
+        value = json.loads(h.secret(name, h.region()) or "{}")
+    except ValueError:
+        return
+    if not isinstance(value, dict):
+        return
+    budget = value.get("budget") if value.get("ready") == node else None
+    if not isinstance(budget, dict) or not all(type(budget.get(k)) is int and 1 <= budget[k] <= high
+                                               for k, high in (("memory", 1048576), ("slots", 64), ("cpus", 64))):
+        return
+    h.invite_runner(node, budget["memory"], budget["slots"], budget["cpus"], secret_id=name)
 
 
 def removals():
