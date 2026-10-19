@@ -81,6 +81,10 @@ export interface HostArgs {
      * Default: no timer.
      */
     backupSchedule?: pulumi.Input<string>;
+    /** Opt in to 30-minute running recovery points and upload after 10 hibernated
+     * minutes. Requires backupUrl, a compatible upgraded worker and safe bucket
+     * lifecycle (no current snapshot/chunk expiry). Default: false. */
+    recoveryPoints?: pulumi.Input<boolean>;
     /** Minutes without a connection or activity before a box hibernates; 0 turns it off. Default: 30. */
     idleMinutes?: pulumi.Input<number>;
     /** CPU admission ratio: 1 (default) or 2 for dev workloads; RAM, slots and disk are unchanged. */
@@ -177,6 +181,7 @@ export interface HostConfigInputs {
     storeUrl?: string;
     imageArtifacts?: { [profile: string]: { version: number; attempt: string; digest: string } };
     backupSchedule: string;
+    recoveryPoints?: boolean;
     idleMinutes: number;
     vcpuOvercommit?: number;
     directMac?: string;
@@ -218,6 +223,7 @@ export function hostConfig(c: HostConfigInputs): object {
     if (vcpuOvercommit !== 1 && vcpuOvercommit !== 2) {
         throw new Error("vcpuOvercommit must be 1 or 2");
     }
+    if (c.recoveryPoints && !backup) throw new Error("recoveryPoints needs backupUrl");
     if (!Number.isInteger(c.idleMinutes) || c.idleMinutes < 0 || c.idleMinutes > 10080) {
         throw new Error(`idleMinutes must be a whole number from 0 to 10080, not ${c.idleMinutes}`);
     }
@@ -244,7 +250,7 @@ export function hostConfig(c: HostConfigInputs): object {
         dashboard: { logins: c.dashboardLogins, ...(capability ? { capability } : {}) },
         developerImages: images ? images.split(" ") : [],
         ...(c.storeUrl ? { store: { url: c.storeUrl, images: artifacts } } : {}),
-        backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule },
+        backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule, ...(c.recoveryPoints ? { recovery: true } : {}) },
         idleMinutes: c.idleMinutes,
         vcpuOvercommit,
         ...(c.runner ? { runner: c.runner } : {}),
@@ -291,6 +297,11 @@ export function backupPolicy(partition: string, url: string, includeRunnerSnapsh
             },
             ...(includeRunnerSnapshots ? [{ Effect: "Allow", Action: "s3:GetObject",
                 Resource: `arn:${partition}:s3:::${bucket}/${runnerSnapshots}` }] : []),
+            {
+                Effect: "Allow",
+                Action: ["s3:GetBucketVersioning", "s3:GetLifecycleConfiguration"],
+                Resource: `arn:${partition}:s3:::${bucket}`,
+            },
         ],
     });
 }
@@ -453,15 +464,15 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                     pulumi.all([args.repository ?? DEFAULT_REPOSITORY, args.ref ?? `v${require("./package.json").version}`]),
                     pulumi.all([args.tailscaleAuthKeySecretArn ?? "", args.tailscaleHostname ?? name, args.tailscaleSsh ?? false]),
                     pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? [], args.dashboardCapability ?? ""]),
-                    pulumi.all([backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30, args.vcpuOvercommit ?? 1]),
+                    pulumi.all([backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30, args.vcpuOvercommit ?? 1, args.recoveryPoints ?? false]),
                     runner,
                     directInterface ? directInterface.macAddress : pulumi.output(""),
                     pulumi.all([args.storeUrl ?? "", args.imageArtifacts ?? {}]),
                 ])
-                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit], runner, directMac, [storeUrl, imageArtifacts]]) =>
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints], runner, directMac, [storeUrl, imageArtifacts]]) =>
                     JSON.stringify(hostConfig({
                         repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
-                        dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, runner, directMac, storeUrl, imageArtifacts,
+                        dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints, runner, directMac, storeUrl, imageArtifacts,
                     })),
                 ),
             tags,
@@ -492,7 +503,7 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
             size: args.dataVolumeSizeGib ?? 100,
             encrypted: true,
             tags: named.apply((t) => ({ ...t, Name: `${name}-data` })),
-        }, parent);
+        }, { ...parent, retainOnDelete: true });
 
         const amiId = args.amiId ?? aws.ssm.getParameterOutput({ name: UBUNTU_AMI_PARAMETER }, parent).value;
         // Stage 0 only: these values never change with the config or the release.

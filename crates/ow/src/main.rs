@@ -468,6 +468,16 @@ enum BackupAction {
         #[arg(long)]
         endpoint_url: Option<String>,
     },
+    /// Capture due recovery points and upload changed chunks (local host command).
+    /// Schedule once a minute; running interval 30m, hibernation delay 10m.
+    Recover {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        from: Option<PathBuf>,
+        #[arg(long)]
+        endpoint_url: Option<String>,
+    },
     /// Download a snapshot from a store onto this runner and bring its machine up
     /// under the same ID (the runner's worker must be running).
     Restore {

@@ -21,6 +21,13 @@ async function api(path, body) {
 async function refresh() { try { data = await api('/api/state'); $('host-controls').hidden = !data.host_controls; $('pool-policy').textContent = data.pool_policy || ''; render(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; } }
 function action(label, callback, disabled = false) { const button = element('button', label, 'button secondary'); button.disabled = disabled || busy; button.addEventListener('click', () => Promise.resolve(callback()).catch(() => {})); return button; }
 function select(id) { selected = id; render(); }
+function durability(item) {
+  const d = item.durability;
+  if (!d) return 'Off-host recovery status unavailable';
+  const saved = d.last_durable_at ? `Last durable ${new Date(d.last_durable_at * 1000).toLocaleString()}` : 'No durable recovery point yet';
+  const retry = d.retry_at ? ` · retry ${new Date(d.retry_at * 1000).toLocaleTimeString()}` : '';
+  return `${saved}${(!d.current_state_durable && d.last_durable_at && Date.now() / 1000 - d.last_durable_at > 3600) ? ' · one-hour disk recovery target exceeded' : ''}${d.pending ? ' · upload pending' : ''}${d.error ? ` · ${d.error}${retry}` : ''}${d.last_durable_at ? ' · off-host copies retained' : ''}`;
+}
 function machine() { return [...data.workspaces, ...(data.shared || [])].find(item => item.id === selected); }
 function setView(next) { view = next; for (const id of ['machines', 'snapshots', 'usage']) $(id + '-view').hidden = id !== view; document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view)); const names = {machines: ['Your machines.', 'A place to build, experiment, and pick up where you left off.', 'Machines'], snapshots: ['Pick up from here.', 'Saved memory and disk state, ready to restore or fork.', 'Snapshots'], usage: ['Room to grow.', 'See what your machines use, and free capacity when you need it.', 'Resource usage']}; $('page-title').textContent = names[view][0]; $('page-description').textContent = names[view][1]; $('breadcrumb').textContent = 'Your sandbox / ' + names[view][2]; }
 function render() {
@@ -41,6 +48,9 @@ function render() {
     const meta = element('div', undefined, 'card-meta'); meta.append(element('span', `${item.vcpu_count || 1} vCPU`), element('span', mib(item.memory_mib)));
     card.append(top, element('h3', item.id), meta, element('span', diskUsage(item), 'card-lineage'), element('span', item.source ? `Forked from ${item.source}` : (imageNames[item.image || 'alpine'] || 'Linux machine'), 'card-lineage')); if (item.node) card.append(element('span', `${item.node}${item.node_online === false ? ' · offline' : ''}`, 'card-lineage'));
     if (item.owner) card.append(element('span', `Shared by ${item.owner} · ${item.role}`, 'card-lineage'));
+    const recovery = element('span', durability(item), 'card-lineage' + (item.durability && (!item.durability.last_durable_at || item.durability.error || (!item.durability.current_state_durable && Date.now() / 1000 - item.durability.last_durable_at > 3600)) ? ' recovery-warning' : ''));
+    if (item.durability) recovery.title = item.durability.retention || '';
+    card.append(recovery);
     card.addEventListener('click', () => select(item.id)); $(item.owner ? 'shared-grid' : 'machine-grid').append(card);
   }
   if (!data.workspaces.length) $('machine-grid').append(element('div', 'Your first machine is one click away. Choose “New machine” to get started.', 'empty'));

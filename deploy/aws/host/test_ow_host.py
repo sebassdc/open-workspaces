@@ -154,6 +154,20 @@ class Render(unittest.TestCase):
         images = self.files["/etc/systemd/system/open-workspaces-images.service"]
         self.assertNotIn("ExecStartPost", images, "a new developer image no longer restarts anything")
 
+    def test_recovery_is_opt_in_and_never_restarts_worker(self):
+        from unittest.mock import patch
+        self.assertNotIn("/etc/systemd/system/ow-recovery.timer", self.files)
+        files = h.render(config(backup__recovery=True), BUDGET)
+        unit = files["/etc/systemd/system/ow-recovery.service"][0]
+        self.assertIn("ExecStart=/usr/local/bin/ow-recovery", unit)
+        self.assertIn("OnUnitInactiveSec=1min", files["/etc/systemd/system/ow-recovery.timer"][0])
+        self.assertEqual(files["/etc/systemd/system/open-workspaces-worker.service"],
+                         h.render(config(), BUDGET)["/etc/systemd/system/open-workspaces-worker.service"])
+        self.assertNotIn("worker", h.units_changed({"/etc/systemd/system/ow-recovery.timer"}))
+        for backup in ({"url": "", "recovery": True}, {"url": "s3://b/p", "recovery": "true"}):
+            with self.assertRaises(Refused):
+                config(backup=backup)
+
     def test_scripts_are_valid_shell_and_the_wrapper_runs_the_current_release(self):
         for path, text in self.files.items():
             if text.startswith("#!/bin/"):
