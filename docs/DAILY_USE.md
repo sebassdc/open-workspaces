@@ -315,7 +315,7 @@ With an opted-in artifact store and fencing-capable runner/agent:
 
 ```sh
 ow --server URL --operation-key park-1 park BOX
-ow --server URL list
+ow --server URL status
 ow --server URL --operation-key wake-1 wake BOX
 # Only after reviewing a reported RAM incompatibility:
 ow --server URL --operation-key cold-1 wake BOX --accept-cold
@@ -326,7 +326,7 @@ It publishes before releasing placement; failed publication leaves the source
 recoverable. Connections share a single wake for a parked hibernated box. A stopped
 box requires explicit `start` or `wake`; opening its preview/terminal cannot boot it.
 No eligible capacity queues the same operation. Follow its step, queue reason and
-file-object byte progress in the existing operation records from `list`. Timeout
+file-object byte progress in the existing operation records from `status`. Timeout
 is not cancellation: reconnect to join the same wake. An incompatible RAM failure
 requires a fresh key and explicit cold consent; its stored RAM is retained.
 See [park/wake lifecycle, compatibility and verification limits](LIFECYCLE.md#explicit-park-and-shared-wake).

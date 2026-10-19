@@ -239,7 +239,7 @@ after a connection wait. SSH policy generation changes invalidate the transfer.
 Existing stream revocation checks still run after worker stream creation. A joining
 user sees safe step/progress information, not another user's operation key/name.
 Connection waits are bounded; reconnect joins the same operation. Explicit command
-results return the existing operation record and can be followed through `list`'s
+results return the existing operation record and can be followed through `status`'s
 operations, including `transfer.step`, `queued`, and `progress`.
 
 Progress reports logical bytes in completed compressed file objects. It is polled
