@@ -180,7 +180,7 @@ impl State {
         let mut value: Value = serde_json::from_slice(bytes)?;
         if let Some(schema) = value.get("worker_state_schema") {
             ensure!(
-                schema == 2 && value["next_index"].is_null(),
+                (schema == 2 || schema == 3) && value["next_index"].is_null(),
                 "unsupported worker state schema"
             );
             let index = value
@@ -206,7 +206,15 @@ impl State {
     fn value(&self) -> Value {
         let mut value = json!(self);
         if !self.placements.is_empty() {
-            value["worker_state_schema"] = json!(2);
+            value["worker_state_schema"] =
+                json!(if self.placements.values().any(|m| m.fork_initialized
+                    || m.import.as_ref().is_some_and(|i| i.fork_source.is_some())
+                    || m.phase == lifecycle::Phase::Discarded)
+                {
+                    3
+                } else {
+                    2
+                });
             value["managed_next_index"] = json!(self.next_index);
             // Old workers require a u32 here and must refuse the entire managed registry.
             value["next_index"] = Value::Null;
@@ -1015,7 +1023,13 @@ impl Runtime {
             vm::reflink(&directory.join("disk.ext4"), &replacement)?;
             fs::rename(replacement, self.machine_dir(id).join("disk.ext4"))?;
         }
-        self.spawn(&workspace, snapshot.as_deref().filter(|_| resume), false)?;
+        let fork = self.state.placements.get(id).is_some_and(|m| {
+            !m.fork_initialized && m.import.as_ref().is_some_and(|i| i.fork_source.is_some())
+        });
+        self.spawn(&workspace, snapshot.as_deref().filter(|_| resume), fork)?;
+        if fork {
+            self.state.placements.get_mut(id).unwrap().fork_initialized = true;
+        }
         let workspace = self.state.workspaces.get_mut(id).unwrap();
         workspace.state = "running".into();
         let slept = workspace.hibernation.take();
@@ -1408,7 +1422,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"recovery_points_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
@@ -1534,6 +1548,7 @@ impl Runtime {
             "ssh-info" => Ok(crate::ssh_guest::info(&crate::ssh_guest::load(
                 &self.root, id,
             )?)),
+            "ssh-policy" => Ok(json!({"enrolled":crate::ssh_guest::load(&self.root,id)?})),
             "ssh-keys" => {
                 let keys = crate::ssh_guest::validate_keys(&request["keys"])?;
                 let root = self.root.clone();

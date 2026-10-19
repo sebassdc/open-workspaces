@@ -878,8 +878,8 @@ pub fn run(cli: Cli) -> Result<i32> {
                 .retain(|_, value| !value.is_null());
             request
         }
-        Action::Park { .. } | Action::Wake { .. } => {
-            anyhow::bail!("park/wake requires a remote controller")
+        Action::Move { .. } | Action::Park { .. } | Action::Wake { .. } => {
+            anyhow::bail!("move/park/wake requires a remote controller")
         }
         Action::Start { id } => json!({"op":"start","id":id}),
         Action::Stop { id } => json!({"op":"stop","id":id}),
@@ -937,7 +937,12 @@ pub fn run(cli: Cli) -> Result<i32> {
             id,
             child,
             snapshot,
-        } => json!({"op":"fork","id":id,"child":child,"snapshot":snapshot}),
+            node,
+            accept_cold: _,
+        } => {
+            ensure!(node.is_none(), "targeted fork requires a remote controller");
+            json!({"op":"fork","id":id,"child":child,"snapshot":snapshot})
+        }
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),
         Action::Delete { id } => {
             // Publications close only once the worker has accepted the delete.

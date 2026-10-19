@@ -20,6 +20,12 @@ use std::sync::{Arc, Mutex};
 struct Operation {
     op: String,
     #[serde(default)]
+    transfer: Option<i64>,
+    #[serde(default)]
+    epoch: Option<i64>,
+    #[serde(default)]
+    abort: Option<bool>,
+    #[serde(default)]
     node: Option<String>,
     #[serde(default)]
     operation_key: Option<String>,
@@ -127,6 +133,28 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             }
         }
         "start" | "stop" | "hibernate" | "ssh-info" | "delete" => {}
+        "move" | "transfer-control" => {
+            ensure!(
+                request["operation_key"].is_string(),
+                "operation key required"
+            );
+            if operation.op == "move" {
+                ensure!(request["node"].is_string(), "target node required");
+                request["accept_cold"] = json!(operation.accept_cold.unwrap_or(false));
+            } else {
+                ensure!(
+                    !operation.accept_cold.unwrap_or(false),
+                    "cold consent requires a new transfer"
+                );
+                request["transfer"] = json!(operation.transfer.context("transfer required")?);
+                request["epoch"] = json!(operation.epoch.context("current epoch required")?);
+                request["abort"] = json!(operation.abort.unwrap_or(false));
+                ensure!(
+                    request["abort"] == true || request["node"].is_string(),
+                    "choose abort or target"
+                );
+            }
+        }
         "park" | "wake" => {
             ensure!(
                 request["operation_key"].is_string(),
@@ -191,6 +219,13 @@ fn validated(bytes: &[u8]) -> Result<Value> {
                 .ok_or_else(|| anyhow::anyhow!("Child name required"))?;
             runtime::identifier(&child)?;
             request["child"] = json!(child);
+            if request["node"].is_string() {
+                ensure!(
+                    request["operation_key"].is_string(),
+                    "operation key required"
+                );
+                request["accept_cold"] = json!(operation.accept_cold.unwrap_or(false));
+            }
             if let Some(snapshot) = operation.snapshot {
                 runtime::identifier(&snapshot)?;
                 request["snapshot"] = json!(snapshot);
@@ -428,7 +463,7 @@ pub async fn handle(
     let Ok(bytes) = to_bytes(request.into_body(), 384 * 1024).await else {
         return secure((StatusCode::PAYLOAD_TOO_LARGE, "Operation too large").into_response());
     };
-    let operation = match validated(&bytes) {
+    let mut operation = match validated(&bytes) {
         Ok(value) => value,
         Err(_) => {
             return secure(
@@ -440,11 +475,42 @@ pub async fn handle(
             );
         }
     };
+    // A moved child's ordinary fork keeps its existing use-role permission and defaults to its runner.
+    if operation["op"] == "fork" && !operation["node"].is_string() {
+        let target = catalog.as_ref().and_then(|shared| {
+            let mut c=shared.lock().ok()?;
+            let user=c.user(&identity).ok()?;
+            let physical=c.machine(user,operation["id"].as_str()?,"fork").ok()?;
+            c.db.query_row("SELECT node FROM resources WHERE kind='machine' AND physical=?1 AND placement_managed=1 AND node<>''",[physical],|r|r.get::<_,String>(0)).ok()
+        });
+        if let Some(target) = target {
+            operation["node"] = json!(target);
+            if !operation["operation_key"].is_string() {
+                operation["operation_key"] = json!(crate::common::nonce().unwrap_or_default());
+            }
+        }
+    }
     let result = if matches!(operation["op"].as_str(), Some("share" | "unshare")) {
         // Not through with_catalog: a slow worker call there must not delay a revocation.
         match root {
             Some(root) => tokio::task::spawn_blocking(move || {
                 crate::catalog::share_unlocked(&root, &identity, &operation)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r),
+            None => Err(anyhow::anyhow!("ownership catalog unavailable")),
+        }
+    } else if matches!(operation["op"].as_str(), Some("move" | "transfer-control"))
+        || operation["op"] == "fork" && operation["node"].is_string()
+    {
+        match catalog {
+            Some(catalog) => tokio::task::spawn_blocking(move || {
+                if operation["op"] == "transfer-control" {
+                    crate::transfers::control(catalog, &identity, &operation)
+                } else {
+                    crate::transfers::relocate(catalog, &identity, &operation)
+                }
             })
             .await
             .map_err(anyhow::Error::from)
@@ -692,5 +758,27 @@ mod tests {
             validated(br#"{"op":"delete","id":"old","command":"x"}"#).unwrap(),
             json!({"op":"delete","id":"old"})
         );
+    }
+}
+
+#[cfg(test)]
+mod movement_validation_tests {
+    use super::*;
+    #[test]
+    fn targeted_move_fork_and_explicit_recovery_use_existing_operation_envelopes() {
+        for request in [
+            json!({"op":"move","id":"box","node":"target","operation_key":"move"}),
+            json!({"op":"fork","id":"owner@example.test/box","child":"mine","node":"target","operation_key":"fork"}),
+            json!({"op":"transfer-control","id":"box","transfer":1,"epoch":2,"abort":true,"operation_key":"abort"}),
+        ] {
+            assert!(validated(&serde_json::to_vec(&request).unwrap()).is_ok());
+        }
+        for request in [
+            json!({"op":"move","id":"box","operation_key":"move"}),
+            json!({"op":"fork","id":"box","child":"mine","node":"target"}),
+            json!({"op":"transfer-control","id":"box","transfer":1,"abort":true,"operation_key":"abort"}),
+        ] {
+            assert!(validated(&serde_json::to_vec(&request).unwrap()).is_err());
+        }
     }
 }

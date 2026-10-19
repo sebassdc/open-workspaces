@@ -330,3 +330,13 @@ file-object byte progress in the existing operation records from `status`. Timeo
 is not cancellation: reconnect to join the same wake. An incompatible RAM failure
 requires a fresh key and explicit cold consent; its stored RAM is retained.
 See [park/wake lifecycle, compatibility and verification limits](LIFECYCLE.md#explicit-park-and-shared-wake).
+
+### Move or fork to an explicit runner
+
+Owners can use `ow --server URL move BOX --node RUNNER`; existing fork permissions
+also allow `ow --server URL fork BOX CHILD --node RUNNER`. Both return a durable
+operation tracked by `ow --server URL status`. Compatible moves preserve processes,
+grants and the pinned SSH host key. Children have independent writes, belong to the
+requester and require separate SSH enrollment. Worker interface 3 and a configured
+artifact store are required; installation alone does not move existing boxes.
+See [move/fork recovery and cold-consent rules](LIFECYCLE.md#explicit-move-and-cross-runner-fork).

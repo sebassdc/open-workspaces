@@ -2013,6 +2013,7 @@ fn transfer_fixture() -> (Fake, Catalog, i64, String, crate::transfers::Intent) 
         target: Some("beta".into()),
         capture: Some("capture".into()),
         child: None,
+        snapshot: None,
         memory_mib: 256,
         cpus: 1,
         disk_bytes: 8 * common::GIB,
@@ -2436,8 +2437,12 @@ fn transfer_commit_is_atomic_and_terminal_transitions_are_forward_only() {
     );
     assert!(c.commit_transfer(t.id, t.epoch).is_err());
     assert!(c.operation(user, json!({"op":"start","id":"box"})).is_err());
-    assert!(c.terminal_target(user, "box").is_err());
-    assert!(c.ssh_target(user, "box").is_err());
+    assert_eq!(c.terminal_target(user, "box").unwrap().1, t.machine);
+    assert_eq!(
+        c.managed_placement(&t.machine).unwrap().unwrap().epoch,
+        t.epoch as u64
+    );
+    assert!(c.ssh_target(user, "box").is_err()); // The fixture does not advertise guest SSH.
 }
 #[test]
 fn transfer_fork_reserves_child_identity_and_releases_only_its_attempt() {
@@ -3086,7 +3091,7 @@ fn aborted_fork_cleanup_rolls_back_with_an_uncertain_target() {
     )
     .unwrap();
     c.db.execute(
-        "INSERT INTO owner_allocations VALUES('m-cleanup',1,256,8)",
+        "UPDATE owner_allocations SET cpus=1,memory_mib=256,disk_gib=8 WHERE physical='m-cleanup'",
         [],
     )
     .unwrap();
@@ -3622,4 +3627,93 @@ fn controller_private_backup_preserves_all_authority_and_artifact_roots() {
     );
     assert_eq!(copy.placement("machine", &physical).unwrap(), "alpha");
     assert!(!restored.root.join("control.sock").exists());
+}
+
+#[test]
+fn legacy_key_replacement_invalidates_a_concurrent_transfer_policy_read() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let user = c.user(&identity("owner")).unwrap();
+    fake.worker("alpha");
+    c.operation(user, json!({"op":"create","id":"box","node":"alpha"}))
+        .unwrap();
+    let physical = c.physical(user, "machine", "box").unwrap();
+    c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.guest_ssh_v1',json('true')) WHERE id='alpha'",[]).unwrap();
+    c.db.execute(
+        "UPDATE resources SET ssh_policy='\"disabled\"' WHERE physical=?1",
+        [&physical],
+    )
+    .unwrap();
+    c.operation(
+        user,
+        json!({"op":"ssh-keys","id":"box","keys":[],"operation_key":"revoke"}),
+    )
+    .unwrap();
+    let (policy, generation): (Option<String>, i64) =
+        c.db.query_row(
+            "SELECT ssh_policy,ssh_policy_generation FROM resources WHERE physical=?1",
+            [&physical],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(policy.is_none());
+    assert_eq!(generation, 1);
+    assert!(
+        c.set_transfer_ssh_policy(user, "box", 0, &crate::transfers::PublicSshPolicy::Disabled)
+            .is_err()
+    );
+    c.set_transfer_ssh_policy(
+        user,
+        "box",
+        generation,
+        &crate::transfers::PublicSshPolicy::Disabled,
+    )
+    .unwrap();
+}
+
+#[test]
+fn named_fork_shape_is_rechecked_before_atomic_admission() {
+    use crate::transfers::*;
+    let (fake, c, user, physical, mut input) = transfer_fixture();
+    c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'snapshot','saved','saved-id',?2,'alpha')",params![user,json!({"workspace":physical,"memory_mib":256,"vcpu_count":1,"disk_bytes":input.disk_bytes}).to_string()]).unwrap();
+    input.kind = Kind::Fork;
+    input.capture = None;
+    input.snapshot = Some("saved".into());
+    input.child = Some(Child {
+        id: "child-id".into(),
+        name: "child".into(),
+    });
+    input.memory_mib = 512;
+    assert!(
+        c.begin_transfer(user, "named-fork", &input)
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot identity or shape changed")
+    );
+    assert!(c.physical(user, "machine", "child").is_err());
+    assert_eq!(
+        c.db.query_row("SELECT COUNT(*) FROM transfer_locks", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    input.memory_mib = 256;
+    let t = c.begin_transfer(user, "named-fork", &input).unwrap();
+    drop(c);
+    let c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(
+        c.db.query_row(
+            "SELECT json_extract(response,'$.fork_snapshot') FROM operations WHERE id=?1",
+            [t.operation],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "saved-id"
+    );
+    assert_eq!(
+        c.begin_transfer(user, "named-fork", &input).unwrap().id,
+        t.id
+    );
+    input.snapshot = None;
+    assert!(c.begin_transfer(user, "named-fork", &input).is_err());
 }

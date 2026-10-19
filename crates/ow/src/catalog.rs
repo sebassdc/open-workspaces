@@ -668,6 +668,10 @@ impl Catalog {
             intent.memory_mib > 0 && intent.cpus > 0 && intent.disk_bytes <= i64::MAX as u64,
             "invalid target shape"
         );
+        ensure!(
+            intent.snapshot.is_none() || intent.kind == Kind::Fork,
+            "only fork selects a snapshot"
+        );
         let fingerprint = json!({"transfer":intent}).to_string();
         self.transfer_write(|c| {
             // Recheck current ownership/sharing even for a joined operation.
@@ -691,7 +695,11 @@ impl Catalog {
             if let Some(capture) = &intent.capture {
                 c.transfer_capture(capture, owner, &source)?;
             }
-            ensure!(intent.kind.needs_fence() || intent.capture.is_some(), "stored capture required");
+            ensure!(intent.kind.needs_fence() || intent.kind == Kind::Fork || intent.capture.is_some(), "stored capture required");
+            let fork_snapshot = if let Some(snapshot) = &intent.snapshot {
+                common::identifier(snapshot)?;
+                Some(c.db.query_row("SELECT physical FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4 AND json_extract(metadata,'$.memory_mib')=?5 AND json_extract(metadata,'$.vcpu_count')=?6 AND json_extract(metadata,'$.disk_bytes')=?7",params![user,snapshot,source_node,source,intent.memory_mib,intent.cpus,intent.disk_bytes as i64],|r|r.get::<_,String>(0)).context("snapshot identity or shape changed during admission")?)
+            } else { None };
             // Global high-watermark survives aborts, deleted children and controller restarts.
             c.db.execute("INSERT INTO settings(key,value) VALUES('transfer_epoch','0') ON CONFLICT(key) DO NOTHING",[])?;
             let high = c.db.query_row("SELECT value FROM settings WHERE key='transfer_epoch'",[],|r|r.get::<_,String>(0))?.parse::<i64>().context("invalid epoch high-watermark")?;
@@ -704,12 +712,17 @@ impl Catalog {
                 // INSERT, never reserve/reuse: an existing ID or logical name is a conflict.
                 c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'machine',?2,?3,'{\"state\":\"pending\"}','')",params![user,child.name,child.id])?;
                 c.db.execute("UPDATE resources SET ssh_policy='\"disabled\"' WHERE kind='machine' AND physical=?1",[&child.id])?;
+                limits::admit(&c.root,&c.db,&child.id,"fork",&json!({}),&json!({"memory_mib":intent.memory_mib,"vcpu_count":intent.cpus,"disk_bytes":intent.disk_bytes}))?;
                 child.id.clone()
             } else { source.clone() };
             c.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,?2,?3,'pending',?4,?5,?6)",params![user,intent.kind.operation(),intent.child.as_ref().map(|ch|ch.name.as_str()).unwrap_or(&intent.machine),intent.target.as_deref().unwrap_or(""),key,fingerprint])?;
             let operation = c.db.last_insert_rowid();
             c.db.execute("INSERT INTO transfers(operation,kind,source,machine,source_node,source_epoch,source_capture,source_policy_generation,target,epoch,capture,step) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'preparing')",params![operation,intent.kind.operation(),source,machine,source_node,source_epoch,source_capture,policy_generation,intent.target,epoch,intent.capture])?;
             let id = c.db.last_insert_rowid();
+            if intent.kind == Kind::Fork {
+                let snapshot = fork_snapshot.unwrap_or_else(|| format!("transfer-{id}-fork"));
+                c.db.execute("UPDATE operations SET response=json_object('fork_snapshot',?1,'requested_snapshot',?2) WHERE id=?3",params![snapshot,intent.snapshot,operation])?;
+            }
             for affected in if machine == source { vec![&source] } else { vec![&source,&machine] } {
                 c.db.execute("INSERT INTO transfer_locks(machine,transfer) VALUES(?1,?2)",params![affected,id])?;
             }
@@ -728,7 +741,7 @@ impl Catalog {
         let c = self;
         // Catalog capacity only; T3 additionally validates worker capability and disk headroom.
         let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("target offline, draining or without a registered budget")?;
-        let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1 AND (?2=0 OR physical<>?3)",params![target,t.kind==crate::transfers::Kind::Move && target==t.source_node,t.source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         let (extra_mib, extra_cpus, extra_slots) = c.extra_usage(target)?;
         ensure!(
             used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64
@@ -821,7 +834,7 @@ impl Catalog {
             let t = c.transfer(id)?;
             ensure!(t.epoch == epoch && t.step == expected, "stale transfer result");
             ensure!(expected.permits(t.kind,next), "invalid transfer transition");
-            if next == Step::Exported {
+            if next == Step::Exported && t.kind != Kind::Fork {
                 ensure!(proof.source_fenced,"positive source fence required; timeout is not a fence");
                 c.db.execute("UPDATE resources SET placement_managed=1 WHERE kind='machine' AND physical=?1",[&t.source])?;
             }
@@ -871,6 +884,7 @@ impl Catalog {
         self.transfer_write(|c| {
             let t = c.transfer(id)?;
             ensure!(t.epoch == epoch && t.step == Step::Prepared,"stale transfer commit");
+            ensure!(c.db.query_row("SELECT json_extract(response,'$.intervention') IS NULL FROM operations WHERE id=?1",[t.operation],|r|r.get::<_,bool>(0))?,"explicit recovery is pending");
             let unchanged:bool = c.db.query_row("SELECT EXISTS(SELECT 1 FROM resources r JOIN transfers t ON t.source=r.physical WHERE r.kind='machine' AND t.id=?1 AND r.node=t.source_node AND r.placement_epoch=t.source_epoch AND r.current_capture IS t.source_capture AND r.ssh_policy_generation=t.source_policy_generation)",[id],|r|r.get(0))?;
             ensure!(unchanged,"source authority or SSH policy changed");
             let (actor,address):(i64,String) = c.db.query_row("SELECT owner,json_extract(request,'$.transfer.machine') FROM operations WHERE id=?1",[t.operation],|r|Ok((r.get(0)?,r.get(1)?)))?;
@@ -889,6 +903,28 @@ impl Catalog {
         })
     }
 
+    pub(crate) fn retarget_transfer(
+        &self,
+        id: i64,
+        epoch: i64,
+        target: &str,
+        input: &crate::transfers::Intent,
+        action: &Value,
+    ) -> Result<()> {
+        self.transfer_write(|c| {
+            let t=c.transfer(id)?;
+            ensure!(t.epoch==epoch && t.step.before_commit(),"stale recovery result");
+            let high:i64=c.db.query_row("SELECT CAST(value AS INTEGER) FROM settings WHERE key='transfer_epoch'",[],|r|r.get(0))?;
+            let next=high.checked_add(1).context("epoch exhausted")?;
+            c.db.execute("UPDATE settings SET value=?1 WHERE key='transfer_epoch'",[next.to_string()])?;
+            c.db.execute("DELETE FROM transfer_reservations WHERE transfer=?1 AND epoch=?2",params![id,epoch])?;
+            c.db.execute("UPDATE transfers SET target=?1,epoch=?2,step=?4 WHERE id=?3",params![target,next,id,if t.kind==crate::transfers::Kind::Fork && t.step==crate::transfers::Step::Preparing {"preparing"}else{"exported"}])?;
+            c.reserve_transfer(&c.transfer(id)?,target,input)?;
+            c.db.execute("UPDATE operations SET node=?1,response=json_remove(json_set(COALESCE(response,'{}'),'$.last_intervention',json(?2)),'$.intervention') WHERE id=?3",params![target,action.to_string(),t.operation])?;
+            Ok(())
+        })
+    }
+
     // Legacy observations have no placement epoch and cannot mutate managed authority.
     fn legacy_machine(&self, physical: &str) -> Result<bool> {
         Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND physical=?1 AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1))",[physical],|r|r.get(0))?)
@@ -901,7 +937,7 @@ impl Catalog {
         Ok(())
     }
     pub(crate) fn managed_placement(&self, physical: &str) -> Result<Option<common::Placement>> {
-        let placement: Option<(i64,String,i64)> = self.db.query_row("SELECT r.placement_epoch,r.node,t.id FROM resources r JOIN transfers t ON t.machine=r.physical AND t.epoch=r.placement_epoch AND t.target=r.node AND t.step='succeeded' AND t.kind IN ('restore','wake') WHERE r.kind='machine' AND r.physical=?1 AND r.placement_managed=1 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=r.physical)",[physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let placement: Option<(i64,String,i64)> = self.db.query_row("SELECT r.placement_epoch,r.node,t.id FROM resources r JOIN transfers t ON t.machine=r.physical AND t.epoch=r.placement_epoch AND t.target=r.node AND t.step='succeeded' AND t.kind IN ('restore','wake','move','fork') WHERE r.kind='machine' AND r.physical=?1 AND r.placement_managed=1 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=r.physical)",[physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         Ok(placement.map(|(epoch, node, id)| common::Placement {
             epoch: epoch as u64,
             node,
@@ -953,7 +989,7 @@ impl Catalog {
             .as_deref()
             .and_then(|s| serde_json::from_str::<Value>(s).ok())
         {
-            for field in ["progress", "queued"] {
+            for field in ["progress", "queued", "cleanup_pending"] {
                 if let Some(v) = value.get(field) {
                     info[field] = v.clone();
                 }
@@ -1792,7 +1828,14 @@ impl Catalog {
                 ensure!(
                     matches!(
                         op.as_str(),
-                        "start" | "stop" | "exec" | "ssh-info" | "put" | "get" | "hibernate"
+                        "start"
+                            | "stop"
+                            | "exec"
+                            | "ssh-info"
+                            | "ssh-keys"
+                            | "put"
+                            | "get"
+                            | "hibernate"
                     ),
                     "managed mutation requires lifecycle coordination"
                 );
@@ -2158,6 +2201,23 @@ impl Catalog {
                 eprintln!("operation {operation} reconciliation: {error:#}");
             }
             return Err(self.outcome_error(user, operation));
+        }
+        if op == "ssh-keys" && request.get("placement").is_some() {
+            let current = wire::request(
+                &root,
+                json!({"op":"ssh-policy","id":physical,"placement":request["placement"]}),
+            )?;
+            let policy: crate::transfers::PublicSshPolicy = serde_json::from_value(current)?;
+            let generation: i64 = self.db.query_row(
+                "SELECT ssh_policy_generation FROM resources WHERE kind='machine' AND physical=?1",
+                [&physical],
+                |r| r.get(0),
+            )?;
+            self.set_transfer_ssh_policy(user, &name, generation, &policy)?;
+        }
+        if op == "ssh-keys" && request.get("placement").is_none() {
+            // A concurrent legacy key change invalidates a transfer admission's policy read.
+            self.db.execute("UPDATE resources SET ssh_policy=NULL,ssh_policy_generation=ssh_policy_generation+1 WHERE kind='machine' AND physical=?1",[&physical])?;
         }
         let mut value = envelope["result"].clone();
         let correlated = if matches!(

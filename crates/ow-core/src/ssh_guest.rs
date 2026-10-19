@@ -48,6 +48,41 @@ fn read_policy(path: &Path) -> Result<Policy> {
     );
     Ok(p)
 }
+/// Called under the worker runtime lock on an exact prepared incarnation.
+pub fn install_public(root: &Path, id: &str, value: &Value) -> Result<()> {
+    let target = path(root, id);
+    if value == "disabled" {
+        ensure!(!target.exists(), "unexpected target SSH policy");
+        return Ok(());
+    }
+    ensure!(
+        value
+            .as_object()
+            .is_some_and(|v| v.len() == 1 && v.contains_key("enrolled")),
+        "invalid public SSH policy"
+    );
+    let mut incoming: Policy = serde_json::from_value(value["enrolled"].clone())?;
+    crate::common::identifier(&incoming.identity)?;
+    crate::common::identifier(&incoming.generation)?;
+    ensure!(
+        key(&incoming.host_key)? == incoming.host_key
+            && validate_keys(&json!(incoming.keys))? == incoming.keys,
+        "noncanonical SSH policy"
+    );
+    if target.exists() {
+        let previous = load(root, id)?;
+        ensure!(
+            previous.identity == incoming.identity
+                && previous.generation == incoming.generation
+                && previous.host_key == incoming.host_key
+                && previous.keys == incoming.keys,
+            "SSH policy generation changed; refusing stale install"
+        );
+    }
+    incoming.ready = false;
+    runtime::atomic_json(&target, &json!(incoming))
+}
+
 pub fn key(input: &str) -> Result<String> {
     ensure!(
         input.len() <= 512 && !input.contains(['\r', '\n']),
@@ -257,6 +292,31 @@ mod tests {
         assert!(validate_keys(&json!(&keys[..16])).is_ok());
         assert!(validate_keys(&json!(keys)).is_err());
     }
+    #[test]
+    fn prepared_policy_retry_cannot_overwrite_a_revocation_generation() {
+        let root = std::env::temp_dir().join(format!("ow-policy-{}", vm::nonce().unwrap()));
+        fs::create_dir_all(root.join("machines/box")).unwrap();
+        let mut bytes = Vec::from(&11u32.to_be_bytes()[..]);
+        bytes.extend(b"ssh-ed25519");
+        bytes.extend(32u32.to_be_bytes());
+        bytes.extend([7; 32]);
+        let mut p = Policy {
+            identity: "identity".into(),
+            generation: "first".into(),
+            host_key: format!("ssh-ed25519 {}", STANDARD.encode(bytes)),
+            keys: vec![],
+            ready: false,
+        };
+        let original = json!({"enrolled":p});
+        install_public(&root, "box", &original).unwrap();
+        install_public(&root, "box", &original).unwrap();
+        p.generation = "revoked".into();
+        runtime::atomic_json(&path(&root, "box"), &p).unwrap();
+        assert!(install_public(&root, "box", &original).is_err());
+        assert_eq!(load(&root, "box").unwrap().generation, "revoked");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn policy_replacement_fences_both_byte_directions_and_cleans_up() {
         use std::net::TcpListener;

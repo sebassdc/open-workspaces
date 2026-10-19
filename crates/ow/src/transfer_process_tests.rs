@@ -58,6 +58,14 @@ fn subprocess_entry() {
             )
             .unwrap();
         }
+        "transport" => nodes::controller(
+            &root,
+            origin.strip_prefix("http://").unwrap().parse().unwrap(),
+            None,
+            None,
+            true,
+        )
+        .unwrap(),
         "agent" => nodes::agent(
             &root,
             &origin,
@@ -84,6 +92,11 @@ fn worker(root: &Path) -> Result<()> {
         let mut socket = socket?;
         let request = wire::line(&mut socket)?;
         let result = worker_request(root, &request);
+        let drop_reply = root.join("drop-ssh-policy-reply");
+        if request["op"] == "ssh-policy" && drop_reply.exists() {
+            fs::remove_file(drop_reply)?;
+            continue;
+        }
         let _ = wire::send(&mut socket, &wire::response(result));
     }
     Ok(())
@@ -92,7 +105,7 @@ fn worker_request(root: &Path, request: &Value) -> Result<Value> {
     let op = request["op"].as_str().context("op")?;
     let path = root.join("fixture-state.json");
     let mut state: Value = serde_json::from_slice(&fs::read(&path)?)?;
-    let status = || json!({"worker_pid":std::process::id(),"worker_protocol":2,"placement_fencing_v1":true,"max_memory_mib":2048,"max_running":4,"max_vcpus":4,"max_guest_memory_mib":2048,"max_guest_vcpus":4,"available_disk_bytes":1073741824,"disk_observed_unix_s":now(),"reserved_disk_bytes":0,"max_disk_gib":128,"min_free_gib":0,"workspace_count":1,"max_workspaces":8,"guest_ssh_v1":true,"disk_resize_v1":true,"compat":{"runtime":common::RUNTIME,"cpu":"fixture","kernel_sha256":store::sha256(b"kernel")}});
+    let status = || json!({"worker_pid":std::process::id(),"worker_protocol":3,"placement_fencing_v1":true,"move_fork_v1":true,"max_memory_mib":2048,"max_running":4,"max_vcpus":4,"max_guest_memory_mib":2048,"max_guest_vcpus":4,"available_disk_bytes":1073741824,"disk_observed_unix_s":now(),"reserved_disk_bytes":0,"max_disk_gib":128,"min_free_gib":0,"workspace_count":1,"max_workspaces":8,"guest_ssh_v1":true,"disk_resize_v1":true,"compat":{"runtime":common::RUNTIME,"cpu":"fixture","kernel_sha256":store::sha256(b"kernel")}});
     match op {
         "status" => return Ok(status()),
         "inspect" => {
@@ -109,6 +122,20 @@ fn worker_request(root: &Path, request: &Value) -> Result<Value> {
                 json!([state["workspace"]])
             });
         }
+        "ssh-policy" => {
+            ensure!(
+                state["workspace"]["id"] == request["id"]
+                    && state["workspace"]["placement"] == request["placement"]
+                    && state["workspace"]["lifecycle"]["phase"] == "active",
+                "stale policy read"
+            );
+            state["counts"][op] = json!(state["counts"][op].as_u64().unwrap_or(0) + 1);
+            ow_core::runtime::atomic_json(&path, &state)?;
+            return Ok(state
+                .get("ssh_policy")
+                .cloned()
+                .unwrap_or(json!("disabled")));
+        }
         "snapshots" => return Ok(json!([])),
         "stats" => return Ok(json!({"running":{}})),
         "placement-check" => {
@@ -119,6 +146,19 @@ fn worker_request(root: &Path, request: &Value) -> Result<Value> {
             return Ok(json!({}));
         }
         _ => {}
+    }
+    if op == "policy-prepare" {
+        ensure!(
+            state["workspace"]["placement"] == request["placement"]
+                && state["workspace"]["lifecycle"]["phase"] == "prepared",
+            "policy requires prepared copy"
+        );
+        ow_core::ssh_guest::install_public(
+            root,
+            request["id"].as_str().unwrap(),
+            &request["policy"],
+        )?;
+        return Ok(json!({"installed":true}));
     }
     let key = request["operation_key"]
         .as_str()
@@ -137,13 +177,15 @@ fn worker_request(root: &Path, request: &Value) -> Result<Value> {
             state["workspace"]["placement"] = json!(placement);
             state["workspace"]["lifecycle"] = json!({"phase":"active","intent":null});
         }
-        "export" => {
+        "export" | "snapshot" => {
             ensure!(
                 state["workspace"]["placement"] == json!(placement),
                 "wrong export placement"
             );
             if state["park_fixture"] == true {
-                let snapshot = request["capture"].as_str().context("capture")?;
+                let snapshot = request[if op == "snapshot" { "name" } else { "capture" }]
+                    .as_str()
+                    .context("capture")?;
                 let dir = root.join("snapshots").join(snapshot);
                 fs::create_dir_all(&dir)?;
                 let mut files = serde_json::Map::new();
@@ -166,10 +208,17 @@ fn worker_request(root: &Path, request: &Value) -> Result<Value> {
                     &json!({"name":snapshot,"workspace":"physical","managed":true,"memory_mib":256,"vcpu_count":1,"runtime":common::RUNTIME,"cpu":"fixture","kernel_sha256":store::sha256(b"kernel"),"files":files}),
                 )?;
             }
+            if op == "snapshot" {
+                state["keys"][key] = request.clone();
+                state["counts"][op] = json!(state["counts"][op].as_u64().unwrap_or(0) + 1);
+                ow_core::runtime::atomic_json(&path, &state)?;
+                return Ok(json!({"name":request["name"],"workspace":request["id"]}));
+            }
+            state["workspace"]["vmm_running"] = json!(false);
             state["workspace"]["state"] = json!("exported");
             state["workspace"]["lifecycle"] = json!({"phase":"exported","intent":{"transfer":request["transfer"],"capture":request["capture"]}});
         }
-        "import-prepare" => {
+        "import-prepare" | "fork-prepare" => {
             ensure!(
                 state["workspace"].is_null(),
                 "existing disk cannot be replaced"
@@ -181,11 +230,38 @@ fn worker_request(root: &Path, request: &Value) -> Result<Value> {
                     == request["manifest_sha256"].as_str().unwrap(),
                 "native manifest mismatch"
             );
-            let machine = root.join("machines/physical");
+            let machine = root.join("machines").join(request["id"].as_str().unwrap());
             fs::create_dir_all(&machine)?;
             fs::copy(capture.join("disk.ext4"), machine.join("disk.ext4"))?;
             fs::File::open(machine.join("disk.ext4"))?.sync_all()?;
-            state["workspace"] = json!({"id":"physical","state":"prepared","memory_mib":256,"vcpu_count":1,"disk_bytes":4,"vmm_running":false,"placement":placement,"lifecycle":{"phase":"prepared","intent":null,"import":{"snapshot":snapshot,"manifest_sha256":request["manifest_sha256"],"cold":request["cold"]}}});
+            state["workspace"] = json!({"id":request["id"],"state":"prepared","memory_mib":256,"vcpu_count":1,"disk_bytes":4,"vmm_running":false,"placement":placement,"lifecycle":{"phase":"prepared","intent":null,"import":{"snapshot":snapshot,"manifest_sha256":request["manifest_sha256"],"cold":request["cold"]}}});
+            if op == "fork-prepare" {
+                state["workspace"]["lifecycle"]["import"]["fork_source"] =
+                    request["fork_source"].clone();
+            }
+        }
+        "ssh-keys" => {
+            ensure!(
+                state["workspace"]["id"] == request["id"]
+                    && state["workspace"]["placement"] == json!(placement)
+                    && state["workspace"]["lifecycle"]["phase"] == "active",
+                "stale key change"
+            );
+            let keys = ow_core::ssh_guest::validate_keys(&request["keys"])?;
+            let host_key = state["ssh_policy"]["enrolled"]["host_key"]
+                .as_str()
+                .or_else(|| keys.first().map(String::as_str))
+                .context("enrollment needs a key")?
+                .to_owned();
+            state["ssh_policy"] = json!({"enrolled":{"identity":"fixture-ssh","generation":format!("keys-{}",state["counts"][op].as_u64().unwrap_or(0)+1),"host_key":host_key,"keys":keys,"ready":true}});
+        }
+        "export-cleanup" => {
+            ensure!(
+                state["workspace"]["placement"] == json!(placement)
+                    && state["workspace"]["lifecycle"]["phase"] == "exported",
+                "cleanup requires exact export"
+            );
+            state["workspace"]["lifecycle"]["phase"] = json!("cleaned");
         }
         "activate" => {
             ensure!(
@@ -272,8 +348,13 @@ impl Processes {
             }
             assert!(
                 start.elapsed() < Duration::from_secs(40),
-                "timeout at {label}; logs: {}",
-                self.root.display()
+                "timeout at {label}; logs: {}; controller: {}; operations: {:?}",
+                self.root.display(),
+                fs::read_to_string(root.join("controller.log")).unwrap_or_default(),
+                nodes::db(root).and_then(|db| Ok(db
+                    .prepare("SELECT response FROM operations")?
+                    .query_map([], |r| r.get::<_, Option<String>>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?))
             );
             if let Some(child) = &mut self.controller {
                 assert!(
@@ -449,6 +530,7 @@ fn fixture() -> Processes {
             target: Some("target".into()),
             capture: Some("capture".into()),
             child: None,
+            snapshot: None,
             memory_mib: 256,
             cpus: 1,
             disk_bytes: 4,
@@ -612,3 +694,7 @@ fn sigkill_agent_before_and_after_real_jobs_and_journal_effects_recovers() {
 
 #[path = "parking_process_tests.rs"]
 mod parking;
+
+#[cfg(test)]
+#[path = "movement_process_tests.rs"]
+mod movement_tests;

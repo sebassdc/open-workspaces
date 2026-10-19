@@ -1,6 +1,6 @@
 # Placement catalog and transfer lifecycle
 
-The catalog persists transfer intent and executes explicit managed restore, park and wake requests.
+The catalog persists transfer intent and executes explicit managed restore, park, wake, move and fork requests.
 Existing boxes remain fixed-placement until an owner requests a transfer. Installation
 alone does not move, park, start, stop or upgrade a worker. See [ADR 0007](adr/0007-catalog-placement-authority.md).
 
@@ -28,8 +28,7 @@ Before managing a non-fork placement, reconcile this policy explicitly.
 
 Move and restore follow preparing → exported → importing → prepared → commit.
 Park follows preparing → exported → prepared → commit → succeeded, with no target
-reservation. Fork and hibernated wake follow preparing → importing → prepared →
-commit. Non-park committed transfers confirm started before succeeded. Abort/fail
+reservation. Fork follows preparing → exported (immutable snapshot published) → importing → prepared → commit; its source keeps running. Hibernated wake follows preparing → importing → prepared → commit. Non-park committed transfers confirm started before succeeded. Abort/fail
 is allowed only before commit. Before import begins it can release unused target
 capacity; afterward positive target exclusion is mandatory, including after an
 uncertain reply. Exported sources remain managed and fenced after abort until an
@@ -49,8 +48,7 @@ in the durable intent and enforcement by both the restore runner and worker.
 ## Permissions
 
 The public restore API accepts a catalog artifact ID, target node, owner-scoped
-operation key and optional explicit cold consent. Park and wake use the existing API/CLI surfaces described below; move/fork remain
-catalog contracts without a public executor.
+operation key and optional explicit cold consent. Park, wake, move and targeted fork use the existing API/CLI surfaces.
 
 | Action | Owner | Shared admin | Shared use | Node / guest |
 | --- | --- | --- | --- | --- |
@@ -256,8 +254,8 @@ that decision's commit. Ordinary connections cannot supply this consent.
 This is class 1 controller/agent orchestration atop already installed T2 worker
 primitives. Schema/reader floor remain 5 and no new migration number is claimed.
 The optional `explicit_start` intent field is omitted when false, preserving prior
-restore fingerprints. Older controllers do not execute park/wake or route completed
-wake placements; rollback fails closed rather than ignoring placement authority.
+restore fingerprints. Older controllers do not execute park/wake/move/fork or route their completed
+placements; rollback fails closed rather than ignoring placement authority.
 New private publication/progress jobs require the advertised agent support; worker
 protocol, runtime, installed worker pins and release versions are unchanged.
 No timer, automatic parking/drain policy or workstation movement is installed.
@@ -285,3 +283,90 @@ by that verified worker export, rather than inventing a name from the new park I
 binding is persisted in the artifact row. A retry can repair an unpublished incorrect
 binding using a fresh attempt token while retaining the old attempt lease. Published
 artifacts cannot be rebound to a different capture.
+
+## Explicit move and cross-runner fork
+
+```sh
+ow --server URL move BOX --node RUNNER --operation-key move-1
+ow --server URL fork BOX CHILD --node RUNNER --operation-key fork-1
+ow --server URL status
+```
+
+Move is owner-only and preserves physical ID, logical name, owner, sharing grants,
+public SSH key policy and pinned guest host key. A running move captures paired RAM
+and disk and resumes processes only on a compatible runtime/CPU/host-kernel/guest-kernel
+tuple. Moving a stopped or hibernated copy preserves that state; move is not an
+implicit start. `--accept-cold` is an explicit disk-only execution decision and keeps
+the stored RAM artifact recoverable. No live resize is included.
+
+A named `--snapshot` uses the saved snapshot's RAM, CPU and disk shape, including
+a snapshot taken before the parent was resized. Snapshot selection and its target
+reservation commit with admission before any worker effect.
+
+Targeted fork snapshots the source, publishes and verifies the artifact, prepares a
+new unstarted child, commits its reserved ID/name and requester ownership, then
+activates it. Existing admin/use sharing roles retain fork permission. Ordinary
+fork defaults to the current runner after a managed move. Guest machine ID, network
+identity and SSH host identity refresh on the child's first activation. It inherits
+no enrolled public keys or sharing grants; enroll it separately with `ssh-authorize`.
+Guest files and other credentials are copied, as with existing forks.
+
+The source must acknowledge a durable execution fence before a move can import or
+commit elsewhere. Offline before acknowledgment waits. Offline after acknowledgment
+but before publication also waits; silence never authorizes source-loss recovery.
+Once the verified artifact is catalog-stored, the target may continue while the
+source is offline. Cleanup removes only that exported machine directory, preserves
+snapshots and its durable fence, and retries when the source returns. Status exposes
+`cleanup_pending`. Contradictory running reports block reconciliation, including a
+lost activation reply; a timeout never selects another target after commit.
+
+Before commit, an owner can explicitly recover a move using the transfer ID and
+**current epoch** shown by status:
+
+```sh
+ow --server URL move BOX --transfer 17 --epoch 23 --node OTHER
+ow --server URL move BOX --transfer 17 --epoch 23 --abort
+```
+
+Retargeting first persists worker exclusion of the old unstarted target, then
+allocates a fresh epoch/reservation. A delayed prepare or activation at the excluded
+epoch is rejected after worker restart. Abort waits for a sealed, stored source
+capture, excludes the target and performs a fresh-epoch return to the source before
+restoring access. It does not clear an export fence or revive old authority. The
+fork requester can use the same recovery command with its source address; abort
+retires only its reserved child after exclusion. The source owner may also abort a
+revoked requester's pre-commit fork without restoring that grant. Once a fork has
+committed, forward recovery checks the new child's ownership; later source-sharing
+revocation does not undo the committed independent child or restore source access. Source loss requires a separate
+positively attested recovery procedure; this command never infers that permission.
+After commit only forward recovery on the committed target is allowed. A pending
+explicit recovery decision blocks a racing catalog commit.
+
+Delete, resize, snapshot and SSH-key mutations are blocked while transfer locks are
+held. Sharing revocation stays available and is rechecked before effects/commit and
+access. Prepared SSH-policy installation runs under the worker lock and refuses a
+different persisted policy generation. Subsequent managed key replacement updates
+the catalog generation before another transfer can be admitted. Legacy key changes
+also advance that generation and invalidate cached policy, so an admission read
+cannot survive a concurrent revocation. Export replay rechecks the source policy
+before reusing an acknowledged fence. Managed delete,
+resize and ordinary restore remain unsupported; cold resize is a later slice.
+Managed fork uses its own locked snapshot path.
+
+This slice is **class 2**: worker interface 3 adds fork preparation, durable target
+exclusion, serialized prepared policy installation and running-source registration.
+Agents accept interfaces 1–3, but movement requires `move_fork_v1` from the actual
+worker plus the configured artifact jobs. New managed child/exclusion registries
+use worker state schema 3; older workers refuse them. Catalog schema/minimum reader
+remain 5; no migration number is consumed. Use the existing per-unit quiesce, warm
+compatibility and explicit cold-consent upgrade path on dedicated eligible runners.
+Installing this release never moves a box, changes a worker pin or deploys capacity.
+
+Fault tests cover before/after replies and catalog reopen at every step. The subprocess
+fixture SIGKILLs real controllers at eight move and eight fork boundaries; it models
+worker execution and uses a local object store. The opt-in `move_fork_real_vm_counter_ssh_grants_and_independent_writes`
+fixture requires explicit fresh roots, a built binary and KVM/reflink-capable assets.
+It checks real process/boot continuity, strict pinned-host-key OpenSSH, grants, child
+ownership, separate enrollment and independent disk writes on two disposable workers.
+Its execution record, rather than its presence or a successful API call, establishes
+hardware acceptance. Live cloud-store IAM/policy and fleet rollout remain separate.

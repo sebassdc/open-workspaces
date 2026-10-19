@@ -1,7 +1,7 @@
 //! Explicit parking and connection admission; no parking policy or timer.
 use super::*;
 
-fn shape(c: &Catalog, physical: &str, kind: Kind, address: &str) -> Result<Intent> {
+pub(super) fn shape(c: &Catalog, physical: &str, kind: Kind, address: &str) -> Result<Intent> {
     let metadata: String = c.db.query_row(
         "SELECT metadata FROM resources WHERE kind='machine' AND physical=?1",
         [physical],
@@ -14,6 +14,7 @@ fn shape(c: &Catalog, physical: &str, kind: Kind, address: &str) -> Result<Inten
         target: None,
         capture: None,
         child: None,
+        snapshot: None,
         memory_mib: meta["memory_mib"]
             .as_u64()
             .context("unknown memory")?
@@ -24,7 +25,7 @@ fn shape(c: &Catalog, physical: &str, kind: Kind, address: &str) -> Result<Inten
             .try_into()?,
         disk_bytes: meta["disk_bytes"].as_u64().context("unknown disk size")?,
         accept_cold: false,
-        explicit_start: false,
+        explicit_start: kind == Kind::Move && meta["state"] == "running",
     })
 }
 pub(super) fn admission(c: &Catalog, user: i64, request: &Value, kind: Kind) -> Result<Transfer> {
@@ -90,7 +91,7 @@ fn join_wake(c: &Catalog, user: i64, request: &Value, t: Transfer) -> Result<Tra
     }
 }
 pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> {
-    let (user, physical, node, epoch, root) = {
+    let (user, physical, node, epoch, generation, root) = {
         let mut c = shared.lock().unwrap();
         let user = c.user(identity)?;
         let address = request["id"].as_str().context("machine required")?;
@@ -103,10 +104,10 @@ pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Resu
             )?,
             "park requires the owner"
         );
-        let (node, epoch): (String, i64) = c.db.query_row(
-            "SELECT node,placement_epoch FROM resources WHERE kind='machine' AND physical=?1",
+        let (node, epoch, generation): (String, i64, i64) = c.db.query_row(
+            "SELECT node,placement_epoch,ssh_policy_generation FROM resources WHERE kind='machine' AND physical=?1",
             [&physical],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         // Retry terminal history even though its placement is now empty.
         if c.db.query_row(
@@ -120,7 +121,7 @@ pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Resu
             launch(shared, t.id);
             return Ok(info);
         }
-        (user, physical, node, epoch, c.root.clone())
+        (user, physical, node, epoch, generation, c.root.clone())
     };
     {
         let c = shared.lock().unwrap();
@@ -142,7 +143,7 @@ pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Resu
         json!({"op":"restore-policy","id":physical}),
     )?)?;
     let c = shared.lock().unwrap();
-    ensure!(c.db.query_row("SELECT node=?2 AND placement_epoch=?3 FROM resources WHERE kind='machine' AND physical=?1",params![physical,node,epoch],|r|r.get::<_,bool>(0))?,"source authority changed");
+    ensure!(c.db.query_row("SELECT node=?2 AND placement_epoch=?3 AND ssh_policy_generation=?4 FROM resources WHERE kind='machine' AND physical=?1",params![physical,node,epoch,generation],|r|r.get::<_,bool>(0))?,"source authority or SSH policy changed");
     let stored: Option<String> = c.db.query_row(
         "SELECT ssh_policy FROM resources WHERE kind='machine' AND physical=?1",
         [&physical],
@@ -154,7 +155,7 @@ pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Resu
             "source public policy differs from catalog"
         );
     } else {
-        c.set_transfer_ssh_policy(user, request["id"].as_str().unwrap(), 0, &policy)?;
+        c.set_transfer_ssh_policy(user, request["id"].as_str().unwrap(), generation, &policy)?;
     }
     let t = admission(&c, user, request, Kind::Park)?;
     let info = c.operation_info(user, t.operation)?;
@@ -457,118 +458,18 @@ pub(super) fn tick(
     match t.step {
         Step::Preparing => export_source(shared, t, &input, &policy, &source_authority, call),
         Step::Exported => {
-            let seen = call(&t.source_node, json!({"op":"inspect","id":t.source}))?;
-            source_fence(&shared.lock().unwrap(), t, &seen, &source_authority)?;
-            let snapshot = seen["lifecycle"]["intent"]["capture"]
-                .as_str()
-                .context("fenced capture missing")?
-                .to_owned();
-            common::identifier(&snapshot)?;
-            let (a, expires) = {
-                let c = shared.lock().unwrap();
-                let artifact = format!("park-{}", t.id);
-                let old:Option<(String,String,i64,String,String)>=c.db.query_row("SELECT a.attempt,a.store_url,l.expires,a.local_name,a.state FROM artifacts a JOIN leases l ON l.artifact=a.id AND l.token=a.attempt WHERE a.id=?1",[&artifact],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-                let (attempt, url, expires) = if let Some((
-                    attempt,
-                    url,
-                    expires,
-                    previous,
-                    state,
-                )) = old
-                {
-                    if previous == snapshot {
-                        (attempt, url, expires)
-                    } else {
-                        ensure!(
-                            state == "uploading",
-                            "published capture identity differs from source fence"
-                        );
-                        let token = store::token()?;
-                        let tx = rusqlite::Transaction::new_unchecked(
-                            &c.db,
-                            rusqlite::TransactionBehavior::Immediate,
-                        )?;
-                        tx.execute("UPDATE artifacts SET attempt=?1,local_name=?2 WHERE id=?3 AND state='uploading'",params![token,snapshot,artifact])?;
-                        tx.execute("INSERT INTO leases(artifact,holder,purpose,token,expires) VALUES(?1,?2,'push',?3,?4)",params![artifact,name(t),token,at+7200])?;
-                        tx.commit()?;
-                        (token, url, at + 7200)
-                    }
-                } else {
-                    let url = crate::image_store::configured_url(&c.root)?;
-                    let attempt = store::token()?;
-                    let tx = rusqlite::Transaction::new_unchecked(
-                        &c.db,
-                        rusqlite::TransactionBehavior::Immediate,
-                    )?;
-                    tx.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,attempt,store_url) SELECT ?1,'capture',owner,physical,?2,'uploading',?3,?4 FROM resources WHERE kind='machine' AND physical=?5",params![artifact,snapshot,attempt,url,t.source])?;
-                    tx.execute("INSERT INTO leases(artifact,holder,purpose,token,expires) VALUES(?1,?2,'push',?3,?4)",params![artifact,name(t),attempt,at+7200])?;
-                    tx.execute(
-                        "UPDATE transfers SET capture=?1 WHERE id=?2",
-                        params![artifact, t.id],
-                    )?;
-                    tx.commit()?;
-                    (attempt, url, at + 7200)
-                };
-                (
-                    Artifact {
-                        id: artifact,
-                        machine: t.source.clone(),
-                        store_url: url,
-                        reference: Reference {
-                            attempt,
-                            digest: String::new(),
-                        },
-                        snapshot,
-                        memory_mib: input.memory_mib,
-                        cpus: input.cpus,
-                        disk_bytes: input.disk_bytes,
-                    },
-                    expires,
-                )
-            };
-            // Probe a completed publication before retrying; an uncertain live attempt is never duplicated.
-            let mut request = json!({"op":"capture-published","artifact":a});
-            let mut result = call(&t.source_node, request.clone())?;
-            if result["present"] != true {
-                if expires <= at {
-                    let c = shared.lock().unwrap();
-                    let token = store::token()?;
-                    let tx = rusqlite::Transaction::new_unchecked(
-                        &c.db,
-                        rusqlite::TransactionBehavior::Immediate,
-                    )?;
-                    ensure!(tx.execute("UPDATE artifacts SET attempt=?1 WHERE id=?2 AND attempt=?3 AND state='uploading'",params![token,a.id,a.reference.attempt])?==1,"publication attempt changed");
-                    tx.execute("INSERT INTO leases(artifact,holder,purpose,token,expires) VALUES(?1,?2,'push',?3,?4)",params![a.id,name(t),token,at+7200])?;
-                    tx.commit()?;
-                    return Ok(true);
-                }
-                request["op"] = json!("capture-push");
-                request["expires"] = json!(expires);
-                result = call(&t.source_node, request)?;
+            if !publish_capture(shared, t, &input, &source_authority, at, call)? {
+                return Ok(true);
             }
-            let reference: Reference = serde_json::from_value(result["reference"].clone())?;
-            let manifest: store::Manifest = serde_json::from_value(result["manifest"].clone())?;
-            let mut pinned = a.clone();
-            pinned.reference = reference.clone();
-            native(&manifest, &pinned)?;
-            ensure!(
-                reference.attempt == a.reference.attempt
-                    && store::sha256(&manifest.bytes()?) == reference.digest,
-                "publication reference mismatch"
-            );
             let c = shared.lock().unwrap();
-            authorized(&c, t)?;
-            let bytes: u64 = manifest.files.values().map(|f| f.size).sum();
-            c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.progress',json(?1),'$.capture_manifest',json(?2)) WHERE id=?3",params![json!({"bytes_completed":bytes,"bytes_total":bytes,"unit":"logical bytes in completed file objects"}).to_string(),serde_json::to_string(&manifest)?,t.operation])?;
-            c.db.execute("UPDATE artifacts SET state='stored',digest=?1,logical_bytes=?2,stored_at=CURRENT_TIMESTAMP WHERE id=?3 AND attempt=?4 AND state IN ('uploading','stored')",params![reference.digest,bytes as i64,a.id,reference.attempt])?;
-            c.db.execute("INSERT INTO artifact_copies(artifact,node,state,last_used) VALUES(?1,?2,'present',?3) ON CONFLICT(artifact,node) DO UPDATE SET state='present',last_used=excluded.last_used",params![a.id,t.source_node,at])?;
+            let current = c.transfer(t.id)?;
             c.advance_transfer(
                 t.id,
                 t.epoch,
                 t.step,
                 Step::Prepared,
                 &Evidence {
-                    capture: Some(a.id),
+                    capture: current.capture,
                     ..Default::default()
                 },
             )?;
@@ -615,12 +516,12 @@ pub(super) fn clean_cached_source(
             old.step == Step::Succeeded
                 && old.source == t.machine
                 && old.source_node == node
-                && matches!(old.kind, Kind::Park | Kind::Restore),
+                && matches!(old.kind, Kind::Park | Kind::Restore | Kind::Move),
             "retained copy is not a completed export"
         );
         let placement: common::Placement = serde_json::from_value(seen["placement"].clone())?;
         source_fence(&c, &old, seen, &placement)?;
-        ensure!(c.db.query_row("SELECT node='' OR placement_epoch=?2 FROM resources WHERE kind='machine' AND physical=?1",params![t.machine,t.epoch],|r|r.get::<_,bool>(0))?,"wake no longer owns the parked source");
+        ensure!(c.db.query_row("SELECT node='' OR placement_epoch=?2 FROM resources WHERE kind='machine' AND physical=?1",params![t.machine,t.epoch],|r|r.get::<_,bool>(0))? || (t.kind == Kind::Move && c.db.query_row("SELECT node=?2 AND placement_epoch=?3 FROM resources WHERE kind='machine' AND physical=?1",params![t.source,t.source_node,t.source_epoch],|r|r.get::<_,bool>(0))?),"transfer no longer owns the source");
         json!({"op":"export-cleanup","id":t.machine,"placement":placement,"transfer":export,"capture":seen["lifecycle"]["intent"]["capture"],"operation_key":format!("{}-cleanup-{}",name(t),id)})
     };
     let cleaned = call(node, request)?;
@@ -632,4 +533,130 @@ pub(super) fn clean_cached_source(
         "retained source cleanup unconfirmed"
     );
     Ok(())
+}
+
+// Shared immutable publication path for park, move and fork.
+pub(super) fn publish_capture(
+    shared: &Shared,
+    t: &Transfer,
+    input: &Intent,
+    source_authority: &common::Placement,
+    at: i64,
+    call: &impl Fn(&str, Value) -> Result<Value>,
+) -> Result<bool> {
+    let snapshot = if t.kind == Kind::Fork {
+        shared.lock().unwrap().db.query_row(
+            "SELECT json_extract(response,'$.fork_snapshot') FROM operations WHERE id=?1",
+            [t.operation],
+            |r| r.get::<_, String>(0),
+        )?
+    } else {
+        let seen = call(&t.source_node, json!({"op":"inspect","id":t.source}))?;
+        source_fence(&shared.lock().unwrap(), t, &seen, source_authority)?;
+        seen["lifecycle"]["intent"]["capture"]
+            .as_str()
+            .context("fenced capture missing")?
+            .to_owned()
+    };
+    common::identifier(&snapshot)?;
+    let (a, expires) = {
+        let c = shared.lock().unwrap();
+        let artifact = format!(
+            "{}-{}",
+            if t.kind == Kind::Park {
+                "park"
+            } else {
+                "capture"
+            },
+            t.id
+        );
+        let old:Option<(String,String,i64,String,String)>=c.db.query_row("SELECT a.attempt,a.store_url,l.expires,a.local_name,a.state FROM artifacts a JOIN leases l ON l.artifact=a.id AND l.token=a.attempt WHERE a.id=?1",[&artifact],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let (attempt, url, expires) = if let Some((attempt, url, expires, previous, state)) = old {
+            if previous == snapshot {
+                (attempt, url, expires)
+            } else {
+                ensure!(
+                    state == "uploading",
+                    "published capture identity differs from source fence"
+                );
+                let token = store::token()?;
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &c.db,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                tx.execute("UPDATE artifacts SET attempt=?1,local_name=?2 WHERE id=?3 AND state='uploading'",params![token,snapshot,artifact])?;
+                tx.execute("INSERT INTO leases(artifact,holder,purpose,token,expires) VALUES(?1,?2,'push',?3,?4)",params![artifact,name(t),token,at+7200])?;
+                tx.commit()?;
+                (token, url, at + 7200)
+            }
+        } else {
+            let url = crate::image_store::configured_url(&c.root)?;
+            let attempt = store::token()?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                &c.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            tx.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,attempt,store_url) SELECT ?1,'capture',owner,physical,?2,'uploading',?3,?4 FROM resources WHERE kind='machine' AND physical=?5",params![artifact,snapshot,attempt,url,t.source])?;
+            tx.execute("INSERT INTO leases(artifact,holder,purpose,token,expires) VALUES(?1,?2,'push',?3,?4)",params![artifact,name(t),attempt,at+7200])?;
+            tx.execute(
+                "UPDATE transfers SET capture=?1 WHERE id=?2",
+                params![artifact, t.id],
+            )?;
+            tx.commit()?;
+            (attempt, url, at + 7200)
+        };
+        (
+            Artifact {
+                id: artifact,
+                machine: t.source.clone(),
+                store_url: url,
+                reference: Reference {
+                    attempt,
+                    digest: String::new(),
+                },
+                snapshot,
+                memory_mib: input.memory_mib,
+                cpus: input.cpus,
+                disk_bytes: input.disk_bytes,
+            },
+            expires,
+        )
+    };
+    // Probe a completed publication before retrying; an uncertain live attempt is never duplicated.
+    let mut request = json!({"op":"capture-published","artifact":a,"fork":t.kind == Kind::Fork});
+    let mut result = call(&t.source_node, request.clone())?;
+    if result["present"] != true {
+        if expires <= at {
+            let c = shared.lock().unwrap();
+            let token = store::token()?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                &c.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure!(tx.execute("UPDATE artifacts SET attempt=?1 WHERE id=?2 AND attempt=?3 AND state='uploading'",params![token,a.id,a.reference.attempt])?==1,"publication attempt changed");
+            tx.execute("INSERT INTO leases(artifact,holder,purpose,token,expires) VALUES(?1,?2,'push',?3,?4)",params![a.id,name(t),token,at+7200])?;
+            tx.commit()?;
+            return Ok(false);
+        }
+        request["op"] = json!("capture-push");
+        request["expires"] = json!(expires);
+        result = call(&t.source_node, request)?;
+    }
+    let reference: Reference = serde_json::from_value(result["reference"].clone())?;
+    let manifest: store::Manifest = serde_json::from_value(result["manifest"].clone())?;
+    let mut pinned = a.clone();
+    pinned.reference = reference.clone();
+    native(&manifest, &pinned)?;
+    ensure!(
+        reference.attempt == a.reference.attempt
+            && store::sha256(&manifest.bytes()?) == reference.digest,
+        "publication reference mismatch"
+    );
+    let c = shared.lock().unwrap();
+    authorized(&c, t)?;
+    let bytes: u64 = manifest.files.values().map(|f| f.size).sum();
+    c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.progress',json(?1),'$.capture_manifest',json(?2)) WHERE id=?3",params![json!({"bytes_completed":bytes,"bytes_total":bytes,"unit":"logical bytes in completed file objects"}).to_string(),serde_json::to_string(&manifest)?,t.operation])?;
+    c.db.execute("UPDATE artifacts SET state='stored',digest=?1,logical_bytes=?2,stored_at=CURRENT_TIMESTAMP WHERE id=?3 AND attempt=?4 AND state IN ('uploading','stored')",params![reference.digest,bytes as i64,a.id,reference.attempt])?;
+    c.db.execute("INSERT INTO artifact_copies(artifact,node,state,last_used) VALUES(?1,?2,'present',?3) ON CONFLICT(artifact,node) DO UPDATE SET state='present',last_used=excluded.last_used",params![a.id,t.source_node,at])?;
+    Ok(true)
 }

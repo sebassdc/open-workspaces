@@ -24,7 +24,10 @@ pub fn reflink(source: &Path, destination: &Path) -> Result<()> {
     // Unit fixtures use byte copies on tmpfs; real VM acceptance requires host reflinks.
     #[cfg(test)]
     if rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EOPNOTSUPP) {
-        std::fs::copy(source, destination)?;
+        // Match reflink semantics: preserve the new disk's mode, not the sealed source's.
+        let mut src = src;
+        let mut dst = dst;
+        std::io::copy(&mut src, &mut dst)?;
         dst.sync_all()?;
         return Ok(());
     }

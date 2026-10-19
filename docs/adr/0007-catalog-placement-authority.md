@@ -1,6 +1,6 @@
 # ADR 0007: durable placement authority and transfer reservations
 
-Status: implemented catalog contract with explicit verified restore, park and wake execution.
+Status: implemented catalog contract with explicit verified restore, park, wake, move and fork execution.
 Pattern: ADR 0002's single-controller SQLite intents, ADR 0005's per-unit upgrade boundary,
 and ADR 0006's existing artifact references.
 
@@ -16,9 +16,12 @@ committed node, epoch, capture and CPU/RAM reservations together.
 
 A single `BEGIN IMMEDIATE` transaction admits an owner-scoped operation key and
 canonical input fingerprint, a globally increasing attempt epoch, affected-machine
-locks, the optional fork child's physical ID and owner-scoped name, and target
-capacity. Same key and input joins the original operation, including its terminal
-outcome; changed input rejects. A new deliberate retry uses a new operation key.
+locks, the optional fork child's physical ID and owner-scoped name, the selected
+fork snapshot and target capacity. Named forks reserve the snapshot's RAM, CPU and
+disk shape. Generated snapshot names are durable before any capture RPC, so a
+controller restart replays the same capture. Same key and input joins the original
+operation, including its terminal outcome; changed input rejects. A new deliberate
+retry uses a new operation key.
 The committed high-watermark survives abort and child deletion. An allocated epoch
 whose transaction was committed is never reused, even if import is uncertain.
 
@@ -57,11 +60,15 @@ attempt's reservation. Legacy epochless results, stopped/missing inventories and
 snapshot discovery cannot mutate managed or transferring resources. Legacy routing
 fails closed for these resources until epoch-bearing orchestration is connected.
 
+Managed SSH-key changes read back the active worker's public policy through the
+node agent before completing the catalog operation. Retrying a journaled change
+reads the current policy, including later revocations.
+
 All new writer transactions perform SQLite work only. Store transfer, verification,
 worker RPCs and waits must occur outside them, with results supplied as explicit
 evidence. The transition API is controller-internal; evidence flags are attestations
 by the orchestrator after checking worker proof, never public caller parameters.
 Explicit managed restore now executes these contracts through the transfer runner;
-park/wake now reuse this runner; move/fork remain dormant. No automatic movement policy is activated.
+park/wake/move/targeted fork now reuse this runner. Explicit pre-commit target exclusion and fresh-epoch source return preserve the original authority until a conditional commit. No automatic movement policy is activated.
 
 See [lifecycle contract](../LIFECYCLE.md) for phases, permissions and rollout gates.

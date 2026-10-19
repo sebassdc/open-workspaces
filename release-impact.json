@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.12",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 5,
+        "min_reader": 5
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Explicit move and targeted cross-runner fork through durable catalog intents, immutable artifact jobs, prepared imports and conditional commit. Move preserves physical ID, owner/grants and pinned SSH policy; fork refreshes guest/network/SSH identity and belongs to its requester. Explicit pre-commit cancellation/retarget excludes unstarted targets and uses a fresh epoch; post-commit uncertainty stays pinned for forward recovery. Worker interface 3 adds child preparation, durable target exclusion, serialized prepared SSH policy and running-source registration; managed child/exclusion state uses reader-guarded worker state schema 3. Agents accept worker interfaces 1-3; older workers remain fixed-placement and cannot advertise move/fork. Catalog schema/reader floor 5, host protocol 1, runtime, guest kernel and host layout 2 are unchanged. Use the class-2 quiesce/swap/resume upgrade with compatibility checks and explicit cold-memory-loss consent on dedicated eligible runners; no automatic box movement, cold resize, timer, host replacement or infrastructure activation."
+    },
+    {
       "version": "0.9.11",
       "class": 1,
       "changes": [
