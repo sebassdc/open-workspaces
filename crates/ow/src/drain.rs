@@ -676,6 +676,7 @@ pub(crate) fn agent_inventory(root: &Path, request: &Value) -> Result<Value> {
         unmanaged.push("active cache staging".into());
     }
     let mut captures = Vec::new();
+    let mut recovery_journals = Vec::new();
     let mut capture_bytes = 0;
     for dir in ["machines", "snapshots", "recovery", "images"] {
         let path = root.join(dir);
@@ -740,6 +741,48 @@ pub(crate) fn agent_inventory(root: &Path, request: &Value) -> Result<Value> {
                 && entry.metadata()?.len() == 0
             {
                 // Persistent advisory lock files carry no guest data.
+            } else if dir == "recovery" && entry.file_type()?.is_file() {
+                let meta = entry.metadata()?;
+                ensure!(meta.len() <= 65536, "recovery journal oversized");
+                let raw = fs::read(entry.path())?;
+                capture_bytes += raw.len();
+                ensure!(capture_bytes <= 512 * 1024, "recovery inventory oversized");
+                let value: Value = serde_json::from_slice(&raw)?;
+                let journal: ow_core::recovery::Recovery = serde_json::from_value(value.clone())?;
+                let id = name.strip_suffix(".json").unwrap_or("");
+                let point_valid = |point: &ow_core::recovery::Point| {
+                    common::identifier(&point.snapshot).is_ok()
+                        && point
+                            .source
+                            .as_deref()
+                            .is_none_or(|s| common::identifier(s).is_ok())
+                };
+                if common::identifier(id).is_ok()
+                    && machines
+                        .as_array()
+                        .context("invalid machines")?
+                        .iter()
+                        .any(|m| m["id"] == id)
+                    && journal.store.len() == 64
+                    && journal.store.bytes().all(|b| b.is_ascii_hexdigit())
+                    && serde_json::to_value(&journal)? == value
+                    && journal.pending.is_none()
+                    && journal
+                        .sleep
+                        .as_deref()
+                        .is_none_or(|s| common::identifier(s).is_ok())
+                    && journal.durable.as_ref().is_none_or(|p| {
+                        point_valid(p)
+                            && captures
+                                .iter()
+                                .any(|c| c["name"] == p.snapshot && c["native"]["workspace"] == id)
+                    })
+                {
+                    // Settled scheduling metadata carries no disk; captures are checked separately.
+                    recovery_journals.push(json!({"machine":id,"journal":value}));
+                } else {
+                    unmanaged.push(format!("{dir}/{name}"));
+                }
             } else if dir == "images" {
                 // Only digest-verified immutable image caches may be left on a retained disk.
                 let entries = ow_core::cache::inventory(root)?;
@@ -753,12 +796,13 @@ pub(crate) fn agent_inventory(root: &Path, request: &Value) -> Result<Value> {
     }
     captures.sort_by_key(|v| v["name"].as_str().unwrap_or_default().to_owned());
     unmanaged.sort();
+    recovery_journals.sort_by_key(|v| v["machine"].as_str().unwrap_or_default().to_owned());
     let seal = if root.join("drain-seal.json").exists() {
         serde_json::from_slice::<Value>(&fs::read(root.join("drain-seal.json"))?)?["seal"].clone()
     } else {
         Value::Null
     };
-    let result = json!({"worker":{"pid":pid,"start":start,"boot":fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()},"running":status["running"],"machines":machines,"captures":captures,"unmanaged":unmanaged,"seal":seal});
+    let result = json!({"worker":{"pid":pid,"start":start,"boot":fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()},"running":status["running"],"machines":machines,"captures":captures,"recovery_journals":recovery_journals,"unmanaged":unmanaged,"seal":seal});
     ensure!(
         serde_json::to_vec(&result)?.len() < 900_000,
         "runner inventory too large"

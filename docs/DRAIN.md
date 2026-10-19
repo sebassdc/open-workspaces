@@ -44,7 +44,12 @@ controller restart resumes through durable transfer history. Legacy unmanaged
 hibernated boxes cannot be adopted by the existing worker primitives: they retain
 the runner and RAM until separately reconciled. Unknown, partial or unmanaged
 captures, files, images, recovery records or staging refuse retirement rather
-than being deleted. This conservative refusal is inspectable in `error`.
+than being deleted. Valid settled recovery journals for known worker copies are
+scheduling metadata: they remain on the retained disk and are included in the
+inventory digest. Empty journals from polling stopped boxes do not block parking.
+Pending recovery uploads still block drain; durable references must have matching
+local captures, which pass the same publication checks as other captures. This
+conservative refusal is inspectable in `error`.
 
 Cleanup is only `export-cleanup` of a positively fenced, durably published,
 completed transfer whose source no longer owns placement. It never invokes
