@@ -1285,7 +1285,7 @@ fn disk_resize_is_owner_only_and_requires_a_capable_stopped_runner() {
     // No disk capability: explicit sizing must fail rather than silently create 8 GiB.
     let create = json!({"op":"create","id":"diskbox","node":"disk-node","disk_gib":32,"memory_mib":256,"vcpu_count":1,"image":"alpine"});
     assert!(c.operation(owner, create.clone()).is_err());
-    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.disk_resize_v1',json('true')) WHERE id='disk-node'", []).unwrap();
+    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.disk_resize_v1',json('true'),'$.available_disk_bytes',1099511627776,'$.disk_observed_unix_s',CAST(strftime('%s','now') AS INTEGER)) WHERE id='disk-node'", []).unwrap();
     let created = c.operation(owner, create).unwrap();
     assert_eq!(created["disk_bytes"], 32 * common::GIB);
     let grow = json!({"op":"resize","id":"diskbox","disk_gib":64});
@@ -1426,7 +1426,7 @@ fn quota_config(root: &Path, caps: Value) {
     .unwrap();
 }
 fn quota_node(fake: &Fake) {
-    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET memory_mib=4096,slots=8,capabilities=json_set(capabilities,'$.memory_mib',4096,'$.slots',8,'$.vcpus',8,'$.disk_resize_v1',json('true'))",[]).unwrap();
+    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET memory_mib=4096,slots=8,capabilities=json_set(capabilities,'$.memory_mib',4096,'$.slots',8,'$.vcpus',8,'$.disk_resize_v1',json('true'),'$.available_disk_bytes',70368744177664,'$.disk_observed_unix_s',CAST(strftime('%s','now') AS INTEGER))",[]).unwrap();
 }
 #[test]
 fn owner_quota_each_boundary_override_and_stopped_accounting() {
@@ -1980,7 +1980,7 @@ fn catalog_store_images_pin_retry_versions_and_keep_legacy_boxes() {
             |r| r.get(0)
         )
         .unwrap(),
-        1
+        2
     );
     assert_eq!(
         c.db.query_row::<i64, _, _>(
@@ -2720,6 +2720,20 @@ fn transfer_schema_four_keeps_store_roots_and_failed_preparation_rolls_back() {
     let (fake, c, user, physical, intent) = transfer_fixture();
     c.db.execute("INSERT INTO artifact_copies(artifact,node,state,last_used) VALUES('capture','beta','present',1)",[]).unwrap();
     c.db.execute("INSERT INTO leases(artifact,holder,purpose,expires) VALUES('capture','fixture','pull',9999999999)",[]).unwrap();
+    let triggers: Vec<String> =
+        c.db.prepare(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'cache_guard_%'",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for trigger in triggers {
+        c.db.execute_batch(&format!("DROP TRIGGER {trigger}"))
+            .unwrap();
+    }
+    c.db.execute_batch("DROP TABLE cache_evictions").unwrap();
     c.db.execute_batch("DROP TABLE transfer_reservations;DROP TABLE transfer_locks;DROP TABLE transfers;
       ALTER TABLE resources DROP COLUMN placement_managed;ALTER TABLE resources DROP COLUMN placement_epoch;
       ALTER TABLE resources DROP COLUMN current_capture;ALTER TABLE resources DROP COLUMN ssh_policy;
@@ -3136,6 +3150,33 @@ fn aborted_fork_cleanup_rolls_back_with_an_uncertain_target() {
         c.machine(guest, "owner@example.test/child", "fork")
             .is_err()
     );
+}
+
+#[test]
+fn transfer_target_rechecks_controller_drain_independently_of_worker_drain() {
+    let (fake, c, user, _, intent) = transfer_fixture();
+    c.db.execute(
+        "INSERT INTO node_placement_policy(node,controller_drain) VALUES('beta',1)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        c.begin_transfer(user, "controller-drain", &intent)
+            .unwrap_err()
+            .to_string()
+            .contains("draining")
+    );
+    c.db.execute("UPDATE node_placement_policy SET controller_drain=0", [])
+        .unwrap();
+    c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.drain',json('true')) WHERE id='beta'",[]).unwrap();
+    assert!(
+        c.begin_transfer(user, "worker-drain", &intent)
+            .unwrap_err()
+            .to_string()
+            .contains("draining")
+    );
+    drop(c);
+    drop(fake);
 }
 
 #[test]

@@ -359,6 +359,12 @@ pub const MAC_OPERATIONS: &[&str] = &[
     "terminal",
 ];
 pub fn node_operation(v: &serde_json::Value, op: &str) -> Result<()> {
+    if matches!(op, "cache-inventory" | "cache-evict") {
+        ensure!(
+            v["cache_eviction_v1"] == true && v["backend"] != "apple-virtualization",
+            "worker lacks cache eviction support"
+        );
+    }
     if PLACEMENT_OPERATIONS.contains(&op) {
         placement_capable(v)?;
     }
@@ -435,6 +441,27 @@ pub fn node_capabilities(v: &serde_json::Value) -> Result<()> {
                         .is_some_and(|digest| crate::store::valid_digest(digest).is_ok()))),
             "invalid image digest inventory"
         );
+    }
+    if let Some(cap) = v.get("cache_eviction_v1") {
+        ensure!(cap.is_boolean(), "invalid cache capability");
+        if cap == true {
+            ensure!(
+                linux
+                    && v["worker"]["protocol"]
+                        .as_u64()
+                        .is_some_and(|p| p >= 2 && p <= WORKER_PROTOCOL),
+                "cache eviction requires a capable worker"
+            );
+        }
+    }
+    if v.get("cache_entries").is_some() || v.get("cache_inventory_v1").is_some() {
+        ensure!(
+            v["cache_inventory_v1"] == true
+                && v["cache_eviction_v1"] == true
+                && v["cache_observed_unix_s"].as_u64().is_some(),
+            "invalid cache inventory contract"
+        );
+        validate_cache_entries(&v["cache_entries"])?;
     }
     if mac {
         ensure!(
@@ -602,5 +629,69 @@ mod placement_tests {
             placement_capable(&json!({"worker_protocol":1,"placement_fencing_v1":true})).is_err()
         );
         assert!(worker_compatible(&legacy).is_ok());
+    }
+}
+
+/// Keep negotiated cache reports below the bounded node control frame.
+pub fn validate_cache_entries(v: &serde_json::Value) -> Result<()> {
+    let entries = v.as_array().context("cache entries must be an array")?;
+    ensure!(
+        entries.len() <= 32 && serde_json::to_vec(v)?.len() <= 24576,
+        "cache inventory oversized"
+    );
+    let mut names = std::collections::BTreeSet::new();
+    for e in entries {
+        let name = e["name"].as_str().context("cache name missing")?;
+        crate::store::image_name(name)?;
+        crate::store::valid_digest(e["digest"].as_str().context("cache digest missing")?)?;
+        ensure!(
+            names.insert(name)
+                && e["logical_bytes"]
+                    .as_u64()
+                    .is_some_and(|n| n <= 16 * 1024 * GIB)
+                && e["last_used"].is_u64()
+                && e.get("exclusive_bytes").is_some_and(|n| n.is_null()
+                    || n.as_u64()
+                        .is_some_and(|n| n <= 16 * 1024 * GIB + 1024 * 1024))
+                && e["pins"]
+                    .as_array()
+                    .is_some_and(|a| a.len() <= 8
+                        && a.iter().all(|s| s.as_str().is_some_and(|s| s.len() <= 32))),
+            "invalid cache inventory entry"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn cache_reports_are_optional_bounded_and_cannot_promote_a_legacy_worker() {
+        let legacy = json!({"type":"heartbeat","protocol":1,"backend":"firecracker","arch":"x86_64","runtime":RUNTIME,"memory_mib":1024,"slots":2,"vcpus":2,"images":["ubuntu"]});
+        assert!(node_capabilities(&legacy).is_ok());
+        assert!(node_operation(&legacy, "cache-evict").is_err());
+        let entry = json!({"name":"tools@1","digest":"a".repeat(64),"logical_bytes":1024,"exclusive_bytes":null,"last_used":0,"pins":[]});
+        let mut cap = legacy.clone();
+        cap["worker"] = json!({"protocol":2});
+        cap["cache_eviction_v1"] = json!(true);
+        cap["cache_inventory_v1"] = json!(true);
+        cap["cache_observed_unix_s"] = json!(100);
+        cap["cache_entries"] = json!([entry.clone()]);
+        assert!(node_capabilities(&cap).is_ok());
+        assert!(node_operation(&cap, "cache-evict").is_ok());
+        cap["worker"]["protocol"] = json!(1);
+        assert!(node_capabilities(&cap).is_err());
+        cap["worker"]["protocol"] = json!(2);
+        for bad in [
+            json!(null),
+            json!([entry.clone(), entry.clone()]),
+            json!([{"name":"../bad"}]),
+            json!(vec![entry; 33]),
+        ] {
+            cap["cache_entries"] = bad;
+            assert!(node_capabilities(&cap).is_err());
+        }
     }
 }

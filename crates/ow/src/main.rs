@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod backup;
+#[cfg(any(target_os = "linux", test))]
+mod cache_catalog;
 #[cfg(target_os = "linux")]
 mod catalog;
 mod client;
@@ -28,6 +30,8 @@ mod nodes;
 mod onboarding;
 #[cfg(target_os = "linux")]
 mod onboarding;
+#[cfg(any(target_os = "linux", test))]
+mod placement;
 #[cfg(target_os = "linux")]
 mod preview;
 #[cfg(target_os = "linux")]

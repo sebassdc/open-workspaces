@@ -84,6 +84,7 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS node_limits(node TEXT PRIMARY KEY REFERENCES nodes(id), vcpu_cap INTEGER NOT NULL CHECK(vcpu_cap BETWEEN 1 AND 16));")?;
     // Additive larger-cap authority; legacy readers retain conservative CPU limits.
     db.execute_batch("CREATE TABLE IF NOT EXISTS node_capacity_limits(node TEXT PRIMARY KEY REFERENCES nodes(id), vcpu_cap INTEGER NOT NULL CHECK(vcpu_cap BETWEEN 1 AND 64));")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS node_placement_policy(node TEXT PRIMARY KEY REFERENCES nodes(id),pool TEXT NOT NULL DEFAULT 'default',active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),controller_drain INTEGER NOT NULL DEFAULT 0 CHECK(controller_drain IN (0,1)));")?;
     Ok(db)
 }
 /// Catalog schema this binary writes (`PRAGMA user_version`).
@@ -343,7 +344,7 @@ pub fn revoke(root: &Path, node: &str) -> Result<()> {
 }
 pub fn inventory(root: &Path) -> Result<Value> {
     let db = db(root)?;
-    let mut stmt = db.prepare("SELECT id,revoked,heartbeat,memory_mib,slots,capabilities,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16) FROM nodes ORDER BY id")?;
+    let mut stmt = db.prepare("SELECT id,revoked,heartbeat,memory_mib,slots,capabilities,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16),rowid,COALESCE((SELECT pool FROM node_placement_policy WHERE node=nodes.id),'default'),COALESCE((SELECT active FROM node_placement_policy WHERE node=nodes.id),1),COALESCE((SELECT controller_drain FROM node_placement_policy WHERE node=nodes.id),0) FROM nodes ORDER BY id")?;
     let rows = stmt.query_map([], |r| {
         let ram:u32 = r.get(3)?;
         let slots:u32 = r.get(4)?;
@@ -353,7 +354,10 @@ pub fn inventory(root: &Path) -> Result<Value> {
         for (key,bound) in [("memory_mib",ram),("slots",slots),("vcpus",cpus)] {
             cap[key]=json!(cap[key].as_u64().unwrap_or(0).min(bound as u64));
         }
-        Ok(json!({"id":r.get::<_,String>(0)?,"revoked":r.get::<_,bool>(1)?,"online":!r.get::<_,bool>(1)? && r.get::<_,i64>(2)?>now()-OFFLINE && r.get::<_,i64>(2)?<=now(),"last_seen_unix_s":r.get::<_,i64>(2)?,"memory_mib":cap["memory_mib"],"slots":cap["slots"],"capabilities":cap,"owner_limits":{"memory":ram,"slots":slots,"cpus":cpus}}))
+        cap["pool"] = json!(r.get::<_,String>(8)?);
+        cap["active"] = json!(r.get::<_,bool>(9)?);
+        cap["controller_drain"] = json!(r.get::<_,bool>(10)?);
+        Ok(json!({"enrollment_order":r.get::<_,i64>(7)?,"id":r.get::<_,String>(0)?,"revoked":r.get::<_,bool>(1)?,"online":!r.get::<_,bool>(1)? && r.get::<_,i64>(2)?>now()-OFFLINE && r.get::<_,i64>(2)?<=now(),"last_seen_unix_s":r.get::<_,i64>(2)?,"memory_mib":cap["memory_mib"],"slots":cap["slots"],"capabilities":cap,"owner_limits":{"memory":ram,"slots":slots,"cpus":cpus}}))
     })?;
     Ok(Value::Array(
         rows.collect::<std::result::Result<Vec<_>, _>>()?,
@@ -456,8 +460,8 @@ async fn session(
     if auth(&c.root, &node, &headers).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    ws.max_message_size(4096)
-        .max_frame_size(4096)
+    ws.max_message_size(32768)
+        .max_frame_size(32768)
         .on_upgrade(move |socket| session_loop(c, node, headers, socket))
 }
 async fn job(
@@ -548,7 +552,7 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
                                     tokio::task::spawn_blocking(move||{let _=crate::image_store::prefetch(&root,&node,&images);});
                                 }
                                 // Old native agents expect job IDs only; acknowledge only the guided agent's optional extension.
-                                if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break;}}
+                                if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation,"extensions":["cache-inventory-v1"]}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break;}}
                             }
                     }
                 }, Some(Ok(Message::Pong(_)))=>{}, _=>break}
@@ -1034,6 +1038,19 @@ pub(crate) fn redeem(origin: &str, value: &Value, ca: Option<&Path>) -> Result<V
     Ok(result)
 }
 
+#[cfg(target_os = "linux")]
+fn cache_extension(beat: &mut Value, status: &Value, root: &Path, negotiated: bool) -> Result<()> {
+    if negotiated && status["cache_eviction_v1"] == true {
+        let _guard = ow_core::cache::lock(root, false)?;
+        beat["cache_eviction_v1"] = json!(true);
+        beat["cache_inventory_v1"] = json!(true);
+        beat["cache_entries"] = json!(ow_core::cache::inventory(root)?);
+        beat["cache_observed_unix_s"] = json!(now());
+        beat["compat"] = status["compat"].clone();
+    }
+    Ok(())
+}
+
 pub fn agent(
     root: &Path,
     controller: &str,
@@ -1131,9 +1148,9 @@ pub fn agent(
     };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
     #[cfg(target_os = "linux")]
-    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true,"disk_resize_v1":status["disk_resize_v1"]==true});
+    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true,"disk_resize_v1":status["disk_resize_v1"]==true});
     #[cfg(target_os = "macos")]
-    let hello = json!({"type":"heartbeat","ready_ack":guided,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
+    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Worker status for the heartbeats, fetched on its own thread: the worker answers
@@ -1183,6 +1200,8 @@ pub fn agent(
             timeout_socket(&ws)?;
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
             let mut unconfirmed = None;
+            #[cfg(target_os = "linux")]
+            let mut cache_negotiated = false;
             loop {
                 // A refused heartbeat closes the channel at once; one still open a second
                 // later was accepted.
@@ -1222,6 +1241,8 @@ pub fn agent(
                         );
                     }
                     beat["image_digests"] = status["image_digests"].clone();
+                    #[cfg(target_os = "linux")]
+                    cache_extension(&mut beat, &status, root, cache_negotiated)?;
                     beat["disk_resize_v1"] = json!(status["disk_resize_v1"] == true);
                     beat["placement_fencing_v1"] =
                         json!(common::placement_capable(&status).is_ok());
@@ -1256,7 +1277,7 @@ pub fn agent(
                 }
                 match ws.read() {
                     Ok(tungstenite::Message::Text(id)) => {
-                        if guided && let Ok(v) = serde_json::from_str::<Value>(&id) {
+                        if let Ok(v) = serde_json::from_str::<Value>(&id) {
                             ensure!(
                                 v["type"] == "ready" && v["node"] == node,
                                 "invalid controller acknowledgement"
@@ -1265,7 +1286,15 @@ pub fn agent(
                                 .as_str()
                                 .context("acknowledgement generation required")?;
                             common::identifier(generation)?;
-                            channel_status(root, "dispatchable", &instance, Some(generation))?;
+                            #[cfg(target_os = "linux")]
+                            {
+                                cache_negotiated = v["extensions"]
+                                    .as_array()
+                                    .is_some_and(|a| a.iter().any(|x| x == "cache-inventory-v1"));
+                            }
+                            if guided {
+                                channel_status(root, "dispatchable", &instance, Some(generation))?;
+                            }
                             continue;
                         }
                         common::identifier(&id)?;
@@ -1359,6 +1388,8 @@ fn agent_job(
     let op = request["op"].as_str().context("op")?;
     ensure!(
         [
+            "cache-inventory",
+            "cache-evict",
             "image-build",
             "image-pull",
             "capture-pull",
@@ -1407,6 +1438,12 @@ fn agent_job(
         ensure!(
             common::Placement::from_request(&request)?.node == node,
             "placement targets another node"
+        );
+    }
+    if matches!(op, "cache-inventory" | "cache-evict") {
+        ensure!(
+            checked["cache_eviction_v1"] == true,
+            "worker lacks cache eviction support"
         );
     }
     wire::expect_worker(checked["worker_pid"].as_u64().map(|pid| pid as u32));

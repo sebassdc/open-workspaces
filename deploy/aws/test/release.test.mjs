@@ -100,3 +100,36 @@ test("the entries since the previous release tag declare what the diff changed",
         .match(/'vmlinux-[^']+': \(\s*'[^']+',\s*'([0-9a-f]{64})'/)?.[1];
     if (pin(`v${previous}`) !== pin("HEAD")) assert.ok(declared.has("guest-kernel"), "the guest kernel pin changed: declare guest-kernel");
 });
+
+test("the cache release plans a worker upgrade and preserves capture gates", () => {
+    const result = JSON.parse(execFileSync("python3", ["-c", `
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import upgrade
+m = json.load(open(sys.argv[2]))
+target = "0.9.7"
+e = next(e for e in m["releases"] if e["version"] == target)
+pins = dict.fromkeys(("agent", "dashboard", "worker"), "0.9.4")
+compat = {"runtime": e["runtime"]["vmm"], "cpu": "test-cpu", "kernel_sha256": e["runtime"]["guest_kernel_sha256"]}
+captures = [{"name": "test-box", **compat}]
+p = upgrade.plan(m, pins, target, captures=captures, compat=compat)
+try:
+    upgrade.plan(m, pins, target, captures=captures, compat=compat, max_class=1)
+except upgrade.Refused:
+    pass
+else:
+    raise AssertionError("class-1 ceiling accepted a worker upgrade")
+try:
+    upgrade.plan(m, pins, target, captures=[{**captures[0], "cpu": "other-cpu"}], compat=compat)
+except upgrade.Refused as error:
+    assert "--accept-cold" in str(error)
+else:
+    raise AssertionError("incompatible capture accepted without cold consent")
+print(json.dumps(p))
+`, new URL("../host/", import.meta.url).pathname, new URL("../../../release-impact.json", import.meta.url).pathname], { encoding: "utf8" }));
+    assert.equal(result.class, 2);
+    assert.deepEqual(result.move, { agent: "0.9.7", dashboard: "0.9.7", worker: "0.9.7" });
+    assert.deepEqual(result.restart, ["agent", "dashboard", "worker"]);
+    assert.deepEqual(result.cold, []);
+    assert.equal(result.catalog_backup, false);
+});
