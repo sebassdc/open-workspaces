@@ -4,6 +4,15 @@ OS phase 2 of the [roadmap](ROADMAP.md): a box sleeps when nobody uses it and
 wakes when someone connects; snapshots go to S3 and come back on another runner;
 images are built from recipes in a repository.
 
+A controller-only installation (`ow host up --controller-only`, or AWS Host
+`role: "controller"`) offers access and placement on enrolled remote runners.
+It has zero local compute and builds no images. An empty node inventory means
+create has no capacity; add an authorized runner first. Build images and enable
+recovery-point uploads on runners. The controller's scheduled backup copies its
+catalog only; runner captures remain in their configured stores. See
+[controller packaging](SINGLE_HOST.md#controller-without-local-compute) and
+[private catalog recovery](CORE.md#catalog).
+
 ## Wake on connect
 
 A hibernated box resumes when something reaches it: an SSH connection

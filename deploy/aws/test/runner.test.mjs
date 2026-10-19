@@ -151,3 +151,39 @@ test("direct Tailscale refuses another VPC, AZ or the primary subnet", () => {
         assert.throws(() => tailscaleDirectSubnet(host, bad), /separate public subnet/);
     }
 });
+
+test("controller role needs no nested virtualization and preserves existing stage 0", async () => {
+    created.length = 0;
+    new Host("ctl-only", { ...hostArgs, role: "controller" });
+    new Host("combined", hostArgs);
+    await settle();
+    const ctl = byName("ctl-only-host", "ec2/instance:").inputs;
+    const host = byName("combined-host", "ec2/instance:").inputs;
+    assert.equal(ctl.instanceType, "m7i.large");
+    assert.equal(ctl.cpuOptions, undefined);
+    assert.equal(host.instanceType, "m8i-flex.xlarge");
+    assert.deepEqual(host.cpuOptions, { nestedVirtualization: "enabled" });
+    assert.equal(ctl.userData.replaceAll("ctl-only", "HOST"), host.userData.replaceAll("combined", "HOST"));
+    assert.equal(byName("ctl-only-host", "securityGroup:").inputs.ingress, undefined);
+    const config = JSON.parse(byName("ctl-only-config", "ssm/parameter:").inputs.insecureValue);
+    assert.equal(config.role, "controller");
+    assert.deepEqual(config.developerImages, []);
+    assert.deepEqual(config.dashboard, { logins: hostArgs.dashboardLogins });
+    assert.equal(config.tailscale.secretArn, secretArn);
+    assert.equal(config.backup.url, hostArgs.backupUrl);
+    assert.ok(!("runner" in config));
+    assert.ok(!created.some((r) => r.name.startsWith("ctl-only") && r.type.includes("secretVersion")));
+});
+
+test("controller config refuses local compute settings and unknown roles", () => {
+    const config = { repository: "https://example.test/ow.git", ref: "v0.5.0", tailscaleAuthKeySecretArn: secretArn,
+        tailscaleHostname: "controller", tailscaleSsh: false, dashboardLogins: [], developerImages: [],
+        backupUrl: "s3://bucket/root", backupSchedule: "", idleMinutes: 30, role: "controller" };
+    assert.equal(hostConfig(config).role, "controller");
+    for (const change of [{ developerImages: ["ubuntu"] }, { recoveryPoints: true },
+        { storeUrl: "s3://bucket/root", imageArtifacts: { ubuntu: { version: 1, attempt: "a".repeat(32), digest: "b".repeat(64) } } }]) {
+        assert.throws(() => hostConfig({ ...config, ...change }), /no local images or recovery worker/);
+    }
+    assert.throws(() => hostConfig({ ...config, role: "other" }), /role must/);
+    assert.throws(() => hostConfig({ ...config, runner: { node: "node", controller: "ctl", joinSecretArn: secretArn } }), /role must/);
+});

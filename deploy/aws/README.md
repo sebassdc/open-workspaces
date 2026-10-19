@@ -4,7 +4,8 @@
 `Host` component creates one EC2 instance with nested virtualization that runs
 the Open Workspaces controller and runner together (single-host mode). A
 [`Runner`](#runners) adds another such instance that runs only a runner and joins
-a Host's controller.
+a Host's controller. Opt-in `Host` role `controller` runs only the control plane
+without nested virtualization or local compute; existing defaults are unchanged.
 
 What it creates:
 
@@ -82,6 +83,7 @@ export const instanceId = host.instanceId;
 | `dashboardLogins` | none | Tailnet logins allowed into the web dashboard. Needs `tailscaleAuthKeySecretArn`; see below. |
 | `dashboardCapability` | none | Application capability (`example.com/cap/open-workspaces`) admitting tailnet users without a login list. Needs `tailscaleAuthKeySecretArn`. Either this or `dashboardLogins` enables the dashboard; if both are set, either admits. |
 | `developerImages` | none | `["ubuntu"]`: build the [developer image](../../docs/GUEST_IMAGES.md) (user `dev`, SSH server, toolchains) after boot. SSH into boxes and golden-image recipes need it. |
+| `role` | `host` | `controller` opts a new host into remote-only capacity: no local worker, agent, images or KVM. In-place role conversion is refused. |
 | `backupUrl` | none | `s3://bucket/prefix`: install `ow-backup`, and let the host role list, read and add objects under the prefix (never delete). See below. |
 | `backupSchedule` | none | When `ow-backup` runs, as a systemd calendar expression (`*-*-* 01:00:00 UTC`); the host installs a timer. Needs `backupUrl`. |
 | `idleMinutes` | `30` | A box idle this long hibernates and wakes on its next connection; `0` turns it off. |
@@ -250,6 +252,48 @@ Progress: `/var/log/open-workspaces-bootstrap.log`; state:
 `ok tailscale=...`). Building from source takes most of the boot time; see the
 [EC2 timings](../../docs/experiments/ec2-timings.md).
 
+## Controller-only Host
+
+```ts
+const controller = new ow.Host("control", {
+    role: "controller",
+    tailscaleAuthKeySecretArn: key,
+    dashboardLogins: ["you@example.com"],
+    backupUrl: store.url,
+    backupSchedule: "*-*-* 01:00:00 UTC",
+});
+new ow.Runner("compute-a", {
+    controller: { hostName: "control", roleName: controller.roleName },
+    tailscaleAuthKeySecretArn: key,
+    backupUrl: store.url,
+    developerImages: ["ubuntu"],
+});
+```
+
+This is an opt-in **new** host. The default instance type for this role is
+`m7i.large`; it omits the nested-virtualization CPU option. Pass a suitable
+x86-64 Ubuntu instance/AMI for your control-plane load. Creating it is a separate
+infrastructure/spend action, never a side effect of upgrading this package.
+
+It retains the same data volume, Tailscale state mount, private CA, SSM config,
+node invitation helpers and dashboard/gateway. The release builds only the
+controller binary. There is no worker socket/unit/pin, local node credential,
+guest image build or recovery-point timer. `developerImages`, `imageArtifacts`
+and `recoveryPoints` belong on runners and are refused here. `storeUrl` may
+still identify the catalog's artifact store. No GC or scaler loop is enabled.
+
+`ow-host ready` checks the listener and optional dashboard without requiring a
+runner. `ow-host status` reports zero local memory, CPU and slots; create fails
+clearly before enrollment. Configure private pool cost limits, then use the
+existing `ow-aws --host control runner-add compute-a` enrollment flow.
+`ow-backup` copies only the catalog on this role; each runner backs up its own
+captures. Verify all catalog roots on a private restore before enabling any
+future destructive maintenance. See [catalog recovery](../../docs/CORE.md#catalog).
+
+The host/runner defaults, credentials and per-unit pins are unchanged. No stage
+0 change is needed. Changing an existing host's role through `apply` is refused;
+fenced replacement-controller recovery/cutover is a separate operation.
+
 ## Runners
 
 Configure the controller's private [owner limits and pool cost forecast](../../docs/LIMITS.md)
@@ -368,8 +412,8 @@ the run and the stack is still destroyed.
 
 ## Limits
 
-- The controller always runs on a Host, next to that Host's own runner;
-  Runners only add runners. A controller-only host is a later phase.
+- The controller runs on a Host, optionally without a local runner using
+  `role: "controller"`. Controller replacement/cutover is a separate procedure.
 - The host builds each release from source (first boot and every upgrade,
   about 4 minutes incremental on 4 vCPUs); there are no prebuilt release
   binaries yet.

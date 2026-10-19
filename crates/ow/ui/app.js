@@ -35,12 +35,13 @@ function render() {
   if (!selected && data.workspaces.length) selected = data.workspaces[0].id;
   if (selected && !machine()) selected = null;
   const running = data.workspaces.filter(item => item.state === 'running').length, stats = data.stats;
+  const capacity = stats.limit_memory_mib ?? 0;
   $('metric-running').textContent = running; $('metric-total').textContent = `${data.workspaces.length} machines in your sandbox`;
   $('metric-memory').textContent = mib((stats.total_pss_kib || 0) / 1024);
   $('metric-reserved').textContent = mib(stats.reserved_memory_mib || 0);
-  $('metric-limit').textContent = `of ${mib(stats.limit_memory_mib || 4096)} capacity`;
+  $('metric-limit').textContent = `of ${mib(capacity)} capacity`;
   $('nav-count').textContent = data.workspaces.length; $('machine-total').textContent = data.workspaces.length;
-  $('capacity').max = stats.limit_memory_mib || 4096; $('capacity').value = stats.reserved_memory_mib || 0; $('capacity-text').textContent = `${mib(stats.reserved_memory_mib || 0)} / ${mib(stats.limit_memory_mib || 4096)}`;
+  $('capacity').hidden = capacity === 0; $('capacity').max = capacity || 1; $('capacity').value = stats.reserved_memory_mib || 0; $('capacity-text').textContent = `${mib(stats.reserved_memory_mib || 0)} / ${mib(capacity)}`;
   $('machine-grid').replaceChildren(); $('shared-grid').replaceChildren(); $('shared-view').hidden = !(data.shared || []).length;
   for (const item of [...data.workspaces, ...(data.shared || [])]) {
     const card = element('button', undefined, 'machine-card' + (item.id === selected ? ' selected' : '')); card.dataset.machine = item.id; card.setAttribute('aria-pressed', String(item.id === selected));

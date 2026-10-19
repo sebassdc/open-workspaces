@@ -553,6 +553,9 @@ enum HostAction {
         /// Idle and budget limits are then the worker's own environment.
         #[arg(long)]
         external_worker: bool,
+        /// Controller listener only: no KVM check, worker or local node agent.
+        #[arg(long, conflicts_with_all = ["external_worker", "node", "memory", "slots", "cpus", "idle_minutes"])]
+        controller_only: bool,
     },
     /// Check Linux/KVM/storage/tools and current host demand without starting VMs.
     Doctor,
@@ -728,6 +731,7 @@ fn main_result() -> anyhow::Result<i32> {
             cpus,
             idle_minutes,
             external_worker,
+            controller_only,
         } = command
         {
             anyhow::ensure!(cli.server.is_none(), "host up is local; omit --server");
@@ -741,6 +745,7 @@ fn main_result() -> anyhow::Result<i32> {
                 cpus,
                 idle_minutes,
                 external_worker,
+                controller_only,
             );
             #[cfg(not(target_os = "linux"))]
             {
@@ -752,6 +757,7 @@ fn main_result() -> anyhow::Result<i32> {
                     cpus,
                     idle_minutes,
                     external_worker,
+                    controller_only,
                 );
                 anyhow::bail!("host up requires Linux x86-64 with KVM");
             }

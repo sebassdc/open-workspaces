@@ -1143,7 +1143,10 @@ impl Catalog {
         let mut running = BTreeMap::new();
         let mut pss = 0;
         let mut limit = 0;
-        let mut pool = vec![("local".to_owned(), 4096)];
+        let mut pool = Vec::new();
+        if self.root.join("control.sock").exists() {
+            pool.push(("local".to_owned(), 4096));
+        }
         let nodes = nodes::inventory(&self.root)?;
         for n in nodes.as_array().unwrap() {
             pool.push((
@@ -1426,7 +1429,10 @@ impl Catalog {
         disk: Option<u32>,
     ) -> Result<String> {
         let inventory = nodes::inventory(&self.root)?;
-        if inventory.as_array().unwrap().is_empty() && requested.is_none() {
+        if inventory.as_array().unwrap().is_empty()
+            && requested.is_none()
+            && self.root.join("control.sock").exists()
+        {
             common::guest_shape(local_status, memory, cpus)?;
             return Ok("local".into());
         }

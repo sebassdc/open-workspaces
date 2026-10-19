@@ -197,27 +197,40 @@ pub fn up(
     cpus: u32,
     idle_minutes: u64,
     external_worker: bool,
+    controller_only: bool,
 ) -> Result<i32> {
-    common::host_limits(memory, slots, cpus)?;
+    if !controller_only {
+        common::host_limits(memory, slots, cpus)?;
+    }
     let base = self::base(base)?;
     let controller = host::data_root(Some(base.join("controller")))?;
-    let runner = host::data_root(Some(base.join("runner")))?;
     ensure!(
         !onboarding::held_lock(&controller.join("node-controller.lock"))?,
         "a controller is already running for {}",
         base.display()
     );
-    let report = onboarding::doctor(&runner)?;
-    ensure!(
-        report["supported"] == true,
-        "this machine cannot run workspaces: {}",
-        report["diagnostics"]
-    );
+    let runner = base.join("runner");
+    if controller_only {
+        ensure!(
+            !runner.exists() && !controller.join("control.sock").exists(),
+            "controller-only requires a base without local runner data; use the controller cutover procedure"
+        );
+    } else {
+        let runner = host::data_root(Some(runner.clone()))?;
+        let report = onboarding::doctor(&runner)?;
+        ensure!(
+            report["supported"] == true,
+            "this machine cannot run workspaces: {}",
+            report["diagnostics"]
+        );
+    }
     let hostname = fs::read_to_string("/proc/sys/kernel/hostname")?
         .trim()
         .to_owned();
     let node = node.unwrap_or_else(|| connect::node_name(&hostname));
-    common::identifier(&node)?;
+    if !controller_only {
+        common::identifier(&node)?;
+    }
     let tailnet = tailscale();
     // Never a public listener by default: the tailnet address, else loopback only.
     let listen = listen.unwrap_or_else(|| {
@@ -258,47 +271,49 @@ pub fn up(
     }
     nodes::write_private(
         &saved,
-        &json!({"controller":advertised,"local":local,"node":node}),
+        &json!({"controller":advertised,"local":local,"node":if controller_only { None } else { Some(&node) }}),
     )?;
 
-    if external_worker {
-        // The worker has its own unit and limits; restarting this process leaves its VMs running.
-        wait_worker(&runner, Duration::from_secs(60))?;
-    } else {
-        let started = Command::new(std::env::current_exe()?)
-            .arg("--local")
-            .arg("--data-dir")
-            .arg(&runner)
-            .arg("up")
-            .env("OW_MAX_MEMORY_MIB", memory.to_string())
-            .env("OW_MAX_RUNNING", slots.to_string())
-            .env("OW_MAX_VCPUS", cpus.to_string())
-            .env(ow_core::idle::ENV, (idle_minutes * 60).to_string())
-            .stdout(Stdio::null())
-            .status()?;
-        ensure!(
-            started.success(),
-            "local runner failed to start; see {}",
-            runner.join("worker.log").display()
-        );
-    }
     let credential = runner.join("node.json");
     let join = runner.join("join.json");
-    if !credential.exists() {
-        if join.exists() {
-            fs::remove_file(&join)?;
+    if !controller_only {
+        if external_worker {
+            // The worker has its own unit and limits; restarting this process leaves its VMs running.
+            wait_worker(&runner, Duration::from_secs(60))?;
+        } else {
+            let started = Command::new(std::env::current_exe()?)
+                .arg("--local")
+                .arg("--data-dir")
+                .arg(&runner)
+                .arg("up")
+                .env("OW_MAX_MEMORY_MIB", memory.to_string())
+                .env("OW_MAX_RUNNING", slots.to_string())
+                .env("OW_MAX_VCPUS", cpus.to_string())
+                .env(ow_core::idle::ENV, (idle_minutes * 60).to_string())
+                .stdout(Stdio::null())
+                .status()?;
+            ensure!(
+                started.success(),
+                "local runner failed to start; see {}",
+                runner.join("worker.log").display()
+            );
         }
-        nodes::invitation(
-            &controller,
-            &node,
-            600,
-            memory,
-            slots,
-            cpus,
-            Some(&advertised),
-            |v| nodes::write_private(&join, v),
-        )
-        .with_context(|| format!("enrolling local runner {node}; pass --node NEW_ID"))?;
+        if !credential.exists() {
+            if join.exists() {
+                fs::remove_file(&join)?;
+            }
+            nodes::invitation(
+                &controller,
+                &node,
+                600,
+                memory,
+                slots,
+                cpus,
+                Some(&advertised),
+                |v| nodes::write_private(&join, v),
+            )
+            .with_context(|| format!("enrolling local runner {node}; pass --node NEW_ID"))?;
+        }
     }
 
     stop_on_signal()?;
@@ -328,18 +343,21 @@ pub fn up(
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    {
-        let (runner, local, ca) = (runner.clone(), local.clone(), base.join("tls/ca.pem"));
-        std::thread::spawn(move || {
-            let result = nodes::agent(&runner, &local, &credential, Some(&join), Some(&ca), false);
-            let _ = done.send(("local runner agent", result));
-        });
-    }
     println!("Controller listening on {listen}; runners dial {advertised}");
-    if wait_online(&controller, &node, unix_now(), Duration::from_secs(30)) {
-        println!("Runner {node} online. Add machines with: ow node add ssh://user@host");
-    } else {
-        println!("Runner {node} not online yet; check ow node list");
+    if !controller_only {
+        {
+            let (runner, local, ca) = (runner.clone(), local.clone(), base.join("tls/ca.pem"));
+            std::thread::spawn(move || {
+                let result =
+                    nodes::agent(&runner, &local, &credential, Some(&join), Some(&ca), false);
+                let _ = done.send(("local runner agent", result));
+            });
+        }
+        if wait_online(&controller, &node, unix_now(), Duration::from_secs(30)) {
+            println!("Runner {node} online. Add machines with: ow node add ssh://user@host");
+        } else {
+            println!("Runner {node} not online yet; check ow node list");
+        }
     }
     if listen.ip().is_loopback() {
         println!("Loopback only: other machines cannot reach this controller (no tailnet found).");

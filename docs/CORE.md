@@ -91,13 +91,45 @@ new file with mode 0600. It never overwrites a file, and checks the copy with
 `PRAGMA integrity_check`. The catalog holds owner identities and credential
 hashes: keep backups private.
 
-Restore onto a new controller: stop `ow host up`, then in the controller data
-directory remove `catalog.sqlite3`, `catalog.sqlite3-wal` and
-`catalog.sqlite3-shm`, and install the backup as `catalog.sqlite3` with mode
-0600, then start the controller again. Runner credential hashes are in the
-catalog, so runners enrolled before the backup should reconnect when the
-controller URL and CA (`~/.ow/tls`) are unchanged; that reconnect is not tested
-yet (only the restored catalog's contents are).
+For a controller-only host, scheduled `ow-backup` copies this catalog only;
+sealed captures and recovery points are backed up by the runners. The copy
+includes owner/grant/node credentials, placement epochs, transfers/reservations,
+SSH policy, artifact roots/copies and leases. TLS trust/config lives outside
+SQLite and must be preserved separately and privately.
+
+Restore into an isolated, owned mode-0700 directory, with the listener,
+dashboard, admission and all maintenance writers stopped. Preserve the current
+directory and backup; do not overwrite the only copy. Keep the same valid
+`controller/.ow-data` marker (or initialize an empty controller directory with
+`ow --data-dir DIR node-list` before installing the catalog). Install the backup
+as `catalog.sqlite3` mode 0600 for its service user, without stale `-wal`/`-shm`
+files from another catalog. Never copy a live SQLite file with `cp`; take the
+consistent `ow backup catalog` first.
+
+Before starting writers or enabling any future GC/scaler/destructive loop:
+
+1. Run `PRAGMA integrity_check` and `PRAGMA foreign_key_check` on the private
+   copy; require `ok` and no foreign-key violations. Check `user_version` and
+   `settings.min_reader_schema` against the intended binary.
+2. Compare the source backup and restored copy's owners, resources, grants,
+   node credential hashes/revocations/limits, placements/epochs, SSH policies,
+   transfer phases/locks/reservations and epoch high-watermark. Compare all
+   artifacts, current captures, image versions, artifact copies and leases;
+   stored/parked captures remain roots even without a local worker or node.
+   Inspect private values locally, never publish catalogs or credential hashes.
+3. Account for writes after the backup. Keep maintenance disabled until roots
+   and ownership across that gap are reconstructed or explicitly resolved.
+   Runner inventory alone cannot recover parked boxes or authorize cleanup.
+4. Positively stop/isolate the previous authority before starting a replacement.
+   Keep the matching private CA, controller URL and config so existing runner
+   credentials reconnect. No two writable controllers; a host-local lock is
+   not a fence across hosts. After any replacement write, rollback needs the
+   latest catalog with both writers stopped, never the stale pre-cutover copy.
+
+The synthetic controller-role tests verify a private restored catalog's owner,
+grant, node, transfer/reservation and artifact/copy/lease rows. They do not prove
+a live cross-host controller cutover or stale-backup recovery. Those require a
+separate disposable-fixture drill; no automatic failover is provided.
 
 ### Snapshots
 
