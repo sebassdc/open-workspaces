@@ -324,3 +324,19 @@ Catalog schema4/reader floor3, worker interface2/readers1–2, host-runner proto
 runtime, guest kernel, host layout and stage0 are unchanged from v0.9.0. Keep
 capture compatibility and explicit cold-memory-loss gates. A published release
 alone neither activates recovery nor upgrades a running host.
+
+
+## Placement catalog (v0.9.3)
+
+The dormant [placement and transfer contract](LIFECYCLE.md) raises the catalog to
+schema 5 with minimum reader 5. From v0.9.2 this is class 1: copy the catalog and
+move controller, dashboard and agent catalog readers together, retaining the
+worker pin. Worker interface 2, host protocol 1, runtime, guest kernel and host
+layout are unchanged. Existing recovery configuration stays as configured;
+installing this release does not activate managed movement.
+
+Schema-3/4 writers are refused. The upgrade plan requires a catalog backup and
+disables automatic rollback across this reader-floor boundary. Freeze mutations
+before upgrading, retain the private consistent backup, and follow the controlled
+recovery procedure if rollback is needed after new writes. A stale backup cannot
+authorize older placement epochs or discard new transfer/artifact roots.
