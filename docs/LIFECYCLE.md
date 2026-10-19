@@ -1,8 +1,8 @@
 # Placement catalog and transfer lifecycle
 
-The catalog contract persists transfer intent; it does not execute transfers.
-Existing boxes remain fixed-placement. Installation alone does not move, park,
-start, stop or upgrade a worker. See [ADR 0007](adr/0007-catalog-placement-authority.md).
+The catalog persists transfer intent and executes explicit managed restore requests.
+Existing boxes remain fixed-placement until an owner requests a restore. Installation
+alone does not move, park, start, stop or upgrade a worker. See [ADR 0007](adr/0007-catalog-placement-authority.md).
 
 ## Authority and phases
 
@@ -44,11 +44,13 @@ Stopped and hibernated remain different user states. Parking a stopped disk capt
 preserves stopped state. Connection-triggered wake accepts only a parked hibernated
 box; explicit start orchestration for a stopped box is separate. A list, name lookup
 or card view grants no start authority. Cold memory loss requires explicit consent
-in the durable intent and enforcement by the future worker orchestrator.
+in the durable intent and enforcement by both the restore runner and worker.
 
 ## Permissions
 
-The following are catalog admission contracts, not new public commands.
+The public restore API accepts a catalog artifact ID, target node, owner-scoped
+operation key and optional explicit cold consent. Other transfer kinds remain
+catalog contracts without a public executor.
 
 | Action | Owner | Shared admin | Shared use | Node / guest |
 | --- | --- | --- | --- | --- |
@@ -90,11 +92,61 @@ This is a class 1 controller/catalog change. Update every catalog-reading contro
 dashboard and node-management process together; keep running worker pins unchanged.
 A control-plane restart may interrupt streams but must not restart a worker or VM.
 Release 0.9.3 declares catalog schema 5 / reader floor 5 as a class 1 change
-from v0.9.2. Keep the worker pin unchanged; transfer execution remains dormant.
+from v0.9.2. Keep the worker pin unchanged; that catalog foundation alone did not
+activate transfer execution.
 
-Before enabling transfer execution, require worker-enforced placement fences and
+Restore execution requires worker-enforced placement fences and
 replay-safe steps, exact runtime compatibility checks, artifact validation, owner
 and disk admission, explicit cold-loss consent and epoch-bearing routing for every
 wake/stream path. Legacy runners remain ineligible for managed movement. Test real
 execution only on disposable boxes. Synthetic catalog tests do not establish VM
 migration, RAM portability, S3 enforcement or recovery of an isolated running VM.
+
+## Restore execution and recovery
+
+`restore` with an artifact uses the phases above; legacy named-snapshot restore
+retains its original interface. Controller startup scans nonterminal restore rows.
+A private per-transfer file lock coalesces concurrent runners; the SQLite predicates
+remain authoritative. Four transfer runners at most execute concurrently. No network
+wait, compression, hashing or object transfer holds the catalog mutex or a writer
+transaction. Agent pull/cache jobs do not enter the serial worker.
+
+The source's public policy is reconciled from the authorized stopped copy before
+admission and checked again after export. Its ownership, shape and physical ID come
+from the catalog. A stored artifact must match owner and machine, its pinned manifest
+digest/token, native manifest name/subject/shape, exact consistency set and file hashes.
+F-store validates paths, codecs, sizes and uncompressed hashes before publishing a
+private local capture. Existing captures and disks cannot be overwritten.
+
+A pull lease records each agent attempt before dispatch. Uncertain attempts cannot
+be restarted until expiry; a new attempt gets a new token/staging directory. Verified
+cache inspection can establish completion sooner. Worker requests use fixed
+transfer/step keys; uncertain imports first inspect the epoch-bearing inventory and
+native import fingerprint, then resume only their own partial import. A prepared
+copy is never activated before conditional catalog commit. Activation first persists
+`start_uncertain`; a matching running copy confirms a lost reply, while contradictory
+or active-but-nonrunning state stops for reconciliation rather than replaying start.
+A responding source is checked for contradictory execution before commit/activation.
+Source absence before positive fencing never allows progress. An offline source after
+its acknowledged durable export cannot restart through legacy requests.
+
+Compatibility is checked before import. Incompatible RAM fails that operation without
+removing the stored artifact. A new operation with explicit cold consent can reuse a
+freshly inspected export fence from a matching prior catalog intent; it cannot alter
+the old operation's fingerprint or re-enable the source. Compatible imported copies
+retain memory state; cold copies explicitly discard RAM at import. The worker checks
+compatibility again at the trust boundary.
+
+Only successfully adopted restore placements enable the new epoch-bearing routes.
+Unsupported managed mutations remain blocked. Terminal/SSH check their revocation
+watch again after opening the worker stream. Ownership and existing grants remain
+catalog facts and are rechecked at admission, each step, commit and stream routing.
+
+This adds class 1 controller/agent orchestration, with no schema migration, reader-floor
+change or worker runtime change. It requires the T2 protocol-2 worker semantics to
+already be installed through their separate class 2 upgrade. Old agents do not
+advertise `managed_restore_v1` and are ineligible. Agent capability reflects the
+checked worker executable, and JSON additions remain optional for older controllers.
+No worker or VM is restarted by installing the controller. Retained source copies,
+cache cleanup, automatic recovery from unapproved source loss and legacy-backup
+catalog registration are outside this restore executor. See DAILY_USE for commands.

@@ -3054,3 +3054,69 @@ fn aborted_fork_cleanup_rolls_back_with_an_uncertain_target() {
             .is_err()
     );
 }
+
+#[test]
+fn adopted_restore_preserves_owner_grants_and_routes_exec_and_streams_with_epoch() {
+    use crate::transfers::*;
+    let (mut fake, mut c, user, physical, mut intent) = transfer_fixture();
+    intent.kind = Kind::Restore;
+    c.db.execute("DELETE FROM nodes WHERE id='beta'", [])
+        .unwrap();
+    fake.worker("beta");
+    c.db.execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.guest_ssh_v1',json('true')) WHERE id='beta'",[]).unwrap();
+    let grantee = c.user(&identity("guest")).unwrap();
+    c.db.execute(
+        "INSERT INTO grants(physical,grantee,role) VALUES(?1,?2,'use')",
+        params![physical, grantee],
+    )
+    .unwrap();
+    let t = c.begin_transfer(user, "restore", &intent).unwrap();
+    prepare_transfer(&c, &t);
+    c.commit_transfer(t.id, t.epoch).unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Committed,
+        Step::Started,
+        &Evidence::default(),
+    )
+    .unwrap();
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Started,
+        Step::Succeeded,
+        &Evidence::default(),
+    )
+    .unwrap();
+    let placement = c.managed_placement(&physical).unwrap().unwrap();
+    assert_eq!(placement.node, "beta");
+    assert_eq!(placement.epoch, t.epoch as u64);
+    let address = "owner@example.test/box";
+    assert_eq!(c.state(user).unwrap()["workspaces"][0]["id"], "box");
+    assert_eq!(c.state(grantee).unwrap()["shared"][0]["id"], address);
+    let result = c
+        .operation(
+            grantee,
+            json!({"op":"exec","id":address,"command":"true","operation_key":"exec-restored"}),
+        )
+        .unwrap();
+    assert_eq!(result["exit_code"], 0);
+    let request:String=c.db.query_row("SELECT json_extract(request,'$.request.placement') FROM operations WHERE retry_key='exec-restored'",[],|r|r.get(0)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&request).unwrap(),
+        json!(placement)
+    );
+    assert_eq!(c.ssh_target(grantee, address).unwrap().1, physical);
+    assert_eq!(c.terminal_target(grantee, address).unwrap().1, physical);
+    assert!(
+        c.operation(grantee, json!({"op":"exec","id":physical,"command":"true"}))
+            .is_err()
+    );
+    c.operation(
+        user,
+        json!({"op":"unshare","id":"box","with":"guest@example.test"}),
+    )
+    .unwrap();
+    assert!(c.ssh_target(grantee, address).is_err());
+}

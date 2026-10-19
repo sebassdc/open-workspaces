@@ -1212,6 +1212,10 @@ pub fn agent(
                     // health checks, and a drain the host upgrader declares.
                     #[cfg(target_os = "linux")]
                     {
+                        beat["managed_restore_v1"] = json!(
+                            common::placement_capable(&status).is_ok()
+                                && crate::image_store::configured_url(root).is_ok()
+                        );
                         beat["image_store_v1"] = json!(
                             status["image_store_v1"] == true
                                 && crate::image_store::configured_url(root).is_ok()
@@ -1357,6 +1361,9 @@ fn agent_job(
         [
             "image-build",
             "image-pull",
+            "capture-pull",
+            "capture-cache",
+            "restore-policy",
             "status",
             "list",
             "stats",
@@ -1407,6 +1414,9 @@ fn agent_job(
         #[cfg(target_os = "linux")]
         let response = if op == "image-build" || op == "image-pull" {
             wire::response(crate::image_store::job(root, &request))
+        } else if matches!(op, "capture-pull" | "capture-cache" | "restore-policy") {
+            common::placement_capable(&checked)?;
+            wire::response(crate::transfers::job(root, &request))
         } else {
             journal_request(root, &request, common::placement_capable(&checked).is_ok())?
         };

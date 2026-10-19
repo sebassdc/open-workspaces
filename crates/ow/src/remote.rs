@@ -567,17 +567,21 @@ async fn handle(app: &App, mut request: Request) -> Response {
         let target = crate::dashboard::with_catalog(
             app.catalog.clone(),
             identity.clone(),
-            move |catalog, user| catalog.ssh_target(user, &name),
+            move |catalog, user| {
+                let (root, id, revoked) = catalog.ssh_target(user, &name)?;
+                let placement = catalog.managed_placement(&id)?;
+                Ok((root, id, revoked, placement))
+            },
         )
         .await;
-        let Ok((root, id, revoked)) = target else {
+        let Ok((root, id, revoked, placement)) = target else {
             return (
                 StatusCode::NOT_FOUND,
                 "Machine not found or SSH node unavailable",
             )
                 .into_response();
         };
-        return crate::ssh_gateway::upgrade(&root, request, expires, id, None, revoked).await;
+        return crate::ssh_gateway::upgrade(&root, request, expires, id, placement, revoked).await;
     }
     if let Some(_root) = &app.dashboard
         && request.uri().path().starts_with("/api/terminal/")
@@ -601,13 +605,18 @@ async fn handle(app: &App, mut request: Request) -> Response {
         let id = crate::dashboard::with_catalog(
             app.catalog.clone(),
             identity.clone(),
-            move |catalog, user| catalog.terminal_target(user, &name),
+            move |catalog, user| {
+                let (root, id, revoked) = catalog.terminal_target(user, &name)?;
+                let placement = catalog.managed_placement(&id)?;
+                Ok((root, id, revoked, placement))
+            },
         )
         .await;
-        let Ok((target_root, id, revoked)) = id else {
+        let Ok((target_root, id, revoked, placement)) = id else {
             return (StatusCode::NOT_FOUND, "Machine not found").into_response();
         };
-        return crate::terminal::upgrade(&target_root, request, expires, id, None, revoked).await;
+        return crate::terminal::upgrade(&target_root, request, expires, id, placement, revoked)
+            .await;
     }
     if !matches!(
         *request.method(),
@@ -865,6 +874,9 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
         })
         .transpose()?
         .map(|c| Arc::new(std::sync::Mutex::new(c)));
+    if let Some(catalog) = &catalog {
+        crate::transfers::recover(catalog);
+    }
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

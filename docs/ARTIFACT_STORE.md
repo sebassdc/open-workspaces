@@ -36,6 +36,25 @@ fail closed. There must be no current-object age expiry covering the store, at
 least seven days of noncurrent undo, and a conditional-creation deny applying to
 all principals. See [ADR 0006](adr/0006-write-once-artifact-store.md).
 
+## Workspace capture adapter
+
+Managed restore consumes committed `capture`/`snapshot` artifact rows already bound
+to an existing catalog owner and physical machine. It never enumerates storage to
+create that binding. Format-1 `metadata.native_manifest` contains the exact native
+snapshot JSON as a string; its bytes are preserved when staging the worker capture.
+The adapter validates its name, workspace, memory, CPUs, disk size, complete file
+set and hashes against the catalog intent and pinned outer manifest. No owner field
+inside either manifest grants ownership. RAM captures require all three files:
+`state`, `memory`, `disk.ext4`; disk-only captures contain only `disk.ext4`.
+
+Private `capture-pull` and `capture-cache` node jobs reuse the object store's pinned
+reference and validated pull staging. Per-attempt leases/tokens live in the existing
+catalog tables; retries inspect the verified cache before allocating another attempt.
+These byte transfers and hashes run in the agent, outside the serial worker. Native
+`import-prepare` remains unstarted until conditional catalog adoption and activation.
+This adapter does not index or convert legacy `SnapshotStore` backups; their existing
+publication and retention stay separate. See [restore lifecycle](LIFECYCLE.md).
+
 ## Publish once, pull by digest
 
 These are trusted Linux operator commands on an initialized ownership controller.

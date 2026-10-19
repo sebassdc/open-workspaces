@@ -1,6 +1,7 @@
 //! Backups: a consistent SQLite copy of the controller catalog, and an interim
 //! runner's sealed snapshots to an S3-compatible [`SnapshotStore`], restorable
-//! onto another runner.
+//! onto another runner. This operator-local path never grants catalog ownership;
+//! managed remote restore consumes authorized catalog artifacts in `transfers`.
 use crate::{BackupAction, common, selfhost, wire};
 use anyhow::{Context, Result, bail, ensure};
 use ow_core::snapshot_store::{S3Store, SnapshotStore};

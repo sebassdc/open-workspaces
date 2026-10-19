@@ -28,6 +28,10 @@ struct Operation {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    artifact: Option<String>,
+    #[serde(default)]
+    accept_cold: Option<bool>,
+    #[serde(default)]
     child: Option<String>,
     #[serde(default)]
     snapshot: Option<String>,
@@ -148,6 +152,18 @@ fn validated(bytes: &[u8]) -> Result<Value> {
                 crate::ssh_guest::validate_keys(&json!(operation.keys.context("keys required")?))?;
             request["keys"] = json!(keys);
             request["upgrade"] = json!(operation.upgrade.unwrap_or(false));
+        }
+        "restore" if operation.artifact.is_some() => {
+            ensure!(operation.name.is_none(), "choose a snapshot or artifact");
+            let artifact = operation.artifact.unwrap();
+            runtime::identifier(&artifact)?;
+            ensure!(request["node"].is_string(), "target node required");
+            ensure!(
+                request["operation_key"].is_string(),
+                "operation key required"
+            );
+            request["artifact"] = json!(artifact);
+            request["accept_cold"] = json!(operation.accept_cold.unwrap_or(false));
         }
         "snapshot" | "restore" => {
             let name = operation
@@ -422,6 +438,16 @@ pub async fn handle(
             .and_then(|r| r),
             None => Err(anyhow::anyhow!("ownership catalog unavailable")),
         }
+    } else if operation["op"] == "restore" && operation["artifact"].is_string() {
+        match catalog {
+            Some(catalog) => tokio::task::spawn_blocking(move || {
+                crate::transfers::restore(catalog, &identity, &operation)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r),
+            None => Err(anyhow::anyhow!("ownership catalog unavailable")),
+        }
     } else if matches!(operation["op"].as_str(), Some("publish" | "unpublish")) {
         match preview_host {
             Some(host) => {
@@ -480,6 +506,27 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn managed_restore_accepts_only_explicit_catalog_artifact_target_and_key() {
+        let valid = json!({"op":"restore","id":"box","artifact":"capture","node":"target","operation_key":"retry","accept_cold":true});
+        assert_eq!(
+            validated(&serde_json::to_vec(&valid).unwrap()).unwrap(),
+            valid
+        );
+        for field in ["artifact", "node", "operation_key"] {
+            let mut invalid = valid.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(validated(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+        let mut both = valid.clone();
+        both["name"] = json!("snapshot");
+        assert!(validated(&serde_json::to_vec(&both).unwrap()).is_err());
+        let mut invalid = valid.clone();
+        invalid["accept_cold"] = json!("yes");
+        assert!(validated(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        assert!(validated(br#"{"op":"restore","id":"box","name":"local-snapshot"}"#).is_ok());
+    }
+
     #[test]
     fn preview_ports_are_explicit_valid_numbers() {
         assert_eq!(
