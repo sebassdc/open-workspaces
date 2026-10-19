@@ -33,7 +33,7 @@ Synthetic runtime file bytes are integrity fixtures, not bootable VM evidence.
 ## Static source/build/artifact pins
 
 All paths below are under:
-`/home/sebassdc/dev/open-workspaces-lanes/assets-progress/`.
+`/path/to/worktrees/assets-progress/`.
 
 | Item | Path or pin |
 | --- | --- |
@@ -72,11 +72,11 @@ Run from this lane. Existing pinned tools were read from main's dedicated
 storage; target and output were isolated inside this lane's owned 0700 build root.
 
 ```bash
-export CARGO_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo
-export RUSTUP_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/rustup
+export CARGO_HOME=/path/to/open-workspaces/data/runtime-spike/cargo
+export RUSTUP_HOME=/path/to/open-workspaces/data/runtime-spike/rustup
 export OW_HOST_BUILD_ROOT="$PWD/data/assets-progress-build"
 export CARGO_TARGET_DIR="$OW_HOST_BUILD_ROOT/target"
-export OW_CROSS_BUILD_ROOT=/home/sebassdc/dev/open-workspaces/data/macos-build
+export OW_CROSS_BUILD_ROOT=/path/to/open-workspaces/data/macos-build
 export OW_HOST_BUILD_OUTPUT="$OW_HOST_BUILD_ROOT/release"
 # Root created mode 0700; .ow-host-build contains this exact line plus newline:
 # open-workspaces dedicated host build v1
@@ -110,7 +110,7 @@ TLS harness exit 0. Actual command per test, with a fresh short owned scratch ro
 
 ```bash
 unshare --user --map-current-user --pid --fork --mount-proc \
-  /home/sebassdc/dev/open-workspaces-lanes/assets-progress/data/assets-progress-build/release/ow-linux-amd64 \
+  /path/to/worktrees/assets-progress/data/assets-progress-build/release/ow-linux-amd64 \
   --local --data-dir /tmp/ow-ap-<fresh-suffix> host update-assets --ubuntu-dev
 ```
 

@@ -1,6 +1,6 @@
 # Invited Linux hosts through one domain — plan brief
 Size: L | Updated: 2026-10-03 | State: bounded release deployed; physical second-host test pending
-Pattern: Rust gateway + SQLite ownership + outbound authenticated node agents; ADR 0002. Existing fixed public CLI artifacts and dedicated path-specific Access applications are the deployment pattern.
+Pattern: gateway + SQLite ownership + outbound authenticated node agents; ADR 0002. Existing fixed public CLI artifacts and dedicated path-specific Access applications are the deployment pattern.
 
 ## Goal
 An owner can invite a trusted Linux computer into this controller's explicitly shared private pool; its operator can install the CLI, run a guided host join and see the node online through the existing domain without Tailscale/router changes.

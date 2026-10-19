@@ -20,7 +20,7 @@ def processes():
   if not p.name.isdigit():continue
   try:
    comm=(p/'comm').read_text().strip();cmd=(p/'cmdline').read_bytes().replace(b'\0',b' ').decode()
-   if 'firecracker' in comm or (cmd.startswith('/home/sebassdc/dev/open-workspaces/') and ('worker' in cmd or 'node-' in cmd or 'dashboard' in cmd or 'supervisor' in cmd)):
+   if 'firecracker' in comm or (cmd.startswith(str(REPO)+'/') and ('worker' in cmd or 'node-' in cmd or 'dashboard' in cmd or 'supervisor' in cmd)):
     out[p.name]={'comm':comm,'argv':cmd,'start':(p/'stat').read_text().split(') ')[1].split()[19]}
   except (FileNotFoundError,PermissionError):pass
  return out
@@ -35,7 +35,7 @@ def call(args,env=None,timeout=120,input=None):
 if PREPARE:
  headroom();(ROOT/'baseline.json').write_text(json.dumps(processes(),indent=2))
  # Capture inode only of existing owner disk; never open its content.
- owner=Path('/home/sebassdc/dev/open-workspaces/data/prototype/machines/ubuntu-dev/disk.ext4')
+ owner=REPO/'data/prototype/machines/ubuntu-dev/disk.ext4'
  if owner.exists():(ROOT/'owner-disk.json').write_text(json.dumps({'inode':owner.stat().st_ino,'device':owner.stat().st_dev}))
  for args in [
  ['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=SSH Test CA','-addext','basicConstraints=critical,CA:TRUE','-addext','keyUsage=critical,keyCertSign,cRLSign','-keyout',ROOT/'ca.key','-out',ROOT/'ca.pem'],
@@ -249,7 +249,7 @@ finally:
  except Exception as exc:(ROOT/'cleanup-error.txt').write_text(repr(exc))
  time.sleep(.3)
  after=processes();baseline=json.loads((ROOT/'baseline.json').read_text());shared_ok=after==baseline
- owner=Path('/home/sebassdc/dev/open-workspaces/data/prototype/machines/ubuntu-dev/disk.ext4');inode_ok=not (ROOT/'owner-disk.json').exists() or json.loads((ROOT/'owner-disk.json').read_text())=={'inode':owner.stat().st_ino,'device':owner.stat().st_dev}
+ owner=REPO/'data/prototype/machines/ubuntu-dev/disk.ext4';inode_ok=not (ROOT/'owner-disk.json').exists() or json.loads((ROOT/'owner-disk.json').read_text())=={'inode':owner.stat().st_ino,'device':owner.stat().st_dev}
  owned=[]
  for pdir in Path('/proc').iterdir():
   try:

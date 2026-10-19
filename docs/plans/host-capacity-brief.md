@@ -1,5 +1,5 @@
 # Adjustable host capacity and Ubuntu — plan brief
-Size: M | Pattern: Rust gateway + SQLite owner authority + outbound node agent + private bounded worker (ADR 0002).
+Size: M | Pattern: gateway + SQLite owner authority + outbound node agent + private bounded worker (ADR 0002).
 
 ## Goal
 An existing Linux host can accept owner-authorized budget changes and prepare Ubuntu dev, while users create/resize larger guests within enforced host capacity.

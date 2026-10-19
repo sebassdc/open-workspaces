@@ -4,7 +4,7 @@ Date: 2026-10-04. Status: accepted for an isolated local ARM64 feasibility
 slice; private-pool backend integration is pending.
 
 ## Pattern and decision
-Retain Rust for control and use a narrow, original Swift helper around Apple's
+Retain the control plane and use a narrow, original native helper around Apple's
 Virtualization framework. No new hypervisor or third-party orchestration source
 is incorporated. This follows the explicit backend-capability direction in
 ARCHITECTURE.md, while preserving ADR 0002's currently homogeneous Linux pool.
@@ -19,7 +19,7 @@ persistent Linux root disk. FAT is a bounded fixture, not the selected productio
 workspace filesystem.
 
 ## Observed evidence
-The signed native helper booted real aarch64 Linux 6.18.52-0-virt. Native Rust CLI
+The signed native helper booted real aarch64 Linux 6.18.52-0-virt. Native CLI
 boot/restore, command status 7, binary SHA256 round trip, controlling console
 resize and interruption, cold persistence and positive helper exit pass.
 
@@ -57,7 +57,7 @@ installed. Its minimum exceeds the handoff's 2 GiB limit: owner allocation and
 licensing review remain separate gates.
 
 Apple's framework is supplied by macOS and used under the installed SDK terms.
-The original helper/init are Apache-2.0 repository source. Alpine boot artifacts
+The original helper/init are MIT-licensed repository source. Alpine boot artifacts
 retain upstream licenses (including Linux and BusyBox GPL terms); bytes are
 kept in ignored storage, not committed or published. No Ignition/AGPL code reused.
 

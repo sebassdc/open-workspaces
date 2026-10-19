@@ -332,7 +332,7 @@ exec /usr/local/bin/ow-guest --vsock
             for name in names + ["linux-modules.deb", "InRelease", "Packages.xz"]
         },
         "licenses": {
-            "ow-guest": "Apache-2.0",
+            "ow-guest": "MIT",
             "ubuntu": "individual package licenses retained under /usr/share/doc; signed Ubuntu upstream packages",
             "linux-kernel": "GPL-2.0-only; Ubuntu linux source package 6.8.0-142.142",
         },

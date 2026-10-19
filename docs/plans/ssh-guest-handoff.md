@@ -18,7 +18,7 @@ None for implementation. RELEASE remains the planner's review gate.
 
 ## Files
 - Brief: `docs/plans/ssh-guest-brief.md`; coordination: `docs/plans/mac-ssh-coordination.md`.
-- Branch: `work/ssh-guest`, baseline `b1703f1`; changed Rust SSH/client/gateway/catalog/node/runtime modules, guest recipes, acceptance scripts and scoped documentation.
+- Branch: `work/ssh-guest`, baseline `b1703f1`; changed SSH/client/gateway/catalog/node/runtime modules, guest recipes, acceptance scripts and scoped documentation.
 - Private evidence: `data/ssh-evidence/final-checks.json`, `pins.json`, logs; final receipts `v/v/result.json`, `v/w/result.json`, `v/x/result.json`.
 - Frozen binary: `data/ssh-evidence/frozen/ow`, SHA256 `38a6303328ebdb718efa45963cfb8f83241f306880b294ff79ecf0cc19d3a479`. Source-map digest and per-file pins are in the report/private evidence.
 

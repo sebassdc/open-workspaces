@@ -1,115 +1,118 @@
 # Open Workspaces
 
-An open-source platform for persistent Linux workspaces for developers and AI agents, designed for self-hosting on a single machine and eventual deployment to AWS or Kubernetes.
+An open-source platform for persistent Linux workspaces for developers and AI agents, designed for self-hosting on one machine or a private pool of hosts.
 
-**Status: runnable local Rust/Firecracker prototype. Production hardening is pending.**
+## Feature matrix
 
-KVM now works on the development machine. Real-VM tests pass for exec, files,
-HTTP access, persistence, paired RAM/disk snapshots, independent forks,
-hibernation, corruption rejection and worker restart recovery.
+**Core** means available in the supported Linux setup. **Opt-in** requires explicit
+operator configuration. **Experimental** has bounded acceptance and platform
+limits. **Not yet live** means code is merged, but activation or deployment
+acceptance remains outstanding. Versions below are the first tagged release
+containing that feature, not a claim that your host has installed or enabled it.
+Production hardening remains ongoing.
 
-```bash
-./ow up
-./ow create my-box
-./ow exec my-box -- 'uname -r; echo hello'
-./ow snapshot my-box prepared
-./ow fork my-box branch --snapshot prepared
-./ow hibernate branch
-./ow stats
+### Boxes and lifecycle
+
+| Feature | What it does | Status | Shipped in | Guide |
+| --- | --- | --- | --- | --- |
+| Persistent Linux boxes | Create Alpine, Ubuntu or Arch workspaces on a prepared KVM runner; execute commands and transfer files. | Core | v0.1.0 | [Local use](docs/LOCAL_PROTOTYPE.md) |
+| Start, stop and delete | Keep disks across cold restarts; explicitly delete a stopped box and its snapshots. | Core | v0.1.0 | [CLI](docs/AGENT_CLI.md) |
+| CPU, RAM and disk sizing | Select resource sizes, grow sparse root disks, and resize stopped boxes. | Core | v0.1.0; disk sizing v0.7.0 | [Disks](docs/DISKS.md) |
+
+### Access
+
+| Feature | What it does | Status | Shipped in | Guide |
+| --- | --- | --- | --- | --- |
+| Remote CLI | Install compiled macOS/Linux clients; discover images, identity, targets and capacity. | Core | v0.8.0; discovery v0.8.5 | [Install](docs/INSTALL.md), [agent CLI](docs/AGENT_CLI.md) |
+| SSH and SFTP | Connect editors and standard SSH tools to explicitly enrolled Linux guests. | Opt-in | v0.1.0 | [SSH](docs/SSH.md) |
+| Interactive terminals | Use a guest PTY from `ow shell` or the dashboard, with resize and job control. | Core | v0.1.0 | [Terminals](docs/TERMINALS.md) |
+| Dashboard and tailnet login | Manage boxes in the browser using Tailscale identity and an operator-configured access grant; Access JWT remains an alternative. | Opt-in | v0.1.0; tailnet v0.2.0; grants v0.8.3 | [Dashboard](docs/DASHBOARD.md) |
+| Private previews | Publish a guest HTTP port as a separate authenticated tailnet HTTPS URL. | Opt-in | v0.8.0 | [Previews](docs/DAILY_USE.md#tailnet-https-previews-v080) |
+
+### Snapshots, forks and recovery
+
+| Feature | What it does | Status | Shipped in | Guide |
+| --- | --- | --- | --- | --- |
+| Local snapshots and forks | Capture paired RAM/disk state, restore it, and fork independent Linux disks on the same runner. | Core | v0.1.0 | [Snapshots](docs/LOCAL_PROTOTYPE.md) |
+| Hibernate and wake | Release guest CPU/RAM while preserving state; resume on connection, with optional idle hibernation. | Core | v0.2.0 | [Daily use](docs/DAILY_USE.md) |
+| Off-host backups | Copy catalogs and sealed snapshots to S3-compatible storage; verify captures before restoring. | Opt-in | v0.2.0 | [Backups](docs/CORE.md), [snapshot store](docs/DAILY_USE.md) |
+| Recovery points | Upload periodic running captures and hibernation state; report last durable capture and failures. | Opt-in | v0.9.2 | [Recovery](docs/RECOVERY.md) |
+| Managed restore | Adopt an existing catalog-authorized capture through durable transfer and worker fencing. | Not yet live | v0.9.5 | [Transfer lifecycle](docs/LIFECYCLE.md) |
+| Park, wake and move across runners | Store a box without placement, wake on an eligible runner, or explicitly move/fork to a compatible target. | Not yet live | v0.9.11; move/fork v0.9.12 | [Transfer lifecycle](docs/LIFECYCLE.md) |
+
+### Storage and images
+
+| Feature | What it does | Status | Shipped in | Guide |
+| --- | --- | --- | --- | --- |
+| Developer images | Use prepared Ubuntu/Arch with Git, curl, Neovim, native build tools and language toolchains. | Core | v0.1.0 | [Guest images](docs/GUEST_IMAGES.md) |
+| Golden images | Build a reusable local image from a trusted recipe. | Opt-in | v0.2.0 | [Image recipes](docs/DAILY_USE.md) |
+| Write-once shared images | Publish versioned images to S3 and pull digest-verified copies onto runners. | Opt-in | v0.9.0 | [Artifact store](docs/ARTIFACT_STORE.md) |
+| Cache-aware placement | Advertise verified image copies, reserve staging space and evict eligible sealed cache copies. | Opt-in | v0.9.7 | [Cache](docs/CACHE.md) |
+| Artifact garbage collection | Inspect dry runs and, only after activation checks, collect unreferenced format-1 objects with undo evidence. | Not yet live | v0.9.10 | [Collection gates](docs/STORE_GC.md) |
+
+### Hosts, runners and placement
+
+| Feature | What it does | Status | Shipped in | Guide |
+| --- | --- | --- | --- | --- |
+| Self-hosted Linux and invited runners | Run one host, add an SSH/SSM/tailnet runner, or enroll a trusted outbound host. | Core | v0.1.0; transports v0.2.0 | [Single host](docs/SINGLE_HOST.md), [invitations](docs/HOSTS.md) |
+| AWS host and runner components | Provision dedicated nested-virtualization EC2 capacity with SSM and optional Tailscale. | Opt-in | v0.1.0; runner v0.6.0 | [AWS](deploy/aws/README.md) |
+| Controller without local compute | Run the controller/dashboard while placing boxes only on enrolled remote runners. | Opt-in | v0.9.8 | [Controller-only mode](docs/SINGLE_HOST.md#controller-without-local-compute) |
+| Placement authority | Persist transfer intent and enforce exact placement epochs at capable workers; installation alone moves nothing. | Not yet live | fences v0.8.6; catalog v0.9.3 | [Fencing](docs/PLACEMENT_FENCING.md), [catalog](docs/LIFECYCLE.md) |
+| Explicit runner retirement | Drain eligible runners, park sleeping boxes and produce an empty certificate; provider deletion is separate. | Not yet live | v0.9.13 | [Drain](docs/DRAIN.md) |
+| Apple Silicon host | Run bounded Ubuntu ARM64 via a native helper; Linux-only capabilities and general host distribution remain limited. | Experimental | v0.1.0 | [Mac host](docs/MAC_HOST.md) |
+
+### Limits, security and identity
+
+| Feature | What it does | Status | Shipped in | Guide |
+| --- | --- | --- | --- | --- |
+| Owner quotas and pool admission | Reserve CPU, RAM, logical disk, box count and configured pool cost estimates before admission. | Core | v0.8.1 | [Limits](docs/LIMITS.md) |
+| vCPU overcommit | Allow a Linux host operator to select 1× or 2× vCPU admission; RAM is not overcommitted. | Opt-in | v0.8.5 | [Overcommit](docs/HOSTS.md#linux-vcpu-overcommit) |
+| User ownership and sharing | Scope boxes, snapshots and access to authenticated owners with explicit use/admin grants. | Core | v0.2.0 | [Users](docs/USERS.md) |
+| Guest isolation and egress | Run Linux guests under Firecracker/KVM with private host control and filtered guest networking. | Core | v0.1.0 | [Networking](docs/NETWORKING.md) |
+| CredentialBroker | Library-only per-box authorization for temporary AWS roles and secret writes; no live provider adapter or guest endpoint. | Not yet live | v0.8.0 (library only) | [Broker boundaries](docs/CREDENTIAL_BROKER.md) |
+
+Snapshots depend on runtime/CPU/kernel compatibility. External connections may
+need to reconnect after restore or hibernation. Host operators are trusted with
+the workloads on their hardware. No automatic failover, provider scale-in,
+production certification, Kubernetes operator or public SDK is claimed.
+
+## Get started
+
+Install a [versioned remote client](docs/INSTALL.md) to connect to an existing
+host, or follow [single-host setup](docs/SINGLE_HOST.md) for your own Linux/KVM
+machine. Tailnet clients need no Rust, root or cloudflared.
+
+```sh
+ow login --tailnet https://NAME.TAILNET.ts.net
+ow create my-box
+ow exec my-box -- 'uname -r; echo hello'
+ow shell my-box
+ow snapshot my-box prepared
+ow fork my-box branch --snapshot prepared
+ow hibernate branch
 ```
 
-See the [local prototype guide](docs/LOCAL_PROTOTYPE.md),
-[runtime measurements](docs/experiments/runtime-spike.md), and
-[runtime/storage decision](docs/adr/0001-local-runtime-and-storage.md).
+For local development, use `./ow` and the [local setup guide](docs/LOCAL_PROTOTYPE.md).
+Deployment-specific endpoints, account configuration and credentials stay private.
 
-The browser dashboard is running behind Cloudflare Access on the existing
-project hostname: create machines, run commands, capture snapshots, fork,
-hibernate/resume and view memory use. See the [dashboard guide](docs/DASHBOARD.md)
-and [Internet access setup](docs/REMOTE_ACCESS.md). **Open Terminal** now provides
-a real guest PTY over authenticated WebSocket; `./ow shell` uses the same guest
-backend locally. See [terminal details](docs/TERMINALS.md). Owner browser
-verification of the updated UI remains pending.
+## Design and development
 
-Headless Arch and Ubuntu Base guest profiles are also available from the New
-machine dialog or `./ow create NAME --image arch` or `--image ubuntu`. See [image sources,
-Omarchy findings and compatibility tests](docs/GUEST_IMAGES.md).
+- [Architecture](docs/ARCHITECTURE.md) and [runtime/storage decision](docs/adr/0001-local-runtime-and-storage.md).
+- [Roadmap](docs/ROADMAP.md), [handoff](docs/HANDOFF.md) and [engineering instructions](AGENTS.md).
+- [Runtime evidence](docs/experiments/runtime-spike.md) and [deployment options](docs/DEPLOYMENT.md).
+- [In-place upgrades and release impact](docs/UPGRADES.md).
 
-A bounded native Apple Silicon node now runs persistent Ubuntu ARM64 with
-exec, files and PTY over the existing authenticated node transport. Local VM
-and TLS acceptance passed; live gateway/dashboard pool acceptance awaits
-planner review and a dedicated invitation. macOS guests remain pending.
-See the [Mac operator guide](docs/MAC_HOST.md) and [integration evidence](docs/plans/mac-node-report.md).
-
-An AWS Pulumi component runs one nested-virtualization EC2 host with controller
-and runner, reachable only through SSM or Tailscale. See [deploy/aws](deploy/aws/README.md)
-and the [EC2 timings](docs/experiments/ec2-timings.md).
-
-Single-host mode: `ow host up` runs the controller and a runner on one Linux
-machine, and `ow node add ssh://user@host` adds any SSH-reachable KVM machine
-as another runner (`ssm://` and `tailscale://` targets go through AWS Systems
-Manager or a tailnet). See [single-host mode and SSH runners](docs/SINGLE_HOST.md).
-The `ow-core` crate holds the compute, connect and capability traits, and
-`ow backup` copies the catalog and snapshots; see [core traits and backups](docs/CORE.md).
-Idle boxes hibernate and wake on the next connection, snapshots restore from S3
-onto another runner, and `ow image build` makes golden images from recipes; see
-[wake on connect, snapshot store and golden images](docs/DAILY_USE.md).
-Opt-in running recovery points, hibernate uploads and last-durable status are
-described in [recovery points](docs/RECOVERY.md).
-
-The opt-in [write-once artifact store and shared images](docs/ARTIFACT_STORE.md)
-publish base/golden images once through S3, with catalog versions and digest-verified
-runner pulls. Live fleet rollout and controller GC remain separate gates.
-
-Owners can create larger sparse root disks with `ow create NAME --disk 64GiB` and
-grow a stopped box with `ow resize NAME --disk 128GiB`; new Linux boxes default to
-32 GiB. See [disk sizing, host admission and reporting](docs/DISKS.md).
-
-## Install the remote client
-
-Use the [versioned GitHub Release installer](docs/INSTALL.md) for a compiled
-macOS or Linux client. Tailnet clients need no Rust, root or cloudflared.
-Connection endpoints and release pins belong in the consuming project.
-
-For an existing coding agent operating its own remote workspace, see the
-[remote CLI discovery guide](docs/AGENT_CLI.md) for target/identity, images,
-resource units, noninteractive output and safe retries.
-
-## Read first
-
-1. [Agent handoff](docs/HANDOFF.md): context, first task, and acceptance criteria.
-2. [Research and feature inventory](docs/RESEARCH.md): Boxd capabilities, user stories, sources, and limitations.
-3. [Architecture](docs/ARCHITECTURE.md): proposed Rust components and runtime decision.
-4. [Roadmap](docs/ROADMAP.md): phased backlog and delivery gates.
-5. [Deployment](docs/DEPLOYMENT.md): development machine, Hostinger, AWS, and Kubernetes.
-6. [Agent instructions](AGENTS.md): engineering and host boundaries.
-
-## Proposed direction
-
-- Rust API, scheduler, worker, guest agent, and CLI.
-- Firecracker v1.17.0 for the local prototype under ADR 0001; broader deployment suitability remains under evaluation.
-- SQLite for the current single-host ownership/catalog; PostgreSQL proposed for a broader control plane; local copy-on-write storage for active disks; S3-compatible storage for durable artifacts.
-- TypeScript dashboard and SDK, followed by a Python SDK.
-- First local pilot: persistent remote workspaces, full-state snapshots/forks, hibernation and resource measurements. Broader recovery hardening, teams, desktop and integrations follow.
-- A container backend may support trusted workloads on hosts without KVM, with its reduced capabilities explicitly advertised.
-
-This is an independent implementation inspired by public product behavior. There is no affiliation with Boxd and no claim of API compatibility or performance parity. The name is provisional.
+This is an independent implementation inspired by public product behavior.
+There is no affiliation with Boxd or claim of API compatibility or performance
+parity. The name is provisional.
 
 ## Licensing
 
-Original material in this repository is licensed under Apache-2.0. Upstream components keep their own licenses. Ignition is AGPL-3.0: evaluating it does not authorize incorporating its code into an Apache-only implementation. Record a licensing decision before reusing upstream code.
-
-Guest Internet access and the remote CLI curl installer are implemented. See [networking and remote connection](docs/NETWORKING.md).
-
-New Ubuntu and Arch machines include Git, curl, Neovim, GCC and mise-managed
-Node/Python/Rust, with guest-only passwordless sudo for the `dev` account. See
-[developer image details](docs/GUEST_IMAGES.md#developer-tools-and-permissions).
-
-Dashboard and remote CLI machines now belong to the authenticated user. Names,
-snapshots, terminal access and usage are scoped through a durable SQLite catalog.
-See [ownership, migration and database limits](docs/USERS.md) and
-[owner quotas and pool cost admission](docs/LIMITS.md).
-
-Guest OpenSSH source now provides `ow ssh`, standard ProxyCommand/config and
-SFTP for explicitly enrolled Ubuntu/Arch guests, locally and through outbound
-Linux nodes. See [SSH setup, identity and verification](docs/SSH.md).
-Image publication and shared-service rollout remain planner-owned.
+Original material in this repository is licensed under [MIT](LICENSE).
+Vendored [xterm.js](crates/ow/ui/vendor/XTERM-LICENSE) and
+[addon-fit](crates/ow/ui/vendor/FIT-LICENSE) retain their MIT licenses and
+copyright notices. Dependencies, downloaded runtimes and guest distribution
+packages keep their own licenses; the project license does not relicense them.
+Ignition is AGPL-3.0: evaluating it does not authorize incorporating its code
+into this MIT-licensed implementation. Record a licensing decision before reusing
+upstream code.

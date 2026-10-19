@@ -44,7 +44,7 @@ overlay/role, `docs/AGENT_TOOLING.md`, `docs/plans/multinode-architecture.md`,
 `docs/adr/0001-local-runtime-and-storage.md` and
 `docs/plans/security-review-2026-10-03.md`.
 
-Pattern: extend the existing Rust gateway + durable SQLite ownership catalog +
+Pattern: extend the existing gateway + durable SQLite ownership catalog +
 owner-only Unix-socket worker. Keep scheduling and node transport inside the
 existing binary/modules. No separate broker, distributed database, generic
 orchestration framework or new hypervisor is needed for this slice.
@@ -52,7 +52,7 @@ orchestration framework or new hypervisor is needed for this slice.
 Source baseline: node-core at `a7333dbb96d2304b3e247c8c4b328e54b6e1d91c`.
 At initial inspection its product source had no pending changes; only unrelated
 instruction/overlay files were pending. Line references below are relative to
-`/home/sebassdc/dev/open-workspaces-lanes/node-core/` at that baseline unless an
+`/path/to/worktrees/node-core/` at that baseline unless an
 implementation appendix states otherwise. The same relevant root source was
 read. No build, tests, VM launch, process signals, service changes, cloud writes
 or paid resources were used. Existing test claims were read, not reproduced.

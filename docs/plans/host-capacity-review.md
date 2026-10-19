@@ -241,9 +241,9 @@ Proposed fix: obtain/check opened-file type, owner, mode, length and identity ag
 - W6's actual 8 GiB header/stream acceptance request above remains open. Cache success on tiny fixture files cannot substitute for cold prepared-image header latency, concurrent service responsiveness, complete streamed size/digest, or timeout cleanup.
 - Parent should compare build.json.source_sha256 and each file to this source pin, then record final CLI/guest/bundle/image/manifest digests and provenance privately before deployment. No deployment verdict until W7 is resolved or explicitly scoped out with a documented immutable-publish contract and source review, and the actual evidence is attributed to the resulting matching artifacts.
 
-Reviewed checkout: `/home/sebassdc/dev/open-workspaces-lanes/capacity-core`, baseline `2e4c58374b24cf1747a0c6dccc2c5f2c84ae954f`, 2026-10-04. Initial tracked diff was empty. Line references below describe that observed baseline; they must be refreshed when the builder declares the diff stable.
+Reviewed checkout: `/path/to/worktrees/capacity-core`, baseline `2e4c58374b24cf1747a0c6dccc2c5f2c84ae954f`, 2026-10-04. Initial tracked diff was empty. Line references below describe that observed baseline; they must be refreshed when the builder declares the diff stable.
 
-Authority: `host-capacity-review-brief.md` followed by `host-capacity-brief.md`. Pattern: ADR 0002, Rust gateway + SQLite owner authority + outbound node agent + private bounded worker. Reviewer writes this report only in root. No builds, tests, workflows, VM/service operations, artifact preparation, cloud actions or commits were performed. Existing root changes were inspected and preserved. Planner owns testing and rollout.
+Authority: `host-capacity-review-brief.md` followed by `host-capacity-brief.md`. Pattern: ADR 0002, gateway + SQLite owner authority + outbound node agent + private bounded worker. Reviewer writes this report only in root. No builds, tests, workflows, VM/service operations, artifact preparation, cloud actions or commits were performed. Existing root changes were inspected and preserved. Planner owns testing and rollout.
 
 ## Contracts for builder and planner
 

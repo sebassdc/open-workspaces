@@ -1,6 +1,6 @@
 # Runtime feasibility spike
 
-Status: runnable local Rust/Firecracker prototype; further feasibility and alpha
+Status: runnable local Firecracker prototype; further feasibility and alpha
 hardening checks remain open. KVM works after the owner's firmware change.
 The local runtime/storage decision is recorded in [ADR 0001](../adr/0001-local-runtime-and-storage.md).
 See [the prototype guide](../LOCAL_PROTOTYPE.md) for commands and limits.
@@ -127,7 +127,7 @@ independent shell/HTTP counters and disk writes, cold restart, and full-state
 restore after all original VMM processes exited. The guest kernel logs entropy
 reseeding due to VM fork. Host networking lives in a temporary namespace.
 
-The Rust CLI/worker/gateway prototype has a real-VM end-to-end regression adding
+The CLI/worker/gateway prototype has a real-VM end-to-end regression adding
 48 KiB binary transfers, operation idempotency, loopback publishing, identities,
 guest-root peer-network attempts, hibernation, snapshot rewind, corruption rejection,
 graceful/abrupt worker recovery, memory admission exhaustion and PSS statistics.
@@ -277,7 +277,7 @@ memory-intensive density and saturation results remain open.
 
 ## Interactive terminal and OS-profile continuation
 
-The subsequent owner-authorized slice implements native Rust guest PTYs through
+The subsequent owner-authorized slice implements native guest PTYs through
 authenticated WebSockets and the local `ow shell` command. Real HTTPS/WSS browser
 tests cover interactive vi, signals/job control, resize, flow control, cleanup and
 concurrent management exec; see [terminal evidence](../TERMINALS.md). Headless

@@ -49,7 +49,7 @@ Two intermediate attempts are retained honestly: the first new async test failed
 
 ## Frozen paths and pins
 
-All paths below are relative to **`/home/sebassdc/dev/open-workspaces-lanes/compressed-assets`**. Build root is owned 0700 with the existing required marker; prior outputs were not overwritten.
+All paths below are relative to **`/path/to/worktrees/compressed-assets`**. Build root is owned 0700 with the existing required marker; prior outputs were not overwritten.
 
 | Artifact | Path | SHA-256 |
 |---|---|---|
@@ -66,19 +66,19 @@ The flat immutable prepared bundle is **`data/compressed-assets-build/bundle-rev
 
 ## Exact successful commands
 
-Working directory: `/home/sebassdc/dev/open-workspaces-lanes/compressed-assets`.
+Working directory: `/path/to/worktrees/compressed-assets`.
 
 ```sh
-export CARGO_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/cargo
-export RUSTUP_HOME=/home/sebassdc/dev/open-workspaces/data/runtime-spike/rustup
+export CARGO_HOME=/path/to/open-workspaces/data/runtime-spike/cargo
+export RUSTUP_HOME=/path/to/open-workspaces/data/runtime-spike/rustup
 "$CARGO_HOME/bin/cargo" +1.97.0 test --locked -p ow onboarding::tests -- --test-threads=1
 export OW_HOST_BUILD_ROOT="$PWD/data/compressed-assets-build"
 export CARGO_TARGET_DIR="$PWD/data/compressed-assets-build/target"
-export OW_CROSS_BUILD_ROOT=/home/sebassdc/dev/open-workspaces/data/macos-build
+export OW_CROSS_BUILD_ROOT=/path/to/open-workspaces/data/macos-build
 export OW_HOST_BUILD_OUTPUT="$PWD/data/compressed-assets-build/release-reviewed"
 scripts/build-host-cli.sh
 python scripts/prepare-compressed-host-bundle.py \
-  --raw-bundle /home/sebassdc/dev/open-workspaces/data/host-verify/capacity-release-1791097374223248458/published/host-bundle \
+  --raw-bundle /path/to/open-workspaces/data/host-verify/capacity-release-1791097374223248458/published/host-bundle \
   --encoded-ubuntu "$PWD/data/compressed-assets/ubuntu.ext4.zst" \
   --linux-cli "$PWD/data/compressed-assets-build/release-reviewed/ow-linux-amd64" \
   --output "$PWD/data/compressed-assets-build/bundle-reviewed" \

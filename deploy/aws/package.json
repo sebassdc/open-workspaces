@@ -1,8 +1,8 @@
 {
   "name": "open-workspaces-aws",
-  "version": "0.9.13",
+  "version": "0.9.14",
   "description": "One nested-virtualization EC2 host running the Open Workspaces controller and runner.",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "main": "index.ts",
   "scripts": {
     "check": "tsc --noEmit && node --import ./test/resolve-ts.mjs --test test/*.test.mjs && python3 -m unittest discover -s host -p 'test_*.py'"

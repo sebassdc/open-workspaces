@@ -11,7 +11,7 @@ This handoff creates documentation only. No runtime was installed, upstream repo
 The owner subsequently authorized this development machine as the sandbox and
 prioritized fast remote Linux computers, paired RAM+disk snapshots, independent
 full-state forks, and resource consumption measurements in the first local pilot.
-The runtime spike produced a runnable local Rust/Firecracker prototype; see
+The runtime spike produced a runnable local Firecracker prototype; see
 [usage and limits](LOCAL_PROTOTYPE.md), [evidence](experiments/runtime-spike.md),
 and [runtime decision](adr/0001-local-runtime-and-storage.md). The KVM firmware
 blocker was resolved by the owner. Broader alpha, recovery and security gates
@@ -25,7 +25,7 @@ Public denial/redirect checks pass; positive owner login and session revocation
 remain pending. See [remote access](REMOTE_ACCESS.md)
 for enforcement, validation and the remaining acceptance checks. The browser
 dashboard is now implemented and replaces the guest demo on the existing project
-hostname. See [dashboard features and validation](DASHBOARD.md). Authenticated WebSocket streaming with a native Rust guest PTY is now implemented
+hostname. See [dashboard features and validation](DASHBOARD.md). Authenticated WebSocket streaming with a native guest PTY is now implemented
 and tested locally through a TLS terminator; see [terminal details](TERMINALS.md).
 Remote CLI login and native macOS Apple Silicon/Intel clients plus a portable Linux x86-64 curl installer are now implemented;
 public owner WebSocket verification and per-workspace multi-user roles remain open.
@@ -60,10 +60,10 @@ private runtime recovery journal. See [user scope and limitations](USERS.md).
 ## Current findings
 
 - Boxd combines persistent Linux microVM workspaces, full-state branching, remote human access, and an integration/automation platform.
-- Its docs identify the open-source Rust project Ignition as a foundation. The public repository is not established as current Boxd source or full feature parity.
+- Its docs identify the open-source project Ignition as a foundation. The public repository is not established as current Boxd source or full feature parity.
 - Ignition is AGPL-3.0 and its README warns against production use; evaluate build reproducibility, security, maintainability, and licensing.
 - Firecracker is the default candidate because it supplies the virtualization engine and snapshot primitives. Its orchestration and product layer still need building.
-- A read-only check of the existing Hostinger server found no /dev/kvm. Hostinger's published policy disables nested virtualization. This limitation does not establish anything about the owner's separate development machine.
+- A read-only check of a separate shared server found no /dev/kvm. That hosting provider's published policy disables nested virtualization. This limitation does not establish anything about the owner's separate development machine.
 - AWS documents nested virtualization on selected EC2 families. Validate support, region, configuration, and runtime behavior rather than assuming all EC2 instances work.
 - Boxd latency claims have not been independently benchmarked. Restoring RAM does not guarantee external network sessions survive or that the application is immediately usable.
 
@@ -89,7 +89,7 @@ private runtime recovery journal. See [user scope and limitations](USERS.md).
 
 ## Next implementation slice
 
-After the runtime decision, introduce a Rust workspace with shared types, API, worker, CLI, and guest agent. Implement create -> wait-ready -> exec -> write file -> stop/start -> verify file -> publish HTTP -> backup -> replace worker -> restore. Start with one operator and one worker, but authenticate all externally reachable control operations.
+After the runtime decision, introduce a workspace with shared types, API, worker, CLI, and guest agent. Implement create -> wait-ready -> exec -> write file -> stop/start -> verify file -> publish HTTP -> backup -> replace worker -> restore. Start with one operator and one worker, but authenticate all externally reachable control operations.
 
 The initial local pilot now also includes snapshot -> fork multiple independent
 children -> validate RAM and disk state -> hibernate/restore, with resource

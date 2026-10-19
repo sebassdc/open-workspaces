@@ -1,7 +1,7 @@
 # host-core — bounded implementation
 Read [host-onboarding.md](host-onboarding.md), AGENTS/README/HANDOFF, ADR 0002, MULTINODE, NETWORKING, dashboard/client/nodes/catalog and installed builder role. Owner has said go; do not ask again for bounded implementation.
 
-Own product implementation in isolated `work/host-core` worktree. Reuse existing Rust protocol/runtime and public CLI installer; design an easy invitation-based flow, not a new scheduler. Emit `docs/plans/host-core-interface.md` early with exact CLI/routes/download/config/permission contracts so review/verification can proceed.
+Own product implementation in isolated `work/host-core` worktree. Reuse existing host protocol/runtime and public CLI installer; design an easy invitation-based flow, not a new scheduler. Emit `docs/plans/host-core-interface.md` early with exact CLI/routes/download/config/permission contracts so review/verification can proceed.
 
 Implement narrowly owner-authorized node invitations/revocation, pool policy disclosure, guided Linux host doctor/join/status/start/stop, capacity selection, persistent private credentials/root and verified fixed Alpine runtime assets. Invitation secrets must never enter URLs, process argv or ordinary logs; prompt hidden or private stdin/file input. Friend host participation need not admit its operator to human workspace management. Dashboard owner identity must be bound to verified issuer/subject/catalog identity, never caller email alone. Shared human pool visibility stays explicit. Default non-owner users cannot administer nodes. Short expiry/single-use/node-scoped atomic consume and active revoke/fencing remain enforced.
 

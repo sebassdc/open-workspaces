@@ -4,7 +4,7 @@ Owner authorization: 2026-10-03, implement, coordinate, merge and deploy on this
 Assigned builder: node-verify. Pattern: existing rootless real-VM regressions plus private project process deployment.
 
 ## Scope
-Prepare independent acceptance checks while node-core implements in `/home/sebassdc/dev/open-workspaces-lanes/node-core`. Read its eventual `docs/MULTINODE.md` and ADR 0002, and root `docs/plans/multinode-review.md`. Own only a new focused experiment script (if useful), `docs/plans/multinode-verification-results.md`, and deployment artifacts under ignored project data. Do not modify product Rust, shared task board, existing files or credentials. Do not commit until the planner requests a bounded verification commit.
+Prepare independent acceptance checks while node-core implements in `/path/to/worktrees/node-core`. Read its eventual `docs/MULTINODE.md` and ADR 0002, and root `docs/plans/multinode-review.md`. Own only a new focused experiment script (if useful), `docs/plans/multinode-verification-results.md`, and deployment artifacts under ignored project data. Do not modify product Rust, shared task board, existing files or credentials. Do not commit until the planner requests a bounded verification commit.
 
 Coordinate through report files; do not type into working agents' composers. Record architecture/commands needed early. Wait for a coherent implementation before running acceptance. Planner will explicitly release deployment after review/merge; do not deploy early.
 

@@ -63,7 +63,7 @@ session. No launch-at-login/reboot persistence was installed or tested.
 
 ## Observed product checks
 Human access used the existing authorized dashboard session and successful
-`ow login https://workspaces.sebashurtado.com`. No human login intervention was
+`ow login https://workspaces.example.com`. No human login intervention was
 needed. Node credentials were not substituted for human credentials.
 
 1. **Dashboard create:** `mac-pool-check`, explicitly placed on `mac-arm64-pilot`,
@@ -114,10 +114,10 @@ actual product operations; use the existing saved root, never redeem the invite 
 
 ```sh
 ./target/mac-host/ow --data-dir "$OW_MAC_NODE" host status
-./target/mac-host/ow --server https://workspaces.sebashurtado.com inspect mac-pool-check
-./target/mac-host/ow --server https://workspaces.sebashurtado.com exec mac-pool-check -- \
+./target/mac-host/ow --server https://workspaces.example.com inspect mac-pool-check
+./target/mac-host/ow --server https://workspaces.example.com exec mac-pool-check -- \
   'sha256sum /home/dev/ow-test/persistencia.txt /home/dev/ow-test/gateway-binary.bin'
-./target/mac-host/ow --server https://workspaces.sebashurtado.com shell mac-pool-check
+./target/mac-host/ow --server https://workspaces.example.com shell mac-pool-check
 ./target/mac-host/ow --data-dir "$OW_MAC_NODE" host stop
 ./target/mac-host/ow --data-dir "$OW_MAC_NODE" host start
 ```

@@ -2,13 +2,13 @@
 
 Date: 2026-10-03. Status: implemented for the bounded prototype; independent
 acceptance passed; final stable-commit source review and planner deployment remain pending.
-Pattern: Rust gateway + SQLite ownership + private Unix worker, under ADR 0001.
+Pattern: gateway + SQLite ownership + private Unix worker, under ADR 0001.
 
 ## Decision
 
 Reuse the existing Firecracker/Btrfs runtime, guest PTY protocol and human gateway.
 Add an isolated native TLS node controller and outbound node agent to the same
-Rust binary. Node authority is separate from human Access assertions. Enrollment
+binary. Node authority is separate from human Access assertions. Enrollment
 uses an operator-minted node-bound expiring one-use 256-bit secret; persistent
 node credentials are scoped bearer secrets whose digests/revocation live in SQLite.
 No third-party broker, paid/vendor transport, SSH management or new hypervisor.

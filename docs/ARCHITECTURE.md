@@ -1,6 +1,6 @@
 # Architecture
 
-Status: the broader architecture remains a proposal. The local Rust prototype uses
+Status: the broader architecture remains a proposal. The local prototype uses
 Firecracker and Btrfs under [ADR 0001](adr/0001-local-runtime-and-storage.md).
 See [implemented behavior and limitations](LOCAL_PROTOTYPE.md).
 
@@ -12,31 +12,31 @@ The PostgreSQL, object-storage and service decomposition below remain proposals.
 
 ## Runtime decision
 
-Default candidate: a Rust product layer around Firecracker. Evaluate Ignition first for useful semantics and potential reuse under an appropriate license. Do not implement a new VMM. Do not assume Firecracker automatically reproduces Ignition's networking or Boxd's live-fork behavior.
+Default candidate: a product layer around Firecracker. Evaluate Ignition first for useful semantics and potential reuse under an appropriate license. Do not implement a new VMM. Do not assume Firecracker automatically reproduces Ignition's networking or Boxd's live-fork behavior.
 
 | Candidate | Benefit | Required evaluation |
 | --- | --- | --- |
 | Firecracker | Existing KVM isolation and snapshot primitives; Apache-2.0 | Guest support, snapshot consistency, clone identity, host networking and readiness |
-| Ignition | Rust orchestration, KVM, proxying, snapshot-oriented startup | Public tree build, kernel/dependency assumptions, production gaps, AGPL model |
+| Ignition | Orchestration, KVM, proxying, snapshot-oriented startup | Public tree build, kernel/dependency assumptions, production gaps, AGPL model |
 | Container backend | Runs trusted workspaces without nested virtualization | Shared kernel; no promise of full-memory snapshots, live fork, or equivalent isolation |
 
 Backend capability discovery should expose hardware isolation, memory capture, independent disk clone, hibernation, and runtime version. Refuse unsupported operations explicitly.
 
-The current single-machine prototype is one Rust binary with a local Unix-socket
+The current single-machine prototype is one binary with a local Unix-socket
 worker, CLI, authenticated browser dashboard/API and loopback gateway. It uses a
 SQLite ownership/placement/operation catalog, a worker JSON runtime registry and
 serial guest command transport rather than the proposed PostgreSQL/API/guest-agent stack below.
 That narrow slice validates real VM behavior before adding those services.
-The dashboard serves embedded HTML/CSS/JavaScript from Rust and exposes only the
+The dashboard serves embedded HTML/CSS/JavaScript from the gateway and exposes only the
 owner's VM lifecycle/exec operations. See [dashboard boundaries](DASHBOARD.md).
 
 ## Components
 
 ```mermaid
 flowchart TD
-    Clients[CLI / Dashboard / SDKs] --> API[Rust API and scheduler]
+    Clients[CLI / Dashboard / SDKs] --> API[API and scheduler]
     API --> DB[PostgreSQL control state]
-    API --> Worker[Rust worker on KVM Linux]
+    API --> Worker[Worker on KVM Linux]
     Traffic[Workspace traffic] --> Gateway[Authenticated routing and wake gateway]
     Gateway --> Worker
     Worker --> Guest[MicroVM and guest agent]
