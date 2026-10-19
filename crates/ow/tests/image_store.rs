@@ -136,6 +136,8 @@ print(json.dumps(out))
             .arg("image")
             .args(args)
             .env("OW_ASSET_DIR", &assets)
+            .env("XDG_CONFIG_HOME", root.0.join("client-config"))
+            .env("OW_SERVER", "http://fixture.invalid")
             .env(
                 "PATH",
                 std::env::join_paths(
@@ -173,6 +175,13 @@ print(json.dumps(out))
     );
     assert_eq!(calls.lock().unwrap().len(), before);
     run(&["pull", "tools@1"]);
+    assert!(
+        run(&["list", "--catalog"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["name"] == "tools" && i["status"] == "current")
+    );
     assert_eq!(
         fs::read(runner.join("images/tools@1/disk.ext4")).unwrap(),
         b"golden disk"

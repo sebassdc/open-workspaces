@@ -635,7 +635,8 @@ fn main_result() -> anyhow::Result<i32> {
     }
     if let Action::Image { command } = cli.command {
         let selected = if cli.local_mode
-            || (!matches!(command, ImageAction::List { .. }) && cli.server.is_none())
+            || (!matches!(command, ImageAction::List { catalog: false, .. })
+                && cli.server.is_none())
         {
             None
         } else {
