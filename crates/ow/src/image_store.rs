@@ -35,6 +35,31 @@ fn check(image: &Image) -> Result<()> {
     store::valid_digest(&image.recipe_sha256)?;
     Ok(())
 }
+pub(crate) fn reserve_pull(root: &Path, bytes: u64) -> Result<ow_core::cache::Reservation> {
+    let protected = if root.join("control.sock").exists() {
+        let status = wire::request(root, json!({"op":"status"}))?;
+        status["min_free_gib"]
+            .as_u64()
+            .context("worker reserve unknown")?
+            .checked_mul(common::GIB)
+            .and_then(|n| {
+                n.checked_add(
+                    status["max_memory_mib"]
+                        .as_u64()?
+                        .checked_mul(1024 * 1024)?,
+                )
+            })
+            .context("cache reserve overflow")?
+    } else {
+        // Standalone operator pulls have no worker admission contract; keep conservative defaults.
+        ensure!(
+            !root.join("state.json").exists(),
+            "worker unavailable; cannot reserve staging safely"
+        );
+        9 * common::GIB
+    };
+    ow_core::cache::Reservation::new(root, bytes, protected)
+}
 pub fn install(objects: &dyn Objects, image: &Image, root: &Path) -> Result<Value> {
     let started = std::time::Instant::now();
     let _cache = ow_core::cache::lock(root, false)?;
@@ -73,30 +98,7 @@ pub fn install(objects: &dyn Objects, image: &Image, root: &Path) -> Result<Valu
         Ok(count)
     };
     ensure!(count()? < 32, "golden image limit (32) reached");
-    let protected = if root.join("control.sock").exists() {
-        let status = wire::request(root, json!({"op":"status"}))?;
-        status["min_free_gib"]
-            .as_u64()
-            .context("worker reserve unknown")?
-            .checked_mul(common::GIB)
-            .and_then(|n| {
-                n.checked_add(
-                    status["max_memory_mib"]
-                        .as_u64()?
-                        .checked_mul(1024 * 1024)?,
-                )
-            })
-            .context("cache reserve overflow")?
-    } else {
-        // Standalone operator pulls have no worker admission contract; keep conservative defaults.
-        ensure!(
-            !root.join("state.json").exists(),
-            "worker unavailable; cannot reserve staging safely"
-        );
-        9 * common::GIB
-    };
-    let _reservation =
-        ow_core::cache::Reservation::new(root, manifest.files["disk.ext4"].size, protected)?;
+    let _reservation = reserve_pull(root, manifest.files["disk.ext4"].size)?;
     let stage = images.join(format!(".pull-{}", store::token()?));
     store::pull(objects, &image.reference, &stage)?;
     let result = (|| {

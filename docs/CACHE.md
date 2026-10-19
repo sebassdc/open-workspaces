@@ -65,9 +65,11 @@ from their committed artifacts.
 
 ## Space admission
 
-Every pull reserves its full uncompressed logical size until installation or
-cleanup. Process-held reservation locks let concurrent pulls sum their outstanding
-demand and recognize abandoned records after a crash. Partial files still occupy
+Image and capture pulls share one staging budget. Before downloading file objects,
+each reserves its full verified uncompressed logical size until installation or
+cleanup; captures include disk, VM state and RAM files in that total. Process-held
+reservation locks let concurrent pulls sum their outstanding demand and recognize
+abandoned records after a crash. Partial files still occupy
 physical space. Under the admission lock, a pull re-reads machine disk lengths
 rather than trusting a preceding worker status. Existing full logical disk
 reservations, the configured minimum free space, and one host-memory-sized capture
