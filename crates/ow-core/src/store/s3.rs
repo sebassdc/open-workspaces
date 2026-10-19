@@ -158,6 +158,25 @@ impl S3Objects {
         );
         Ok(())
     }
+    fn complete(&self, key: &str, upload: &str, parts: &[Value], path: &Path) -> Result<Value> {
+        // The 10,000-part document exceeds Linux's per-argument limit; keep it out of argv.
+        serde_json::to_writer(private_file(path)?, &json!({"Parts":parts}))?;
+        let manifest = format!("file://{}", path.display());
+        self.call(
+            "complete-multipart-upload",
+            key,
+            &[
+                "--upload-id",
+                upload,
+                "--multipart-upload",
+                &manifest,
+                "--if-none-match",
+                "*",
+                "--checksum-type",
+                "COMPOSITE",
+            ],
+        )
+    }
 }
 struct Scratch(PathBuf);
 impl Scratch {
@@ -268,22 +287,8 @@ impl Objects for S3Objects {
                 }
             }
             let checksum = format!("{}-{}", STANDARD.encode(composite.finalize()), parts.len());
-            let manifest = json!({"Parts":parts}).to_string();
             if self
-                .call(
-                    "complete-multipart-upload",
-                    key,
-                    &[
-                        "--upload-id",
-                        upload,
-                        "--multipart-upload",
-                        &manifest,
-                        "--if-none-match",
-                        "*",
-                        "--checksum-type",
-                        "COMPOSITE",
-                    ],
-                )
+                .complete(key, upload, &parts, &scratch.0.join("complete.json"))
                 .is_err()
             {
                 self.same(key, &checksum, total)?;
@@ -350,6 +355,42 @@ impl Drop for Download {
 mod tests {
     use super::*;
     #[test]
+    fn s3_completes_ten_thousand_parts_without_large_arguments() {
+        let scratch = Scratch::new().unwrap();
+        let script = scratch.0.join("aws");
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import sys,json,pathlib,stat
+a=sys.argv[1:]
+def arg(k):return a[a.index(k)+1]
+assert max(map(len,a))<4096
+uri=arg('--multipart-upload');assert uri.startswith('file://')
+p=pathlib.Path(uri[7:]);assert stat.S_IMODE(p.stat().st_mode)==0o600
+assert p.stat().st_size>1024*1024
+parts=json.loads(p.read_text())['Parts'];assert len(parts)==10000
+for i,part in enumerate(parts,1):
+    assert part=={'PartNumber':i,'ETag':'"'+'a'*32+'"','ChecksumSHA256':'b'*43+'='}
+assert arg('--if-none-match')=='*' and arg('--checksum-type')=='COMPOSITE'
+print('{}')
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut objects = S3Objects::new("s3://bucket/root", None).unwrap();
+        objects.program = Some(script);
+        let parts: Vec<_> = (1..=10000).map(|n|json!({"PartNumber":n,"ETag":format!("\"{}\"","a".repeat(32)),"ChecksumSHA256":format!("{}=","b".repeat(43))})).collect();
+        let key = format!(
+            "{}disk.ext4.zst",
+            attempt_prefix(&token().unwrap()).unwrap()
+        );
+        let path = scratch.0.join("complete upload.json");
+        objects.complete(&key, "upload", &parts, &path).unwrap();
+        let directory = scratch.0.clone();
+        drop(scratch);
+        assert!(!directory.exists());
+    }
+    #[test]
     fn s3_conditional_single_and_multipart_retries_verify_checksums() {
         let scratch = Scratch::new().unwrap();
         let script = scratch.0.join("aws");
@@ -376,7 +417,8 @@ elif op=='upload-part':
  (root/('part'+arg('--part-number'))).write_bytes(data);print(json.dumps({'ETag':'etag','ChecksumSHA256':h}))
 elif op=='complete-multipart-upload':
  assert arg('--if-none-match')=='*'
- parts=json.loads(arg('--multipart-upload'))['Parts'];data=b''.join((root/('part'+str(p['PartNumber']))).read_bytes() for p in parts)
+ uri=arg('--multipart-upload');assert uri.startswith('file://')
+ parts=json.loads(pathlib.Path(uri[7:]).read_text())['Parts'];data=b''.join((root/('part'+str(p['PartNumber']))).read_bytes() for p in parts)
  if dest.exists():sys.exit(1)
  composite=digest(b''.join(base64.b64decode(p['ChecksumSHA256']) for p in parts))+'-'+str(len(parts))
  dest.write_bytes(data);state.write_text(json.dumps({'ChecksumSHA256':composite,'ContentLength':len(data)}))
@@ -404,6 +446,18 @@ else:raise Exception(op)
         assert!(calls.contains("head-object") && calls.contains("abort-multipart-upload"));
         assert!(calls.contains("root/store/v1/u/"));
         assert!(!calls.contains("delete-object") && !calls.contains("list-objects"));
+        for call in calls
+            .lines()
+            .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
+        {
+            if let Some(index) = call.iter().position(|arg| arg == "--multipart-upload") {
+                let path = call[index + 1].strip_prefix("file://").unwrap();
+                assert!(
+                    !Path::new(path).exists(),
+                    "completion scratch survives upload"
+                );
+            }
+        }
     }
 }
 

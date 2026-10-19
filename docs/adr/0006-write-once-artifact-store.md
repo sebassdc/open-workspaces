@@ -24,6 +24,8 @@ at a time. Each part has an S3 SHA-256 checksum. A failed/lost completion respon
 or existing key succeeds only after HEAD confirms the expected checksum and byte
 length; an ETag is never treated as SHA-256. Multipart retry checks the composite
 SHA-256, including its part count.
+The completion list is spooled to a private scratch JSON file and passed to the
+CLI by file URI; it does not occupy a potentially oversized command argument.
 
 A private new directory receives downloads. The reader first checks the manifest
 against the catalog digest, validates every key, then verifies each decoded file's

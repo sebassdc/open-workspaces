@@ -27,6 +27,8 @@ The AWS CLI must support `--if-none-match` on both `s3api put-object` and
 one compressed 64 MiB part at a time; each part has a SHA-256 checksum. The 10,000
 part limit caps a compressed object at 625 GiB in this implementation. A lost
 completion response is checked with HEAD, including composite SHA-256 and length.
+The completion part list is a private scratch JSON file passed by file URI, so
+large uploads do not exceed the operating system's command-argument limit.
 
 Before image publication/build, the application checks bucket versioning,
 lifecycle, and the write-once policy. Missing read permissions or an unsafe bucket
