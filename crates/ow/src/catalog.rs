@@ -1555,6 +1555,7 @@ impl Catalog {
             let image = crate::image_catalog::resolve_stored(&self.db, selector)?;
             crate::image_store::dispatch(
                 &self.root,
+                &self.root,
                 &node,
                 json!({"op":"image-pull","image":image}),
             )?;

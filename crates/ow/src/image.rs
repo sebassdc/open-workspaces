@@ -387,7 +387,8 @@ fn controller_build(
         ow_core::store::image_name(base_image)?.1.is_some(),
         "pin --base-image as NAME@N"
     );
-    let controller = selfhost::base(base)?.join("controller");
+    let base = selfhost::base(base)?;
+    let controller = base.join("controller");
     let mut db = catalog::open(&controller)?;
     let base_image = catalog::resolve(&db, base_image)?;
     ensure!(
@@ -410,6 +411,7 @@ fn controller_build(
     }
     let result = image_store::dispatch(
         &controller,
+        &base.join("runner"),
         &image.node,
         json!({"op":"image-build","image":image,"base_image":base_image,"recipe":text,"memory_mib":memory,"vcpu_count":cpus,"timeout_seconds":timeout_minutes*60}),
     )?;

@@ -244,7 +244,13 @@ pub fn publish(
         u64::try_from(image.expires - 7200)?,
     )
 }
-pub fn dispatch(controller: &Path, node: &str, request: Value) -> Result<Value> {
+/// The catalog/leases belong to the controller; local job state belongs to its worker.
+pub fn dispatch(
+    controller: &Path,
+    local_runner: &Path,
+    node: &str,
+    request: Value,
+) -> Result<Value> {
     let lease = if request["op"] == "image-pull" {
         let image: Image = serde_json::from_value(request["image"].clone())?;
         let db = image_catalog::open(controller)?;
@@ -255,7 +261,7 @@ pub fn dispatch(controller: &Path, node: &str, request: Value) -> Result<Value> 
     };
     let result = (|| {
         if node == "local" {
-            return job(controller, &request);
+            return job(local_runner, &request);
         }
         let root = crate::nodes::route(controller, node)?;
         let value = wire::connect_waiting(&root, &request, Duration::from_secs(7200))?.1;
@@ -550,7 +556,12 @@ pub fn prefetch(controller: &Path, node: &str, advertised: &Value) -> Result<()>
                 .iter()
                 .map(|image| {
                     scope.spawn(move || {
-                        dispatch(controller, node, json!({"op":"image-pull","image":image}))
+                        dispatch(
+                            controller,
+                            controller,
+                            node,
+                            json!({"op":"image-pull","image":image}),
+                        )
                     })
                 })
                 .collect();
