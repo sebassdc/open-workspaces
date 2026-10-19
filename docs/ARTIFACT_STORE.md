@@ -172,3 +172,6 @@ cleanup, catalog concurrency/expiry/retirement, image installation and schema 3
 read/write compatibility. Live AWS IAM enforcement, real fresh-host timing and
 controller-placed golden-image guest execution require a dedicated acceptance run.
 Local tests do not establish that those live checks have passed.
+
+See [local cache and placement](CACHE.md) for negotiated verified inventory,
+lease-excluded eviction, staging reservations and deterministic cache hints.

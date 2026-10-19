@@ -108,6 +108,9 @@ print(json.dumps(out))
                 let request: Value = serde_json::from_str(&line).unwrap();
                 worker_calls.lock().unwrap().push(request.clone());
                 let result = match request["op"].as_str().unwrap() {
+                    "status" => {
+                        json!({"reserved_disk_bytes":0,"min_free_gib":5,"max_memory_mib":4096})
+                    }
                     "create" => {
                         assert_eq!(request["image"], "ubuntu@1");
                         json!({})

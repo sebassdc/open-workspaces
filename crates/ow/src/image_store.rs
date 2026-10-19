@@ -36,6 +36,8 @@ fn check(image: &Image) -> Result<()> {
     Ok(())
 }
 pub fn install(objects: &dyn Objects, image: &Image, root: &Path) -> Result<Value> {
+    let started = std::time::Instant::now();
+    let _cache = ow_core::cache::lock(root, false)?;
     check(image)?;
     let manifest = store::read_manifest(objects, &image.reference)?;
     ensure!(
@@ -50,13 +52,15 @@ pub fn install(objects: &dyn Objects, image: &Image, root: &Path) -> Result<Valu
     let target = images.join(&name);
     let local = json!({"name":name,"base":manifest.metadata["base"],"recipe_sha256":manifest.metadata["recipe_sha256"],"disk_sha256":manifest.files["disk.ext4"].sha256,"store":image,"image_digest":image.reference.digest});
     if target.exists() {
-        let previous: Value = serde_json::from_slice(&fs::read(target.join("manifest.json"))?)?;
+        let mut previous: Value = serde_json::from_slice(&fs::read(target.join("manifest.json"))?)?;
         ensure!(
             previous["image_digest"] == image.reference.digest
                 && store::hash_file(&target.join("disk.ext4"))?
                     == manifest.files["disk.ext4"].sha256,
             "installed image version conflicts or is corrupt"
         );
+        ow_core::cache::touch(root, &name)?;
+        previous["measurement"] = json!({"method":"verified-local-image","logical_bytes":manifest.files["disk.ext4"].size,"n":1,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0});
         return Ok(previous);
     }
     let count = || -> Result<usize> {
@@ -69,6 +73,30 @@ pub fn install(objects: &dyn Objects, image: &Image, root: &Path) -> Result<Valu
         Ok(count)
     };
     ensure!(count()? < 32, "golden image limit (32) reached");
+    let protected = if root.join("control.sock").exists() {
+        let status = wire::request(root, json!({"op":"status"}))?;
+        status["min_free_gib"]
+            .as_u64()
+            .context("worker reserve unknown")?
+            .checked_mul(common::GIB)
+            .and_then(|n| {
+                n.checked_add(
+                    status["max_memory_mib"]
+                        .as_u64()?
+                        .checked_mul(1024 * 1024)?,
+                )
+            })
+            .context("cache reserve overflow")?
+    } else {
+        // Standalone operator pulls have no worker admission contract; keep conservative defaults.
+        ensure!(
+            !root.join("state.json").exists(),
+            "worker unavailable; cannot reserve staging safely"
+        );
+        9 * common::GIB
+    };
+    let _reservation =
+        ow_core::cache::Reservation::new(root, manifest.files["disk.ext4"].size, protected)?;
     let stage = images.join(format!(".pull-{}", store::token()?));
     store::pull(objects, &image.reference, &stage)?;
     let result = (|| {
@@ -105,12 +133,16 @@ pub fn install(objects: &dyn Objects, image: &Image, root: &Path) -> Result<Valu
             fs::rename(&stage, &target)?;
             File::open(&images)?.sync_all()?;
         }
+        ow_core::cache::touch(root, &name)?;
         Ok(local)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&stage);
     }
-    result
+    result.map(|mut value| {
+        value["measurement"]=json!({"method":"verified-zstd-pull","logical_bytes":manifest.files["disk.ext4"].size,"n":1,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0});
+        value
+    })
 }
 /// Only an operator or the authenticated controller calls this job; guests cannot.
 pub fn job(root: &Path, request: &Value) -> Result<Value> {
@@ -124,8 +156,18 @@ pub fn job(root: &Path, request: &Value) -> Result<Value> {
     );
     let objects = store::S3Objects::new(&image.store_url, None)?;
     if request["op"] == "image-pull" {
-        return install(&objects, &image, root);
+        install(&objects, &image, root)
+    } else {
+        build_job(root, request, &image, &objects)
     }
+}
+
+fn build_job(
+    root: &Path,
+    request: &Value,
+    image: &Image,
+    objects: &store::S3Objects,
+) -> Result<Value> {
     objects.verify_configuration()?;
     ensure!(
         request["op"] == "image-build" && image.expires > now(),
@@ -143,7 +185,7 @@ pub fn job(root: &Path, request: &Value) -> Result<Value> {
             && base.store_url == image.store_url,
         "base image mismatch"
     );
-    install(&objects, &base, root)?;
+    install(objects, &base, root)?;
     let jobs = root.join("image-jobs");
     if !jobs.exists() {
         fs::DirBuilder::new().mode(0o700).create(&jobs)?;
@@ -212,7 +254,7 @@ pub fn job(root: &Path, request: &Value) -> Result<Value> {
         File::open(&jobs)?.sync_all()?;
         local
     };
-    let reference = publish(&objects, &image, &sealed.join("disk.ext4"), local)?;
+    let reference = publish(objects, image, &sealed.join("disk.ext4"), local)?;
     Ok(json!({"reference":reference}))
 }
 pub fn publish(
@@ -251,6 +293,17 @@ pub fn dispatch(
     node: &str,
     request: Value,
 ) -> Result<Value> {
+    let cache_capable = if request["op"] != "image-pull" {
+        false
+    } else if node == "local" {
+        wire::request(local_runner, json!({"op":"status"}))
+            .is_ok_and(|s| s["cache_eviction_v1"] == true)
+    } else {
+        crate::nodes::operation_capable(controller, node, "cache-inventory").is_ok()
+    };
+    if request["op"] == "image-pull" && cache_capable {
+        crate::cache_catalog::reconcile(controller, local_runner, node)?;
+    }
     let lease = if request["op"] == "image-pull" {
         let image: Image = serde_json::from_value(request["image"].clone())?;
         let db = image_catalog::open(controller)?;
@@ -260,6 +313,20 @@ pub fn dispatch(
         None
     };
     let result = (|| {
+        if request["op"] == "image-pull" {
+            if cache_capable {
+                let image: Image = serde_json::from_value(request["image"].clone())?;
+                let objects = store::S3Objects::new(&image.store_url, None)?;
+                let manifest = store::read_manifest(&objects, &image.reference)?;
+                crate::cache_catalog::make_room(
+                    controller,
+                    local_runner,
+                    node,
+                    manifest.files["disk.ext4"].size,
+                    &image.reference.digest,
+                )?;
+            }
+        }
         if node == "local" {
             return job(local_runner, &request);
         }
@@ -277,9 +344,13 @@ pub fn dispatch(
     })();
     // An uncertain remote pull may still be running: retain its lease until expiry.
     if result.is_ok()
-        && let Some((id, db)) = lease
+        && let Some((id, mut db)) = lease
     {
-        db.execute("DELETE FROM leases WHERE id=?1", [id])?;
+        let image: Image = serde_json::from_value(request["image"].clone())?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO artifact_copies(artifact,node,state,last_used) VALUES(?1,?2,'present',?3) ON CONFLICT(artifact,node) DO UPDATE SET state='present',last_used=excluded.last_used",rusqlite::params![image.artifact,node,now()])?;
+        tx.execute("DELETE FROM leases WHERE id=?1", [id])?;
+        tx.commit()?;
     }
     result
 }
@@ -372,8 +443,15 @@ mod tests {
         .unwrap();
         let runner = root.join("runner");
         fs::create_dir(&runner).unwrap();
-        install(&objects, &image, &runner).unwrap();
-        install(&objects, &image, &runner).unwrap();
+        let cold = install(&objects, &image, &runner).unwrap();
+        let warm = install(&objects, &image, &runner).unwrap();
+        assert_eq!(cold["measurement"]["method"], "verified-zstd-pull");
+        assert_eq!(warm["measurement"]["method"], "verified-local-image");
+        assert_eq!(cold["measurement"]["n"], 1);
+        assert_eq!(cold["measurement"]["logical_bytes"], 11);
+        fs::remove_dir_all(runner.join("images/tools@1")).unwrap();
+        let stale = install(&objects, &image, &runner).unwrap();
+        assert_eq!(stale["measurement"]["method"], "verified-zstd-pull");
         assert_eq!(
             fs::read(runner.join("images/tools@1/disk.ext4")).unwrap(),
             b"sealed disk"
@@ -446,6 +524,7 @@ pub fn install_base(
         ["ubuntu", "arch", "alpine"].contains(&image.name.as_str()),
         "only built-in base profiles can replace assets"
     );
+    let _cache = ow_core::cache::lock(runner, false)?;
     let manifest = store::read_manifest(objects, &image.reference)?;
     ensure!(manifest.kind == "base", "base artifact required");
     let kernel = store::hash_file(&assets.join("downloads/vmlinux-6.1.186"))?;
@@ -565,11 +644,9 @@ pub fn prefetch(controller: &Path, node: &str, advertised: &Value) -> Result<()>
                     })
                 })
                 .collect();
-            for (image, job) in batch.iter().zip(jobs) {
+            for job in jobs {
                 match job.join() {
-                    Ok(Ok(_)) => {
-                        db.execute("INSERT INTO artifact_copies(artifact,node,state,last_used) VALUES(?1,?2,'present',?3) ON CONFLICT(artifact,node) DO UPDATE SET state='present',last_used=excluded.last_used",rusqlite::params![image.artifact,node,now()])?;
-                    }
+                    Ok(Ok(_)) => {}
                     _ => eprintln!("image prefetch failed; on-demand create can retry"),
                 }
             }

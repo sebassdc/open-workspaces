@@ -386,6 +386,9 @@ impl Catalog {
               INSERT INTO settings(key,value) VALUES('min_reader_schema','5') ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),5);")?;
         }
 
+        // Additive guards are enforced by SQLite even for prior schema-5 writers.
+        crate::cache_catalog::initialize(&db)?;
+
         // A newer catalog this binary may read (its floor allows it) keeps its version.
         db.execute_batch(&format!("UPDATE resources SET reserved_mib=COALESCE(json_extract(metadata,'$.memory_mib'),0) WHERE kind='machine' AND placement_managed=0 AND reserved_mib=0 AND json_extract(metadata,'$.state')='running'; PRAGMA user_version={}; COMMIT;", version.max(nodes::SCHEMA)))?;
         nodes::db(root)?;
@@ -702,7 +705,7 @@ impl Catalog {
             }
             if let Some(target) = &intent.target {
                 // Catalog capacity only; T3 additionally validates worker capability and disk headroom.
-                let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("target offline, draining or without a registered budget")?;
+                let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("target offline, draining or without a registered budget")?;
                 let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
                 let (extra_mib,extra_cpus,extra_slots) = c.extra_usage(target)?;
                 ensure!(used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64 && used_cpus as u64 + extra_cpus + intent.cpus as u64 <= cpus as u64 && used_slots as u64 + extra_slots < slots as u64,"node capacity exhausted");
@@ -1283,7 +1286,7 @@ impl Catalog {
         image: &str,
         cpus: u64,
         local_status: &Value,
-        disk: bool,
+        disk: Option<u32>,
     ) -> Result<String> {
         let inventory = nodes::inventory(&self.root)?;
         if inventory.as_array().unwrap().is_empty() && requested.is_none() {
@@ -1294,7 +1297,7 @@ impl Catalog {
         for n in inventory.as_array().unwrap() {
             let id = n["id"].as_str().unwrap();
             if requested.is_some_and(|r| r != id)
-                || (disk && n["capabilities"]["disk_resize_v1"] != true)
+                || (disk.is_some() && n["capabilities"]["disk_resize_v1"] != true)
                 || common::guest_shape(&n["capabilities"], memory, cpus).is_err()
                 || n["online"] != true
                 || n["capabilities"]["drain"] == true
@@ -1316,10 +1319,46 @@ impl Catalog {
                 && used_cpus as u64 + extra_cpus + cpus
                     <= n["capabilities"]["vcpus"].as_u64().unwrap_or(0)
             {
-                candidates.push((used, id.to_owned()));
+                let cap = n["capabilities"].clone();
+                let transfers: i64 = self.db.query_row(
+                    "SELECT COALESCE(SUM(disk_bytes),0) FROM transfer_reservations WHERE node=?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                let logical: i64 = self.db.query_row("SELECT COALESCE(SUM(a.disk_gib),0) FROM owner_allocations a JOIN resources r ON r.kind='machine' AND r.physical=a.physical WHERE r.node=?1",[id],|r|r.get(0))?;
+                let disk_extra = (transfers as u64).saturating_add(
+                    (logical as u64 * common::GIB)
+                        .saturating_sub(cap["reserved_disk_bytes"].as_u64().unwrap_or(0)),
+                );
+                candidates.push(crate::placement::Candidate {
+                    id: id.to_owned(),
+                    online: true,
+                    active: cap["controller_drain"] != true && cap["active"] != false,
+                    pool: cap["pool"].as_str().unwrap_or("default").into(),
+                    free: crate::placement::Capacity {
+                        memory_mib: n["memory_mib"]
+                            .as_u64()
+                            .unwrap()
+                            .saturating_sub(used as u64 + extra_mib),
+                        cpus: cap["vcpus"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_sub(used_cpus as u64 + extra_cpus),
+                        slots: n["slots"]
+                            .as_u64()
+                            .unwrap()
+                            .saturating_sub(count as u64 + extra_slots),
+                        disk_bytes: cap["available_disk_bytes"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_sub(disk_extra),
+                    },
+                    joined: n["enrollment_order"].as_u64().unwrap_or(0),
+                    capabilities: cap,
+                });
             }
         }
-        candidates.sort();
+
         if candidates.is_empty() {
             let online: Vec<_> = inventory
                 .as_array()
@@ -1342,17 +1381,35 @@ impl Catalog {
                 .collect();
             ensure!(!prepared.is_empty(), "node lacks prepared image");
             ensure!(
-                prepared
-                    .iter()
-                    .any(|n| (!disk || n["capabilities"]["disk_resize_v1"] == true)
-                        && common::node_operation(&n["capabilities"], "create").is_ok()),
+                prepared.iter().any(|n| (disk.is_none()
+                    || n["capabilities"]["disk_resize_v1"] == true)
+                    && common::node_operation(&n["capabilities"], "create").is_ok()),
                 "node capability does not support create"
             );
             anyhow::bail!("node capacity exhausted");
         }
-        candidates
-            .first()
-            .map(|(_, id)| id.clone())
+        let stored = crate::image_catalog::resolve_stored(&self.db, image)
+            .ok()
+            .or_else(|| crate::image_catalog::resolve(&self.db, image).ok());
+        let demand = crate::placement::Demand {
+            requested,
+            pool: "default",
+            memory_mib: memory,
+            cpus,
+            disk_bytes: u64::from(disk.unwrap_or(common::DEFAULT_DISK_GIB)) * common::GIB,
+            image,
+            image_digest: stored.as_ref().map(|i| i.reference.digest.as_str()),
+            parent_digest: stored.as_ref().map(|i| i.base_digest.as_str()),
+            capture_digest: None,
+            compatibility: None,
+            managed: false,
+            disk_sizing: disk.is_some(),
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        };
+        crate::placement::choose(&candidates, &demand)
+            .map(|n| n.id.clone())
             .context("node capacity exhausted")
     }
     fn capacity(
@@ -1375,6 +1432,12 @@ impl Catalog {
             .iter()
             .find(|n| n["id"] == node)
             .context("node")?;
+        ensure!(
+            n["capabilities"]["drain"] != true
+                && n["capabilities"]["controller_drain"] != true
+                && n["capabilities"]["active"] != false,
+            "node draining or inactive"
+        );
         common::guest_shape(&n["capabilities"], memory, cpus)?;
         let (limit, slots) = (
             n["memory_mib"].as_u64().unwrap_or(0),
@@ -1659,7 +1722,7 @@ impl Catalog {
                         request["image"].as_str().unwrap_or("alpine"),
                         request["vcpu_count"].as_u64().unwrap_or(1),
                         &local_status,
-                        request.get("disk_gib").is_some(),
+                        common::requested_disk(&request)?,
                     )?;
                     self.db.execute(
                         "UPDATE resources SET node=?1 WHERE kind='machine' AND physical=?2",
@@ -2173,7 +2236,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let cap = json!({"backend":"firecracker","arch":"x86_64","runtime":common::RUNTIME,"protocol":1,"memory_mib":4096,"vcpus":4,"slots":2,"images":["ubuntu"],"disk_resize_v1":true,"max_guest_memory_mib":4096,"max_guest_vcpus":4});
+        let cap = json!({"backend":"firecracker","arch":"x86_64","runtime":common::RUNTIME,"protocol":1,"memory_mib":4096,"vcpus":4,"slots":2,"images":["ubuntu"],"disk_resize_v1":true,"available_disk_bytes":64*common::GIB,"disk_observed_unix_s":now,"max_guest_memory_mib":4096,"max_guest_vcpus":4});
         c.db.execute("INSERT INTO nodes(id,heartbeat,memory_mib,slots,capabilities) VALUES('runner',?1,4096,2,?2)", params![now as i64,cap.to_string()]).unwrap();
         c.db.execute("INSERT INTO node_usage(node,extra_mib,extra_cpus,extra_slots) VALUES('runner',512,1,0)", []).unwrap();
         let inventory = nodes::inventory(&root).unwrap();
@@ -2187,24 +2250,25 @@ mod tests {
         assert!(!output.to_string().contains("bob-private"));
         assert!(!output.to_string().contains(&physical));
         assert_eq!(
-            c.choose(None, 2048, "ubuntu", 2, &json!({}), true).unwrap(),
+            c.choose(None, 2048, "ubuntu", 2, &json!({}), Some(32))
+                .unwrap(),
             "runner"
         );
         assert!(
-            c.choose(None, 4096, "ubuntu", 2, &json!({}), true)
+            c.choose(None, 4096, "ubuntu", 2, &json!({}), Some(32))
                 .unwrap_err()
                 .to_string()
                 .contains("capacity exhausted")
         );
         assert!(
-            c.choose(None, 256, "arch", 1, &json!({}), true)
+            c.choose(None, 256, "arch", 1, &json!({}), Some(32))
                 .unwrap_err()
                 .to_string()
                 .contains("lacks prepared image")
         );
         c.db.execute("UPDATE nodes SET heartbeat=0", []).unwrap();
         assert!(
-            c.choose(None, 256, "ubuntu", 1, &json!({}), true)
+            c.choose(None, 256, "ubuntu", 1, &json!({}), Some(32))
                 .unwrap_err()
                 .to_string()
                 .contains("no online node")
@@ -2505,6 +2569,20 @@ mod tests {
         let mut c = Catalog::open(&root, &owner.issuer, None).unwrap();
         let user = c.user(&owner).unwrap();
         let physical = c.reserve(user, "machine", "demo").unwrap();
+        let triggers: Vec<String> =
+            c.db.prepare(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'cache_guard_%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for trigger in triggers {
+            c.db.execute_batch(&format!("DROP TRIGGER {trigger}"))
+                .unwrap();
+        }
+        c.db.execute_batch("DROP TABLE cache_evictions").unwrap();
         c.db.execute_batch(
             "ALTER TABLE resources DROP COLUMN placement_managed; ALTER TABLE resources DROP COLUMN placement_epoch; ALTER TABLE resources DROP COLUMN current_capture; ALTER TABLE resources DROP COLUMN ssh_policy; ALTER TABLE resources DROP COLUMN ssh_policy_generation; DROP TABLE transfer_reservations; DROP TABLE transfer_locks; DROP TABLE transfers; ALTER TABLE resources DROP COLUMN node; ALTER TABLE resources DROP COLUMN reserved_mib; ALTER TABLE resources DROP COLUMN reserved_cpus; DROP INDEX operation_retry; ALTER TABLE operations DROP COLUMN node; ALTER TABLE operations DROP COLUMN retry_key; ALTER TABLE operations DROP COLUMN request; ALTER TABLE operations DROP COLUMN response; CREATE UNIQUE INDEX legacy_physical ON resources(physical); PRAGMA user_version=1;",
         )

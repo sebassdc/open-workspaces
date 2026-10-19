@@ -2,6 +2,10 @@
 mod backup;
 #[cfg(target_os = "linux")]
 mod catalog;
+#[cfg(any(target_os = "linux", test))]
+mod cache_catalog;
+#[cfg(any(target_os = "linux", test))]
+mod placement;
 mod client;
 #[cfg(target_os = "linux")]
 mod dashboard;

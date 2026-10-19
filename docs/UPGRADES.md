@@ -340,3 +340,12 @@ disables automatic rollback across this reader-floor boundary. Freeze mutations
 before upgrading, retain the private consistent backup, and follow the controlled
 recovery procedure if rollback is needed after new writes. A stale backup cannot
 authorize older placement epochs or discard new transfer/artifact roots.
+
+## Negotiated cache operations
+
+[Cache inventory and placement](CACHE.md) are class 1; worker eviction and staging
+enforcement are class 2 and require the normal worker upgrade action. The optional
+capability and controller acknowledgment gate the new shape and operations.
+The additive catalog guards retain schema/read floor 5. No release version or
+worker pin is advanced merely by installing controller inventory code; the
+coordinated release must carry the class-2 declaration before rollout.
