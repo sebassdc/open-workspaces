@@ -461,3 +461,5 @@ both short development bursts and sustained compilation before enabling 2:1;
 record host and guest CPU steal separately, plus build and preview p50/p95,
 errors, sample counts and host configuration. Guest-local preview timing does not
 include the gateway, tailnet or a user's WAN.
+
+For a controlled class-1 controller replacement, use the [recovery guide](../../docs/CONTROLLER_RECOVERY.md). The checklist is read-only with respect to services; explicit host freeze/conversion commands preserve worker pins. Live cutover, private trust transfer and capacity remain separate operator gates.

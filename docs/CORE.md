@@ -131,6 +131,8 @@ grant, node, transfer/reservation and artifact/copy/lease rows. They do not prov
 a live cross-host controller cutover or stale-backup recovery. Those require a
 separate disposable-fixture drill; no automatic failover is provided.
 
+See the [replacement-controller guide](CONTROLLER_RECOVERY.md) for the read-only `ow backup catalog-check`, persistent freeze, runner conversion and rollback checklist.
+
 ### Snapshots
 
 ```sh
