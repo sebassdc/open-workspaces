@@ -651,7 +651,7 @@ class Staging(unittest.TestCase):
             raise u.urllib.error.URLError("network unreachable")
 
         with mock.patch.object(u.urllib.request, "urlopen", fail):
-            with self.assertRaisesRegex(Refused, "cannot download .*--from-source"):
+            with self.assertRaisesRegex(Refused, "cannot download .*--from-source builds instead"):
                 u.download("https://github.com/o/r/releases/download/v1.2.3/SHA256SUMS")
 
         def missing(*a, **k):

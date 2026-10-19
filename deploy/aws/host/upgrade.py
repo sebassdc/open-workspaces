@@ -251,7 +251,7 @@ def download(url):
     except OSError as e:  # urllib's HTTP and network errors, and timeouts
         if isinstance(e, urllib.error.HTTPError) and e.code == 404:
             return None
-        raise Refused(f"cannot download {url}: {e}; retry, or pass --from-source")
+        raise Refused(f"cannot download {url}: {e}; retry (ow-host upgrade --from-source builds instead)")
 
 
 def released(target, role):
@@ -270,9 +270,12 @@ def released(target, role):
         why = f"no released binary for {os.uname().machine}"
     else:
         sums = download(f"{url}/SHA256SUMS")
-        sums = dict(line.split()[::-1] for line in (sums or b"").decode().splitlines() if len(line.split()) == 2)
-        missing = [asset for asset in files.values() if asset not in sums]
-        why = missing and f"release {tag} publishes no {', '.join(missing)}"
+        if sums is None:
+            why = f"no published release {tag} with a SHA256SUMS"
+        else:
+            sums = dict(line.split()[::-1] for line in sums.decode().splitlines() if len(line.split()) == 2)
+            missing = [asset for asset in files.values() if asset not in sums]
+            why = missing and f"release {tag} publishes no {', '.join(missing)}"
     if why:
         say(f"building {target['release']} from source: {why}")
         return None
@@ -348,6 +351,8 @@ def stage(target, from_source=False):
         if built[-1:] != [target["version"]]:
             raise Refused(f"{name}: built ow reports {' '.join(built)}, not {target['version']}")
         digest = hashlib.sha256((rel / "bin/ow").read_bytes()).hexdigest()
+        if got and digest != hashlib.sha256(got["ow"]).hexdigest():
+            raise Refused(f"{name}: installed bin/ow is not the verified released binary")
         h.write_json(f"{h.SRV}/releases/{name}/STAGED", {
             "version": target["version"], "commit": target["commit"], "ref": target["ref"], "ow_sha256": digest,
             "staged": int(time.time()), "seconds": round(time.monotonic() - started),
