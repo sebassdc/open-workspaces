@@ -445,6 +445,15 @@ pub async fn handle(
         // Worker diagnostics may contain host paths; keep detailed error text in operator logs.
         Err(error) => {
             eprintln!("Dashboard workspace operation failed: {error:#}");
+            if let Some(missing) = error.downcast_ref::<crate::catalog::ResourceNotFound>() {
+                return secure(
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"ok":false,"error_code":"not_found","error":missing.to_string()})),
+                    )
+                        .into_response(),
+                );
+            }
             if let Some(rejection) = error.downcast_ref::<crate::limits::Rejection>() {
                 return secure(
                     (

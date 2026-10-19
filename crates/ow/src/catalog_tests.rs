@@ -183,8 +183,65 @@ fn identity(name: &str) -> Identity {
     }
 }
 
-#[test]
-fn known_rejections_give_safe_actions_without_worker_details() {
+#[tokio::test]
+async fn missing_machine_delete_is_not_found_without_worker_contact() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let owner = c.user(&identity("alice")).unwrap();
+    c.reserve(owner, "machine", "private-box").unwrap();
+    let c = Arc::new(Mutex::new(c));
+    for name in [
+        "missing-box",
+        "private-box",
+        "alice@example.test/private-box",
+    ] {
+        let response = crate::dashboard::handle(
+            Some(c.clone()),
+            None,
+            identity("bob"),
+            Request::builder()
+                .method("POST")
+                .uri("/api/operation")
+                .header("x-ow-request", "dashboard")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"op":"delete","id":name,"operation_key":"missing-delete"}).to_string(),
+                ))
+                .unwrap(),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{name}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({"ok":false,"error_code":"not_found","error":format!("machine '{name}' was not found.")})
+        );
+    }
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    let c = c.lock().unwrap();
+    assert_eq!(
+        c.db.query_row("SELECT count(*) FROM operations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        c.db.query_row("SELECT count(*) FROM resources", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn known_rejections_give_safe_actions_without_worker_details() {
     let mut fake = Fake::new();
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();
     fake.worker("alpha");
@@ -211,9 +268,8 @@ fn known_rejections_give_safe_actions_without_worker_details() {
     ] {
         *fake.reject.lock().unwrap() = Some(op.into());
         *fake.diagnostic.lock().unwrap() = diagnostic.into();
-        let error = c
-            .operation(owner, json!({"op":op,"id":"demo"}))
-            .unwrap_err();
+        let request = json!({"op":op,"id":"demo","operation_key":common::nonce().unwrap()});
+        let error = c.operation(owner, request.clone()).unwrap_err();
         let failure = error.downcast_ref::<OperationFailure>().unwrap();
         assert!(
             failure.message().contains(expected),
@@ -223,6 +279,33 @@ fn known_rejections_give_safe_actions_without_worker_details() {
         assert_eq!(failure.0["state"], "failed");
         assert!(!failure.message().contains("/srv/private"));
         assert!(!failure.message().contains("os error"));
+        let catalog = Arc::new(Mutex::new(c));
+        let response = crate::dashboard::handle(
+            Some(catalog.clone()),
+            None,
+            identity("alice"),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/operation")
+                .header("x-ow-request", "dashboard")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(request.to_string()))
+                .unwrap(),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"], failure.message());
+        assert!(!body.to_string().contains("/srv/private"));
+        assert!(!body.to_string().contains("os error"));
+        c = Arc::try_unwrap(catalog).ok().unwrap().into_inner().unwrap();
     }
     assert_eq!(c.state(owner).unwrap()["workspaces"][0]["state"], "running");
 }
