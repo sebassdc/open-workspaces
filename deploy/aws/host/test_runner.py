@@ -43,6 +43,7 @@ class Config(unittest.TestCase):
             ("runner__node", "x" * 33, "node ID"), ("runner__controller", "a b", "host name"),
             ("runner__joinSecretArn", "", "joinSecretArn"), ("runner__joinSecretArn", "arn:aws:iam::1:role/x", "joinSecretArn"),
             ("tailscale__secretArn", "", "tailnet"), ("dashboard__logins", ["you@example.com"], "no dashboard"),
+            ("dashboard__capability", "example.test/cap/open-workspaces", "no dashboard"),
         ]:
             with self.assertRaisesRegex(Refused, message, msg=key):
                 runner(**{key: value})

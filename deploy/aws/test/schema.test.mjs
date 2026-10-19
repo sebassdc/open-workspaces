@@ -22,4 +22,6 @@ test("pulumi package get-schema finds every component", (t) => {
             "#/types/open-workspaces-aws:index:TailscaleDirectArgs");
     }
     assert.equal(schema.resources["open-workspaces-aws:index:Runner"].inputProperties.controller.$ref, "#/types/open-workspaces-aws:index:RunnerController");
+    assert.equal(schema.resources["open-workspaces-aws:index:Host"].inputProperties.dashboardCapability.type, "string");
+    assert.ok(!("dashboardCapability" in schema.resources["open-workspaces-aws:index:Runner"].inputProperties));
 });

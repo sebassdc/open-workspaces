@@ -2,7 +2,7 @@
   "schema": 1,
   "releases": [
     {
-      "version": "0.8.2",
+      "version": "0.8.4",
       "class": 2,
       "changes": [
         "worker",
@@ -38,6 +38,44 @@
       "host_layout": 2,
       "in_place_from": "0.5.0",
       "notes": "Remote CLI discovery reports selected server, identity, prepared images and admission headroom with honest unknown/offline capacity. Worker and agent add optional disk reservation/headroom and box-count observations; controller exposes bounded authenticated metadata and safe first-use errors. Existing JSON, raw exec exit/output and operation-key retries remain compatible. Protocols, catalog schema, runtime, images and host layout are unchanged; use the normal warm worker upgrade and preserve cold-memory-loss gates."
+    },
+    {
+      "version": "0.8.3",
+      "class": 1,
+      "changes": [
+        "component",
+        "config",
+        "dashboard",
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "catalog": {
+        "schema": 3,
+        "min_reader": 3
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Capability-based tailnet admission through optional dashboardCapability and fresh Tailscale whois grants, with stable user ownership and terminal/SSH/preview stream revocation. In-place host config carries the capability and preserves preview helpers for capability-only dashboards. Upgrade the dashboard and apply host configuration; worker, controller, protocols, catalog schema, guest images, snapshot format, host layout v2 and stage 0 are unchanged. No instance replacement is required."
     },
     {
       "version": "0.8.1",

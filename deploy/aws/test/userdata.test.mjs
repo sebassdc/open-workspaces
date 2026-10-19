@@ -85,6 +85,9 @@ test("the config is validated in the component", () => {
     assert.doesNotThrow(() => hostConfig(base));
     for (const [bad, message] of [
         [{ dashboardLogins: ["a@example.com"] }, /needs tailscaleAuthKeySecretArn/],
+        [{ dashboardCapability: "example.test/cap/open-workspaces" }, /needs tailscaleAuthKeySecretArn/],
+        ...["bad", "example.test/", "https://example.test/cap", "example.test/cap\nX=1", "-bad.test/cap", "example.test/" + "a".repeat(512)]
+            .map((capability) => [{ dashboardCapability: capability }, /dashboardCapability must be/]),
         [{ backupSchedule: "daily" }, /backupSchedule needs backupUrl/],
         [{ backupUrl: "s3://my-bucket/ow", backupSchedule: "daily; id" }, /systemd calendar/],
         [{ idleMinutes: 1.5 }, /idleMinutes/],
@@ -94,6 +97,13 @@ test("the config is validated in the component", () => {
     ]) {
         assert.throws(() => hostConfig({ ...base, ...bad }), message);
     }
+});
+
+test("capability admission enables a dashboard without logins or user data changes", async () => {
+    const before = await deploy({});
+    const after = await deploy({ tailscaleAuthKeySecretArn: secretArn, dashboardCapability: "example.test/cap/open-workspaces" });
+    assert.deepEqual(after.config.dashboard, { logins: [], capability: "example.test/cap/open-workspaces" });
+    assert.equal(before.userData, after.userData);
 });
 
 test("user data keeps values literal and starts with the bootstrap shebang", () => {

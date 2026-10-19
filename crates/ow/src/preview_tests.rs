@@ -1,5 +1,5 @@
 //! End-to-end HTTP/WS through the real gateway, with a stand-in worker TCP tunnel.
-use super::tests::tailnet_config;
+use super::tests::{capability_answer, capability_config};
 use super::*;
 use axum::{
     extract::ws::{Message, WebSocketUpgrade},
@@ -8,13 +8,22 @@ use axum::{
 use serde_json::json;
 use std::future::IntoFuture;
 use std::{
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    os::unix::net::UnixListener,
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tungstenite::client::IntoClientRequest;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tailnet_preview_http_websocket_and_revocation() {
+    preview_http_websocket_and_revocation(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tailnet_capability_preview_http_websocket_and_revocation() {
+    preview_http_websocket_and_revocation(true).await;
+}
+
+async fn preview_http_websocket_and_revocation(capability: bool) {
     let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = backend.local_addr().unwrap();
     let guest = tokio::spawn(
@@ -57,15 +66,26 @@ async fn tailnet_preview_http_websocket_and_revocation() {
     );
     let root = std::env::temp_dir().join(format!("ow-preview-{}", crate::common::nonce().unwrap()));
     fs::create_dir(&root).unwrap();
-    let mut config = tailnet_config();
+    let mut config = capability_config();
     config.previews = true;
-    config.allowed_emails = vec![
-        "owner@example.test".into(),
-        "stranger@example.test".into(),
-        "outsider@example.test".into(),
-    ];
-    fs::write(&config.whois.cli,"#!/bin/sh\ncase \"$3\" in\n100.64.0.1) echo '{\"UserProfile\":{\"ID\":42,\"LoginName\":\"owner@example.test\"}}';;\n100.64.0.2) echo '{\"UserProfile\":{\"ID\":43,\"LoginName\":\"stranger@example.test\"}}';;\n100.64.0.3) echo '{\"UserProfile\":{\"ID\":44,\"LoginName\":\"outsider@example.test\"}}';;\n*) exit 1;;\nesac\n").unwrap();
-    fs::set_permissions(&config.whois.cli, fs::Permissions::from_mode(0o755)).unwrap();
+    if !capability {
+        config.allowed_capability = None;
+        config.allowed_emails = vec![
+            "owner@example.test".into(),
+            "stranger@example.test".into(),
+            "outsider@example.test".into(),
+        ];
+    }
+    let whois_dir = config.whois.cli.parent().unwrap().to_owned();
+    for (ip, id, login) in [
+        ("100.64.0.1", 42, "owner@example.test"),
+        ("100.64.0.2", 43, "stranger@example.test"),
+        ("100.64.0.3", 44, "outsider@example.test"),
+    ] {
+        let mut answer = capability_answer();
+        answer["UserProfile"] = json!({"ID":id,"LoginName":login});
+        fs::write(whois_dir.join(format!("{ip}.json")), answer.to_string()).unwrap();
+    }
     let mut c = crate::catalog::Catalog::open(&root, &config.issuer(), None).unwrap();
     let owner = crate::catalog::Identity {
         issuer: config.issuer(),
@@ -210,8 +230,11 @@ async fn tailnet_preview_http_websocket_and_revocation() {
         .await
         .unwrap();
     assert_eq!(r.text().await.unwrap(), "guest /api/state");
-    for revoke_share in [true, false] {
-        if !revoke_share {
+    for reason in ["admission", "share", "unpublish"]
+        .into_iter()
+        .filter(|reason| capability || *reason != "admission")
+    {
+        if reason == "unpublish" {
             catalog
                 .lock()
                 .unwrap()
@@ -222,6 +245,7 @@ async fn tailnet_preview_http_websocket_and_revocation() {
                 .unwrap();
         }
         let h = host.clone();
+        let revoking_admission = reason == "admission";
         let mut socket = tokio::task::spawn_blocking(move || {
             let mut req = format!("ws://{addr}/socket").into_client_request().unwrap();
             for (k, v) in [
@@ -239,7 +263,12 @@ async fn tailnet_preview_http_websocket_and_revocation() {
             let (mut socket, response) = tungstenite::connect(req).unwrap();
             assert_eq!(response.headers()["sec-websocket-protocol"], "vite-hmr");
             if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_mut() {
-                tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(if revoking_admission {
+                    36
+                } else {
+                    3
+                })))
+                .unwrap();
             }
             socket
                 .send(tungstenite::Message::Text("hot reload".into()))
@@ -252,7 +281,12 @@ async fn tailnet_preview_http_websocket_and_revocation() {
         })
         .await
         .unwrap();
-        if revoke_share {
+        if revoking_admission {
+            let mut answer = capability_answer();
+            answer["UserProfile"] = json!({"ID":43,"LoginName":"stranger@example.test"});
+            answer["CapMap"] = json!({});
+            fs::write(whois_dir.join("100.64.0.2.json"), answer.to_string()).unwrap();
+        } else if reason == "share" {
             crate::catalog::share_unlocked(
                 &root,
                 &owner,
@@ -276,8 +310,25 @@ async fn tailnet_preview_http_websocket_and_revocation() {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::FORBIDDEN
+            if revoking_admission {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::FORBIDDEN
+            }
         );
+        if revoking_admission {
+            let mut answer = capability_answer();
+            answer["UserProfile"] = json!({"ID":43,"LoginName":"stranger@example.test"});
+            fs::write(whois_dir.join("100.64.0.2.json"), answer.to_string()).unwrap();
+            assert_eq!(
+                http("stranger@example.test", "100.64.0.2")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
     }
     // Disabled preview mode and Cloudflare auth never expose preview routes.
     for access in [false, true] {
@@ -307,4 +358,5 @@ async fn tailnet_preview_http_websocket_and_revocation() {
     drop(db);
     drop(catalog);
     fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(whois_dir).unwrap();
 }
