@@ -280,6 +280,9 @@ pub struct Staged {
     previous: Option<PathBuf>,
     started: std::time::Instant,
     paused_ms: u64,
+    /// The captured box's network index: unique per create, so a box deleted and made
+    /// again under the same ID while this was hashed is not mistaken for it.
+    index: u32,
     /// The live fork waiting for this capture: (parent, child).
     pub fork: Option<(String, String)>,
 }
@@ -1255,6 +1258,7 @@ impl Runtime {
             previous: previous.map(Path::to_path_buf),
             started,
             paused_ms: 0,
+            index: workspace.index,
             fork: None,
         };
         let result = (|| {
@@ -1285,8 +1289,10 @@ impl Runtime {
             let id = staged.snapshot.workspace.clone();
             let name = staged.snapshot.name.clone();
             // The worker served other requests while this was hashed: re-check what they may change.
-            self.workspace(&id)
-                .context("workspace was deleted during the capture")?;
+            ensure!(
+                self.workspace(&id).is_ok_and(|w| w.index == staged.index),
+                "workspace was deleted during the capture"
+            );
             let destination = self.snapshot_dir(&name);
             if destination.join("manifest.json").exists() {
                 let existing: Snapshot =
@@ -1339,6 +1345,7 @@ impl Runtime {
         name: &str,
         generated: bool,
     ) -> Result<Value> {
+        let mut created = false;
         let result = (|| {
             if let Some(existing) = self.state.workspaces.get(child) {
                 // A retried fork whose first attempt made the child meanwhile.
@@ -1355,6 +1362,7 @@ impl Runtime {
                 snapshot.workspace == parent,
                 "snapshot belongs to another workspace"
             );
+            created = true;
             self.create(
                 child,
                 snapshot.memory_mib,
@@ -1365,12 +1373,15 @@ impl Runtime {
                 None,
             )
         })();
-        let made = self
-            .state
-            .workspaces
-            .get(child)
-            .is_some_and(|w| w.source.as_deref() == Some(parent) && w.state != "failed");
-        if generated && (result.is_err() || !made) {
+        // Kept only when this capture became a child that runs (as a live fork always kept it).
+        let used = created
+            && result.is_ok()
+            && self
+                .state
+                .workspaces
+                .get(child)
+                .is_some_and(|w| w.state != "failed");
+        if generated && !used {
             let directory = self.snapshot_dir(name);
             if directory.exists()
                 && let Err(error) = fs::remove_dir_all(&directory)

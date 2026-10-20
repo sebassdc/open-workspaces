@@ -198,8 +198,11 @@ A live fork (`ow fork BOX CHILD` without `--snapshot`) captures the running box.
 A stopped or hibernated box is refused before anything is reserved: run
 `ow start BOX` first, or fork one of its snapshots with `--snapshot NAME`. A fork
 the runner rejects leaves its child `failed` with `unmade: true` and releases its
-reservation. A create or fork still pending or uncertain after 30 minutes whose
-machine the runner does not list fails with a timeout error. If `ssh-info` reports no registered key, run
+reservation. A create or fork left uncertain (a lost reply or an interrupted
+controller) for 30 minutes whose machine the runner does not list fails with a
+timeout error.
+
+If `ssh-info` reports no registered key, run
 `ow ssh-authorize NAME --key PATH_TO_PUBLIC_KEY`, then retry.
 
 Admission codes are additive API `error_code` fields (or an operation's stored
