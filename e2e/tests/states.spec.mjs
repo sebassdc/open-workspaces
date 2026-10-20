@@ -1,4 +1,4 @@
-import {test, expect, machines, card, notice} from './fixtures.mjs';
+import {test, expect, machines, card, notice, signIn} from './fixtures.mjs';
 
 test('worker outage shows an error and recovers on refresh', async ({dashboard: page}) => {
   await machines(page, 'steady');
@@ -52,15 +52,13 @@ test.describe('narrow width', () => {
     await expect(page.getByRole('button', {name: 'Create machine'})).toBeInViewport();
   });
 
-  test('a long signed-in email does not widen the phone layout', async ({page}) => {
+  test('a long signed-in email does not widen the phone layout', async ({page, user}) => {
     // 64 characters is the longest local part an address may have.
-    const email = `${'a'.repeat(64)}@example.test`;
-    await page.route('**/api/state', async route => {
-      const json = await (await route.fetch()).json();
-      json.result.discovery.identity.email = email;
-      await route.fulfill({json});
-    });
+    const name = user.padEnd(64, 'a');
+    const email = `${name}@example.test`;
+    await signIn(page.context(), name);
     await page.goto('/');
+    await expect(page.locator('#account-email')).toHaveText(email);
     await expect(page.locator('#account-email')).toHaveAttribute('title', email);
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0);
   });
