@@ -23,6 +23,14 @@ test('empty sandbox invites a first machine', async ({dashboard: page}) => {
   await expect(page.locator('#snapshot-list .empty')).toHaveText(/No checkpoints yet/);
 });
 
+test('memory counter shows your usage against your owner limits', async ({dashboard: page}) => {
+  await expect(page.locator('#metric-reserved')).toHaveText('0 MiB of 32.0 GiB');
+  await machines(page, 'counted');
+  // The harness uses the default owner caps: 8 machines, 16 vCPU, 32 GiB memory, 256 GiB disk.
+  await expect(page.locator('#metric-reserved')).toHaveText('256 MiB of 32.0 GiB');
+  await expect(page.locator('#metric-limit')).toHaveText('1 of 8 machines · 1 of 16 vCPU · 32 of 256 GiB disk');
+});
+
 test('create dialog creates a machine with the chosen shape', async ({dashboard: page}) => {
   await page.getByRole('button', {name: '＋ New machine'}).click();
   await expect(dialog(page)).toBeVisible();
