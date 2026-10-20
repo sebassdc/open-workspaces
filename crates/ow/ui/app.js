@@ -117,8 +117,27 @@ function openDialog(op, id, snapshot) {
   if (op === 'create') {
     const form=$('operation-form'), image=form.elements.image, memory=form.elements.memory_mib, node=form.elements.node;
     const fitShape=()=>{const mac=image.value==='ubuntu-arm64'; if(mac && Number(memory.value)<512) memory.value='512'; form.elements.disk_gib.disabled=mac; form.elements.disk_gib.parentElement.hidden=mac;};
-    image.addEventListener('change',fitShape);
-    node.addEventListener('change',()=>{const selectedNode=(data.nodes||[]).find(n=>n.id===node.value);const images=selectedNode?.capabilities?.images;if(images?.length===1) image.value=images[0];fitShape();});
+    const vcpu=form.elements.vcpu_count, pool=data.discovery?.nodes?.length ? data.discovery : null;
+    // Offer only what some eligible node can place: the chosen node (or any, when automatic) must
+    // have the image ready and room for memory and vCPU together. A lone local host decides itself.
+    const ready=(name,id)=>pool.images?.find(i=>i.name===name)?.nodes?.some(c=>c.node===id&&c.availability==='available');
+    const room=(n,mem,cpu)=>{const f=n.available,g=n.per_guest; return (!f||(f.memory_mib>=mem&&f.vcpus>=cpu&&f.slots>0)) && (!g?.memory_mib||g.memory_mib.includes(mem)) && (g?.max_vcpus==null||g.max_vcpus>=cpu);};
+    const allow=(select,ok)=>{for(const o of select.options) o.disabled=!ok(o.value); if(select.selectedOptions[0]?.disabled) select.value=[...select.options].find(o=>!o.disabled)?.value ?? select.value;};
+    const constrain=()=>{
+      if(pool){
+        const nodes=pool.nodes.filter(n=>n.online&&!n.draining&&(!node.value||n.id===node.value));
+        allow(image,v=>nodes.some(n=>ready(v,n.id)));
+        const here=nodes.filter(n=>ready(image.value,n.id)), fits=(mem,cpu)=>here.some(n=>room(n,mem,cpu));
+        if(here.length){
+          // An unplaceable pair restarts from the smallest shape that fits; then each list offers what fits with the other.
+          if(!fits(+memory.value,+vcpu.value)){vcpu.value='1'; memory.value=[...memory.options].find(o=>fits(+o.value,1))?.value ?? memory.value;}
+          allow(memory,v=>fits(+v,+vcpu.value)); allow(vcpu,v=>fits(+memory.value,+v));
+        }
+      }
+      fitShape();
+    };
+    for(const select of [image,node,memory,vcpu]) select.addEventListener('change',constrain);
+    constrain();
   }
   if (op === 'publish') { const port = field('port', 'Guest HTTP port', '3000'), input = port.querySelector('input'); input.type = 'number'; input.removeAttribute('pattern'); input.removeAttribute('maxlength'); input.min = '1'; input.max = '65535'; input.step = '1'; $('dialog-fields').append(port); }
   if (op === 'share') { const email = field('with', 'Teammate email', '', null), input = email.querySelector('input'); input.type = 'email'; input.removeAttribute('pattern'); input.maxLength = 254; $('dialog-fields').append(email, field('role', 'Role', 'use', [['use','Use · terminal, SSH, commands, fork'],['admin','Admin · also stop, snapshot, restore, SSH keys']])); }
