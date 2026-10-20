@@ -272,8 +272,8 @@ impl S3Objects {
         }
         let checksum = format!("{}-{}", STANDARD.encode(composite.finalize()), parts.len());
         let parts: Vec<_> = parts.into_iter().map(|(_, e, c)| (e, c)).collect();
-        if http.complete_multipart(key, upload, &parts).is_err() {
-            Self::same(http, key, &checksum, total)?;
+        if let Err(error) = http.complete_multipart(key, upload, &parts) {
+            Self::same(http, key, &checksum, total).map_err(|_| error)?;
         }
         Ok(())
     }
@@ -450,8 +450,10 @@ impl Objects for S3Objects {
         let first = part(source, self.part_size)?;
         if (first.len() as u64) < self.part_size {
             let (checksum, length) = (checksum(&first), first.len() as u64);
-            if !http.put_new(&key, first).unwrap_or(false) {
-                Self::same(&http, &key, &checksum, length)?;
+            match http.put_new(&key, first) {
+                Ok(true) => {}
+                Ok(false) => Self::same(&http, &key, &checksum, length)?,
+                Err(error) => Self::same(&http, &key, &checksum, length).map_err(|_| error)?,
             }
             return Ok(());
         }
