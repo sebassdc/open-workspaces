@@ -33,6 +33,8 @@ test("pulumi package get-schema finds every component", (t) => {
     assert.equal(schema.resources["open-workspaces-aws:index:Host"].inputProperties.storeGc.type, "boolean");
     assert.ok(!("storeGc" in schema.resources["open-workspaces-aws:index:Runner"].inputProperties));
     assert.ok(!("dashboardCapability" in schema.resources["open-workspaces-aws:index:Runner"].inputProperties));
+    assert.equal(schema.resources["open-workspaces-aws:index:Host"].inputProperties.poolAdmins.type, "array");
+    assert.ok(!("poolAdmins" in schema.resources["open-workspaces-aws:index:Runner"].inputProperties));
     const pool = schema.resources["open-workspaces-aws:index:RunnerPool"];
     // A pool never follows a moving image, and the controller alone sizes it.
     for (const input of ["amiId", "controller", "maxSize", "instanceHourlyCents", "diskMonthlyCentsPerGib", "tailscaleAuthKeySecretArn"]) {

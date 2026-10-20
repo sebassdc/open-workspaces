@@ -188,7 +188,8 @@ The explicit email allowlist is still required for Cloudflare Access and for
 
 `"pool_admins": ["admin@example.com"]` (optional; default none) lists login
 emails that may transfer and fork any box and create boxes for others; see
-[pool admins](USERS.md#pool-admins-and-transfers). It admits nobody by itself.
+[pool admins](USERS.md#pool-admins-and-transfers). It admits nobody by itself. On an
+AWS host, set it with the component's `poolAdmins` input.
 
 After Tailscale propagates a policy removal to the host, the next request is
 denied and existing terminal/SSH/preview streams close within 35 seconds. No dashboard

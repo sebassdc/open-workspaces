@@ -82,6 +82,7 @@ export const instanceId = host.instanceId;
 | `tailscaleDirect` | none | `{ subnetId: "subnet-public" }`: secondary interface and Elastic IP for UDP 41641 only. Public subnet must be in the same VPC/AZ, with an internet gateway route. Needs `tailscaleAuthKeySecretArn`; leaves the running host in its private subnet. |
 | `tailscaleSsh` | `false` | Tailscale SSH, authorized by your tailnet policy. |
 | `dashboardLogins` | none | Tailnet logins allowed into the web dashboard. Needs `tailscaleAuthKeySecretArn`; see below. |
+| `poolAdmins` | none | Host only. Login emails that may transfer and fork any box and create boxes for others (the dashboard config's `pool_admins`; see [pool admins](../../docs/USERS.md#pool-admins-and-transfers)). Admits nobody by itself; needs `dashboardLogins` or `dashboardCapability`. A change restarts only the dashboard. |
 | `dashboardCapability` | none | Application capability (`example.com/cap/open-workspaces`) admitting tailnet users without a login list. Needs `tailscaleAuthKeySecretArn`. Either this or `dashboardLogins` enables the dashboard; if both are set, either admits. |
 | `developerImages` | none | `["ubuntu"]`: build the [developer image](../../docs/GUEST_IMAGES.md) (user `dev`, SSH server, toolchains) after boot. SSH into boxes and golden-image recipes need it. |
 | `role` | `host` | `controller` opts a new host into remote-only capacity: no local worker, agent, images or KVM. In-place role conversion is refused. |

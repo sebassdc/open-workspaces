@@ -2,6 +2,43 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.38",
+      "class": 0,
+      "changes": [
+        "component",
+        "config",
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "AWS component input poolAdmins (Host only; login emails) sets the gateway config's pool_admins on the controller's dashboard, so pool admins are managed in place; it needs a dashboard and admits nobody by itself. The config parameter carries dashboard.poolAdmins and ow-host writes OW_POOL_ADMINS to dashboard.env only when set, so hosts without it render the same files; setting or changing it restarts only the dashboard. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel, host layout 2 and stage 0 are unchanged."
+    },
+    {
       "version": "0.9.37",
       "class": 2,
       "changes": [
