@@ -106,6 +106,9 @@ Deployment-specific endpoints, account configuration and credentials stay privat
 - [Roadmap](docs/ROADMAP.md), [handoff](docs/HANDOFF.md) and [engineering instructions](AGENTS.md).
 - [Runtime evidence](docs/experiments/runtime-spike.md) and [deployment options](docs/DEPLOYMENT.md).
 - [In-place upgrades and release impact](docs/UPGRADES.md).
+- Configuration rule: the controller is the single source of configuration and
+  state; runners get theirs from it and infrastructure code carries no feature
+  switches. See [contributing](CONTRIBUTING.md#configuration-the-controller-is-the-single-source).
 
 This is an independent implementation inspired by public product behavior.
 There is no affiliation with Boxd or claim of API compatibility or performance

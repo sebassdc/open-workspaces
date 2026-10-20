@@ -18,6 +18,21 @@ remain pending. See docs/LOCAL_PROTOTYPE.md and docs/experiments/runtime-spike.m
 - Do not expose host Docker sockets to the public API or guest workloads.
 - Workload identity must grant only intended workspace capabilities, not implicit account-wide control.
 
+## Configuration: the controller is the single source
+
+The controller host is the single source of configuration and state. Runners
+are dumb workers that receive their configuration from the controller; nothing
+is configured separately per runner. Feature switches and runtime settings live
+with the controller (persisted, versioned, audited), change with one command or
+API call and take effect in seconds without a redeploy. Infrastructure-as-code
+only creates infrastructure (instances, disks, network, IAM) and bootstraps the
+controller; it never carries feature toggles or per-runner application
+settings. Every new feature ships enabled by default where safe, configurable
+on the controller.
+
+Existing per-runner or deploy-only switches are tracked as debt in
+docs/ROADMAP.md (see the config-architecture design).
+
 ## Deployment boundaries
 
 The user authorized creating this research repository. Deploying infrastructure or changing existing services is outside this initial handoff task. Future instructions may authorize those actions.
