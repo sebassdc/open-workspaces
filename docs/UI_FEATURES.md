@@ -52,7 +52,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Rename in place, selection and console history follow | works | v0.9.22 | `machines.spec.mjs › rename keeps the machine selected under its new name` |
 | Recovery status: neutral while the first point is pending, warning only past the one-hour target or on an upload error, relative time | works | v0.9.26 | `states.spec.mjs › a new machine shows a neutral first recovery point`; `states.spec.mjs › recovery status warns only past the one-hour target and shows relative time` |
 | Navigation and resource usage view | works | v0.9.22 | `machines.spec.mjs › navigation switches between machines, snapshots and usage` |
-| Signed-in account shown in the top bar | works | v0.9.28 | `machines.spec.mjs › top bar shows the signed-in account`; `states.spec.mjs › narrow width › a long signed-in email does not widen the phone layout` |
+| Signed-in account shown in the top bar | works | v0.9.29 | `machines.spec.mjs › top bar shows the signed-in account`; `states.spec.mjs › narrow width › a long signed-in email does not widen the phone layout` |
 
 ## Lifecycle
 
@@ -81,6 +81,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Live fork's own capture labelled with the fork it was taken for | works | v0.9.26 | `snapshots.spec.mjs › fork from a running machine creates an independent child` |
 | Failed capture names its machine and when it failed | works | v0.9.26 | `snapshots.spec.mjs › a failed capture names its machine and when it failed` |
 | Fork and restore from the snapshot list | works | v0.9.22 | `snapshots.spec.mjs › fork and restore from the snapshot list` |
+| Fork refused for room names the parent runner and the fork's shape, without CLI hints | works | v0.9.28 | `snapshots.spec.mjs › fork refused for room on the parent runner says so plainly` |
 
 ## Sharing and previews
 
@@ -88,6 +89,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | --- | --- | --- | --- |
 | Share dialog, shared-with-me view, unshare | works | v0.9.22 | `sharing.spec.mjs › share dialog grants a teammate, who sees it under shared with me` |
 | Share dialog rejects an invalid email | works | v0.9.22 | `sharing.spec.mjs › share dialog refuses an invalid email` |
+| Share dialog refuses your own login in plain words | works | v0.9.28 | `sharing.spec.mjs › share dialog refuses your own login plainly` |
 | Publish and unpublish a port | partial | v0.9.22 | `previews.spec.mjs › publish port dialog publishes, links and unpublishes a preview`; `previews.spec.mjs › publish port is hidden when previews are not configured` |
 
 Previews need `tailscale serve` and a root-owned helper on the host, so the
@@ -113,6 +115,6 @@ dashboard.
 | Failed first load: retry in the grid, New machine disabled | works | v0.9.23 | `states.spec.mjs › failed first load offers a retry and keeps New machine disabled` |
 | Expired login message | works | v0.9.22 | `states.spec.mjs › expired login asks the user to reload and sign in` |
 | CLI installer panel (hidden on tailnet sign-in) | partial | v0.9.22 | `states.spec.mjs › the tailnet dashboard offers no CLI installer` (the Access sign-in panel and its copy button are not covered) |
-| Sidebar CLI download link (hidden on tailnet sign-in) | partial | v0.9.28 | `states.spec.mjs › the tailnet dashboard hides the sidebar CLI download` (the link shown where the binary is served is not covered) |
+| Sidebar CLI download link (hidden on tailnet sign-in) | partial | v0.9.29 | `states.spec.mjs › the tailnet dashboard hides the sidebar CLI download` (the link shown where the binary is served is not covered) |
 | Phone width: no horizontal overflow, dialogs fit | works | v0.9.22 | `states.spec.mjs › narrow width › phone layout has no horizontal overflow and dialogs fit` |
 | Keyboard focus kept on the same card or button across the 5 s refresh | works | v0.9.25 | `focus.spec.mjs › focus stays on an action button and a machine card across a refresh`; `focus.spec.mjs › focus stays on a machine card when its disk usage changes`; `focus.spec.mjs › focus stays on the same port Unpublish when an earlier port goes away` |
