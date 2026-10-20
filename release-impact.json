@@ -3,10 +3,11 @@
   "releases": [
     {
       "version": "0.9.29",
-      "class": 1,
+      "class": 2,
       "changes": [
         "controller",
-        "dashboard"
+        "dashboard",
+        "worker"
       ],
       "protocol": {
         "speaks": 1,
@@ -35,7 +36,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "The New machine dialog offers only images and resource sizes eligible for the selected node or automatic placement, shows free node capacity, and blocks creation when no image and size fit. Known refusals use dashboard language, duplicate machine names are refused explicitly while retries retain their original result, and focus starts on Machine name. Class-1 upgrade: restart the controller and dashboard; workers and running machines are untouched. Protocols, catalog schema, runtime, guest kernel and host layout are unchanged."
+      "notes": "The New machine dialog offers only images and resource sizes eligible for the selected node or automatic placement, shows free node capacity, and blocks creation when no image and size fit. Known refusals use dashboard language, duplicate machine names are refused explicitly while retries retain their original result, and focus starts on Machine name. Serial exec now stops commands after 30 s, cleans up their process group before accepting the next command, and keeps output and protocol markers isolated. The console explains the limit and avoids extra blank lines before exit status. Class-2 upgrade: restart the controller and dashboard and replace the worker behind the existing hibernate/resume capture gate. Protocols, catalog schema, runtime, guest kernel and host layout are unchanged."
     },
     {
       "version": "0.9.28",
