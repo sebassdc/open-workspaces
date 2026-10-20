@@ -14,6 +14,19 @@ test('worker outage shows an error and recovers on refresh', async ({dashboard: 
   await expect(page.locator('#updated')).toHaveText(/^Updated/);
 });
 
+test('failed first load offers a retry and keeps New machine disabled', async ({page}) => {
+  await page.route('**/api/state', route => route.fulfill({status: 503, json: {ok: false, error: 'Workspace worker unavailable. Try refreshing.'}}));
+  await page.goto('/');
+  await expect(page.locator('#machine-grid .empty')).toHaveText('Could not reach your machines. Retry');
+  await expect(page.getByRole('button', {name: '＋ New machine'})).toBeDisabled();
+  await expect(page.locator('#pool-policy')).not.toBeEmpty();
+  await page.unroute('**/api/state');
+  await page.locator('#machine-grid').getByRole('button', {name: 'Retry'}).click();
+  await expect(page.locator('#updated')).toHaveText(/^Updated/);
+  await expect(page.locator('#machine-grid .empty')).toHaveText(/Your first machine is one click away/);
+  await expect(page.getByRole('button', {name: '＋ New machine'})).toBeEnabled();
+});
+
 test('expired login asks the user to reload and sign in', async ({page}) => {
   // An identity proxy answers an expired session with its HTML login page, not JSON.
   await page.route('**/api/state', route => route.fulfill({status: 200, contentType: 'text/html', body: '<html>sign in</html>'}));

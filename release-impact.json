@@ -34,7 +34,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "Dashboard fixes. The top bar shows the signed-in email (discovery.identity.email from /api/state) and its initial, truncated with an ellipsis when it does not fit. The sidebar CLI download link shows only when the server serves /cli/ow-linux-amd64, so tailnet sign-in no longer offers a link to a 404 page. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-1 upgrade: the dashboard restarts alone."
+      "notes": "Dashboard copy and counters for a shared host pool. Footer and sidebar name the shared private host pool; the pool banner says who can see guest data and the invitation policy appears only in the invite dialog. The memory counter shows the owner's provisioned usage against their owner limits (machines, vCPU, memory, disk); the usage view labels pool memory as shared by all users. A failed first state load shows a retry in the machine grid and keeps New machine disabled. The top bar shows the signed-in email (discovery.identity.email from /api/state) and its initial, truncated with an ellipsis when it does not fit. The sidebar CLI download link shows only when the server serves /cli/ow-linux-amd64, so tailnet sign-in no longer offers a link to a 404 page. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-1 upgrade: the dashboard restarts alone."
     },
     {
       "version": "0.9.22",

@@ -5,11 +5,14 @@ test('host pool owner invites, budgets and revokes a Linux host', async ({contex
   await signIn(context, 'owner');
   await page.goto('/');
   await expect(page.locator('#host-controls')).toBeVisible();
-  await expect(page.locator('#pool-policy')).toHaveText(/Trusted shared private pool/);
+  // Machine users get pool copy; the invitation policy stays in the invite dialog.
+  await expect(page.locator('#pool-policy')).toHaveText(/can inspect its data\.$/);
+  await expect(page.locator('#pool-policy')).not.toContainText('invitation');
 
   await page.getByRole('button', {name: 'Invite Linux host'}).click();
   const form = page.locator('#host-dialog');
   await expect(form.locator('#host-title')).toHaveText('Invite a trusted Linux host');
+  await expect(form.locator('#host-description')).toContainText('This invitation grants node participation only');
   await form.getByLabel('Node label').fill('e2e-node');
   await form.getByRole('button', {name: 'Create invitation'}).click();
   await expect(form.locator('#host-envelope')).toBeVisible();

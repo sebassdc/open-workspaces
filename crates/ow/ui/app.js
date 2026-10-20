@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-let data = {workspaces: [], snapshots: [], stats: {}}, selected = null, busy = false, dialogOperation = null, view = 'machines';
+let data = {workspaces: [], snapshots: [], stats: {}}, loaded = false, selected = null, busy = false, dialogOperation = null, view = 'machines';
 const histories = new Map();
 const imageNames = {alpine:'Alpine Linux',arch:'Arch Linux',ubuntu:'Ubuntu 24.04', 'ubuntu-arm64':'Ubuntu 24.04 ARM64'};
 // Built-in images, then golden images that the runners advertise (`ow image build`).
@@ -18,7 +18,9 @@ async function api(path, body) {
   if (!response.ok || !value.ok) { const error = Error((value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : '')); error.operation = value.operation; throw error; }
   return value.result;
 }
-async function refresh() { try { data = await api('/api/state'); $('host-controls').hidden = !data.host_controls; $('pool-policy').textContent = data.pool_policy || ''; render(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; } }
+async function refresh() { try { data = await api('/api/state'); $('host-controls').hidden = !data.host_controls; loaded = true; render(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; if (!loaded) loadFailed(); } }
+// Without a first state the grid has nothing to show, so it offers a retry instead.
+function loadFailed() { const retry = element('button', 'Retry', 'text-button'); retry.addEventListener('click', refresh); const empty = element('div', 'Could not reach your machines. ', 'empty load-error'); empty.append(retry); $('machine-grid').replaceChildren(empty); }
 function action(label, callback, disabled = false) { const button = element('button', label, 'button secondary'); button.disabled = disabled || busy; button.addEventListener('click', () => Promise.resolve(callback()).catch(() => {})); return button; }
 function select(id) { selected = id; render(); }
 function durability(item) {
@@ -39,8 +41,10 @@ function render() {
   const capacity = stats.limit_memory_mib ?? 0;
   $('metric-running').textContent = running; $('metric-total').textContent = `${data.workspaces.length} machines in your sandbox`;
   $('metric-memory').textContent = mib((stats.total_pss_kib || 0) / 1024);
-  $('metric-reserved').textContent = mib(stats.reserved_memory_mib || 0);
-  $('metric-limit').textContent = `of ${mib(capacity)} capacity`;
+  // Owner caps refuse a create; pool-wide totals are shared and change as hosts join.
+  const {caps = {}, usage = {}} = data.owner_limits || {};
+  $('metric-reserved').textContent = `${mib(usage.memory_mib || 0)} of ${mib(caps.memory_mib || 0)}`;
+  $('metric-limit').textContent = `${usage.boxes || 0} of ${caps.boxes || 0} machines · ${usage.cpus || 0} of ${caps.cpus || 0} vCPU · ${usage.disk_gib || 0} of ${caps.disk_gib || 0} GiB disk`;
   $('nav-count').textContent = data.workspaces.length; $('machine-total').textContent = data.workspaces.length;
   $('capacity').hidden = capacity === 0; $('capacity').max = capacity || 1; $('capacity').value = stats.reserved_memory_mib || 0; $('capacity-text').textContent = `${mib(stats.reserved_memory_mib || 0)} / ${mib(capacity)}`;
   $('machine-grid').replaceChildren(); $('shared-grid').replaceChildren(); $('shared-view').hidden = !(data.shared || []).length;
@@ -92,7 +96,7 @@ function render() {
   if(data.host_controls) for(const node of (data.nodes||[]).filter(n=>!n.revoked)) {
     const row=element('div'); row.append(element('span',`${node.id} · ${node.online?'online':'offline'} · ${mib(node.memory_mib)} `),action('Adjust budget',()=>hostDialog('budget',node.id))); $('host-node-list').append(row);
   }
-  $('create').disabled = busy;
+  $('create').disabled = busy || !loaded;
 }
 function field(name, label, value, choices) { const wrapper = element('label', label, 'field'); let input; if (choices) { input = element('select'); for (const [v, title] of choices) { const option = element('option', title); option.value = v; input.append(option); } } else { input = element('input'); input.pattern = '[A-Za-z0-9_-]{1,32}'; input.maxLength = 32; input.required = true; input.autocomplete = 'off'; } input.name = name; if (value) input.value = value; wrapper.append(input); return wrapper; }
 function openDialog(op, id, snapshot) {
@@ -192,7 +196,7 @@ $('copy-install').addEventListener('click', async () => {
 });
 
 let hostMode='invite';
-function hostDialog(mode,node='') { hostMode=mode; $('host-description').textContent=mode==='budget'?'Set owner ceilings for this enrolled host. Its operator must separately consent to a stopped-host configuration. Lowering requires online idle inventory with no unresolved demand.':'Share this one-use invitation privately. Host participation grants no human dashboard login.'; $('host-title').textContent=mode==='budget'?'Adjust enrolled host budget':'Invite a trusted Linux host'; $('host-form').elements.ttl.parentElement.hidden=mode==='budget'; $('host-submit').textContent=mode==='budget'?'Save owner limits':'Create invitation'; $('host-form').reset(); $('host-envelope').value=''; $('host-envelope').hidden=true; $('host-instructions').hidden=true; $('host-submit').disabled=false; $('host-error').textContent=''; $('host-form').elements.node.value=node; const limits=(data.nodes||[]).find(n=>n.id===node)?.owner_limits; if(limits) for(const key of ['memory','slots','cpus']) $('host-form').elements[key].value=limits[key]; $('host-dialog').showModal(); }
+function hostDialog(mode,node='') { hostMode=mode; $('host-description').textContent=mode==='budget'?'Set owner ceilings for this enrolled host. Its operator must separately consent to a stopped-host configuration. Lowering requires online idle inventory with no unresolved demand.':`Share this one-use invitation privately. ${data.pool_policy || 'Host participation grants no human dashboard login.'}`; $('host-title').textContent=mode==='budget'?'Adjust enrolled host budget':'Invite a trusted Linux host'; $('host-form').elements.ttl.parentElement.hidden=mode==='budget'; $('host-submit').textContent=mode==='budget'?'Save owner limits':'Create invitation'; $('host-form').reset(); $('host-envelope').value=''; $('host-envelope').hidden=true; $('host-instructions').hidden=true; $('host-submit').disabled=false; $('host-error').textContent=''; $('host-form').elements.node.value=node; const limits=(data.nodes||[]).find(n=>n.id===node)?.owner_limits; if(limits) for(const key of ['memory','slots','cpus']) $('host-form').elements[key].value=limits[key]; $('host-dialog').showModal(); }
 $('host-invite').addEventListener('click',()=>hostDialog('invite'));
 $('host-budget').addEventListener('click',()=>hostDialog('budget'));
 function clearHostInvitation() { $('host-envelope').value=''; $('host-envelope').hidden=true; $('host-instructions').hidden=true; }
