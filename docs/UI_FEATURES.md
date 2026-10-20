@@ -43,6 +43,8 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Feature | Status | Last passed | Test |
 | --- | --- | --- | --- |
 | Machine list: cards, counts, selection | works | v0.9.22 | `machines.spec.mjs › machine list shows cards, counts and the selected machine` |
+| Card content top-aligned; page notice spaced from the card below | works | v0.9.27 | `machines.spec.mjs › cards keep their content at the top, whatever their height` |
+| Phone width: tapping a card scrolls its actions into view | works | v0.9.27 | `machines.spec.mjs › on a phone, tapping a card brings its actions into view` |
 | Empty sandbox and empty snapshot list | works | v0.9.22 | `machines.spec.mjs › empty sandbox invites a first machine` |
 | Memory counter: your usage against your owner limits | works | v0.9.23 | `machines.spec.mjs › memory counter shows your usage against your owner limits` |
 | Create dialog: name, image, memory, vCPU, disk | works | v0.9.22 | `machines.spec.mjs › create dialog creates a machine with the chosen shape` |
@@ -60,6 +62,8 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Stop with its warning, then start | works | v0.9.22 | `lifecycle.spec.mjs › stop explains what is lost, then start brings it back` |
 | Resize a stopped machine's disk | works | v0.9.22 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
 | Delete with snapshot warnings | works | v0.9.22 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `lifecycle.spec.mjs › delete of a machine without snapshots says so` |
+| Resize dialog prefilled with the current size; the same size answers "Already N GiB" | works | v0.9.27 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
+| Destructive confirms (delete, restore) lead with a warning and use a danger button | works | v0.9.27 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `snapshots.spec.mjs › fork and restore from the snapshot list` |
 
 ## Terminal and console
 
@@ -111,17 +115,17 @@ dashboard.
 | CLI installer panel (hidden on tailnet sign-in) | partial | v0.9.22 | `states.spec.mjs › the tailnet dashboard offers no CLI installer` (the Access sign-in panel and its copy button are not covered) |
 | Phone width: no horizontal overflow, dialogs fit | works | v0.9.22 | `states.spec.mjs › narrow width › phone layout has no horizontal overflow and dialogs fit` |
 | Keyboard focus kept on the same card or button across the 5 s refresh | works | v0.9.25 | `focus.spec.mjs › focus stays on an action button and a machine card across a refresh`; `focus.spec.mjs › focus stays on a machine card when its disk usage changes`; `focus.spec.mjs › focus stays on the same port Unpublish when an earlier port goes away` |
-| Gateway error (502/504) says the server is not answering, clears on recovery | works | v0.9.27 | `dialogs.spec.mjs › a gateway error says the server is not answering, not that the login expired` |
-| No console errors on load and dialog open; name patterns compile | works | v0.9.27 | `dialogs.spec.mjs › no console errors on page load and dialog open` |
+| Gateway error (502/504) says the server is not answering, clears on recovery | works | v0.9.28 | `dialogs.spec.mjs › a gateway error says the server is not answering, not that the login expired` |
+| No console errors on load and dialog open; name patterns compile | works | v0.9.28 | `dialogs.spec.mjs › no console errors on page load and dialog open` |
 
 ## Dialogs and notices
 
 | Feature | Status | Last passed | Test |
 | --- | --- | --- | --- |
-| Invalid name refused in the browser, allowed characters named | works | v0.9.27 | `dialogs.spec.mjs › an invalid name is refused in the browser and names the allowed characters` |
-| Dialog shows its result and unlocks before the state reload answers | works | v0.9.27 | `dialogs.spec.mjs › a dialog unlocks with its result while the state reload is slow` |
-| Retry clears the previous error; busy label while it runs | works | v0.9.27 | `dialogs.spec.mjs › the snapshot dialog clears the last error and shows its progress` |
-| Cancelled dialog leaves no stale notice | works | v0.9.27 | `dialogs.spec.mjs › a refused operation leaves no notice behind once its dialog is cancelled` |
-| Result notice cleared on view or machine switch | works | v0.9.27 | `dialogs.spec.mjs › a result notice is cleared when the user switches view or machine` |
-| Command result not shown after leaving its view or machine mid-run | works | v0.9.27 | `dialogs.spec.mjs › a command result started elsewhere does not follow the user to another view or machine` |
-| Gateway error on an operation asks to try again | works | v0.9.27 | `dialogs.spec.mjs › a gateway error on an operation asks to try again, since an open dialog does not poll` |
+| Invalid name refused in the browser, allowed characters named | works | v0.9.28 | `dialogs.spec.mjs › an invalid name is refused in the browser and names the allowed characters` |
+| Dialog shows its result and unlocks before the state reload answers | works | v0.9.28 | `dialogs.spec.mjs › a dialog unlocks with its result while the state reload is slow` |
+| Retry clears the previous error; busy label while it runs | works | v0.9.28 | `dialogs.spec.mjs › the snapshot dialog clears the last error and shows its progress` |
+| Cancelled dialog leaves no stale notice | works | v0.9.28 | `dialogs.spec.mjs › a refused operation leaves no notice behind once its dialog is cancelled` |
+| Result notice cleared on view or machine switch | works | v0.9.28 | `dialogs.spec.mjs › a result notice is cleared when the user switches view or machine` |
+| Command result not shown after leaving its view or machine mid-run | works | v0.9.28 | `dialogs.spec.mjs › a command result started elsewhere does not follow the user to another view or machine` |
+| Gateway error on an operation asks to try again | works | v0.9.28 | `dialogs.spec.mjs › a gateway error on an operation asks to try again, since an open dialog does not poll` |
