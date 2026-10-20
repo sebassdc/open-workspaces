@@ -9,7 +9,8 @@ operator configuration. **Experimental** has bounded acceptance and platform
 limits. **Not yet live** means code is merged, but activation or deployment
 acceptance remains outstanding. Versions below are the first tagged release
 containing that feature, not a claim that your host has installed or enabled it.
-Production hardening remains ongoing.
+Production hardening remains ongoing. Each dashboard action, its status and the
+browser test that guards it are listed in the [UI feature matrix](docs/UI_FEATURES.md).
 
 ### Boxes and lifecycle
 
@@ -27,7 +28,7 @@ Production hardening remains ongoing.
 | Remote CLI | Install compiled macOS/Linux clients; discover images, identity, targets and capacity. | Core | v0.8.0; discovery v0.8.5 | [Install](docs/INSTALL.md), [agent CLI](docs/AGENT_CLI.md) |
 | SSH and SFTP | Connect editors and standard SSH tools to explicitly enrolled Linux guests. | Opt-in | v0.1.0 | [SSH](docs/SSH.md) |
 | Interactive terminals | Use a guest PTY from `ow shell` or the dashboard, with resize and job control. | Core | v0.1.0 | [Terminals](docs/TERMINALS.md) |
-| Dashboard and tailnet login | Manage boxes in the browser using Tailscale identity and an operator-configured access grant; Access JWT remains an alternative. | Opt-in | v0.1.0; tailnet v0.2.0; grants v0.8.3 | [Dashboard](docs/DASHBOARD.md) |
+| Dashboard and tailnet login | Manage boxes in the browser using Tailscale identity and an operator-configured access grant; Access JWT remains an alternative. | Opt-in | v0.1.0; tailnet v0.2.0; grants v0.8.3 | [Dashboard](docs/DASHBOARD.md), [UI feature matrix](docs/UI_FEATURES.md) |
 | Private previews | Publish a guest HTTP port as a separate authenticated tailnet HTTPS URL. | Opt-in | v0.8.0 | [Previews](docs/DAILY_USE.md#tailnet-https-previews-v080) |
 
 ### Snapshots, forks and recovery
