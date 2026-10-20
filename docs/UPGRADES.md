@@ -440,8 +440,10 @@ unchanged.
 Version 0.9.23 is class 2 on runners and controller hosts with a local worker, and
 class 1 on a controller-only host. The worker reports the
 [host reserve](HOSTS.md#host-reserve-capacity-boxes-never-claim) and AWS hosts
-lower its CPU (and, on small hosts, RAM) budget by it; the worker and control
-units move into the `owguests`/`owcontrol` slices with their protections. Use the
+lower its CPU (and, on small hosts, RAM) budget by it; every Linux worker also
+caps its configured budgets at host capacity less the reserve (a runner's by
+default). The worker and control units move into the `owguests`/`owcontrol` slices
+with their protections, and VMMs start with OOM score 500. Use the
 normal quiesce/swap/resume procedure; a running box beyond the lowered budget
 stays hibernated until capacity frees. The node agent's heartbeats no longer wait
 on worker status, cache inventory or status-file writes. Protocol windows, worker

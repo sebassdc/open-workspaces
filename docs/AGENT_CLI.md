@@ -98,7 +98,7 @@ disk capacity; it is never inferred from physical host totals.
 - `host_reserve`: CPU (`cpu_millis`, thousandths of a vCPU), RAM (`memory_mib`)
   and disk (`disk_gib`) the runner keeps for its controller and node agent; the
   effective budgets already exclude them ([host reserve](HOSTS.md#host-reserve-capacity-boxes-never-claim)).
-  CPU and RAM are null for workers before 0.9.23.
+  CPU and RAM are null for workers before 0.9.23, which do not enforce them.
 - `workspaces` reports the worker box limit and observed count (including stopped
   boxes). Available box count is null without a fresh worker observation.
 - `last_seen_unix_s` is the controller heartbeat time. `disk.observed_unix_s` is

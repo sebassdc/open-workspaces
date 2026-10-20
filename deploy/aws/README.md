@@ -491,7 +491,11 @@ subtracts it from logical CPUs before the `vcpuOvercommit` ratio and from RAM:
 runner's invitation budget all use the result (`ow-host status` shows it). The
 controller/agent unit runs in `owcontrol.slice` (`CPUWeight=1000`,
 `MemoryMin`/`MemoryLow`, `OOMScoreAdjust=-900`); the worker and its VMs run in
-`owguests.slice` (`MemoryMax` = host RAM − reserve, `OOMScoreAdjust=500`). See
+`owguests.slice` (`MemoryMax` = host RAM − reserve). There the worker itself is
+protected (`OOMScoreAdjust=-900`, a delegated `control` cgroup with CPU weight 1000
+and `memory.low`) and its VMs run in a `guests` cgroup with OOM score 500, so the
+kernel kills a VM first. A reserve that leaves no room for boxes is refused by
+`apply` before anything changes. See
 [HOSTS.md](../../docs/HOSTS.md#host-reserve-capacity-boxes-never-claim).
 
 Upgrading to 0.9.23 changes the worker and control units and the worker budget:

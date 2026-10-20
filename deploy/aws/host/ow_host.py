@@ -323,6 +323,10 @@ def render(config, budget):
     # The input is a physical budget; all rendered consumers use the same effective budget.
     reserve = config["hostReserve"]
     budget = effective(config, budget)
+    if config["role"] != "controller" and (budget["memory"] < 256 or budget["cpus"] < 1):
+        # Refused before anything is written: the controller keeps running as it was.
+        raise Refused(f"hostReserve ({reserve['cpuMillis']} millicpus, {reserve['memoryMib']} MiB) leaves no "
+                      "room for boxes on this host: lower it, or use a larger instance or role controller")
     files = {}
     asset = f"{SRV}/run/worker/assets"
     worker_bin = f"{SRV}/run/worker/bin/ow"
@@ -334,6 +338,8 @@ def render(config, budget):
         f"OW_MAX_VCPUS={budget['cpus']}\n"
         f"OW_HOST_RESERVE_CPU_MILLIS={reserve['cpuMillis']}\n"
         f"OW_HOST_RESERVE_MEMORY_MIB={reserve['memoryMib']}\n"
+        f"OW_VCPU_OVERCOMMIT={config['vcpuOvercommit']}\n"
+        "OW_DELEGATED_CGROUP=1\n"
         f"OW_IDLE_HIBERNATE_SECS={config['idleMinutes'] * 60}\n",
         0o644,
     )
@@ -354,10 +360,14 @@ ExecStop={worker_bin} --data-dir {RUNNER} down --hibernate
 TimeoutStopSec=900
 Restart=on-failure
 RestartSec=5
-# The VMs are the worker's children: they share its slice and its OOM score, so under
-# memory pressure the kernel kills a VM before the controller or node agent.
+# The worker and its VMs stay below the host reserve. Within that, the worker runs in a
+# protected child cgroup (CPU weight 1000, memory.low) and each VM in a "guests" one with
+# OOM score 500, so the kernel kills a VM before the worker, controller or node agent.
 Slice={GUESTS}
-OOMScoreAdjust=500
+Delegate=cpu memory
+DelegateSubgroup=control
+MemoryLow=256M
+OOMScoreAdjust=-900
 
 [Install]
 WantedBy=multi-user.target
@@ -371,6 +381,8 @@ Description=Open Workspaces worker and VMs, kept out of the host reserve
 
 [Slice]
 MemoryMax={max(budget['hostMemory'] - reserve['memoryMib'], 0)}M
+# Lets the worker's own protection hold inside this slice.
+MemoryLow=256M
 """,
             0o644,
         )

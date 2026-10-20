@@ -220,6 +220,15 @@ class HostReserve(unittest.TestCase):
             with self.assertRaisesRegex(Refused, "hostReserve"):
                 config(hostReserve=bad)
 
+    def test_a_reserve_leaving_no_room_for_boxes_is_refused_before_writing(self):
+        physical = {"memory": 6144, "cpus": 2, "slots": 8, "hostMemory": 8192}
+        with self.assertRaisesRegex(Refused, "no room for boxes"):
+            h.render(config(hostReserve={"cpuMillis": 2000}), physical)
+        tiny = {"memory": 768, "cpus": 1, "slots": 8, "hostMemory": 1024}
+        with self.assertRaisesRegex(Refused, "no room for boxes"):
+            h.render(config(), tiny)
+        self.assertIn("--cpus 1\n", h.render(config(), physical)["/etc/systemd/system/open-workspaces.service"][0])
+
     def test_units_protect_the_control_path_and_cap_the_guests(self):
         files = {k: v[0] for k, v in h.render(config(), BUDGET).items()}
         control = files["/etc/systemd/system/open-workspaces.service"]
@@ -227,11 +236,16 @@ class HostReserve(unittest.TestCase):
             self.assertIn(line + "\n", control)
         self.assertIn("CPUWeight=1000\nMemoryMin=1024M\nMemoryLow=2048M\n", files["/etc/systemd/system/owcontrol.slice"])
         worker = files["/etc/systemd/system/open-workspaces-worker.service"]
-        self.assertIn("Slice=owguests.slice\n", worker)
-        self.assertIn("OOMScoreAdjust=500\n", worker)
-        self.assertIn("MemoryMax=14336M\n", files["/etc/systemd/system/owguests.slice"])
+        # The worker is protected from its own VMs: it sits at -900, they raise themselves to 500.
+        for line in ("Slice=owguests.slice", "Delegate=cpu memory", "DelegateSubgroup=control",
+                     "MemoryLow=256M", "OOMScoreAdjust=-900"):
+            self.assertIn(line + "\n", worker)
+        guests = files["/etc/systemd/system/owguests.slice"]
+        self.assertIn("MemoryMax=14336M\n", guests)
+        self.assertIn("MemoryLow=256M\n", guests)
         env = files["/etc/open-workspaces/worker.env"]
-        self.assertIn("OW_HOST_RESERVE_CPU_MILLIS=1000\nOW_HOST_RESERVE_MEMORY_MIB=2048\n", env)
+        self.assertIn("OW_HOST_RESERVE_CPU_MILLIS=1000\nOW_HOST_RESERVE_MEMORY_MIB=2048\n"
+                      "OW_VCPU_OVERCOMMIT=1\nOW_DELEGATED_CGROUP=1\n", env)
         for path in ("/etc/systemd/system/owcontrol.slice", "/etc/systemd/system/owguests.slice"):
             self.assertIn(path, h.OWNED)
         # A reserve change reaches the worker's budget and the control unit: class 2.
