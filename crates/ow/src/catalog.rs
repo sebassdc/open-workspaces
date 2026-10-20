@@ -127,6 +127,9 @@ const UNMADE: &str = "metadata=json_set(metadata,'$.state','failed','$.unmade',j
 const CREATION_TIMEOUT_MINUTES: u32 = 30;
 const CREATION_TIMEOUT: &str = "Creation did not complete within 30 minutes and the runner has no such machine; it failed. Delete it, or retry with a new operation key.";
 
+/// The guest ends the command (TERM, then KILL) once it outlives the serial timeout.
+pub(crate) const COMMAND_TIMEOUT: &str = "Stopped after 30 s: commands in the console are limited to 30 s. Use Open Terminal (ow shell) for long-running work.";
+
 fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
     match (op, diagnostic) {
         (_, CREATION_TIMEOUT) => CREATION_TIMEOUT,
@@ -157,6 +160,7 @@ fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
             "Named snapshot limit (24) reached. Remove unneeded snapshots on the host before retrying with a new operation key."
         }
         (_, "incomplete snapshot exists; preserve and inspect it") => diagnostic,
+        (_, "guest command timed out after 30s") => COMMAND_TIMEOUT,
         (_, "node route unavailable before dispatch") => {
             "Node is unavailable; no operation was dispatched. Retry with the same operation key when it reconnects."
         }
@@ -772,8 +776,8 @@ impl Catalog {
                 let id = c.db.query_row("SELECT id FROM transfers WHERE operation=?1",[operation],|r|r.get(0))?;
                 return c.transfer(id);
             }
-            ensure!(!c.db.query_row("SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1)",[&source],|r|r.get::<_,bool>(0))?, "machine already has an unfinished transfer");
-            ensure!(!c.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE (owner=?1 AND resource=(SELECT name FROM resources WHERE kind='machine' AND physical=?2) OR json_extract(request,'$.request.id')=?2 OR json_extract(request,'$.request.child')=?2) AND state IN ('pending','uncertain'))",params![owner,source],|r|r.get::<_,bool>(0))?, "machine has unresolved legacy effects");
+            ensure!(!c.db.query_row("SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1)",[&source],|r|r.get::<_,bool>(0))?, limits::Rejection("Box has an unfinished move, fork or wake; wait for it or inspect ow status.".into()));
+            ensure!(!c.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE (owner=?1 AND resource=(SELECT name FROM resources WHERE kind='machine' AND physical=?2) OR json_extract(request,'$.request.id')=?2 OR json_extract(request,'$.request.child')=?2) AND state IN ('pending','uncertain'))",params![owner,source],|r|r.get::<_,bool>(0))?, limits::Rejection("Box has a pending or uncertain operation; resolve it (see ow status) before moving or forking.".into()));
             ensure!(intent.kind == Kind::Fork || c.db.query_row("SELECT ssh_policy IS NOT NULL FROM resources WHERE kind='machine' AND physical=?1",[&source],|r|r.get::<_,bool>(0))?,"reconcile public SSH policy before managing placement");
             ensure!(intent.kind != Kind::Move || intent.target.as_deref() != Some(&source_node),"move requires another node");
             if intent.kind == Kind::Wake {
@@ -828,9 +832,12 @@ impl Catalog {
         intent: &crate::transfers::Intent,
     ) -> Result<()> {
         let c = self;
-        ensure!(!crate::drain::blocked(&c.db, target)?, "target draining");
+        ensure!(
+            !crate::drain::blocked(&c.db, target)?,
+            limits::Rejection(format!("Runner {target} is draining."))
+        );
         // Catalog capacity only; T3 additionally validates worker capability and disk headroom.
-        let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("target offline, draining or without a registered budget")?;
+        let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(|| limits::Rejection(format!("Runner {target} is offline, draining or has no registered budget.")))?;
         let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1 AND (?2=0 OR physical<>?3)",params![target,t.kind==crate::transfers::Kind::Move && target==t.source_node,t.source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         let (extra_mib, extra_cpus, extra_slots) = c.extra_usage(target)?;
         let fits = used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64
@@ -843,7 +850,12 @@ impl Catalog {
                 intent.memory_mib.into(),
             ));
         }
-        ensure!(fits, "node capacity exhausted");
+        ensure!(
+            fits,
+            limits::Rejection(format!(
+                "Runner {target} lacks free memory, vCPUs or box slots for this box."
+            ))
+        );
         c.db.execute("INSERT INTO transfer_reservations(transfer,node,epoch,memory_mib,cpus,disk_bytes) VALUES(?1,?2,?3,?4,?5,?6)",params![t.id,target,t.epoch,intent.memory_mib,intent.cpus,intent.disk_bytes as i64])?;
         Ok(())
     }
@@ -1113,6 +1125,11 @@ impl Catalog {
             if let Some(room) = response["fork_room"].as_str() {
                 info["error"] = json!(room);
                 info["error_code"] = json!("fork_capacity");
+            }
+            // Refusals carry only controller-written public reasons.
+            if response["refused"] == true {
+                info["error"] = response["error"].clone();
+                info["error_code"] = json!(response["code"].as_str().unwrap_or("refused"));
             }
         }
         if let Some((id, epoch, step)) = self
@@ -2850,6 +2867,10 @@ mod tests {
             assert!(message.contains("ow "));
             assert_eq!(public_operation_error("create", diagnostic), message);
         }
+        assert_eq!(
+            public_operation_error("exec", "guest command timed out after 30s"),
+            COMMAND_TIMEOUT
+        );
         assert!(first_use_error("node capacity exhausted: /private/tenant-secret").is_none());
         assert!(
             !public_operation_error("create", "/private/tenant-secret").contains("tenant-secret")

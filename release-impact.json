@@ -2,7 +2,7 @@
   "schema": 1,
   "releases": [
     {
-      "version": "0.9.32",
+      "version": "0.9.35",
       "class": 2,
       "changes": [
         "worker",
@@ -39,6 +39,113 @@
       "waivers": {
         "dashboard": "Only a refusal test adds recovery-seal to private worker operations; dashboard behavior is unchanged."
       }
+    },
+    {
+      "version": "0.9.34",
+      "class": 1,
+      "changes": [
+        "controller"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Cross-runner fork and move refusals say why: the controller names the runner and the reason (offline or draining, no artifact store, stale or exhausted disk headroom, worker without move/fork support, taken child name, unfinished transfer or pending operation, snapshot not of this box) instead of a generic error, and records the refusal as a failed operation with error_code refused that ow status lists; the same operation key returns the same refusal. Class 1: controller only; protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged."
+    },
+    {
+      "version": "0.9.33",
+      "class": 1,
+      "changes": [
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Dashboard dialogs: name fields validate in the browser again (the name pattern no longer fails to compile), naming the allowed characters. A dialog shows its result and unlocks as soon as the operation answers instead of waiting for the state reload. A non-JSON 5xx from the proxy says the server is not answering instead of asking to sign in again. Dialog errors clear on retry, the submit button shows progress (Capturing…), and notices clear on Cancel and on view or machine switch; a result is shown only where its operation started. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-1 upgrade: the dashboard restarts alone."
+    },
+    {
+      "version": "0.9.32",
+      "class": 2,
+      "changes": [
+        "dashboard",
+        "controller",
+        "worker"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Serial exec stops commands after 30 s, including developer-user commands, and cleans up their process group before the next command. Developer login shells retain the command process group. The console explains the limit, keeps command output isolated and avoids extra blank lines before exit status. Class-2 upgrade: restart the controller and dashboard and replace the worker behind the existing hibernate/resume capture gate. Protocols, catalog schema, runtime, guest kernel and host layout are unchanged."
     },
     {
       "version": "0.9.31",

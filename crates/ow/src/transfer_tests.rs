@@ -1904,10 +1904,160 @@ fn shared_admin_move_is_denied_before_runner_contact() {
         )
         .unwrap();
     }
-    let error=relocate(f.shared.clone(),&admin,&json!({"op":"move","id":"owner@example.test/box","node":"missing-runner","operation_key":"denied"})).unwrap_err();
+    let request = json!({"op":"move","id":"owner@example.test/box","node":"missing-runner","operation_key":"denied"});
+    let first = relocate(f.shared.clone(), &admin, &request).unwrap_err();
+    let failure = first
+        .downcast_ref::<crate::catalog::OperationFailure>()
+        .unwrap_or_else(|| panic!("{first:#}"));
+    assert!(failure.message().contains("move requires the owner"));
+    let retried = relocate(f.shared.clone(), &admin, &request).unwrap_err();
+    assert_eq!(
+        retried
+            .downcast_ref::<crate::catalog::OperationFailure>()
+            .unwrap_or_else(|| panic!("{retried:#}"))
+            .0,
+        failure.0
+    );
+    let c = f.shared.lock().unwrap();
+    assert_eq!(
+        c.db.query_row(
+            "SELECT COUNT(*) FROM operations WHERE retry_key='denied'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn a_refused_cross_runner_fork_returns_its_reason_and_journals_a_failed_operation() {
+    let (f, _peers) = moving_fixture(Kind::Fork);
+    {
+        let c = f.shared.lock().unwrap();
+        let t = c.transfer(f.transfer.id).unwrap();
+        c.advance_transfer(t.id, t.epoch, t.step, Step::Aborted, &Evidence::default())
+            .unwrap();
+        // A runner without an artifact store advertises no managed restore.
+        c.db.execute("UPDATE nodes SET capabilities=json_remove(capabilities,'$.managed_restore_v1') WHERE id='target'",[]).unwrap();
+    }
+    let identity = Identity {
+        issuer: "test".into(),
+        subject: "owner".into(),
+        email: "owner@example.test".into(),
+    };
+    let request = json!({"op":"fork","id":"box","child":"other-child","node":"target","operation_key":"refused-fork"});
+    let first = relocate(f.shared.clone(), &identity, &request).unwrap_err();
+    let failure = first
+        .downcast_ref::<crate::catalog::OperationFailure>()
+        .unwrap_or_else(|| panic!("{first:#}"));
+    assert_eq!(failure.0["state"], "failed");
+    assert_eq!(failure.0["error_code"], "refused");
     assert!(
-        error.to_string().contains("move requires the owner"),
-        "{error:#}"
+        failure
+            .message()
+            .starts_with("Runner target has no artifact store configured"),
+        "{}",
+        failure.0
+    );
+    let id = failure.0["id"].as_i64().unwrap();
+    {
+        let c = f.shared.lock().unwrap();
+        let journaled: (String, String, String, String) = c.db.query_row(
+            "SELECT op,resource,node,state FROM operations WHERE id=?1 AND owner=?2 AND retry_key='refused-fork'",
+            params![id, f.user],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            journaled,
+            (
+                "fork".into(),
+                "other-child".into(),
+                "target".into(),
+                "failed".into()
+            )
+        );
+        assert!(
+            !c.db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM resources WHERE name='other-child')",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+    }
+    // The same key returns the same refused operation instead of a second journal entry.
+    let retried = relocate(f.shared.clone(), &identity, &request).unwrap_err();
+    assert_eq!(
+        retried
+            .downcast_ref::<crate::catalog::OperationFailure>()
+            .unwrap()
+            .0["id"],
+        id
+    );
+    // The same key with other parameters is a conflict, not the old refusal.
+    let changed = relocate(
+        f.shared.clone(),
+        &identity,
+        &json!({"op":"fork","id":"box","child":"different-child","node":"source","operation_key":"refused-fork"}),
+    )
+    .unwrap_err();
+    assert!(
+        changed
+            .to_string()
+            .contains("operation key conflicts with original parameters"),
+        "{changed:#}"
+    );
+    // Target capacity exhaustion is refused with its reason and journaled.
+    f.shared
+        .lock()
+        .unwrap()
+        .db
+        .execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.managed_restore_v1',json('true')),memory_mib=1 WHERE id='target'",[])
+        .unwrap();
+    let full = relocate(
+        f.shared.clone(),
+        &identity,
+        &json!({"op":"fork","id":"box","child":"capacity-child","node":"target","operation_key":"capacity-probe"}),
+    )
+    .unwrap_err();
+    let full = full
+        .downcast_ref::<crate::catalog::OperationFailure>()
+        .unwrap_or_else(|| panic!("{full:#}"));
+    assert_eq!(full.0["state"], "failed");
+    assert!(
+        full.message()
+            .contains("Runner target lacks free memory, vCPUs or box slots"),
+        "{}",
+        full.0
+    );
+    assert!(
+        !f.shared
+            .lock()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM resources WHERE name='capacity-child')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+    // A child name that already exists is refused with its reason too.
+    let taken = relocate(
+        f.shared.clone(),
+        &identity,
+        &json!({"op":"fork","id":"box","child":"box","node":"target","operation_key":"taken-name"}),
+    )
+    .unwrap_err();
+    assert!(
+        taken
+            .downcast_ref::<crate::catalog::OperationFailure>()
+            .unwrap()
+            .message()
+            .contains("A box named box already exists"),
+        "{taken:#}"
     );
 }
 

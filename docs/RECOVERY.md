@@ -115,7 +115,7 @@ on a chain of older captures.
 Since 0.9.20 each managed recovery point has a chunk seal:
 it writes the chunk list of every file to `chunks.json` beside the manifest and
 seals each file under the SHA-256 of that ordered list (`"digest":
-"sha256-chunks-32m-v2"` from 0.9.32, `"sha256-chunks-8m-v1"` in older
+"sha256-chunks-32m-v2"` from 0.9.35, `"sha256-chunks-8m-v1"` in older
 points; without that field a file hash is its
 whole-file SHA-256, as for every other snapshot). The disk is a reflink of the
 live disk, so after both disk files are flushed (pending writes are not in the
@@ -134,13 +134,13 @@ device state file (written whole by every capture), and every range whose
 mapping is unknown, delayed, compressed, encrypted or inline. Without an earlier
 seal (first point, a changed destination, or a durable point from an older
 worker) the disk and RAM files are flushed and only their holes are skipped (zero
-chunks, unread, from 0.9.32); every mapped chunk is read, and zero chunks are still
+chunks, unread, from 0.9.35); every mapped chunk is read, and zero chunks are still
 recognized without hashing. This trusts the
 filesystem's extent sharing, as changed-block tracking does; a worker that
 verifies such a snapshot again (after a restart, or for import) reads every byte
 and compares the result with the seal.
 
-From 0.9.32 a capable worker advertises `recovery_client_seal_v1`. The uploader
+From 0.9.35 a capable worker advertises `recovery_client_seal_v1`. The uploader
 requests a pinned unpublished capture, then hashes changed chunks on parallel
 threads, compresses them with zstd level 3 and sends missing chunks immediately:
 one disk read rather than a seal pass followed by an upload pass. It returns the
