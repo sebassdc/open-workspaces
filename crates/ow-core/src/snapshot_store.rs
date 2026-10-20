@@ -326,47 +326,71 @@ use crate::snapshot_digest::hex;
 /// Copies `reader` into `output`, seeking over all-zero 4 KiB blocks so the file
 /// stays sparse. Returns the SHA-256 of all bytes.
 pub fn write_sparse(mut reader: impl Read, output: &mut File) -> Result<String> {
-    const BLOCK: usize = 4096;
+    const BUFFER: usize = 1 << 20;
     let mut hasher = Sha256::new();
     let mut length = 0u64;
-    let mut buffer = vec![0u8; 256 * BLOCK];
-    loop {
-        let mut filled = 0;
-        while filled < buffer.len() {
-            match reader.read(&mut buffer[filled..])? {
-                0 => break,
-                n => filled += n,
+    // Read and hash here, write on a second thread: neither waits for the other.
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    let out = &mut *output;
+    std::thread::scope(|scope| -> Result<()> {
+        let writer = scope.spawn(move || -> Result<()> {
+            for data in receiver {
+                write_runs(out, &data)?;
             }
-        }
-        if filled == 0 {
-            break;
-        }
-        let data = &buffer[..filled];
-        hasher.update(data);
-        // One write or seek per run of data or zero blocks, not per block.
-        let zero = |at: usize| data[at..(at + BLOCK).min(filled)].iter().all(|b| *b == 0);
-        let mut start = 0;
-        while start < filled {
-            let hole = zero(start);
-            let mut end = (start + BLOCK).min(filled);
-            while end < filled && zero(end) == hole {
-                end = (end + BLOCK).min(filled);
+            Ok(())
+        });
+        let read = (|| -> Result<()> {
+            loop {
+                let mut buffer = vec![0u8; BUFFER];
+                let mut filled = 0;
+                while filled < BUFFER {
+                    match reader.read(&mut buffer[filled..])? {
+                        0 => break,
+                        n => filled += n,
+                    }
+                }
+                buffer.truncate(filled);
+                hasher.update(&buffer);
+                length += filled as u64;
+                // A closed channel means the writer failed; its error is returned.
+                if filled == 0 || sender.send(buffer).is_err() || filled < BUFFER {
+                    return Ok(());
+                }
             }
-            if hole {
-                output.seek(SeekFrom::Current((end - start) as i64))?;
-            } else {
-                output.write_all(&data[start..end])?;
-            }
-            start = end;
-        }
-        length += filled as u64;
-        if filled < buffer.len() {
-            break;
-        }
-    }
+        })();
+        drop(sender);
+        writer.join().expect("sparse writer thread panicked")?;
+        read
+    })?;
     output.set_len(length)?;
     output.sync_all()?;
     Ok(hex(&hasher.finalize()))
+}
+
+/// Writes `data` at the current offset: one write or seek per run of data or
+/// all-zero 4 KiB blocks, not per block.
+fn write_runs(output: &mut File, data: &[u8]) -> Result<()> {
+    const BLOCK: usize = 4096;
+    let zero = |at: usize| {
+        data[at..(at + BLOCK).min(data.len())]
+            .iter()
+            .all(|b| *b == 0)
+    };
+    let mut start = 0;
+    while start < data.len() {
+        let hole = zero(start);
+        let mut end = (start + BLOCK).min(data.len());
+        while end < data.len() && zero(end) == hole {
+            end = (end + BLOCK).min(data.len());
+        }
+        if hole {
+            output.seek(SeekFrom::Current((end - start) as i64))?;
+        } else {
+            output.write_all(&data[start..end])?;
+        }
+        start = end;
+    }
+    Ok(())
 }
 
 /// Snapshot names with a stored manifest, from `aws s3 ls --recursive` output.

@@ -170,9 +170,52 @@ pub struct Source {
     pub sha256: String,
 }
 struct Hashing<'a> {
-    input: File,
+    input: ReadAhead,
     hash: &'a mut Sha256,
     size: &'a mut u64,
+}
+/// Reads a file ahead on its own thread (up to 32 MiB), so disk reads overlap
+/// hashing and compression instead of alternating with them.
+struct ReadAhead {
+    blocks: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    current: std::io::Cursor<Vec<u8>>,
+}
+impl ReadAhead {
+    fn new(mut file: File) -> Self {
+        let (sender, blocks) = std::sync::mpsc::sync_channel(8);
+        std::thread::spawn(move || {
+            loop {
+                let mut block = vec![0u8; 4 << 20];
+                let read = file.read(&mut block).map(|n| {
+                    block.truncate(n);
+                    block
+                });
+                let end = !matches!(&read, Ok(block) if !block.is_empty());
+                // Stops when the reader is dropped.
+                if sender.send(read).is_err() || end {
+                    break;
+                }
+            }
+        });
+        Self {
+            blocks,
+            current: std::io::Cursor::new(Vec::new()),
+        }
+    }
+}
+impl Read for ReadAhead {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = self.current.read(bytes)?;
+            if n > 0 || bytes.is_empty() {
+                return Ok(n);
+            }
+            match self.blocks.recv() {
+                Ok(block) => self.current = std::io::Cursor::new(block?),
+                Err(_) => return Ok(0),
+            }
+        }
+    }
 }
 impl Read for Hashing<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -231,7 +274,7 @@ pub fn push(
         let mut hash = Sha256::new();
         let mut size = 0;
         let reader = Hashing {
-            input: input.try_clone()?,
+            input: ReadAhead::new(input.try_clone()?),
             hash: &mut hash,
             size: &mut size,
         };
