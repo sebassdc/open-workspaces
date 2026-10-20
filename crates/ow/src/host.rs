@@ -996,7 +996,9 @@ pub fn run(cli: Cli) -> Result<i32> {
             json!({"op":"fork","id":id,"child":child,"snapshot":snapshot})
         }
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),
-        Action::Delete { id } => {
+        Action::Delete { id, yes } => {
+            let snapshots = wire::request(&root, json!({"op":"snapshots"}))?;
+            crate::client::confirm_delete(&id, &snapshots, yes, crate::client::interactive())?;
             // Publications close only once the worker has accepted the delete.
             let result = wire::request(&root, json!({"op":"delete","id":id}))?;
             unpublish_all(&root, Some(&id))?;

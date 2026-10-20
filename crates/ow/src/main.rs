@@ -364,8 +364,14 @@ enum Action {
         with: String,
     },
     /// Delete a stopped or hibernated workspace with its disk and its own snapshots (on a
-    /// remote server: owner only; a machine the runner no longer has just leaves the list).
-    Delete { id: String },
+    /// remote server: owner only; a machine the runner no longer has, or a create or fork
+    /// that never made it, just leaves the list). Asks first when snapshots go with it.
+    Delete {
+        id: String,
+        /// Delete the box's snapshots with it without asking.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Rewind a workspace to its named snapshot (later changes are replaced).
     Restore {
         id: String,
