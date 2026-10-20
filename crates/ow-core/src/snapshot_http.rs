@@ -283,6 +283,8 @@ impl Http {
             self.client
                 .put(action.sign(SIGNED_FOR))
                 .header("x-amz-checksum-sha256", &checksum)
+                // Large parts get longer than the client's 120 s: about 1 MiB/s at worst.
+                .timeout(Duration::from_secs(120 + (body.len() >> 20) as u64))
                 .body(body.clone())
         })?;
         let status = response.status().as_u16();
