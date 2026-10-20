@@ -10,7 +10,7 @@ const GIB = 1024 ** 3, MAX_MEMORY_MIB = 4096;
 export const FAILING_CAPTURE_VCPUS = 13;
 
 export function fakeWorker(socketPath, log = () => {}) {
-  const machines = new Map(), snapshots = new Map();
+  const machines = new Map(), snapshots = new Map(), terminals = new Set();
   const handlers = {
     list: () => [...machines.values()],
     snapshots: () => [...snapshots.values()],
@@ -40,7 +40,11 @@ export function fakeWorker(socketPath, log = () => {}) {
       return Object.assign(get(r.id), {state: 'running'});
     },
     hibernate: r => Object.assign(get(r.id), {state: 'hibernated'}),
-    stop: r => ({workspace: Object.assign(get(r.id), {state: 'stopped'})}),
+    // Like the real worker killing the VM, stop drops its terminal streams without an exit frame.
+    stop: r => {
+      for (const t of terminals) if (t.id === r.id) t.socket.destroy();
+      return {workspace: Object.assign(get(r.id), {state: 'stopped'})};
+    },
     resize: r => {
       const m = get(r.id);
       for (const key of ['memory_mib', 'vcpu_count']) if (r[key] != null) m[key] = r[key];
@@ -109,6 +113,8 @@ export function fakeWorker(socketPath, log = () => {}) {
       if (request.op === 'terminal') {
         get(request.id);
         terminal = true;
+        const entry = {id: request.id, socket};
+        terminals.add(entry); socket.on('close', () => terminals.delete(entry));
         socket.write(JSON.stringify({ok: true, result: {}}) + '\n');
         send(0, Buffer.from('fake-shell$ '));
         return frames();
@@ -123,7 +129,7 @@ export function fakeWorker(socketPath, log = () => {}) {
       header[0] = kind; header.writeUInt32BE(bytes.length, 1);
       socket.write(Buffer.concat([header, bytes]));
     }
-    // A cooked-mode echo shell: typed bytes come back; "exit" ends with code 0.
+    // A cooked-mode echo shell: typed bytes come back; "exit [code]" ends with that code.
     let line = '';
     function frames() {
       while (pending.length >= 5 && pending.length >= 5 + pending.readUInt32BE(1)) {
@@ -132,7 +138,8 @@ export function fakeWorker(socketPath, log = () => {}) {
         if (kind !== 0) continue;
         for (const ch of bytes.toString()) {
           if (ch !== '\r') { line += ch; send(0, Buffer.from(ch)); continue; }
-          if (line.trim() === 'exit') { send(2, Buffer.from([0, 0, 0, 0])); socket.end(); return; }
+          const exit = /^exit(?:\s+(\d+))?$/.exec(line.trim());
+          if (exit) { const code = Buffer.alloc(4); code.writeInt32BE(Number(exit[1] ?? 0)); send(2, code); socket.end(); return; }
           send(0, Buffer.from(`\r\n${line}\r\nfake-shell$ `)); line = '';
         }
       }

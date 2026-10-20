@@ -1,4 +1,4 @@
-import {test, expect, api, machines, card, detailAction, dialog, notice} from './fixtures.mjs';
+import {test, expect, api, machines, card, detailAction, dialog, notice, signIn} from './fixtures.mjs';
 
 test('machine list shows cards, counts and the selected machine', async ({dashboard: page}) => {
   await machines(page, 'alpha', 'beta');
@@ -263,6 +263,15 @@ test('navigation switches between machines, snapshots and usage', async ({dashbo
   await expect(page.locator('#page-title')).toHaveText('Pick up from here.');
   await page.getByRole('button', {name: /Machines/}).click();
   await expect(page.locator('#machines-view')).toBeVisible();
+});
+
+test('top bar shows the signed-in account', async ({page, user}) => {
+  // A name not starting with "u", so the avatar differs from the "U" placeholder; it creates no machines.
+  const name = `z${user}`;
+  await signIn(page.context(), name);
+  await page.goto('/');
+  await expect(page.locator('#account-email')).toHaveText(`${name}@example.test`);
+  await expect(page.locator('#account-avatar')).toHaveText('Z');
 });
 
 test('cards keep their content at the top, whatever their height', async ({dashboard: page}) => {
