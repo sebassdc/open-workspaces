@@ -83,6 +83,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Terminal dark scrollbar (dark color scheme) | works | v0.9.31 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
 | Terminal notices a machine hibernated or stopped elsewhere and blocks input | works | v0.9.31 | `console.spec.mjs › terminal notices a machine hibernated elsewhere and blocks input`; `console.spec.mjs › terminal explains a machine stopped elsewhere after its connection drops` |
 | Command console: output as text, exit status, clear | works | v0.9.22 | `console.spec.mjs › command console shows output and exit status as text` |
+| Command console: 30 s limit stops the command with a plain message; the next command runs immediately with only its own output | works | v0.9.32 | `console.spec.mjs › a command past the 30 s limit shows a plain message, not the operation journal` |
 
 ## Snapshots and forks
 

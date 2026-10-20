@@ -143,6 +143,14 @@ fn max_disk_gib() -> Result<u32> {
 const MAX_SNAPSHOTS: usize = 24;
 const MAX_WORKSPACES: usize = 32;
 
+// Keep the login shell in the serial command's group so timeout cleanup reaches dev children.
+pub(crate) fn exec_command(command: &str) -> String {
+    format!(
+        "OW_COMMAND={}; if [ -f /etc/ow-developer ]; then su - dev --session-command \"$OW_COMMAND\"; else /bin/sh -c \"$OW_COMMAND\"; fi",
+        shell_quote(command)
+    )
+}
+
 fn default_cpus() -> u32 {
     1
 }
@@ -2018,10 +2026,7 @@ impl Runtime {
             }
             "exec" => {
                 let command = request["command"].as_str().context("missing command")?;
-                let quoted = format!(
-                    "OW_COMMAND={}; if [ -f /etc/ow-developer ]; then su - dev -c \"$OW_COMMAND\"; else /bin/sh -c \"$OW_COMMAND\"; fi",
-                    shell_quote(command)
-                );
+                let quoted = exec_command(command);
                 ensure!(
                     quoted.len() <= 2800,
                     "prototype commands are limited to 2800 bytes after shell quoting"
