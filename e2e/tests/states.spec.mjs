@@ -28,8 +28,9 @@ test('failed first load offers a retry and keeps New machine disabled', async ({
 });
 
 test('expired login asks the user to reload and sign in', async ({page}) => {
-  // An identity proxy answers an expired session with its HTML login page, not JSON.
-  await page.route('**/api/state', route => route.fulfill({status: 200, contentType: 'text/html', body: '<html>sign in</html>'}));
+  // An identity proxy redirects an expired session to its HTML login page.
+  // Use the real HTML root as the redirect target; Playwright does not route subsequent redirect hops.
+  await page.route('**/api/state', route => route.fulfill({status: 302, headers: {location: '/'}}));
   await page.goto('/');
   await expect(notice(page)).toHaveText('Your login may have expired. Reload the page to sign in again.');
   await expect(page.locator('#updated')).toHaveText('Connection interrupted');

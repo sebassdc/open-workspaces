@@ -3,7 +3,7 @@ import {test, expect, machines, detailAction, dialog, notice} from './fixtures.m
 test('no console errors on page load and dialog open', async ({page}) => {
   const errors = [];
   // Network failures are logged too; the tailnet dashboard answers the CLI installer probe with 404 on purpose.
-  page.on('console', message => { if (['error', 'warning'].includes(message.type()) && !message.text().startsWith('Failed to load resource')) errors.push(message.text()); });
+  page.on('console', message => { if (['error', 'warning'].includes(message.type()) && !(message.text().includes('404') && message.location().url.endsWith('/cli/install.sh'))) errors.push(message.text()); });
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
   await expect(page.locator('#updated')).toHaveText(/^Updated/);
@@ -48,6 +48,7 @@ test('a dialog unlocks with its result while the state reload is slow', async ({
   await expect(page.locator('#cancel-dialog')).toBeEnabled();
   await page.locator('#cancel-dialog').click();
   await expect(dialog(page)).toBeHidden();
+  await expect(detailAction(page, 'Snapshot')).toBeEnabled();
   release();
   await page.unroute('**/api/state');
 });
@@ -93,9 +94,8 @@ test('a gateway error says the server is not answering, not that the login expir
   await expect(notice(page)).toHaveText('The server is not answering (HTTP 504); it may be busy or restarting. The page retries on its own.');
   await expect(notice(page)).toHaveClass(/error/);
   await page.unroute('**/api/state');
-  // Once the server answers again, the outage message goes away.
-  await page.getByRole('button', {name: '↻ Refresh'}).click();
-  await expect(page.locator('#updated')).toHaveText(/^Updated/);
+  // The periodic reload recovers without a manual refresh.
+  await expect(page.locator('#updated')).toHaveText(/^Updated/, {timeout: 10_000});
   await expect(notice(page)).toBeHidden();
 });
 
@@ -146,4 +146,18 @@ test('a gateway error on an operation asks to try again, since an open dialog do
   await detailAction(page, 'Snapshot').click();
   await page.getByRole('button', {name: 'Capture snapshot'}).click();
   await expect(page.locator('#dialog-error')).toHaveText('The server is not answering (HTTP 504); it may be busy or restarting. Wait a moment, then try again.');
+});
+
+for (const status of [401, 403]) {
+  test(`HTTP ${status} asks to sign in even with a JSON response`, async ({dashboard: page}) => {
+    await page.route('**/api/state', route => route.fulfill({status, json: {ok: false, error: 'Unauthorized'}}));
+    await page.getByRole('button', {name: '↻ Refresh'}).click();
+    await expect(notice(page)).toHaveText('Your login may have expired. Reload the page to sign in again.');
+  });
+}
+
+test('an unexpected HTML response without an auth redirect does not ask to sign in', async ({dashboard: page}) => {
+  await page.route('**/api/state', route => route.fulfill({status: 200, contentType: 'text/html', body: '<html>Maintenance</html>'}));
+  await page.getByRole('button', {name: '↻ Refresh'}).click();
+  await expect(notice(page)).toHaveText('Unexpected response from the server (HTTP 200). Reload the page.');
 });
