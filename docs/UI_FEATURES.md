@@ -43,8 +43,8 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Feature | Status | Last passed | Test |
 | --- | --- | --- | --- |
 | Machine list: cards, counts, selection | works | v0.9.22 | `machines.spec.mjs › machine list shows cards, counts and the selected machine` |
-| Card content top-aligned; page notice spaced from the card below | works | v0.9.24 | `machines.spec.mjs › cards keep their content at the top, whatever their height` |
-| Phone width: tapping a card scrolls its actions into view | works | v0.9.24 | `machines.spec.mjs › on a phone, tapping a card brings its actions into view` |
+| Card content top-aligned; page notice spaced from the card below | works | v0.9.25 | `machines.spec.mjs › cards keep their content at the top, whatever their height` |
+| Phone width: tapping a card scrolls its actions into view | works | v0.9.25 | `machines.spec.mjs › on a phone, tapping a card brings its actions into view` |
 | Empty sandbox and empty snapshot list | works | v0.9.22 | `machines.spec.mjs › empty sandbox invites a first machine` |
 | Memory counter: your usage against your owner limits | works | v0.9.23 | `machines.spec.mjs › memory counter shows your usage against your owner limits` |
 | Create dialog: name, image, memory, vCPU, disk | works | v0.9.22 | `machines.spec.mjs › create dialog creates a machine with the chosen shape` |
@@ -61,8 +61,8 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Stop with its warning, then start | works | v0.9.22 | `lifecycle.spec.mjs › stop explains what is lost, then start brings it back` |
 | Resize a stopped machine's disk | works | v0.9.22 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
 | Delete with snapshot warnings | works | v0.9.22 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `lifecycle.spec.mjs › delete of a machine without snapshots says so` |
-| Resize dialog prefilled with the current size; the same size answers "Already N GiB" | works | v0.9.24 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
-| Destructive confirms (delete, restore) lead with a warning and use a danger button | works | v0.9.24 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `snapshots.spec.mjs › fork and restore from the snapshot list` |
+| Resize dialog prefilled with the current size; the same size answers "Already N GiB" | works | v0.9.25 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
+| Destructive confirms (delete, restore) lead with a warning and use a danger button | works | v0.9.25 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `snapshots.spec.mjs › fork and restore from the snapshot list` |
 
 ## Terminal and console
 
