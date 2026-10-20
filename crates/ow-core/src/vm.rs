@@ -617,7 +617,7 @@ mod command_tests {
     use std::os::unix::net::UnixStream;
 
     // Exercise both a socket shell and the guest's controlling-terminal/job-control path.
-    fn timeout_recovery(terminal: bool, timeout: Duration) {
+    fn timeout_recovery(terminal: bool, timeout: Duration, developer: bool) {
         let (master, serial): (File, File) = if terminal {
             let (mut master, mut slave) = (-1, -1);
             assert_eq!(
@@ -681,10 +681,27 @@ mod command_tests {
             memory_base: MemoryBase::Unknown,
             address: String::new(),
         };
+        let command = |text: &str| {
+            if developer {
+                crate::runtime::exec_command(text)
+            } else {
+                text.to_owned()
+            }
+        };
+        if developer {
+            assert_eq!(
+                vm.command(&command("id -u; printf '%s\\n' \"$HOME\"; pwd"))
+                    .unwrap(),
+                ("1000\n/home/dev\n/home/dev\n".into(), 0)
+            );
+        }
         let started = Instant::now();
         let error = vm
             .command_within(
-                "(sleep 65; echo leftover-from-child) & sleep 65; echo leftover-from-slow",
+                &command(&format!(
+                    "(sleep {}; echo leftover-from-child) & sleep 65; echo leftover-from-slow",
+                    timeout.as_secs() + 4
+                )),
                 timeout,
             )
             .unwrap_err();
@@ -699,7 +716,7 @@ mod command_tests {
             started.elapsed()
         );
         let quick = Instant::now();
-        let (output, code) = vm.command("echo next-command").unwrap();
+        let (output, code) = vm.command(&command("sleep 3; echo next-command")).unwrap();
         assert_eq!((output.as_str(), code), ("next-command\n", 0));
         assert!(
             quick.elapsed() < Duration::from_secs(5),
@@ -709,27 +726,31 @@ mod command_tests {
         // A TERM-resistant child must not write into the immediately following command.
         let error = vm
             .command_within(
-                "(trap '' TERM; sleep 2; echo leftover-from-resistant-child) & sleep 65",
+                &command("(trap '' TERM; sleep 5; echo leftover-from-resistant-child) & sleep 65"),
                 Duration::from_secs(1),
             )
             .unwrap_err();
         assert_eq!(error.to_string(), "guest command timed out after 1s");
         assert_eq!(
-            vm.command("sleep 3; echo after-resistant-child").unwrap(),
+            vm.command(&command("sleep 3; echo after-resistant-child"))
+                .unwrap(),
             ("after-resistant-child\n".into(), 0)
         );
         assert_eq!(
-            vm.command_within("trap '' TERM; sleep 65", Duration::from_secs(1))
+            vm.command_within(&command("trap '' TERM; sleep 65"), Duration::from_secs(1))
                 .unwrap_err()
                 .to_string(),
             "guest command timed out after 1s"
         );
-        assert_eq!(vm.command("echo last").unwrap(), ("last\n".into(), 0));
         assert_eq!(
-            vm.command("cat; echo stdin-closed").unwrap(),
+            vm.command(&command("echo last")).unwrap(),
+            ("last\n".into(), 0)
+        );
+        assert_eq!(
+            vm.command(&command("cat; echo stdin-closed")).unwrap(),
             ("stdin-closed\n".into(), 0)
         );
-        let (output, code) = vm.command("printf 'no newline'; exit 3").unwrap();
+        let (output, code) = vm.command(&command("printf 'no newline'; exit 3")).unwrap();
         assert_eq!((output.as_str(), code), ("no newline", 3));
         drop(vm);
         std::fs::remove_file(&log).unwrap();
@@ -737,12 +758,20 @@ mod command_tests {
 
     #[test]
     fn a_timed_out_command_is_ended_and_the_next_command_gets_only_its_own_output() {
-        timeout_recovery(false, Duration::from_secs(1));
+        timeout_recovery(false, Duration::from_secs(1), false);
+    }
+
+    #[test]
+    #[ignore = "requires a disposable Linux container with root, dev uid 1000 and /etc/ow-developer"]
+    fn production_timeout_recovers_for_developer_exec() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        assert!(Path::new("/etc/ow-developer").exists());
+        timeout_recovery(true, Duration::from_secs(30), true);
     }
 
     #[test]
     fn production_timeout_recovers_with_terminal_job_control() {
-        timeout_recovery(true, Duration::from_secs(30));
+        timeout_recovery(true, Duration::from_secs(30), false);
     }
 }
 

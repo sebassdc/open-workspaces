@@ -101,6 +101,36 @@ test("the entries since the previous release tag declare what the diff changed",
     if (pin(`v${previous}`) !== pin("HEAD")) assert.ok(declared.has("guest-kernel"), "the guest kernel pin changed: declare guest-kernel");
 });
 
+test("serial timeout recovery upgrades the worker and controller from released versions", () => {
+    const results = JSON.parse(execFileSync("python3", ["-c", `
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import upgrade
+m = json.load(open(sys.argv[2]))
+target = "0.9.31"
+e = next(e for e in m["releases"] if e["version"] == target)
+compat = {"runtime": e["runtime"]["vmm"], "cpu": "test-cpu", "kernel_sha256": e["runtime"]["guest_kernel_sha256"]}
+plans = []
+for installed in ("0.9.29", "0.9.30"):
+    pins = dict.fromkeys(("agent", "dashboard", "worker"), installed)
+    plans.append(upgrade.plan(m, pins, target, captures=[{"name": "dev", **compat}], compat=compat))
+    try:
+        upgrade.plan(m, pins, target, max_class=1)
+    except upgrade.Refused:
+        pass
+    else:
+        raise AssertionError("class-1 ceiling accepted the serial timeout worker fix")
+print(json.dumps(plans))
+`, new URL("../host/", import.meta.url).pathname, new URL("../../../release-impact.json", import.meta.url).pathname], { encoding: "utf8" }));
+    for (const result of results) {
+        assert.equal(result.class, 2);
+        assert.deepEqual(result.move, {agent: "0.9.31", dashboard: "0.9.31", worker: "0.9.31"});
+        assert.deepEqual(result.restart, ["agent", "dashboard", "worker"]);
+        assert.deepEqual(result.cold, []);
+        assert.equal(result.gate.target, "0.9.31");
+    }
+});
+
 test("the cache release plans a worker upgrade and preserves capture gates", () => {
     const result = JSON.parse(execFileSync("python3", ["-c", `
 import json, sys
