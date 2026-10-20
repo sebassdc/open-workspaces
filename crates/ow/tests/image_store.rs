@@ -20,6 +20,13 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+struct S3(std::process::Child);
+impl Drop for S3 {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 struct Worker(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -60,10 +67,12 @@ fn default_controller_build_uses_sibling_runner_and_commits_image() {
 import sys,json,pathlib,hashlib,base64
 root=pathlib.Path(__file__).parent/'objects'
 a=sys.argv[1:]
+if a[:1]==['--endpoint-url']:a=a[2:]
 def arg(k): return a[a.index(k)+1]
 def digest(b): return base64.b64encode(hashlib.sha256(b).digest()).decode()
-if a[:2]==['s3','cp']:
-    sys.stdout.buffer.write((root/a[-2].removeprefix('s3://')).read_bytes());sys.exit(0)
+if a[:2]==['configure','export-credentials']:
+    print('{"Version":1,"AccessKeyId":"fixture","SecretAccessKey":"fixture"}');sys.exit(0)
+assert a[0]=='s3api'
 op=a[1]
 assert arg('--bucket')=='bucket'
 if op=='get-bucket-versioning':out={'Status':'Enabled'}
@@ -83,6 +92,24 @@ else:
 print(json.dumps(out))
 "#).unwrap();
     fs::set_permissions(&aws, fs::Permissions::from_mode(0o700)).unwrap();
+    // Objects move through the loopback S3 fixture over root/objects.
+    fs::create_dir_all(root.0.join("objects")).unwrap();
+    fs::write(
+        root.0.join("s3"),
+        include_bytes!("../../ow-core/tests/fake_s3.py"),
+    )
+    .unwrap();
+    let mut s3 = S3(Command::new("python3")
+        .arg(root.0.join("s3"))
+        .arg(root.0.join("objects"))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap());
+    let mut port = String::new();
+    BufReader::new(s3.0.stdout.take().unwrap())
+        .read_line(&mut port)
+        .unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", port.trim());
     let listener = UnixListener::bind(runner.join("control.sock")).unwrap();
     listener.set_nonblocking(true).unwrap();
     let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -141,6 +168,7 @@ print(json.dumps(out))
             .env("OW_ASSET_DIR", &assets)
             .env("XDG_CONFIG_HOME", root.0.join("client-config"))
             .env("OW_SERVER", "http://fixture.invalid")
+            .env("OW_TEST_S3_ENDPOINT", &endpoint)
             .env(
                 "PATH",
                 std::env::join_paths(
