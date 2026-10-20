@@ -374,11 +374,11 @@ impl Staged {
                 &self.staging,
                 &crate::snapshot_store::DATA_FILES,
                 self.previous.as_deref(),
-                crate::snapshot_digest::CHUNKS_V2,
+                crate::snapshot_digest::CHUNKS_V1,
             )?;
             return Ok((
                 files,
-                Some(crate::snapshot_digest::CHUNKS_V2.into()),
+                Some(crate::snapshot_digest::CHUNKS_V1.into()),
                 Some(stats),
             ));
         }
@@ -2692,7 +2692,7 @@ mod disk_tests {
         .unwrap();
         assert_eq!(
             pinned.digest.as_deref(),
-            Some(crate::snapshot_digest::CHUNKS_V2)
+            Some(crate::snapshot_digest::CHUNKS_V1)
         );
         assert!(runtime.snapshot_dir(name).join("chunks.json").is_file());
         runtime.verified.clear();

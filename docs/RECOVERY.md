@@ -153,7 +153,7 @@ content-addressed chunks remain reusable. A lost seal response is reconciled
 through the committed local manifest. The worker still checks placement authority
 for sealing and acknowledgment.
 
-Older clients and workers use the existing seal-then-upload path. Both
+Older clients and workers use the existing seal-then-upload path and 8 MiB seals. Both
 `sha256-chunks-8m-v1` and `sha256-chunks-32m-v2` points are readable by this
 release, as are original whole-file backups. A format transition hashes the first
 point in the new chunk size; subsequent points reuse its unchanged extents.

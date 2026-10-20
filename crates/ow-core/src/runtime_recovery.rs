@@ -222,10 +222,10 @@ impl Runtime {
                         &staging,
                         &crate::snapshot_store::DATA_FILES,
                         previous.as_deref(),
-                        crate::snapshot_digest::CHUNKS_V2,
+                        crate::snapshot_digest::CHUNKS_V1,
                     )?;
                     snapshot.files = files;
-                    snapshot.digest = Some(crate::snapshot_digest::CHUNKS_V2.into());
+                    snapshot.digest = Some(crate::snapshot_digest::CHUNKS_V1.into());
                     stats = json!(counted);
                     atomic_json(&staging.join("manifest.json"), &snapshot)?;
                     fs::set_permissions(
@@ -573,6 +573,14 @@ mod client_seal_tests {
             );
             assert!(!staging.exists());
             if valid {
+                let committed: Snapshot = serde_json::from_slice(
+                    &fs::read(runtime.snapshot_dir(name).join("manifest.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    committed.digest.as_deref(),
+                    Some(crate::snapshot_digest::CHUNKS_V2)
+                );
                 runtime.request(&ack).unwrap();
                 runtime.request(&ack).unwrap();
                 runtime.verified.clear();
