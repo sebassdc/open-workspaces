@@ -104,3 +104,15 @@ dashboard.
 | Expired login message | works | v0.9.22 | `states.spec.mjs › expired login asks the user to reload and sign in` |
 | CLI installer panel (hidden on tailnet sign-in) | partial | v0.9.22 | `states.spec.mjs › the tailnet dashboard offers no CLI installer` (the Access sign-in panel and its copy button are not covered) |
 | Phone width: no horizontal overflow, dialogs fit | works | v0.9.22 | `states.spec.mjs › narrow width › phone layout has no horizontal overflow and dialogs fit` |
+| Gateway error (502/504) says the server is not answering, clears on recovery | works | v0.9.22 | `dialogs.spec.mjs › a gateway error says the server is not answering, not that the login expired` |
+| No console errors on load and dialog open; name patterns compile | works | v0.9.22 | `dialogs.spec.mjs › no console errors on page load and dialog open` |
+
+## Dialogs and notices
+
+| Feature | Status | Last passed | Test |
+| --- | --- | --- | --- |
+| Invalid name refused in the browser, allowed characters named | works | v0.9.22 | `dialogs.spec.mjs › an invalid name is refused in the browser and names the allowed characters` |
+| Dialog shows its result and unlocks before the state reload answers | works | v0.9.22 | `dialogs.spec.mjs › a dialog unlocks with its result while the state reload is slow` |
+| Retry clears the previous error; busy label while it runs | works | v0.9.22 | `dialogs.spec.mjs › the snapshot dialog clears the last error and shows its progress` |
+| Cancelled dialog leaves no stale notice | works | v0.9.22 | `dialogs.spec.mjs › a refused operation leaves no notice behind once its dialog is cancelled` |
+| Result notice cleared on view or machine switch | works | v0.9.22 | `dialogs.spec.mjs › a result notice is cleared when the user switches view or machine` |
