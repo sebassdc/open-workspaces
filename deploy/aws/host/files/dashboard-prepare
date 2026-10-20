@@ -6,14 +6,15 @@ import json, sys
 s = json.load(sys.stdin)
 sys.exit(1) if s.get("BackendState") != "Running" else print(s["Self"]["DNSName"].rstrip("."))') \
   || { echo "tailscale is not up; the dashboard starts once this host is on the tailnet"; exit 1; }
-runuser -u ow -- env NAME="$name" LOGINS="${OW_DASHBOARD_LOGINS:-}" CAPABILITY="${OW_DASHBOARD_CAPABILITY:-}" python3 -c '
+runuser -u ow -- env NAME="$name" LOGINS="${OW_DASHBOARD_LOGINS:-}" CAPABILITY="${OW_DASHBOARD_CAPABILITY:-}" ADMINS="${OW_POOL_ADMINS:-}" python3 -c '
 import json, os
 path = "/srv/ow/.ow/dashboard.json"
 fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
     json.dump({"auth": "tailscale", "hostname": os.environ["NAME"], "upstream": "http://127.0.0.1:9/",
                "allowed_emails": list(filter(None, os.environ["LOGINS"].split(","))),
-               **({"allowed_capability": os.environ["CAPABILITY"]} if os.environ["CAPABILITY"] else {})}, f)
+               **({"allowed_capability": os.environ["CAPABILITY"]} if os.environ["CAPABILITY"] else {}),
+               **({"pool_admins": os.environ["ADMINS"].split(",")} if os.environ["ADMINS"] else {})}, f)
 os.replace(path + ".tmp", path)'
 tailscale serve --bg http://127.0.0.1:8787 > /dev/null
 echo "dashboard: https://$name/"

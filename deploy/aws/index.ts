@@ -63,6 +63,9 @@ export interface HostArgs {
     /** Application capability (domain/path) admitting tailnet users. Needs tailscaleAuthKeySecretArn.
      * Omit both this and dashboardLogins for no dashboard. When both are set, either admits a user. */
     dashboardCapability?: pulumi.Input<string>;
+    /** Login emails that may transfer and fork any box and create boxes for others (the
+     * gateway config's `pool_admins`). Admits nobody by itself. Needs a dashboard. Default: none. */
+    poolAdmins?: pulumi.Input<pulumi.Input<string>[]>;
     /**
      * Developer images (`ubuntu` only for now) to build on the host after boot: the `dev`
      * user, SSH server and toolchains that SSH access and golden-image recipes need.
@@ -107,7 +110,7 @@ export interface HostArgs {
 }
 
 /** A runner host: Host inputs except dashboard, role and GC rights, plus the controller it joins. */
-export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability" | "role" | "storeGc"> {
+export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability" | "poolAdmins" | "role" | "storeGc"> {
     // The package analyzer loses optional types inherited through Omit.
     vcpuOvercommit?: pulumi.Input<number>;
     hostReserveCpuMillis?: pulumi.Input<number>;
@@ -211,6 +214,7 @@ export interface HostConfigInputs {
     tailscaleSsh: boolean;
     dashboardLogins: string[];
     dashboardCapability?: string;
+    poolAdmins?: string[];
     developerImages: string[];
     backupUrl: string;
     storeUrl?: string;
@@ -252,6 +256,11 @@ export function hostConfig(c: HostConfigInputs): object {
         throw new Error("tailscaleDirect needs tailscaleAuthKeySecretArn and a valid interface MAC");
     }
     dashboardLoginList(c.dashboardLogins);
+    const poolAdmins = c.poolAdmins ?? [];
+    dashboardLoginList(poolAdmins);
+    if (poolAdmins.length > 0 && c.dashboardLogins.length === 0 && !capability) {
+        throw new Error("poolAdmins needs a dashboard: set dashboardLogins or dashboardCapability");
+    }
     if (c.storeUrl) storeRunnerPolicy("aws", c.storeUrl);
     const artifacts = c.imageArtifacts ?? {};
     if (Object.keys(artifacts).length && !c.storeUrl) throw new Error("imageArtifacts needs storeUrl");
@@ -292,7 +301,7 @@ export function hostConfig(c: HostConfigInputs): object {
         if (!c.tailscaleAuthKeySecretArn) {
             throw new Error("a runner needs tailscaleAuthKeySecretArn: its controller listens on the tailnet only");
         }
-        if (c.dashboardLogins.length > 0 || capability) throw new Error("a runner has no dashboard");
+        if (c.dashboardLogins.length > 0 || capability || poolAdmins.length > 0) throw new Error("a runner has no dashboard");
     }
     return {
         schema: 1,
@@ -300,7 +309,7 @@ export function hostConfig(c: HostConfigInputs): object {
         release: { repository: c.repository, ref: c.ref },
         tailscale: { secretArn: c.tailscaleAuthKeySecretArn, hostname: c.tailscaleHostname, ssh: c.tailscaleSsh,
             ...(c.directMac ? { direct: { mac: c.directMac } } : {}) },
-        dashboard: { logins: c.dashboardLogins, ...(capability ? { capability } : {}) },
+        dashboard: { logins: c.dashboardLogins, ...(capability ? { capability } : {}), ...(poolAdmins.length ? { poolAdmins } : {}) },
         developerImages: images ? images.split(" ") : [],
         ...(c.storeUrl ? { store: { url: c.storeUrl, images: artifacts } } : {}),
         backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule, ...(c.recoveryPoints ? { recovery: true } : {}) },
@@ -528,17 +537,17 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                 .all([
                     pulumi.all([args.repository ?? DEFAULT_REPOSITORY, args.ref ?? `v${require("./package.json").version}`]),
                     pulumi.all([args.tailscaleAuthKeySecretArn ?? "", args.tailscaleHostname ?? name, args.tailscaleSsh ?? false]),
-                    pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? [], args.dashboardCapability ?? ""]),
+                    pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? [], args.dashboardCapability ?? "", args.poolAdmins ?? []]),
                     pulumi.all([backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30, args.vcpuOvercommit ?? 1, args.recoveryPoints ?? false]),
                     runner,
                     directInterface ? directInterface.macAddress : pulumi.output(""),
                     pulumi.all([args.storeUrl ?? "", args.imageArtifacts ?? {}]),
                     pulumi.all([hostRole, args.hostReserveCpuMillis, args.hostReserveMemoryMib]),
                 ])
-                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints], runner, directMac, [storeUrl, imageArtifacts], [role, hostReserveCpuMillis, hostReserveMemoryMib]]) =>
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability, poolAdmins], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints], runner, directMac, [storeUrl, imageArtifacts], [role, hostReserveCpuMillis, hostReserveMemoryMib]]) =>
                     JSON.stringify(hostConfig({
                         role, repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
-                        dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints, runner, directMac, storeUrl, imageArtifacts,
+                        dashboardLogins: logins, dashboardCapability: capability, poolAdmins, developerImages: images, backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints, runner, directMac, storeUrl, imageArtifacts,
                         hostReserveCpuMillis, hostReserveMemoryMib,
                     })),
                 ),

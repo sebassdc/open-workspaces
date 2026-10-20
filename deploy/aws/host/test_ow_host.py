@@ -121,6 +121,20 @@ class Render(unittest.TestCase):
             self.assertEqual(files[path], self.files[path], "capability-only dashboards retain preview support")
         self.assertEqual(h.units_changed(changed), {"dashboard"})
 
+    def test_pool_admins_reach_only_the_dashboard_config(self):
+        c = config(dashboard={"logins": ["you@example.com"], "poolAdmins": ["admin@example.com"]})
+        self.assertEqual(c["dashboard"], {"logins": ["you@example.com"], "poolAdmins": ["admin@example.com"]})
+        files = {k: v[0] for k, v in h.render(c, BUDGET).items()}
+        self.assertEqual(files["/etc/open-workspaces/dashboard.env"],
+                         "OW_DASHBOARD_LOGINS=you@example.com\nOW_DASHBOARD_CAPABILITY=\nOW_POOL_ADMINS=admin@example.com\n")
+        changed = {path for path in files if files[path] != self.files[path]}
+        self.assertEqual(h.units_changed(changed), {"dashboard"})
+        for bad in (["not an email"], ["a@example.com\nX=1"], ["a@example.com\n"]):
+            with self.assertRaises(h.Refused):
+                config(dashboard={"logins": ["you@example.com"], "poolAdmins": bad})
+        with self.assertRaises(h.Refused):
+            config(dashboard={"logins": [], "poolAdmins": ["admin@example.com"]})
+
     def test_dashboard_prepare_writes_capability_only_and_email_configs(self):
         import json
         import os
@@ -142,6 +156,12 @@ class Render(unittest.TestCase):
                 self.assertEqual(output["allowed_emails"], logins.split(",") if logins else [])
                 self.assertEqual(output.get("allowed_capability", ""), capability)
                 self.assertEqual((root / "dashboard.json").stat().st_mode & 0o777, 0o600)
+                self.assertNotIn("pool_admins", output)
+            subprocess.run(["bash", "-c", script], check=True, capture_output=True,
+                           env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "OW_DASHBOARD_LOGINS": "you@example.com",
+                                "OW_POOL_ADMINS": "admin@example.com,you@example.com"})
+            output = json.loads((root / "dashboard.json").read_text())
+            self.assertEqual(output["pool_admins"], ["admin@example.com", "you@example.com"])
 
     def test_optional_features_render_only_when_configured(self):
         bare = h.render(config(dashboard={"logins": []}, developerImages=[], backup={"url": ""}), BUDGET)

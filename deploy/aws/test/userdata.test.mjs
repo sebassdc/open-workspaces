@@ -97,6 +97,8 @@ test("the config is validated in the component", () => {
         [{ ref: "a..b" }, /ref must be/],
         [{ repository: "http://plain.example/x" }, /repository must be/],
         [{ developerImages: ["arch"] }, /developerImages takes ubuntu/],
+        [{ tailscaleAuthKeySecretArn: "arn:x", poolAdmins: ["a@example.com"] }, /poolAdmins needs a dashboard/],
+        [{ tailscaleAuthKeySecretArn: "arn:x", dashboardLogins: ["a@example.com"], poolAdmins: ["a@example.com\nX=1"] }, /invalid dashboard login/],
     ]) {
         assert.throws(() => hostConfig({ ...base, ...bad }), message);
     }
@@ -108,6 +110,9 @@ test("capability admission, store pins and overcommit compose without user data 
     const after = await deploy({ tailscaleAuthKeySecretArn: secretArn, dashboardCapability: "example.test/cap/open-workspaces",
         storeUrl: "s3://bucket/prefix", imageArtifacts: pins, vcpuOvercommit: 2 });
     assert.deepEqual(after.config.dashboard, { logins: [], capability: "example.test/cap/open-workspaces" });
+    const admins = await deploy({ tailscaleAuthKeySecretArn: secretArn, dashboardLogins: ["a@example.com"], poolAdmins: ["a@example.com"] });
+    assert.deepEqual(admins.config.dashboard, { logins: ["a@example.com"], poolAdmins: ["a@example.com"] });
+    assert.equal(before.userData, admins.userData);
     assert.deepEqual(after.config.store, { url: "s3://bucket/prefix", images: pins });
     assert.equal(after.config.vcpuOvercommit, 2);
     assert.equal(before.userData, after.userData);
