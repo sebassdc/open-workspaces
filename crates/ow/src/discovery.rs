@@ -87,6 +87,7 @@ pub fn node(inventory: &Value, reserved: Value, now: u64) -> Value {
         "last_seen_unix_s":inventory["last_seen_unix_s"],
         "configured":{"memory_mib":inventory["owner_limits"]["memory"],"vcpus":inventory["owner_limits"]["cpus"],"slots":inventory["owner_limits"]["slots"]},"effective":limits,"reserved":reserved,"available":available,
         "per_guest":{"memory_mib":common::SHAPES_MIB.iter().copied().filter(|m| u64::from(*m)<=ram && (cap["backend"]!="apple-virtualization" || [512,1024,2048].contains(m))).collect::<Vec<_>>(),"max_vcpus":cpus},
+        "host_reserve":{"cpu_millis":cap["host_reserve"]["cpu_millis"].as_u64(),"memory_mib":cap["host_reserve"]["memory_mib"].as_u64(),"disk_gib":cap["min_free_gib"].as_u64()},
         "disk":disk,"workspaces":{"configured":cap["max_workspaces"].as_u64(),"observed":cap["workspace_count"].as_u64(),"available":workspace_headroom},"capabilities":capabilities,"images":cap["images"].as_array().cloned().unwrap_or_default()})
 }
 
@@ -195,6 +196,29 @@ mod tests {
             }
             assert_eq!(projected["capabilities"]["operations"], operations);
         }
+    }
+
+    #[test]
+    fn nodes_show_the_host_reserve_beside_the_disk_reserve() {
+        let mut cap = json!({"type":"heartbeat","protocol":common::PROTOCOL,"backend":"firecracker","arch":"x86_64","runtime":common::RUNTIME,"memory_mib":4096,"slots":2,"vcpus":4,"images":["ubuntu"],"min_free_gib":5,"host_reserve":{"cpu_millis":500,"memory_mib":1024}});
+        let shown = |cap: &Value| {
+            node(
+                &json!({"id":"runner","online":true,"memory_mib":4096,"slots":2,"capabilities":cap}),
+                json!({"memory_mib":0,"vcpus":0,"slots":0}),
+                100,
+            )["host_reserve"]
+                .clone()
+        };
+        assert_eq!(
+            shown(&cap),
+            json!({"cpu_millis":500,"memory_mib":1024,"disk_gib":5})
+        );
+        // An older worker reports no CPU/RAM reserve.
+        cap.as_object_mut().unwrap().remove("host_reserve");
+        assert_eq!(
+            shown(&cap),
+            json!({"cpu_millis":null,"memory_mib":null,"disk_gib":5})
+        );
     }
 
     #[test]

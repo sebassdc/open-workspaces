@@ -54,6 +54,18 @@ fn max_running() -> usize {
 fn max_cpus() -> u32 {
     limit("OW_MAX_VCPUS", 16, crate::common::HOST_CPUS)
 }
+/// CPU and RAM the host keeps for its controller and node agent, outside the budgets above
+/// (which already exclude it): reported only, so placement output can show it.
+fn host_reserve() -> Value {
+    let read = |name| std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok());
+    match (
+        read("OW_HOST_RESERVE_CPU_MILLIS"),
+        read("OW_HOST_RESERVE_MEMORY_MIB"),
+    ) {
+        (Some(cpu), Some(memory)) => json!({"cpu_millis":cpu,"memory_mib":memory}),
+        _ => Value::Null,
+    }
+}
 fn minimum_free_gib() -> Result<u32> {
     match std::env::var("OW_MIN_FREE_GIB") {
         Ok(v) => {
@@ -1494,7 +1506,7 @@ impl Runtime {
                 "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"snapshot_delete_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
-                "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
+                "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":host_reserve(),"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
             "list" => Ok(json!(
