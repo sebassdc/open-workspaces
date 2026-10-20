@@ -54,6 +54,7 @@ fn writable_store(p: &Processes) {
 import sys,json,hashlib,base64,pathlib
 root=pathlib.Path(__file__).parent.parent/'objects'
 a=sys.argv[1:]
+if a[:1]==['--endpoint-url']:a=a[2:]
 def arg(k):return a[a.index(k)+1]
 def digest(b):return base64.b64encode(hashlib.sha256(b).digest()).decode()
 if a[:2]==['configure','export-credentials']:

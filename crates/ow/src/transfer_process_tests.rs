@@ -473,7 +473,7 @@ fn fixture() -> Processes {
     // Local stand-in for the AWS CLI hands out fixture credentials only; objects
     // move through the loopback S3 fixture over root/objects.
     let aws = root.join("bin/aws");
-    fs::write(&aws,"#!/bin/sh\nset -eu\ntest \"$1 $2\" = 'configure export-credentials'\necho '{\"Version\":1,\"AccessKeyId\":\"fixture\",\"SecretAccessKey\":\"fixture\"}'\n").unwrap();
+    fs::write(&aws,"#!/bin/sh\nset -eu\n[ \"$1\" != --endpoint-url ] || shift 2\ntest \"$1 $2\" = 'configure export-credentials'\necho '{\"Version\":1,\"AccessKeyId\":\"fixture\",\"SecretAccessKey\":\"fixture\"}'\n").unwrap();
     fs::set_permissions(aws, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir_all(root.join("objects")).unwrap();
     fs::write(
