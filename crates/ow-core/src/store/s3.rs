@@ -31,6 +31,10 @@ pub struct S3Objects {
 }
 impl S3Objects {
     pub fn new(url: &str, endpoint: Option<&str>) -> Result<Self> {
+        #[cfg(feature = "test-endpoint")]
+        let fixture = std::env::var("OW_TEST_S3_ENDPOINT").ok();
+        #[cfg(feature = "test-endpoint")]
+        let endpoint = endpoint.or(fixture.as_deref());
         let transport = S3Store::new(url, endpoint)?;
         let root = url
             .strip_prefix("s3://")

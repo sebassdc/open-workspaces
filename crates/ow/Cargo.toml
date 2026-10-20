@@ -33,3 +33,5 @@ jsonwebtoken = "9.3"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Transfer process tests point the artifact store at a loopback fixture.
+ow-core = { path = "../ow-core", features = ["test-endpoint"] }

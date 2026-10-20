@@ -56,8 +56,8 @@ root=pathlib.Path(__file__).parent.parent/'objects'
 a=sys.argv[1:]
 def arg(k):return a[a.index(k)+1]
 def digest(b):return base64.b64encode(hashlib.sha256(b).digest()).decode()
-if a[:3]==['s3','cp','--only-show-errors']:
- sys.stdout.buffer.write((root/a[3][5:]).read_bytes());sys.exit(0)
+if a[:2]==['configure','export-credentials']:
+ print('{"Version":1,"AccessKeyId":"fixture","SecretAccessKey":"fixture"}');sys.exit(0)
 assert a[0]=='s3api'
 op=a[1]
 if op=='get-bucket-versioning':print('{"Status":"Enabled"}')

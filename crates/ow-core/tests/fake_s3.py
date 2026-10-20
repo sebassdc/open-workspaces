@@ -4,7 +4,8 @@
 Serves path-style requests from ROOT/<bucket>/<key>, the layout fake_aws.py
 uses, and logs each request to ROOT/calls.jsonl. Prints its port on stdout.
 Fault files in ROOT: deny-head, fail-manifest, and put-budget (how many more
-chunk uploads succeed before the rest are refused).
+chunk uploads succeed before the rest are refused). HEAD reports length, ETag and
+(when asked) SHA-256; ranged GETs must match that ETag.
 """
 import base64
 import hashlib
@@ -19,6 +20,10 @@ from xml.sax.saxutils import escape
 root = Path(sys.argv[1])
 PAGE = 2  # small pages exercise continuation
 budget_lock = threading.Lock()
+
+
+def etag(data):
+    return '"' + hashlib.sha256(data).hexdigest()[:32] + '"'
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -36,11 +41,11 @@ class Handler(BaseHTTPRequestHandler):
             log.write(json.dumps(['http', self.command, key, bucket]) + '\n')
         return bucket, key, query
 
-    def reply(self, status, body=b'', headers=()):
+    def reply(self, status, body=b'', headers=(), length=None):
         self.send_response(status)
         for name, value in headers:
             self.send_header(name, value)
-        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Content-Length', str(len(body) if length is None else length))
         self.end_headers()
         if self.command != 'HEAD':
             self.wfile.write(body)
@@ -52,7 +57,14 @@ class Handler(BaseHTTPRequestHandler):
         bucket, key, _ = self.target()
         if (root / 'deny-head').exists():
             return self.reply(403)
-        self.reply(200 if (root / bucket / key).is_file() else 404)
+        path = root / bucket / key
+        if not path.is_file():
+            return self.reply(404)
+        data = path.read_bytes()
+        headers = [('ETag', etag(data))]
+        if self.headers['x-amz-checksum-mode'] == 'ENABLED':
+            headers.append(('x-amz-checksum-sha256', base64.b64encode(hashlib.sha256(data).digest()).decode()))
+        self.reply(200, headers=headers, length=len(data))
 
     def do_GET(self):
         bucket, key, query = self.target()
@@ -71,7 +83,13 @@ class Handler(BaseHTTPRequestHandler):
         path = root / bucket / key
         if not path.is_file():
             return self.error(404, 'NoSuchKey')
-        self.reply(200, path.read_bytes())
+        data = path.read_bytes()
+        if self.headers['Range']:
+            if self.headers['If-Match'] != etag(data):
+                return self.error(412, 'PreconditionFailed')
+            start, end = map(int, self.headers['Range'].removeprefix('bytes=').split('-'))
+            return self.reply(206, data[start:end + 1])
+        self.reply(200, data)
 
     def do_PUT(self):
         bucket, key, _ = self.target()

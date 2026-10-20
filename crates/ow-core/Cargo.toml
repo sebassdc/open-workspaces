@@ -17,3 +17,7 @@ sha2 = "0.10"
 zstd = { version = "=0.13.3", default-features = false, features = ["zstdmt"] }
 rusty-s3 = "0.10.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "blocking"] }
+
+[features]
+# Dependent crates' tests reach a loopback fixture store through OW_TEST_S3_ENDPOINT.
+test-endpoint = []

@@ -285,6 +285,9 @@ fn worker_request(root: &Path, request: &Value) -> Result<Value> {
 struct Processes {
     root: PathBuf,
     origin: String,
+    /// Loopback S3 fixture serving `root/objects` (path style).
+    s3: Child,
+    s3_endpoint: String,
     controller: Option<Child>,
     agents: BTreeMap<String, Child>,
     workers: Vec<Child>,
@@ -305,6 +308,7 @@ impl Processes {
             .env("OW_TRANSFER_CHILD", role)
             .env("OW_TRANSFER_ROOT", root)
             .env("OW_TRANSFER_ORIGIN", &self.origin)
+            .env("OW_TEST_S3_ENDPOINT", &self.s3_endpoint)
             .env(
                 "PATH",
                 format!(
@@ -440,6 +444,8 @@ impl Processes {
 }
 impl Drop for Processes {
     fn drop(&mut self) {
+        let _ = self.s3.kill();
+        let _ = self.s3.wait();
         if let Some(child) = &mut self.controller {
             let _ = child.kill();
             let _ = child.wait();
@@ -464,10 +470,30 @@ fn fixture() -> Processes {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    // Local stand-in for AWS CLI reads only immutable fixture objects; no cloud credentials.
+    // Local stand-in for the AWS CLI hands out fixture credentials only; objects
+    // move through the loopback S3 fixture over root/objects.
     let aws = root.join("bin/aws");
-    fs::write(&aws,"#!/bin/sh\nset -eu\ntest \"$1 $2 $3\" = 's3 cp --only-show-errors'\nkey=${4#s3://}\nexec cat \"$(dirname \"$0\")/../objects/$key\"\n").unwrap();
+    fs::write(&aws,"#!/bin/sh\nset -eu\ntest \"$1 $2\" = 'configure export-credentials'\necho '{\"Version\":1,\"AccessKeyId\":\"fixture\",\"SecretAccessKey\":\"fixture\"}'\n").unwrap();
     fs::set_permissions(aws, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir_all(root.join("objects")).unwrap();
+    fs::write(
+        root.join("bin/s3"),
+        include_bytes!("../../ow-core/tests/fake_s3.py"),
+    )
+    .unwrap();
+    let mut s3 = Command::new("python3")
+        .arg(root.join("bin/s3"))
+        .arg(root.join("objects"))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut port = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(s3.stdout.take().unwrap()),
+        &mut port,
+    )
+    .unwrap();
+    let s3_endpoint = format!("http://127.0.0.1:{}", port.trim());
     let disk = root.join("sealed-disk");
     fs::write(&disk, b"disk").unwrap();
     let native=json!({"name":"sealed","workspace":"physical","managed":true,"memory_mib":256,"vcpu_count":1,"image":"alpine","runtime":common::RUNTIME,"cpu":"fixture","kernel_sha256":store::sha256(b"kernel"),"files":{"disk.ext4":store::sha256(b"disk")}}).to_string();
@@ -543,6 +569,8 @@ fn fixture() -> Processes {
     let mut processes = Processes {
         root,
         origin,
+        s3,
+        s3_endpoint,
         controller: None,
         agents: BTreeMap::new(),
         workers: Vec::new(),
