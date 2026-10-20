@@ -1977,6 +1977,54 @@ fn a_refused_cross_runner_fork_returns_its_reason_and_journals_a_failed_operatio
             .0["id"],
         id
     );
+    // The same key with other parameters is a conflict, not the old refusal.
+    let changed = relocate(
+        f.shared.clone(),
+        &identity,
+        &json!({"op":"fork","id":"box","child":"different-child","node":"source","operation_key":"refused-fork"}),
+    )
+    .unwrap_err();
+    assert!(
+        changed
+            .to_string()
+            .contains("operation key conflicts with original parameters"),
+        "{changed:#}"
+    );
+    // Target capacity exhaustion is refused with its reason and journaled.
+    f.shared
+        .lock()
+        .unwrap()
+        .db
+        .execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.managed_restore_v1',json('true')),memory_mib=1 WHERE id='target'",[])
+        .unwrap();
+    let full = relocate(
+        f.shared.clone(),
+        &identity,
+        &json!({"op":"fork","id":"box","child":"capacity-child","node":"target","operation_key":"capacity-probe"}),
+    )
+    .unwrap_err();
+    let full = full
+        .downcast_ref::<crate::catalog::OperationFailure>()
+        .unwrap_or_else(|| panic!("{full:#}"));
+    assert_eq!(full.0["state"], "failed");
+    assert!(
+        full.message()
+            .contains("Runner target lacks free memory, vCPUs or box slots"),
+        "{}",
+        full.0
+    );
+    assert!(
+        !f.shared
+            .lock()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM resources WHERE name='capacity-child')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
     // A child name that already exists is refused with its reason too.
     let taken = relocate(
         f.shared.clone(),

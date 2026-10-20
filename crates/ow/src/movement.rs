@@ -71,7 +71,9 @@ fn admit(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> 
             return Ok(info);
         }
         // A refused admission keeps its outcome under its key.
-        if let Some(id) = c.db.query_row("SELECT id FROM operations WHERE owner=?1 AND retry_key=?2 AND op=?3 AND state='failed' AND json_extract(response,'$.refused')=1",params![user,key,kind.operation()],|r|r.get::<_,i64>(0)).optional()? {
+        if let Some((id, saved)) = c.db.query_row("SELECT id,request FROM operations WHERE owner=?1 AND retry_key=?2 AND op=?3 AND state='failed' AND json_extract(response,'$.refused')=1",params![user,key,kind.operation()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).optional()? {
+            let saved: Value = serde_json::from_str::<Value>(&saved)?["request"].take();
+            ensure!(["id","node","child","snapshot","accept_cold"].iter().all(|f| saved[f] == request[f]), "operation key conflicts with original parameters");
             return Err(crate::catalog::OperationFailure(c.operation_info(user,id)?).into());
         }
         let (node,epoch,generation):(String,i64,i64) = c.db.query_row("SELECT node,placement_epoch,ssh_policy_generation FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;

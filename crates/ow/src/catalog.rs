@@ -758,16 +758,21 @@ impl Catalog {
         intent: &crate::transfers::Intent,
     ) -> Result<()> {
         let c = self;
-        ensure!(!crate::drain::blocked(&c.db, target)?, "target draining");
+        ensure!(
+            !crate::drain::blocked(&c.db, target)?,
+            limits::Rejection(format!("Runner {target} is draining."))
+        );
         // Catalog capacity only; T3 additionally validates worker capability and disk headroom.
-        let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("target offline, draining or without a registered budget")?;
+        let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(|| limits::Rejection(format!("Runner {target} is offline, draining or has no registered budget.")))?;
         let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1 AND (?2=0 OR physical<>?3)",params![target,t.kind==crate::transfers::Kind::Move && target==t.source_node,t.source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         let (extra_mib, extra_cpus, extra_slots) = c.extra_usage(target)?;
         ensure!(
             used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64
                 && used_cpus as u64 + extra_cpus + intent.cpus as u64 <= cpus as u64
                 && used_slots as u64 + extra_slots < slots as u64,
-            "node capacity exhausted"
+            limits::Rejection(format!(
+                "Runner {target} lacks free memory, vCPUs or box slots for this box."
+            ))
         );
         c.db.execute("INSERT INTO transfer_reservations(transfer,node,epoch,memory_mib,cpus,disk_bytes) VALUES(?1,?2,?3,?4,?5,?6)",params![t.id,target,t.epoch,intent.memory_mib,intent.cpus,intent.disk_bytes as i64])?;
         Ok(())
