@@ -119,3 +119,5 @@ dashboard.
 | Retry clears the previous error; busy label while it runs | works | v0.9.22 | `dialogs.spec.mjs › the snapshot dialog clears the last error and shows its progress` |
 | Cancelled dialog leaves no stale notice | works | v0.9.22 | `dialogs.spec.mjs › a refused operation leaves no notice behind once its dialog is cancelled` |
 | Result notice cleared on view or machine switch | works | v0.9.22 | `dialogs.spec.mjs › a result notice is cleared when the user switches view or machine` |
+| Command result not shown after leaving its view or machine mid-run | works | v0.9.22 | `dialogs.spec.mjs › a command result started elsewhere does not follow the user to another view or machine` |
+| Gateway error on an operation asks to try again | works | v0.9.22 | `dialogs.spec.mjs › a gateway error on an operation asks to try again, since an open dialog does not poll` |

@@ -114,3 +114,36 @@ test('a result notice is cleared when the user switches view or machine', async 
   await page.locator(`.machine-card[data-machine="${other}"]`).click();
   await expect(notice(page)).toBeHidden();
 });
+
+test('a command result started elsewhere does not follow the user to another view or machine', async ({dashboard: page}) => {
+  await machines(page, 'one', 'two');
+  for (const leave of [() => page.getByRole('button', {name: /Snapshots/}).click(), async () => {
+    const other = await page.locator('#selected-name').textContent() === 'one' ? 'two' : 'one';
+    await page.locator(`.machine-card[data-machine="${other}"]`).click();
+  }]) {
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    await page.route('**/api/operation', async route => { await held; await route.continue(); });
+    await page.getByRole('button', {name: /Machines/}).click();
+    await page.locator('#command').fill('true');
+    await page.getByRole('button', {name: 'Run ↵'}).click();
+    await expect(notice(page)).toHaveText('Running command…');
+    await leave();
+    await expect(notice(page)).toBeHidden();
+    const answered = page.waitForResponse('**/api/operation');
+    release();
+    await answered;
+    await page.unroute('**/api/operation');
+    // `busy` is the page script's own flag; it drops only after the result was handled.
+    await page.waitForFunction(() => !busy);
+    await expect(notice(page)).toBeHidden();
+  }
+});
+
+test('a gateway error on an operation asks to try again, since an open dialog does not poll', async ({dashboard: page}) => {
+  await machines(page, 'busy');
+  await page.route('**/api/operation', route => route.fulfill({status: 504, contentType: 'text/html', body: '<html>Gateway Timeout</html>'}));
+  await detailAction(page, 'Snapshot').click();
+  await page.getByRole('button', {name: 'Capture snapshot'}).click();
+  await expect(page.locator('#dialog-error')).toHaveText('The server is not answering (HTTP 504); it may be busy or restarting. Wait a moment, then try again.');
+});
