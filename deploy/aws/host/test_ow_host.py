@@ -28,7 +28,7 @@ CONFIG = {
     "backup": {"url": "s3://my-bucket/ow/host-1", "schedule": "*-*-* 01:00:00 UTC"},
     "idleMinutes": 30,
 }
-BUDGET = {"memory": 11776, "cpus": 4, "slots": 8}
+BUDGET = {"memory": 11776, "cpus": 4, "slots": 8, "hostMemory": 16384}
 
 
 def config(**changes):
@@ -47,7 +47,8 @@ class Render(unittest.TestCase):
         self.files = {k: v[0] for k, v in h.render(config(), BUDGET).items()}
 
     def test_overcommit_changes_both_admission_consumers_only(self):
-        for ratio, expected in [(1, 4), (2, 8)]:
+        # The host reserve keeps one of the four CPUs before the ratio applies.
+        for ratio, expected in [(1, 3), (2, 6)]:
             files = {k: v[0] for k, v in h.render(config(vcpuOvercommit=ratio), BUDGET).items()}
             self.assertIn(f"OW_MAX_VCPUS={expected}\n", files["/etc/open-workspaces/worker.env"])
             self.assertIn(f"--memory 11776 --slots 8 --cpus {expected}", files["/etc/systemd/system/open-workspaces.service"])
@@ -76,7 +77,7 @@ class Render(unittest.TestCase):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 h.status()
-            self.assertEqual(json.loads(output.getvalue())["budget"], {**BUDGET, "cpus": 8})
+            self.assertEqual(json.loads(output.getvalue())["budget"], {**BUDGET, "cpus": 6})
 
     def test_worker_unit_hibernates_and_control_plane_never_takes_it_down(self):
         worker = self.files["/etc/systemd/system/open-workspaces-worker.service"]
@@ -84,7 +85,7 @@ class Render(unittest.TestCase):
         self.assertIn("ExecStop=/srv/ow/run/worker/bin/ow --data-dir /srv/ow/.ow/runner down --hibernate", worker)
         self.assertIn("TimeoutStopSec=900", worker)
         cp = self.files["/etc/systemd/system/open-workspaces.service"]
-        self.assertIn("ExecStart=/srv/ow/run/agent/bin/ow host up --external-worker --memory 11776 --slots 8 --cpus 4", cp)
+        self.assertIn("ExecStart=/srv/ow/run/agent/bin/ow host up --external-worker --memory 11776 --slots 8 --cpus 3", cp)
         self.assertNotIn("ExecStop", cp)
         self.assertIn("Wants=open-workspaces-worker.service", cp)
         self.assertIn("After=open-workspaces-worker.service", cp)
@@ -197,6 +198,59 @@ class Render(unittest.TestCase):
         self.assertEqual(h.units_changed({h.DIRECT_NETWORK, h.DIRECT_PORT, h.DIRECT_ENV}), set())
         self.assertEqual(files["/etc/systemd/system/open-workspaces-worker.service"],
                          self.files["/etc/systemd/system/open-workspaces-worker.service"])
+
+
+class HostReserve(unittest.TestCase):
+    def test_admission_math_keeps_the_reserve_before_the_ratio(self):
+        host, runner = config(), config(role="runner", dashboard={}, runner={
+            "node": "r1", "controller": "ow-host", "joinSecretArn": CONFIG["tailscale"]["secretArn"]})
+        self.assertEqual(host["hostReserve"], {"cpuMillis": 1000, "memoryMib": 2048})
+        self.assertEqual(runner["hostReserve"], {"cpuMillis": 500, "memoryMib": 1024})
+        physical = {"memory": 6144, "cpus": 2, "slots": 8, "hostMemory": 8192}
+        self.assertEqual(h.effective(host, physical), {**physical, "memory": 6144, "cpus": 1})
+        self.assertEqual(h.effective({**runner, "vcpuOvercommit": 2}, physical), {**physical, "cpus": 3})
+        small = {**physical, "memory": 3072, "hostMemory": 4096}
+        self.assertEqual(h.effective(host, small)["memory"], 2048, "RAM less the reserve, under three quarters")
+        self.assertEqual(h.effective(config(hostReserve={"cpuMillis": 0, "memoryMib": 0}), physical), physical)
+        tiny = {"memory": 768, "cpus": 1, "slots": 8, "hostMemory": 1024}
+        self.assertEqual(h.effective(host, tiny), {**tiny, "memory": 0, "cpus": 0}, "never below zero")
+        self.assertEqual(h.effective({**host, "vcpuOvercommit": 2}, {**physical, "cpus": 64})["cpus"], 64)
+        self.assertEqual(config(hostReserve={"memoryMib": 4096})["hostReserve"], {"cpuMillis": 1000, "memoryMib": 4096})
+        for bad in [{"cpuMillis": -1}, {"cpuMillis": 64001}, {"memoryMib": 1.5}, {"memoryMib": True}, {"other": 1}, []]:
+            with self.assertRaisesRegex(Refused, "hostReserve"):
+                config(hostReserve=bad)
+
+    def test_a_reserve_leaving_no_room_for_boxes_is_refused_before_writing(self):
+        physical = {"memory": 6144, "cpus": 2, "slots": 8, "hostMemory": 8192}
+        with self.assertRaisesRegex(Refused, "no room for boxes"):
+            h.render(config(hostReserve={"cpuMillis": 2000}), physical)
+        tiny = {"memory": 768, "cpus": 1, "slots": 8, "hostMemory": 1024}
+        with self.assertRaisesRegex(Refused, "no room for boxes"):
+            h.render(config(), tiny)
+        self.assertIn("--cpus 1\n", h.render(config(), physical)["/etc/systemd/system/open-workspaces.service"][0])
+
+    def test_units_protect_the_control_path_and_cap_the_guests(self):
+        files = {k: v[0] for k, v in h.render(config(), BUDGET).items()}
+        control = files["/etc/systemd/system/open-workspaces.service"]
+        for line in ("Slice=owcontrol.slice", "CPUWeight=1000", "MemoryMin=1024M", "MemoryLow=2048M", "OOMScoreAdjust=-900"):
+            self.assertIn(line + "\n", control)
+        self.assertIn("CPUWeight=1000\nMemoryMin=1024M\nMemoryLow=2048M\n", files["/etc/systemd/system/owcontrol.slice"])
+        worker = files["/etc/systemd/system/open-workspaces-worker.service"]
+        # The worker is protected from its own VMs: it sits at -900, they raise themselves to 500.
+        for line in ("Slice=owguests.slice", "Delegate=cpu memory", "DelegateSubgroup=control",
+                     "MemoryLow=256M", "OOMScoreAdjust=-900"):
+            self.assertIn(line + "\n", worker)
+        guests = files["/etc/systemd/system/owguests.slice"]
+        self.assertIn("MemoryMax=14336M\n", guests)
+        self.assertIn("MemoryLow=256M\n", guests)
+        env = files["/etc/open-workspaces/worker.env"]
+        self.assertIn("OW_HOST_RESERVE_CPU_MILLIS=1000\nOW_HOST_RESERVE_MEMORY_MIB=2048\n"
+                      "OW_VCPU_OVERCOMMIT=1\nOW_DELEGATED_CGROUP=1\n", env)
+        for path in ("/etc/systemd/system/owcontrol.slice", "/etc/systemd/system/owguests.slice"):
+            self.assertIn(path, h.OWNED)
+        # A reserve change reaches the worker's budget and the control unit: class 2.
+        old, new = h.render(config(), BUDGET), h.render(config(hostReserve={"cpuMillis": 2000}), BUDGET)
+        self.assertEqual(h.units_changed([path for path in old if old[path] != new.get(path)]), {"worker", "agent"})
 
 
 class Validate(unittest.TestCase):
@@ -468,8 +522,8 @@ class StoreImages(unittest.TestCase):
         self.assertNotIn(path, h.render(config(), BUDGET))
         overcommitted = h.render(config(store=c["store"], vcpuOvercommit=2), BUDGET)
         self.assertEqual(overcommitted[path], files[path])
-        self.assertIn("OW_MAX_VCPUS=8\n", overcommitted["/etc/open-workspaces/worker.env"][0])
-        self.assertIn("--memory 11776 --slots 8 --cpus 8",
+        self.assertIn("OW_MAX_VCPUS=6\n", overcommitted["/etc/open-workspaces/worker.env"][0])
+        self.assertIn("--memory 11776 --slots 8 --cpus 6",
                       overcommitted["/etc/systemd/system/open-workspaces.service"][0])
         for bad in [dict(pin, version=0), dict(pin, attempt="../x"), dict(pin, digest="z" * 64)]:
             with self.assertRaises(h.Refused):
