@@ -51,4 +51,17 @@ test.describe('narrow width', () => {
     expect(box.x + box.width).toBeLessThanOrEqual(390);
     await expect(page.getByRole('button', {name: 'Create machine'})).toBeInViewport();
   });
+
+  test('a long signed-in email does not widen the phone layout', async ({page}) => {
+    // 64 characters is the longest local part an address may have.
+    const email = `${'a'.repeat(64)}@example.test`;
+    await page.route('**/api/state', async route => {
+      const json = await (await route.fetch()).json();
+      json.result.discovery.identity.email = email;
+      await route.fulfill({json});
+    });
+    await page.goto('/');
+    await expect(page.locator('#account-email')).toHaveAttribute('title', email);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0);
+  });
 });

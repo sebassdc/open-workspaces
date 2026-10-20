@@ -32,7 +32,7 @@ function machine() { return [...data.workspaces, ...(data.shared || [])].find(it
 function setView(next) { view = next; for (const id of ['machines', 'snapshots', 'usage']) $(id + '-view').hidden = id !== view; document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view)); const names = {machines: ['Your machines.', 'A place to build, experiment, and pick up where you left off.', 'Machines'], snapshots: ['Pick up from here.', 'Saved memory and disk state, ready to restore or fork.', 'Snapshots'], usage: ['Room to grow.', 'See what your machines use, and free capacity when you need it.', 'Resource usage']}; $('page-title').textContent = names[view][0]; $('page-description').textContent = names[view][1]; $('breadcrumb').textContent = 'Your sandbox / ' + names[view][2]; }
 function render() {
   const email = data.discovery?.identity?.email;
-  if (email) { $('account-email').textContent = email; $('account-avatar').textContent = email.slice(0,1).toUpperCase(); }
+  if (email) { $('account-email').textContent = $('account-email').title = email; $('account-avatar').textContent = email.slice(0,1).toUpperCase(); }
   if (!selected && data.workspaces.length) selected = data.workspaces[0].id;
   if (selected && !machine()) selected = null;
   const running = data.workspaces.filter(item => item.state === 'running').length, stats = data.stats;
