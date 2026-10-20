@@ -10,7 +10,8 @@ The dormant [CredentialBroker](CREDENTIAL_BROKER.md) module adds exact per-box
 policy, host identity/provider interfaces and fake-tested request dispatch for
 temporary AWS sessions and write-only Secrets Manager uploads. It installs no
 runtime endpoint; live adapters, lifecycle fencing and IAM/secret approval remain
-activation gates.
+activation gates. Its active web-identity mode, `web_identity`, writes controller-signed
+identity tokens into guests for [per-box AWS access](AWS_ACCESS.md).
 
 The dormant [worker placement fence](PLACEMENT_FENCING.md) adds epoch-checked
 lifecycle primitives and replay rules; catalog/store integration and rollout remain

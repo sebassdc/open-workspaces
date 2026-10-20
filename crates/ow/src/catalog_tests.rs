@@ -221,7 +221,7 @@ async fn missing_machine_delete_is_not_found_without_worker_contact() {
                     json!({"op":"delete","id":name,"operation_key":"missing-delete"}).to_string(),
                 ))
                 .unwrap(),
-            false,
+            None,
             None,
         )
         .await;
@@ -299,7 +299,7 @@ async fn known_rejections_give_safe_actions_without_worker_details() {
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(request.to_string()))
                 .unwrap(),
-            false,
+            None,
             None,
         )
         .await;
@@ -503,7 +503,7 @@ async fn failed_snapshot_dashboard_response_preserves_safe_cause() {
             Some(fake.root.clone()),
             identity("alice"),
             request,
-            false,
+            None,
             None,
         )
         .await;
@@ -2043,7 +2043,7 @@ async fn owner_quota_dashboard_error_names_the_resource_and_cap() {
         Some(fake.root.clone()),
         identity("alice"),
         request,
-        false,
+        None,
         None,
     )
     .await;
@@ -2086,7 +2086,7 @@ async fn dashboard_rename_answers_the_new_name_and_explains_a_taken_one() {
                 Some(root),
                 identity("alice"),
                 request,
-                false,
+                None,
                 None,
             )
             .await;

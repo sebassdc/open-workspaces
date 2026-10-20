@@ -1104,6 +1104,7 @@ fn build_beat(
     cache_extension(&mut beat, status, root, cache_negotiated)?;
     beat["disk_resize_v1"] = json!(status["disk_resize_v1"] == true);
     beat["snapshot_delete_v1"] = json!(status["snapshot_delete_v1"] == true);
+    beat["aws_identity_v1"] = json!(status["aws_identity_v1"] == true);
     #[cfg(target_os = "linux")]
     {
         beat["move_fork_v1"] = json!(
@@ -1539,6 +1540,7 @@ fn agent_job(
             "ssh-info",
             "ssh-keys",
             "ssh-policy",
+            "aws-token",
             "delete"
         ]
         .contains(&op)

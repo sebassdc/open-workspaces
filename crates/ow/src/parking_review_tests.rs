@@ -154,7 +154,7 @@ fn actual_start_api_wakes_stopped_and_hibernated_boxes() {
                     email: "owner@example.test".into(),
                 },
                 request,
-                false,
+                None,
                 None,
             ))
         });
@@ -760,7 +760,7 @@ fn start_api(
             email: "owner@example.test".into(),
         },
         request,
-        false,
+        None,
         None,
     ));
     let status = response.status();

@@ -903,6 +903,7 @@ mod tests {
             "get",
             "put",
             "ssh-keys",
+            "aws-token",
             "stop",
             "delete",
             "restore",

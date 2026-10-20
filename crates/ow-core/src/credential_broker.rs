@@ -23,7 +23,9 @@ impl WorkloadIdentity {
         Ok(())
     }
 
-    fn source_identity(&self) -> String {
+    /// Stable hashed box-generation name: the AWS `SourceIdentity` here and the role
+    /// session name of the web-identity mode ([`crate::web_identity`]).
+    pub fn source_identity(&self) -> String {
         let digest = Sha256::digest(serde_json::to_vec(self).expect("identity serialization"));
         format!("ow-{}", &format!("{digest:x}")[..32])
     }
@@ -90,6 +92,25 @@ fn arn(value: &str) -> Result<Vec<&str>> {
     Ok(parts)
 }
 
+/// An exact IAM role ARN: no wildcards or policy variables, a 12-digit account.
+pub fn role_arn(value: &str) -> Result<()> {
+    let parts = arn(value)?;
+    ensure!(
+        parts[2] == "iam"
+            && parts[3].is_empty()
+            && account(parts[4])
+            && parts[5].strip_prefix("role/").is_some_and(|r| {
+                // IAM's own path and name alphabet, which is also inert in a shell.
+                !r.is_empty()
+                    && !r.ends_with('/')
+                    && r.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-/".contains(&b))
+            }),
+        "exact IAM role ARN required"
+    );
+    Ok(())
+}
+
 fn account(value: &str) -> bool {
     value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
 }
@@ -103,16 +124,7 @@ impl AwsRoleGrant {
     }
 
     fn validate(&self) -> Result<()> {
-        let parts = arn(&self.role_arn)?;
-        ensure!(
-            parts[2] == "iam"
-                && parts[3].is_empty()
-                && account(parts[4])
-                && parts[5]
-                    .strip_prefix("role/")
-                    .is_some_and(|r| !r.is_empty()),
-            "exact IAM role ARN required"
-        );
+        role_arn(&self.role_arn)?;
         ensure!(
             (900..=3600).contains(&self.max_duration_seconds),
             "role duration must be 900–3600 seconds"

@@ -45,14 +45,21 @@ a machine shared with them) gives the machine to another login email with its
 disk, snapshots and running state; its shares end and the old owner keeps an
 admin share only if chosen. Pool admins get an owner email field in the create
 dialog, and owners and pool admins one in the fork dialog; pool admins also see
-other owners' machines under **Pool machines**, where they can only fork or
-transfer them. **Ownership changes**
+other owners' machines under **Pool machines**, where they can fork, transfer or
+manage an operator-allowed AWS role. **Ownership changes**
 lists every transfer, and every machine made for you or from yours, with who did
 it. **Delete** (owner only, on a
 stopped or hibernated machine) removes it with its disk and every snapshot taken
 from it, and closes the sessions of anyone it was shared with. A machine its
 runner no longer lists shows as `missing` and holds no capacity; deleting it
-only drops the entry. The API does not delete snapshots on their own, change host configuration, grant Cloudflare permissions, or serve
+only drops the entry. **AWS role** (owner or admin, when the operator configured
+[per-box AWS access](AWS_ACCESS.md)) attaches one role from the operator's
+allow-list; the machine details then show it with its token expiry and a
+**Detach** button. Configured `pool_admins` get the same AWS settings on **Pool
+machines**. The designated host pool owner also sees a list of box AWS settings
+in the host controls. These attach/detach actions need no share grant; their role
+choices still follow each box owner's allow-list.
+These settings grant no terminal or disk access. The API does not delete snapshots on their own, change host configuration, grant Cloudflare permissions, or serve
 arbitrary guest HTML on the dashboard origin. Public guest-app publishing remains
 a subsequent slice.
 

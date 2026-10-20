@@ -27,7 +27,7 @@ pub struct Catalog {
 }
 
 #[derive(Debug)]
-pub struct ResourceNotFound(String);
+pub struct ResourceNotFound(pub(crate) String);
 impl std::fmt::Display for ResourceNotFound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} was not found.", self.0)
@@ -357,11 +357,11 @@ pub fn share_unlocked(root: &Path, identity: &Identity, request: &Value) -> Resu
 }
 
 /// What a grantee may do on a machine shared with them. Resize, delete, rename, transfer and
-/// sharing stay with the owner. A pool admin reaches any box only to transfer or fork it.
+/// sharing stay with the owner. A pool admin reaches any box to transfer, fork or manage its AWS role.
 fn permitted(role: &str, op: &str) -> bool {
     match role {
         "owner" => true,
-        "pool-admin" => matches!(op, "transfer" | "fork"),
+        "pool-admin" => matches!(op, "transfer" | "fork" | "aws-role"),
         "admin" => !matches!(op, "resize" | "delete" | "rename" | "transfer"),
         "use" => matches!(
             op,
@@ -488,6 +488,7 @@ impl Catalog {
         crate::drain::initialize(&db)?;
         crate::store_gc::initialize(&db)?;
         crate::scaler::initialize(&db)?;
+        crate::aws_identity::initialize(&db)?;
         if version < 7 {
             db.execute_batch("INSERT INTO settings(key,value) VALUES('min_reader_schema','7') ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),7);")?;
         }
@@ -1457,6 +1458,7 @@ impl Catalog {
                 reserved += memory;
                 value["shared_with"] = shared_with(&self.db, &physical)?;
                 value["published_ports"] = self.publications(&physical)?;
+                value["aws_role"] = crate::aws_identity::view(&self.db, &physical)?;
                 machines.push(value);
             } else {
                 snapshots.push(value);
@@ -1481,12 +1483,19 @@ impl Catalog {
             value["published_ports"] = self.publications(&physical)?;
             value["owner"] = json!(owner);
             value["role"] = json!(role);
+            value["aws_role"] = crate::aws_identity::view(&self.db, &physical)?;
+            // An admin attaches from the owner's allow-list, which is what attach checks.
+            if (role == "admin" || self.pool_admin(user)?)
+                && let Ok(Some(config)) = crate::aws_identity::config(&self.root)
+            {
+                value["aws_roles"] = json!(config.roles_for(&owner));
+            }
             shared.push(value);
         }
-        // Pool admins also see every other box, to transfer or fork it; not its details.
+        // Pool admins see other boxes for transfer, fork and AWS settings; not guest data.
         let mut others = Vec::new();
         if self.pool_admin(user)? {
-            let mut stmt = self.db.prepare("SELECT r.metadata,r.node,u.email,r.name,CAST(strftime('%s',r.created_at) AS INTEGER) FROM resources r JOIN users u ON u.id=r.owner WHERE r.kind='machine' AND r.owner<>?1 AND NOT EXISTS(SELECT 1 FROM grants g WHERE g.physical=r.physical AND g.grantee=?1) ORDER BY u.email,r.name")?;
+            let mut stmt = self.db.prepare("SELECT r.metadata,r.node,u.email,r.name,CAST(strftime('%s',r.created_at) AS INTEGER),r.physical FROM resources r JOIN users u ON u.id=r.owner WHERE r.kind='machine' AND r.owner<>?1 AND NOT EXISTS(SELECT 1 FROM grants g WHERE g.physical=r.physical AND g.grantee=?1) ORDER BY u.email,r.name")?;
             let rows = stmt.query_map([user], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -1494,14 +1503,19 @@ impl Catalog {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             })?;
             for row in rows {
-                let (metadata, node, owner, name, created_at) = row?;
+                let (metadata, node, owner, name, created_at, physical) = row?;
                 let metadata: Value = serde_json::from_str(&metadata)?;
                 let mut value = json!({"id":format!("{owner}/{name}"),"owner":owner,"role":"pool-admin","node":node,"created_at":created_at});
                 for key in ["state", "image", "memory_mib", "vcpu_count", "disk_bytes"] {
                     value[key] = metadata[key].clone();
+                }
+                value["aws_role"] = crate::aws_identity::view(&self.db, &physical)?;
+                if let Ok(Some(config)) = crate::aws_identity::config(&self.root) {
+                    value["aws_roles"] = json!(config.roles_for(&owner));
                 }
                 others.push(value);
             }
@@ -1554,8 +1568,17 @@ impl Catalog {
             operations.push(self.operation_info(user, id?)?);
         }
         let discovery = self.discovery(user, &nodes)?;
+        let aws_identity = match crate::aws_identity::config(&self.root) {
+            Ok(Some(config)) => {
+                let email: String =
+                    self.db
+                        .query_row("SELECT email FROM users WHERE id=?1", [user], |r| r.get(0))?;
+                json!({"enabled":true,"issuer":config.issuer,"roles":config.roles_for(&email)})
+            }
+            _ => json!({"enabled":false}),
+        };
         Ok(
-            json!({"discovery":discovery,"owner_limits":limits::state(&self.root,&self.db,user)?,"pool_admin":self.pool_admin(user)?,"audit":self.audit_log(user)?,"operations":operations,"workspaces":machines,"shared":shared,"pool":others,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
+            json!({"discovery":discovery,"aws_identity":aws_identity,"owner_limits":limits::state(&self.root,&self.db,user)?,"pool_admin":self.pool_admin(user)?,"audit":self.audit_log(user)?,"operations":operations,"workspaces":machines,"shared":shared,"pool":others,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
         )
     }
     fn discovery(&self, user: i64, inventory: &Value) -> Result<Value> {
@@ -1633,6 +1656,7 @@ impl Catalog {
             [physical],
         )?;
         tx.execute("DELETE FROM grants WHERE physical=?1", [physical])?;
+        tx.execute("DELETE FROM aws_roles WHERE physical=?1", [physical])?;
         tx.execute(
             "DELETE FROM owner_allocations WHERE physical=?1",
             [physical],
@@ -1643,6 +1667,7 @@ impl Catalog {
             [physical],
         )?;
         tx.commit()?;
+        crate::aws_identity::revoke(&self.root, physical)?;
         cut(user, physical);
         for grantee in grantees {
             cut(grantee, physical);
@@ -1879,6 +1904,15 @@ impl Catalog {
                 ),
                 params![old, physical, new],
             )?;
+            if self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM aws_roles WHERE physical=?1)",
+                [&physical],
+                |r| r.get::<_, bool>(0),
+            )? {
+                crate::aws_identity::revoke(&self.root, &physical)?;
+                self.db
+                    .execute("DELETE FROM aws_roles WHERE physical=?1", [&physical])?;
+            }
             self.db.execute("UPDATE resources SET owner=?1,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND physical=?2",params![new,physical])?;
             let mut cut = self
                 .db
@@ -2354,11 +2388,15 @@ impl Catalog {
                 "delete",
                 "snapshot-delete",
                 "rename",
+                "aws-role",
                 "transfer"
             ]
             .contains(&op.as_str()),
             "unsupported user operation"
         );
+        if op == "aws-role" {
+            return self.aws_role(user, &request, false);
+        }
         if matches!(op.as_str(), "share" | "unshare") {
             return self.share(user, &op, &request);
         }

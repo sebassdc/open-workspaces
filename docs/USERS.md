@@ -104,7 +104,7 @@ each machine, and the dashboard has Share and Unshare buttons.
 | Role | Allows |
 | --- | --- |
 | `use` (default) | exec, shell, SSH stream, `put`/`get`, `ssh-info`, start, hibernate, fork into their own namespace |
-| `admin` | `use`, plus stop, snapshot, restore, deleting their own snapshots and `ssh-keys` |
+| `admin` | `use`, plus stop, snapshot, restore, deleting their own snapshots, `ssh-keys` and the box's [AWS role](AWS_ACCESS.md) |
 
 Resize, rename, delete and sharing stay with the owner. After `ow rename demo
 web`, Bob uses `alice@example.com/web`; his grant, open shells and SSH sessions
@@ -165,10 +165,10 @@ different from a machine's `admin` share role.
 | `ow fork BOX CHILD --owner EMAIL` | yes | yes, any box | no | no |
 | `ow create NAME --owner EMAIL` | no | yes | no | no |
 
-A pool admin reaches another owner's box (`alice@example.com/BOX`) only to transfer
-or fork it; the dashboard lists such boxes for them under Pool machines with
-those two actions only: exec, shells, SSH, lifecycle and sharing still need ownership or a
-share. A pool admin's fork of another owner's box copies everything on it into a
+A pool admin reaches another owner's box (`alice@example.com/BOX`) to transfer,
+fork or manage its [AWS role](AWS_ACCESS.md). The dashboard lists those actions
+under Pool machines; AWS roles must still be allowed for the box owner. Exec,
+shells, SSH, lifecycle and sharing still need ownership or a share. A pool admin's fork of another owner's box copies everything on it into a
 box the admin chooses the owner of, so the list should hold only people trusted
 with every box in the pool.
 

@@ -23,3 +23,7 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 [features]
 # Dependent crates' tests reach a loopback fixture store through OW_TEST_S3_ENDPOINT.
 test-endpoint = []
+
+[dev-dependencies]
+# The web-identity chain test drives the SDK's own provider (already in the lockfile).
+aws-credential-types = "1"
