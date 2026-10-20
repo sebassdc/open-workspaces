@@ -602,6 +602,7 @@ impl Catalog {
         for (key, kind) in [
             ("workspace", "machine"),
             ("source", "machine"),
+            ("fork", "machine"),
             ("hibernation", "snapshot"),
         ] {
             if let Some(physical) = value[key].as_str() {
@@ -1200,7 +1201,7 @@ impl Catalog {
     }
     pub fn state(&mut self, user: i64) -> Result<Value> {
         self.reconcile()?;
-        let mut stmt=self.db.prepare("SELECT kind,physical,metadata,node,reserved_mib FROM resources WHERE owner=?1 ORDER BY created_at,name")?;
+        let mut stmt=self.db.prepare("SELECT kind,physical,metadata,node,reserved_mib,CAST(strftime('%s',created_at) AS INTEGER) FROM resources WHERE owner=?1 ORDER BY created_at,name")?;
         let rows = stmt.query_map([user], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -1208,15 +1209,29 @@ impl Catalog {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, u32>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?;
         let mut machines = Vec::new();
         let mut snapshots = Vec::new();
         let mut reserved = 0;
         for row in rows {
-            let (kind, physical, metadata, node, memory) = row?;
+            let (kind, physical, mut metadata, node, memory, created_at) = row?;
+            if kind == "snapshot" {
+                // An unfinished capture names no machine yet: its snapshot operation does.
+                let attempt: Option<(String, Option<i64>)> = self.db.query_row("SELECT json_extract(request,'$.request.id'),CAST(strftime('%s',finished_at) AS INTEGER) FROM operations WHERE owner=?1 AND op='snapshot' AND json_extract(request,'$.request.name')=?2 ORDER BY id DESC LIMIT 1",params![user,physical],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                let mut value: Value = serde_json::from_str(&metadata)?;
+                if let (Some((machine, finished)), true) = (attempt, value["workspace"].is_null()) {
+                    value["workspace"] = json!(machine);
+                    if value["state"] == "failed" {
+                        value["failed_at"] = json!(finished);
+                    }
+                    metadata = value.to_string();
+                }
+            }
             let mut value = self.view(user, &kind, &physical, &metadata, &node)?;
             if kind == "machine" {
+                value["created_at"] = json!(created_at);
                 reserved += memory;
                 value["shared_with"] = shared_with(&self.db, &physical)?;
                 value["published_ports"] = self.publications(&physical)?;
@@ -1226,7 +1241,7 @@ impl Catalog {
             }
         }
         let mut shared = Vec::new();
-        let mut stmt = self.db.prepare("SELECT r.physical,r.metadata,r.node,u.email,g.role FROM grants g JOIN resources r ON r.kind='machine' AND r.physical=g.physical JOIN users u ON u.id=r.owner WHERE g.grantee=?1 ORDER BY u.email,r.name")?;
+        let mut stmt = self.db.prepare("SELECT r.physical,r.metadata,r.node,u.email,g.role,CAST(strftime('%s',r.created_at) AS INTEGER) FROM grants g JOIN resources r ON r.kind='machine' AND r.physical=g.physical JOIN users u ON u.id=r.owner WHERE g.grantee=?1 ORDER BY u.email,r.name")?;
         let rows = stmt.query_map([user], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -1234,11 +1249,13 @@ impl Catalog {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?;
         for row in rows {
-            let (physical, metadata, node, owner, role) = row?;
+            let (physical, metadata, node, owner, role, created_at) = row?;
             let mut value = self.view(user, "machine", &physical, &metadata, &node)?;
+            value["created_at"] = json!(created_at);
             value["published_ports"] = self.publications(&physical)?;
             value["owner"] = json!(owner);
             value["role"] = json!(role);

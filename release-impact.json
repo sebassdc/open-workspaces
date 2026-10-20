@@ -2,7 +2,7 @@
   "schema": 1,
   "releases": [
     {
-      "version": "0.9.26",
+      "version": "0.9.27",
       "class": 1,
       "changes": [
         "controller",
@@ -36,6 +36,43 @@
       "host_layout": 2,
       "in_place_from": "0.5.0",
       "notes": "The New machine dialog offers only images and resource sizes eligible for the selected node or automatic placement, shows free node capacity, and blocks creation when no image and size fit. Known refusals use dashboard language, duplicate machine names are refused explicitly while retries retain their original result, and focus starts on Machine name. Class-1 upgrade: restart the controller and dashboard; workers and running machines are untouched. Protocols, catalog schema, runtime, guest kernel and host layout are unchanged."
+    },
+    {
+      "version": "0.9.26",
+      "class": 2,
+      "changes": [
+        "dashboard",
+        "controller",
+        "worker"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Dashboard recovery status and snapshot list: machine cards show the last durable point as relative time (full time on hover), a machine under an hour old without a point reads \"First recovery point pending\" in neutral text, and the warning colour appears only once the one-hour target is missed or an upload error is reported. The controller's state gives machines created_at, and a failed capture its machine and failed_at from its snapshot operation. The worker records the child a live fork's capture was taken for in the capture manifest (optional field fork, also in the snapshots reply); older readers ignore it, older captures lack it and read \"Taken for a fork\". Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 2 in place: the normal quiesce/swap/resume upgrade restarts the worker with the dashboard and controller."
     },
     {
       "version": "0.9.25",
