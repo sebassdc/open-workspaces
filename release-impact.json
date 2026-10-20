@@ -38,7 +38,46 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "Optional per-box AWS access: the controller acts as an OIDC identity provider (ES256 key, discovery document and JWKS) and, for boxes with an operator-allowed role attached, signs 15-minute identity tokens with one key per box generation; a move, fork, owner change or detach withdraws the old key from the JWKS so its tokens stop verifying. The worker writes them into running guests on tmpfs through a new aws-token operation (ow exec on images without dev and the terminal agent export them too) that never wakes a box or restarts its idle clock; the AWS SDK chain calls AssumeRoleWithWebIdentity itself. Off unless aws-identity.json exists. Additive catalog table aws_roles; catalog schema 7, worker interface 3, runtime, guest kernel and host layout remain unchanged. Class-2 worker upgrade; runners without aws_identity_v1 report the role as not delivered."
+      "notes": "Optional per-box AWS access: the controller acts as an OIDC identity provider (ES256 key, discovery document and JWKS) and, for boxes with an operator-allowed role attached, signs 15-minute identity tokens with one key per box generation; a move, fork, ownership transfer or detach withdraws the old key from the JWKS so its tokens stop verifying. The worker writes them into running guests on tmpfs through a new aws-token operation (ow exec on images without dev and the terminal agent export them too) that never wakes a box or restarts its idle clock; the AWS SDK chain calls AssumeRoleWithWebIdentity itself. Off unless aws-identity.json exists. Additive catalog table aws_roles; catalog schema 7, worker interface 3, runtime, guest kernel and host layout remain unchanged. Class-2 worker upgrade; runners without aws_identity_v1 report the role as not delivered."
+    },
+    {
+      "version": "0.9.36",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Pool admins (gateway config `pool_admins`, login emails; default none) and owners manage box ownership. New `ow transfer BOX --to EMAIL [--keep-access]` (API op `transfer`, dashboard Transfer action) moves a box and the snapshots its owner took of it to another owner in one catalog transaction: physical ID, disk, placement, previews, SSH keys and running state stay, with no worker contact. Owner or pool admin only; the new owner's name space and limits must have room; grants end and the old owner keeps an admin share only with --keep-access. `ow create --owner EMAIL` (pool admins) and `ow fork BOX CHILD --owner EMAIL` (owner or pool admin, including cross-runner and managed forks) make the box in that owner's name space and limits. Transfer also moves the owner's stored captures and snapshot artifacts. Pool admins see other owners' boxes in the dashboard to fork or transfer them. Every ownership change is recorded in an additive `audit` table, shown to the actor and both owners (`ow audit`, dashboard Ownership changes). Protocol, worker interface 3, catalog schema 7 (additive table), runtime, guest kernel and host layout 2 are unchanged. Class-1 controller and dashboard upgrade; no worker restart.",
+      "waivers": {
+        "worker": "crates/ow/src/host.rs adds only local CLI refusal arms for transfer, audit and --owner; no worker code, operation, runtime or service changes."
+      }
     },
     {
       "version": "0.9.35",

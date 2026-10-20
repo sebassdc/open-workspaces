@@ -58,10 +58,11 @@ The controller is an OpenID Connect identity provider for its boxes:
 5. **Authority.** Off unless the operator writes `aws-identity.json` (issuer and
    role allow-list, optionally per owner email). The box owner, an `admin` grantee
    or the configured pool administrator attaches one allowed role; `use` grantees
-   cannot. Pool authority requires the verified issuer/subject and bound catalog
-   user ID from host administration. It applies only to AWS settings and always
-   checks the box owner's allow-list. The dashboard lists only box names and AWS
-   settings for this purpose, without granting guest or disk access. An attachment
+   cannot. Configured `pool_admins` use the existing catalog-bound verified login;
+   the designated host pool owner uses verified issuer/subject and catalog ID.
+   AWS settings always check the box owner's allow-list. Configured pool admins
+   use Pool machines; the host owner gets a limited AWS settings list. Neither
+   AWS path grants guest or disk access. An attachment
    is pinned to the box owner at attachment: a box whose owner changes has no role until its new owner
    attaches one. Forks get a new box ID and no row, and the refresher removes the
    token files a full-state fork copied from its parent. Cleanup is repeated after

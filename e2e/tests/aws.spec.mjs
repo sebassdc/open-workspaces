@@ -75,3 +75,27 @@ test('pool administrator manages AWS roles without a share and ordinary users ca
   await outsider.close();
   await admin.close();
 });
+
+
+test('configured pool admin manages an unshared box role without guest access', async ({dashboard: page, browser, user}) => {
+  await machines(page, 'pool-role');
+  const address = `${user}@example.test/pool-role`;
+  const admin = await browser.newContext({baseURL: 'https://dashboard.e2e.ts.net', ignoreHTTPSErrors: true});
+  await signIn(admin, 'pooladmin');
+  const pool = await admin.newPage();
+  await pool.goto('/');
+  await expect(pool.locator('#host-controls')).toBeHidden();
+  await pool.locator(`.machine-card[data-machine="${address}"]`).click();
+  await expect(detailAction(pool, 'Open Terminal')).toHaveCount(0);
+  await expect(pool.locator('#run-command')).toBeDisabled();
+  await detailAction(pool, 'AWS role').click();
+  await expect(pool.getByLabel('IAM role').locator('option')).toHaveText([ROLE]);
+  await pool.getByRole('button', {name: 'Attach role', exact: true}).click();
+  await expect(notice(pool)).toHaveText('AWS role attached.');
+  await expect(pool.locator('#aws-role')).toContainText(ROLE);
+  expect((await api(page)).workspaces.find(m => m.id === 'pool-role').aws_role.role_arn).toBe(ROLE);
+  await pool.locator('#aws-role').getByRole('button', {name: 'Detach'}).click();
+  await expect(notice(pool)).toHaveText('AWS role detached; its token was removed.');
+  expect((await api(page)).workspaces.find(m => m.id === 'pool-role').aws_role).toBeNull();
+  await admin.close();
+});

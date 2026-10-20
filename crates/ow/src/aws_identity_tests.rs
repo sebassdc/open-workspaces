@@ -569,3 +569,50 @@ fn revoked_roles_retry_cleanup_after_stop_and_restored_credentials() {
         assert!(!f.present.load(Ordering::SeqCst));
     }
 }
+
+#[test]
+fn configured_pool_admin_and_transfer_reset_follow_aws_authority() {
+    let f = Fixture::new();
+    f.configure(
+        json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":OWNED,"owners":["a@example.test"]}]}),
+    );
+    let mut c = Catalog::open(&f.root, "test", None).unwrap();
+    let owner = c.user(&identity("a", "a@example.test")).unwrap();
+    let next = c.user(&identity("b", "b@example.test")).unwrap();
+    let admin = c.user(&identity("pool", "pool@example.test")).unwrap();
+    c.pool_admins = vec!["pool@example.test".into()];
+    running(&c, owner, "box", "m-box");
+    let attach = json!({"op":"aws-role","id":"a@example.test/box","role_arn":OWNED});
+    c.operation(admin, attach.clone()).unwrap();
+    let old = f.requests().pop().unwrap();
+    verified(&f.root, &old);
+    let pool = c.state(admin).unwrap()["pool"].clone();
+    assert_eq!(pool[0]["aws_role"]["role_arn"], OWNED);
+    assert_eq!(pool[0]["aws_roles"], json!([OWNED]));
+    assert!(c.machine(admin, "a@example.test/box", "exec").is_err());
+    c.operation(admin, json!({"op":"aws-role","id":"a@example.test/box"}))
+        .unwrap();
+    assert!(view(&c.db, "m-box").unwrap().is_null());
+    c.operation(admin, attach.clone()).unwrap();
+    let old = f.requests().pop().unwrap();
+    c.operation(
+        owner,
+        json!({"op":"transfer","id":"box","to":"b@example.test"}),
+    )
+    .unwrap();
+    assert!(rejected(&f.root, &old));
+    assert!(view(&c.db, "m-box").unwrap().is_null());
+    c.operation(
+        next,
+        json!({"op":"transfer","id":"box","to":"a@example.test"}),
+    )
+    .unwrap();
+    assert!(
+        view(&c.db, "m-box").unwrap().is_null(),
+        "transferring back cannot revive a role"
+    );
+    c.operation(admin, attach).unwrap();
+    let new = f.requests().pop().unwrap();
+    verified(&f.root, &new);
+    assert!(rejected(&f.root, &old));
+}

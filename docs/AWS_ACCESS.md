@@ -79,12 +79,14 @@ operator allows for you are offered. The machine details show the role and until
 when its current token is valid, with **Detach**.
 
 - The box owner, a teammate with the `admin` share role, or the configured pool
-  administrator can set or unset it. Pool authority uses the verified login
-  subject and bound catalog user ID (`node_owner_subject` / `node_owner_user_id`),
-  never an email header or a request parameter. A pool administrator needs no
+  administrator can set or unset it. Gateway `pool_admins` uses the catalog-bound
+  verified login, as for transfer/fork. The designated host pool owner is also
+  admitted by verified subject and catalog ID (`node_owner_subject` /
+  `node_owner_user_id`); email headers and request parameters grant no authority. A pool administrator needs no
   share: use `ow aws-role set owner@example.com/box --role-arn ARN` or `unset`.
-  The dashboard's host controls list other owners' boxes with their AWS role,
-  allowed roles and attach/detach actions; this grants no terminal or disk access.
+  Configured pool admins use the dashboard's Pool machines cards; the designated
+  host pool owner gets an AWS settings list in host controls. Both show the box's
+  role, allowed roles and attach/detach actions, without guest or disk controls.
   The chosen role must still be allowed for the **box owner**.
 - `state` is `active` (token delivered, `token_expires_at` in Unix seconds),
   `pending` (the box is not running; it gets one when it runs), `error` (not

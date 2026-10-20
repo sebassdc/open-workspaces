@@ -358,6 +358,8 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Start { .. }
                 | Action::Move { .. }
                 | Action::Rename { .. }
+                | Action::Transfer { .. }
+                | Action::Audit
                 | Action::Park { .. }
                 | Action::Wake { .. }
                 | Action::Stop { .. }
@@ -417,6 +419,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 },
         }
         | Action::Snapshots
+        | Action::Audit
         | Action::Inspect { .. } => {
             let state = request(&url, &token, None)?;
             let mut machines = state["workspaces"].as_array().cloned().unwrap_or_default();
@@ -425,6 +428,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             let result = match action {
                 Action::List => json!(machines),
                 Action::Snapshots => state["snapshots"].clone(),
+                Action::Audit => state["audit"].clone(),
                 Action::Stats => state["stats"].clone(),
                 Action::Status | Action::Nodes | Action::Image { .. } => {
                     discovery_output(&url, &state, &action)?
@@ -446,10 +450,13 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             cpus,
             disk,
             node,
+            owner,
         } => {
-            let mut request = json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"disk_gib":disk.or((image != "ubuntu-arm64").then_some(crate::common::DEFAULT_DISK_GIB)),"node":node});
-            if request["disk_gib"].is_null() {
-                request.as_object_mut().unwrap().remove("disk_gib");
+            let mut request = json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"disk_gib":disk.or((image != "ubuntu-arm64").then_some(crate::common::DEFAULT_DISK_GIB)),"node":node,"owner":owner});
+            for key in ["disk_gib", "owner"] {
+                if request[key].is_null() {
+                    request.as_object_mut().unwrap().remove(key);
+                }
             }
             request
         }
@@ -526,6 +533,11 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             None => json!({"op":"move","id":id,"node":node,"accept_cold":accept_cold}),
         },
         Action::Rename { id, new_name } => json!({"op":"rename","id":id,"name":new_name}),
+        Action::Transfer {
+            id,
+            to,
+            keep_access,
+        } => json!({"op":"transfer","id":id,"to":to,"keep_access":keep_access}),
         Action::Park { id } => json!({"op":"park","id":id}),
         Action::Wake { id, accept_cold } => json!({"op":"wake","id":id,"accept_cold":accept_cold}),
         Action::Start { id } => json!({"op":"start","id":id}),
@@ -558,8 +570,12 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             snapshot,
             node,
             accept_cold,
+            owner,
         } => {
             let mut v = json!({"op":"fork","id":id,"child":child});
+            if let Some(owner) = owner {
+                v["owner"] = json!(owner);
+            }
             if let Some(node) = node {
                 v["node"] = json!(node);
                 v["accept_cold"] = json!(accept_cold);

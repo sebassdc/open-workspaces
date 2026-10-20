@@ -54,10 +54,19 @@ fn admit(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> 
         let mut c = shared.lock().unwrap();
         let user = c.user(identity)?;
         let physical = c.machine(user, address, kind.permission())?;
+        // A fork for someone else: the child, its name and its quota are theirs.
+        let owner = match request["owner"].as_str() {
+            Some(email) if kind == Kind::Fork => {
+                c.fork_for_others(user, address)?;
+                Some(c.user_by_email(user, email)?).filter(|owner| *owner != user)
+            }
+            Some(_) => anyhow::bail!("only fork takes an owner"),
+            None => None,
+        };
         // A refused admission keeps its outcome under its key.
         if let Some((id, saved)) = c.db.query_row("SELECT id,request FROM operations WHERE owner=?1 AND retry_key=?2 AND op=?3 AND state='failed' AND json_extract(response,'$.refused')=1",params![user,key,kind.operation()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).optional()? {
             let saved: Value = serde_json::from_str::<Value>(&saved)?["request"].take();
-            ensure!(["id","node","child","snapshot","accept_cold"].iter().all(|f| saved[f] == request[f]), "operation key conflicts with original parameters");
+            ensure!(["id","node","child","snapshot","accept_cold","owner"].iter().all(|f| saved[f] == request[f]), "operation key conflicts with original parameters");
             return Err(crate::catalog::OperationFailure(c.operation_info(user,id)?).into());
         }
         if kind == Kind::Move {
@@ -74,7 +83,7 @@ fn admit(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> 
             let t = c.transfer(id)?;
             let previous = intent(&c,&t)?;
             let saved_snapshot:Option<String> = c.db.query_row("SELECT json_extract(response,'$.requested_snapshot') FROM operations WHERE id=?1",[t.operation],|r|r.get(0))?;
-            ensure!(previous.kind == kind && previous.machine == address && previous.target.as_deref() == Some(target) && previous.accept_cold == request["accept_cold"].as_bool().unwrap_or(false) && previous.child.as_ref().map(|ch|ch.name.as_str()) == request["child"].as_str() && saved_snapshot.as_deref() == request["snapshot"].as_str(), "operation key conflicts with original parameters");
+            ensure!(previous.kind == kind && previous.machine == address && previous.target.as_deref() == Some(target) && previous.accept_cold == request["accept_cold"].as_bool().unwrap_or(false) && previous.child.as_ref().map(|ch|ch.name.as_str()) == request["child"].as_str() && previous.child.as_ref().and_then(|ch|ch.owner) == owner && saved_snapshot.as_deref() == request["snapshot"].as_str(), "operation key conflicts with original parameters");
             let info = c.operation_info(user,t.operation)?;
             drop(c);
             launch(shared,t.id);
@@ -92,16 +101,17 @@ fn admit(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> 
             let child = request["child"].as_str().context("child name required")?;
             common::identifier(child)?;
             ensure!(
-                !c.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE owner=?1 AND kind='machine' AND name=?2)",params![user,child],|r|r.get::<_,bool>(0))?,
+                !c.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE owner=?1 AND kind='machine' AND name=?2)",params![owner.unwrap_or(user),child],|r|r.get::<_,bool>(0))?,
                 crate::limits::Rejection(format!("A box named {child} already exists; choose another child name."))
             );
             input.child = Some(Child {
                 id: format!("m-{}", &common::nonce()?[..24]),
                 name: child.into(),
+                owner,
             });
             if let Some(snapshot) = request["snapshot"].as_str() {
                 common::identifier(snapshot)?;
-                let metadata: String = c.db.query_row("SELECT metadata FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4",params![user,snapshot,node,physical],|r|r.get(0)).optional()?.ok_or_else(|| crate::limits::Rejection(format!("Snapshot {snapshot} is not a snapshot of this box on its current runner.")))?;
+                let metadata: String = c.db.query_row("SELECT metadata FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4",params![c.snapshot_owner(user, address)?,snapshot,node,physical],|r|r.get(0)).optional()?.ok_or_else(|| crate::limits::Rejection(format!("Snapshot {snapshot} is not a snapshot of this box on its current runner.")))?;
                 let meta: Value = serde_json::from_str(&metadata)?;
                 input.memory_mib = meta["memory_mib"]
                     .as_u64()
