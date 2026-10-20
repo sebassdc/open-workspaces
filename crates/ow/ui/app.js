@@ -30,8 +30,8 @@ function durability(item) {
 }
 function machine() { return [...data.workspaces, ...(data.shared || [])].find(item => item.id === selected); }
 function setView(next) { view = next; for (const id of ['machines', 'snapshots', 'usage']) $(id + '-view').hidden = id !== view; document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view)); const names = {machines: ['Your machines.', 'A place to build, experiment, and pick up where you left off.', 'Machines'], snapshots: ['Pick up from here.', 'Saved memory and disk state, ready to restore or fork.', 'Snapshots'], usage: ['Room to grow.', 'See what your machines use, and free capacity when you need it.', 'Resource usage']}; $('page-title').textContent = names[view][0]; $('page-description').textContent = names[view][1]; $('breadcrumb').textContent = 'Your sandbox / ' + names[view][2]; }
-// render() rebuilds lists, so a focused card or button is replaced; key it by its list, its row's data-key or machine id, and its label to focus its successor.
-const controlKey = node => `${node.dataset.machine || node.closest('[data-key]')?.dataset.key || ''}\n${node.textContent}`;
+// Cards have changing status text; use their machine id alone, and row identity plus label for actions.
+const controlKey = node => node.dataset.machine ?? `${node.closest('[data-key]')?.dataset.key || ''}\n${node.textContent}`;
 function focusKey() { const node = document.activeElement, box = node?.parentElement?.closest('[id]'); return box && node.matches('button, a') ? [box.id, controlKey(node)] : null; }
 function restoreFocus(key) { if (!key || (document.activeElement && document.activeElement !== document.body)) return; const matches = [...($(key[0])?.querySelectorAll('button, a') || [])].filter(other => controlKey(other) === key[1]); if (matches.length === 1) matches[0].focus({preventScroll: true}); }
 function render() { const focused = focusKey(); renderState(); restoreFocus(focused); }

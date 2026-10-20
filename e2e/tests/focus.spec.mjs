@@ -22,6 +22,29 @@ test('focus stays on an action button and a machine card across a refresh', asyn
   await expect(card(page, 'keyboard')).toBeFocused();
 });
 
+test('focus stays on a machine card when its disk usage changes', async ({dashboard: page}) => {
+  await machines(page, 'keyboard', 'other');
+  let usedMiB = 64;
+  await page.route('**/api/state', async route => {
+    const response = await route.fetch({url: `https://127.0.0.1:${process.env.OW_E2E_PORT || 18443}/api/state`, headers: {...await route.request().allHeaders(), host: 'dashboard.e2e.ts.net'}});
+    const body = await response.json();
+    const machine = body.result.workspaces.find(item => item.id === 'other');
+    machine.disk_bytes = 1024 * 1048576;
+    machine.disk_used_bytes = usedMiB * 1048576;
+    await route.fulfill({response, json: body});
+  });
+  await page.reload();
+  const other = card(page, 'other');
+  await expect(other).toContainText('64 MiB used');
+  await other.focus();
+  usedMiB = 65;
+  await nextRefresh(other);
+  await expect(other).toContainText('65 MiB used');
+  await expect(other).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(card(page, 'keyboard')).toBeFocused();
+});
+
 // Previews need `tailscale serve`, so this answers the published ports itself (as previews.spec does).
 test('focus stays on the same port Unpublish when an earlier port goes away', async ({dashboard: page}) => {
   await machines(page, 'ports');
