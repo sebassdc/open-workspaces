@@ -566,10 +566,16 @@ impl FakeController {
                             .push(serde_json::from_slice(&bytes).unwrap());
                         return;
                     }
+                    let node = path.trim_start_matches("/node/").to_owned();
                     loop {
                         match ws.read() {
                             Ok(tungstenite::Message::Text(t)) if t.contains("heartbeat") => {
-                                beats.fetch_add(1, Ordering::SeqCst);
+                                // Acknowledge the first beat, offering the cache extension.
+                                if beats.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    let ack = json!({"type":"ready","node":node,"generation":"g1","extensions":["cache-inventory-v1"]});
+                                    let _ =
+                                        ws.send(tungstenite::Message::Text(ack.to_string().into()));
+                                }
                             }
                             Ok(tungstenite::Message::Ping(v)) => {
                                 let _ = ws.send(tungstenite::Message::Pong(v));
@@ -710,6 +716,96 @@ fn an_agent_whose_worker_leaves_its_protocol_window_drives_it_no_more() {
         1,
         "the incompatible worker never ran a job"
     );
+    let _ = fs::remove_dir_all(worker);
+}
+
+#[test]
+fn heartbeats_continue_while_the_worker_and_the_beat_builder_are_blocked() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let worker = root();
+    let blocked = Arc::new(AtomicBool::new(false));
+    let listener = std::os::unix::net::UnixListener::bind(worker.join("control.sock")).unwrap();
+    {
+        let blocked = blocked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let (mut stream, blocked) = (stream.unwrap(), blocked.clone());
+                // One connection per thread: a blocked request holds only its own.
+                std::thread::spawn(move || {
+                    let Ok(req) = wire::line(&mut stream) else {
+                        return;
+                    };
+                    // A long capture: the worker answers nothing else meanwhile.
+                    while blocked.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    let value = match req["op"].as_str().unwrap() {
+                        "status" => {
+                            json!({"max_memory_mib":512,"max_running":2,"max_vcpus":2,"max_guest_memory_mib":512,"max_guest_vcpus":2,
+                            "guest_ssh_v1":true,"internet":true,"images":[],"version":"0.5.0","worker_pid":std::process::id(),
+                            "worker_protocol":common::WORKER_PROTOCOL,"cache_eviction_v1":true,
+                            "host_reserve":{"cpu_millis":500,"memory_mib":1024}})
+                        }
+                        _ => json!({"output":"forked","exit_code":0}),
+                    };
+                    let _ = wire::send(&mut stream, &json!({"ok":true,"result":value}));
+                });
+            }
+        });
+    }
+    let fake = FakeController::start(
+        json!({"op":"exec","id":"box","command":"true","operation_key":"k1"}),
+    );
+    let credential = worker.join("node.json");
+    write_private(
+        &credential,
+        &json!({"node":"alpha","credential":"a".repeat(64)}),
+    )
+    .unwrap();
+    {
+        let (worker, origin, credential) =
+            (worker.clone(), fake.origin.clone(), credential.clone());
+        std::thread::spawn(move || agent(&worker, &origin, &credential, None, None, true));
+    }
+    let started = std::time::Instant::now();
+    while fake.beats.load(Ordering::SeqCst) < 2 {
+        assert!(started.elapsed() < Duration::from_secs(20), "no heartbeat");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let online = || {
+        serde_json::from_slice::<Value>(&fs::read(worker.join("agent.json")).unwrap_or_default())
+            .is_ok_and(|v| v["online"] == true)
+    };
+    // The controller marks a runner offline after 15 s without a beat; one comes every 3 s.
+    let beats_during = |what: &str| {
+        let before = fake.beats.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(8));
+        assert!(
+            fake.beats.load(Ordering::SeqCst) >= before + 2,
+            "heartbeats stopped while {what}"
+        );
+        assert!(online(), "agent.json online while {what}");
+    };
+    // A job in flight (a fork's capture) and every status request block in the worker.
+    blocked.store(true, Ordering::SeqCst);
+    fake.jobs.send("fork".into()).unwrap();
+    beats_during("the worker is blocked");
+    blocked.store(false, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    while fake.replies.lock().unwrap().is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the job never finished"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Building a beat waits for the cache lock (inventory may hash a new image): Linux only.
+    #[cfg(target_os = "linux")]
+    {
+        let held = ow_core::cache::lock(&worker, true).unwrap();
+        beats_during("the beat builder is blocked");
+        drop(held);
+    }
     let _ = fs::remove_dir_all(worker);
 }
 

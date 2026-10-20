@@ -50,6 +50,8 @@ and optional Tailscale join. Its smoke test and measured timings are in
 [EC2 timings](experiments/ec2-timings.md). Hosts install each release's
 verified published binaries instead of compiling them, and build from source only
 when no matching binary exists ([released binaries](UPGRADES.md#released-binaries)).
+Each host keeps a [host reserve](HOSTS.md#host-reserve-capacity-boxes-never-claim)
+of CPU and RAM that boxes never claim, enforced by systemd slices.
 The guidance below still applies to larger deployments.
 
 Start with a standalone EC2 worker, control-plane service, PostgreSQL and S3. Add managed services/HA only when required. AWS supports nested virtualization on selected EC2 families; enable it explicitly, check regional support and verify runtime operation.

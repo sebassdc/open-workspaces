@@ -235,7 +235,7 @@ class Joins(PoolCase):
         self.assertEqual(h.enrol(wait=60), 0)
         mint = next(c for c in self.aws.calls if "node-join" in c)
         self.assertEqual(mint[mint.index("node-join") + 1], NODE_A)
-        budget = h.budgets(h.validate(POOL_CONFIG))
+        budget = h.effective(h.validate(POOL_CONFIG), h.budgets(h.validate(POOL_CONFIG)))
         self.assertEqual([mint[mint.index(f) + 1] for f in ("--memory", "--slots", "--cpus")],
                          [str(int(budget[k])) for k in ("memory", "slots", "cpus")], "the budget the runner asked for")
         self.assertEqual(json.loads(self.aws.secrets[secret])["used"], NODE_A)

@@ -43,6 +43,8 @@ class Controller(unittest.TestCase):
             self.assertNotIn("worker", path)
             self.assertNotIn("images", path)
             self.assertNotIn("recovery", path)
+        self.assertNotIn("/etc/systemd/system/owguests.slice", files, "no guests here")
+        self.assertIn("Slice=owcontrol.slice\n", text)
         self.assertIn("OW_BACKUP_SNAPSHOTS=0\n", files["/etc/open-workspaces/backup.env"][0])
         self.assertIn("OW_ASSET_DIR=/srv/ow/run/agent/assets", files["/usr/local/bin/ow"][0])
         self.assertEqual(h.role_pins(c), ("agent", "dashboard"))
