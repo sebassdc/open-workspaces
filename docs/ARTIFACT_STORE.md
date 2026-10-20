@@ -34,7 +34,7 @@ its own thread. Uploads send compressed parts with SHA-256 checksums on
 16 MiB of parts in flight, and commit them with a conditional
 `CompleteMultipartUpload`; a short object is one conditional `PutObject`. Parts
 are 16 MiB, doubling every 1000 parts up to 128 MiB, so the 10,000 part limit
-caps a compressed object at about 987 GiB in this implementation. A lost
+caps a compressed object at about 984 GiB in this implementation. A lost
 completion response is checked with HEAD, including composite SHA-256 and
 length. Downloads read 16 MiB ranges on as many threads, all pinned with
 `If-Match` to the ETag first seen, and reassemble them in order while a second

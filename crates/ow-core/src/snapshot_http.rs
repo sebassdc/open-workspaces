@@ -662,7 +662,7 @@ impl Http {
             let read = (|| -> Result<()> {
                 let mut body = first;
                 while !body.is_empty() && !failed.load(Ordering::Relaxed) {
-                    // shortcut: parts of 16, 32, 64, then 128 MiB cap compressed objects at about 987 GiB; grow them further before supporting larger ones.
+                    // shortcut: parts of 16, 32, 64, then 128 MiB cap compressed objects at about 984 GiB; grow them further before supporting larger ones.
                     ensure!(count < 10000, "multipart limit exceeded");
                     count += 1;
                     let length = body.len() as u64;
