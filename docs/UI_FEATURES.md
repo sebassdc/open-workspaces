@@ -49,7 +49,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Refused create shown in the dialog | works | v0.9.22 | `machines.spec.mjs › create dialog shows a refused create and stays open` |
 | Rename in place, selection and console history follow | works | v0.9.22 | `machines.spec.mjs › rename keeps the machine selected under its new name` |
 | Navigation and resource usage view | works | v0.9.22 | `machines.spec.mjs › navigation switches between machines, snapshots and usage` |
-| Signed-in account shown in the top bar | works | v0.9.24 | `machines.spec.mjs › top bar shows the signed-in account`; `states.spec.mjs › narrow width › a long signed-in email does not widen the phone layout` |
+| Signed-in account shown in the top bar | works | v0.9.26 | `machines.spec.mjs › top bar shows the signed-in account`; `states.spec.mjs › narrow width › a long signed-in email does not widen the phone layout` |
 
 ## Lifecycle
 
@@ -106,5 +106,6 @@ dashboard.
 | Failed first load: retry in the grid, New machine disabled | works | v0.9.23 | `states.spec.mjs › failed first load offers a retry and keeps New machine disabled` |
 | Expired login message | works | v0.9.22 | `states.spec.mjs › expired login asks the user to reload and sign in` |
 | CLI installer panel (hidden on tailnet sign-in) | partial | v0.9.22 | `states.spec.mjs › the tailnet dashboard offers no CLI installer` (the Access sign-in panel and its copy button are not covered) |
-| Sidebar CLI download link (hidden on tailnet sign-in) | partial | v0.9.24 | `states.spec.mjs › the tailnet dashboard hides the sidebar CLI download` (the link shown where the binary is served is not covered) |
+| Sidebar CLI download link (hidden on tailnet sign-in) | partial | v0.9.26 | `states.spec.mjs › the tailnet dashboard hides the sidebar CLI download` (the link shown where the binary is served is not covered) |
 | Phone width: no horizontal overflow, dialogs fit | works | v0.9.22 | `states.spec.mjs › narrow width › phone layout has no horizontal overflow and dialogs fit` |
+| Keyboard focus kept on the same card or button across the 5 s refresh | works | v0.9.25 | `focus.spec.mjs › focus stays on an action button and a machine card across a refresh`; `focus.spec.mjs › focus stays on a machine card when its disk usage changes`; `focus.spec.mjs › focus stays on the same port Unpublish when an earlier port goes away` |
