@@ -30,7 +30,11 @@ function durability(item) {
 }
 function machine() { return [...data.workspaces, ...(data.shared || [])].find(item => item.id === selected); }
 function setView(next) { view = next; for (const id of ['machines', 'snapshots', 'usage']) $(id + '-view').hidden = id !== view; document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view)); const names = {machines: ['Your machines.', 'A place to build, experiment, and pick up where you left off.', 'Machines'], snapshots: ['Pick up from here.', 'Saved memory and disk state, ready to restore or fork.', 'Snapshots'], usage: ['Room to grow.', 'See what your machines use, and free capacity when you need it.', 'Resource usage']}; $('page-title').textContent = names[view][0]; $('page-description').textContent = names[view][1]; $('breadcrumb').textContent = 'Your sandbox / ' + names[view][2]; }
-function render() {
+// render() rebuilds lists, so a focused card or button is replaced; key it by its list, label and position among same-label controls to focus its successor.
+function focusKey() { const node = document.activeElement, box = node?.parentElement?.closest('[id]'); if (!box || !node.matches('button, a')) return null; const label = node.dataset.machine || node.textContent; return [box.id, label, [...box.querySelectorAll('button, a')].filter(other => (other.dataset.machine || other.textContent) === label).indexOf(node)]; }
+function restoreFocus(key) { if (!key || (document.activeElement && document.activeElement !== document.body)) return; const match = [...($(key[0])?.querySelectorAll('button, a') || [])].filter(other => (other.dataset.machine || other.textContent) === key[1])[key[2]]; match?.focus({preventScroll: true}); }
+function render() { const focused = focusKey(); renderState(); restoreFocus(focused); }
+function renderState() {
   if (data.user) { $('account-email').textContent = data.user.email; $('account-avatar').textContent = data.user.email.slice(0,1).toUpperCase(); }
   if (!selected && data.workspaces.length) selected = data.workspaces[0].id;
   if (selected && !machine()) selected = null;
