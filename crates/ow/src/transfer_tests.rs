@@ -1441,6 +1441,7 @@ fn moving_fixture(kind: Kind) -> (Fixture, RefCell<Peers>) {
             input.child = Some(Child {
                 id: "child-id".into(),
                 name: "child".into(),
+                owner: None,
             });
         }
         f.transfer = c.begin_transfer(f.user, "move-or-fork", &input).unwrap();
@@ -1702,6 +1703,7 @@ fn transfer_locks_block_conflicting_mutations_and_shared_fork_keeps_requester_ow
     input.child = Some(Child {
         id: "requester-child".into(),
         name: "mine".into(),
+        owner: None,
     });
     let fork = c.begin_transfer(other, "shared-fork", &input).unwrap();
     assert_eq!(

@@ -240,6 +240,9 @@ enum Action {
         /// Placement on a connected node (remote controller only).
         #[arg(long)]
         node: Option<String>,
+        /// Create it for this login email, in their name space and limits (pool admins only).
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// Change a stopped workspace's resources; next start is a cold boot.
     Resize {
@@ -280,6 +283,19 @@ enum Action {
     },
     /// Rename a machine you own in place; ID, disk, snapshots, shares and state stay (remote only).
     Rename { id: String, new_name: String },
+    /// Give a machine to another owner; ID, disk, its snapshots, placement and running state
+    /// stay. Its shares end. Owner or pool admin (remote only).
+    Transfer {
+        id: String,
+        /// The new owner's login email; they address it as NAME, others as EMAIL/NAME.
+        #[arg(long)]
+        to: String,
+        /// Keep an admin share on it for the old owner.
+        #[arg(long)]
+        keep_access: bool,
+    },
+    /// Ownership changes (transfers, boxes made for or forked by someone else) that involve you.
+    Audit,
     /// Stop a workspace (disk persists; running processes end).
     Stop { id: String },
     /// Run a noninteractive command; raw combined output and guest exit status.
@@ -342,6 +358,9 @@ enum Action {
         accept_cold: bool,
         #[arg(long)]
         snapshot: Option<String>,
+        /// Make the child for this login email (the machine's owner or a pool admin).
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// Save RAM and disk, then stop compute; start resumes the saved state.
     Hibernate { id: String },
@@ -952,8 +971,11 @@ fn main_result() -> anyhow::Result<i32> {
         return client::run(&server, cli.command, cli.operation_key);
     }
     anyhow::ensure!(
-        !matches!(cli.command, Action::Share { .. } | Action::Unshare { .. }),
-        "sharing is per user: run ow login <server> first"
+        !matches!(
+            cli.command,
+            Action::Share { .. } | Action::Unshare { .. } | Action::Transfer { .. } | Action::Audit
+        ),
+        "sharing, transfer and audit are per user: run ow login <server> first"
     );
     // Remote commands are checked by the controller against the machine's node.
     #[cfg(target_os = "linux")]
@@ -1040,6 +1062,41 @@ mod capability_tests {
             }
         ));
         assert!(Cli::try_parse_from(["ow", "publish", "demo", "--port", "65536"]).is_err());
+    }
+    #[test]
+    fn transfer_and_owner_flags_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["ow", "transfer", "box", "--to", "bob@example.test", "--keep-access"])
+                .unwrap()
+                .command,
+            Action::Transfer { id, to, keep_access: true } if id == "box" && to == "bob@example.test"
+        ));
+        assert!(Cli::try_parse_from(["ow", "transfer", "box"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["ow", "create", "box", "--owner", "bob@example.test"]).unwrap().command,
+            Action::Create { owner: Some(owner), .. } if owner == "bob@example.test"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ow", "fork", "box", "copy", "--owner", "bob@example.test"]).unwrap().command,
+            Action::Fork { owner: Some(owner), .. } if owner == "bob@example.test"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "ow",
+                "fork",
+                "box",
+                "copy",
+                "--owner",
+                "b@example.test",
+                "--node",
+                "n"
+            ])
+            .is_ok()
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["ow", "audit"]).unwrap().command,
+            Action::Audit
+        ));
     }
     #[test]
     fn rename_takes_the_machine_and_its_new_name() {

@@ -40,7 +40,15 @@ once and shows only its own output. **Open Terminal** creates a separate
 interactive PTY inside the selected running VM. See [terminal transport and limits](TERMINALS.md).
 Guest networking now supports filtered IPv4 Internet egress. The page includes a copyable curl installer for the remote Linux x86-64 CLI; see [networking and CLI](NETWORKING.md). **Rename** (owner only, any state)
 changes only the machine's name and keeps it selected; its disk, snapshots,
-shares, previews and running state stay. **Delete** (owner only, on a
+shares, previews and running state stay. **Transfer** (owner, or a pool admin on
+a machine shared with them) gives the machine to another login email with its
+disk, snapshots and running state; its shares end and the old owner keeps an
+admin share only if chosen. Pool admins get an owner email field in the create
+dialog, and owners and pool admins one in the fork dialog; pool admins also see
+other owners' machines under **Pool machines**, where they can only fork or
+transfer them. **Ownership changes**
+lists every transfer, and every machine made for you or from yours, with who did
+it. **Delete** (owner only, on a
 stopped or hibernated machine) removes it with its disk and every snapshot taken
 from it, and closes the sessions of anyone it was shared with. A machine its
 runner no longer lists shows as `missing` and holds no capacity; deleting it
@@ -170,6 +178,10 @@ are configured, either admits the user: removing their grant does **not** revoke
 an email-allowlisted user. For grant-only administration, omit the email list.
 The explicit email allowlist is still required for Cloudflare Access and for
 `bootstrap_owner_email` legacy ownership migration.
+
+`"pool_admins": ["admin@example.com"]` (optional; default none) lists login
+emails that may transfer and fork any box and create boxes for others; see
+[pool admins](USERS.md#pool-admins-and-transfers). It admits nobody by itself.
 
 After Tailscale propagates a policy removal to the host, the next request is
 denied and existing terminal/SSH/preview streams close within 35 seconds. No dashboard

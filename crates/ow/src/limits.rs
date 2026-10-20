@@ -325,6 +325,38 @@ pub(crate) fn admit(
     save(db, target, wanted, true)
 }
 
+/// A box changing owner counts in full against the new owner's caps, inside the transfer's
+/// transaction. Unlike growth, any dimension it would push over the cap refuses it.
+pub(crate) fn admit_owner(
+    root: &Path,
+    db: &Connection,
+    physical: &str,
+    owner: i64,
+    email: &str,
+) -> Result<()> {
+    let c = load(root)?;
+    let wanted = Resources {
+        boxes: 1,
+        ..allocation(db, physical)?
+    };
+    let used = usage(db, owner, physical)?;
+    let caps = c
+        .owners
+        .get(&owner.to_string())
+        .unwrap_or(&c.owner_defaults);
+    for ((name, next), (used, cap)) in ["CPU", "RAM MiB", "disk GiB", "boxes"]
+        .into_iter()
+        .zip(wanted.values())
+        .zip(used.values().into_iter().zip(caps.values()))
+    {
+        if !used.checked_add(next).is_some_and(|sum| sum <= cap) {
+            // Their usage and caps are theirs to see, not the sender's.
+            return Err(Rejection(format!("{email} has no room for it under their {name} limit; they can free room, or ask the administrator to change limits")).into());
+        }
+    }
+    Ok(())
+}
+
 /// Forecast all authorized capacity, including offline/revoked nodes. Revocation does
 /// not stop cloud billing; only an explicit operator retirement releases its forecast.
 pub(crate) fn pool(root: &Path, db: &Connection, candidate: &str) -> Result<()> {

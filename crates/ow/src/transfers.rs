@@ -85,6 +85,9 @@ impl Step {
 pub(crate) struct Child {
     pub id: String,
     pub name: String,
+    /// Catalog user the child is made for, when not the requester.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -227,7 +230,8 @@ fn authorized(c: &Catalog, t: &Transfer) -> Result<()> {
             Step::Committed | Step::StartUncertain | Step::Started | Step::Succeeded
         )
     {
-        ensure!(c.db.query_row("SELECT owner=?2 AND placement_epoch=?3 AND node=?4 FROM resources WHERE kind='machine' AND physical=?1",params![t.machine,user,t.epoch,t.target],|r|r.get::<_,bool>(0))?,"committed child ownership changed");
+        let owner = intent(c, t)?.child.and_then(|ch| ch.owner).unwrap_or(user);
+        ensure!(c.db.query_row("SELECT owner=?2 AND placement_epoch=?3 AND node=?4 FROM resources WHERE kind='machine' AND physical=?1",params![t.machine,owner,t.epoch,t.target],|r|r.get::<_,bool>(0))?,"committed child ownership changed");
         return Ok(());
     }
     ensure!(

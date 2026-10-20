@@ -366,6 +366,7 @@ while True:
         Some(Child {
             id: "fork-child".into(),
             name: "child".into(),
+            owner: None,
         }),
     );
     assert_eq!(
