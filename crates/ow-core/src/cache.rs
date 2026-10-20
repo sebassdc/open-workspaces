@@ -215,6 +215,21 @@ fn exclusive_bytes(path: &Path) -> Result<u64> {
 /// Conservative logical reservations include stopped and unmanaged on-disk machines.
 /// Caller holds space_lock while changing files or admitting staging.
 pub fn logical_disks(root: &Path) -> Result<u64> {
+    disks(root, |m| m.len())
+}
+
+/// Bytes the machines' disks may still claim from the filesystem: each disk's logical size
+/// minus its allocated blocks. Allocated blocks are already out of free space, so admission
+/// subtracts only this from it. shortcut: reflink-shared blocks count as written, so a box
+/// rewriting shared extents can exceed this; the host reserve absorbs that divergence.
+pub fn unwritten_disks(root: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    disks(root, |m| {
+        m.len().saturating_sub(m.blocks().saturating_mul(512))
+    })
+}
+
+fn disks(root: &Path, bytes: impl Fn(&fs::Metadata) -> u64) -> Result<u64> {
     let mut total = 0u64;
     let entries = match fs::read_dir(root.join("machines")) {
         Ok(e) => e,
@@ -225,7 +240,7 @@ pub fn logical_disks(root: &Path) -> Result<u64> {
         let disk = e?.path().join("disk.ext4");
         if disk.exists() {
             total = total
-                .checked_add(disk.metadata()?.len())
+                .checked_add(bytes(&disk.metadata()?))
                 .context("disk reservation overflow")?;
         }
     }
@@ -452,7 +467,7 @@ impl Reservation {
         let _lock = space_lock(root)?;
         let reserved = staging_locked(root)?;
         let required = protected
-            .checked_add(logical_disks(root)?)
+            .checked_add(unwritten_disks(root)?)
             .and_then(|n| n.checked_add(reserved))
             .and_then(|n| n.checked_add(bytes))
             .context("staging overflow")?;

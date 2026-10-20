@@ -346,19 +346,22 @@ impl Vm {
 
     /// Pauses the guest and captures RAM state and disk. The guest resumes afterwards,
     /// unless `resume` is false and the capture succeeded (hibernation drops the VM).
-    pub fn capture(&mut self, directory: &Path, disk: &Path, resume: bool) -> Result<()> {
+    /// Saves RAM and device state and reflinks the disk while the guest is paused; returns
+    /// how long it was paused. The reflink stays inside the pause: it pairs disk with RAM.
+    pub fn capture(&mut self, directory: &Path, disk: &Path, resume: bool) -> Result<Duration> {
         self.checked("sync")?;
+        let paused = Instant::now();
         self.api("PATCH", "/vm", json!({"state":"Paused"}))?;
         let captured = (|| {
             self.api_waiting("PUT", "/snapshot/create", json!({"snapshot_type":"Full","snapshot_path":directory.join("state"),"mem_file_path":directory.join("memory")}), 900)?;
             reflink(disk, &directory.join("disk.ext4"))
         })();
         if captured.is_ok() && !resume {
-            return Ok(());
+            return Ok(paused.elapsed());
         }
         let resumed = self.resume();
         captured?;
-        resumed
+        resumed.map(|_| paused.elapsed())
     }
 
     pub fn alive(&mut self) -> bool {
@@ -507,7 +510,7 @@ mod clock_tests {
             .unwrap()
             .as_secs();
         let result = if capture_failure {
-            vm.capture(&root, &root.join("disk.ext4"), true)
+            vm.capture(&root, &root.join("disk.ext4"), true).map(drop)
         } else {
             vm.restore(&root)
         };

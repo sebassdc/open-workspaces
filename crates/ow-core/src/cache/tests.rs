@@ -330,3 +330,18 @@ fn cache_eviction_preserves_near_match_and_non_regular_verification_temporaries(
         assert!(dir.join("disk.ext4").exists());
     }
 }
+
+#[test]
+fn written_disk_blocks_are_reserved_once_not_twice() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.root.join("machines/full")).unwrap();
+    let path = f.root.join("machines/full/disk.ext4");
+    fs::write(&path, vec![1u8; 4 << 20]).unwrap();
+    let disk = File::options().write(true).open(&path).unwrap();
+    disk.set_len(12 << 20).unwrap();
+    disk.sync_all().unwrap();
+    assert_eq!(logical_disks(&f.root).unwrap(), 12 << 20);
+    // The written 4 MiB already left free space; only the sparse tail stays reserved.
+    let unwritten = unwritten_disks(&f.root).unwrap();
+    assert!((7 << 20..=8 << 20).contains(&unwritten), "{unwritten}");
+}

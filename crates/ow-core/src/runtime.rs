@@ -266,6 +266,69 @@ impl Snapshot {
     }
 }
 
+/// Hashes of a capture's files, their digest scheme and chunk statistics.
+pub type Sealed = (
+    BTreeMap<String, String>,
+    Option<String>,
+    Option<crate::snapshot_digest::Stats>,
+);
+
+/// A capture whose files are saved and whose guest runs again, still to be hashed.
+pub struct Staged {
+    snapshot: Snapshot,
+    staging: PathBuf,
+    previous: Option<PathBuf>,
+    started: std::time::Instant,
+    paused_ms: u64,
+    /// The live fork waiting for this capture: (parent, child).
+    pub fork: Option<(String, String)>,
+}
+
+impl Staged {
+    /// Hashes the files; needs no runtime, so it may run on any thread.
+    pub fn seal(&self) -> Result<Sealed> {
+        if self.snapshot.managed_recovery {
+            // Recovery points are chunk-sealed so unchanged reflinked extents are not reread.
+            let (files, stats) = crate::snapshot_digest::seal_directory(
+                &self.staging,
+                &crate::snapshot_store::DATA_FILES,
+                self.previous.as_deref(),
+            )?;
+            return Ok((
+                files,
+                Some(crate::snapshot_digest::CHUNKS_V1.into()),
+                Some(stats),
+            ));
+        }
+        // The three files hash in parallel; whole-file digests stay the snapshot format.
+        let hashes = std::thread::scope(|scope| {
+            ["state", "memory", "disk.ext4"]
+                .map(|file| (file, scope.spawn(move || hash(&self.staging.join(file)))))
+                .map(|(file, handle)| {
+                    let digest = handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("hashing {file} panicked"))??;
+                    Ok((file.to_owned(), digest))
+                })
+        });
+        Ok((hashes.into_iter().collect::<Result<_>>()?, None, None))
+    }
+
+    fn discard(&self) {
+        if self.staging.exists()
+            && let Err(error) = fs::remove_dir_all(&self.staging)
+        {
+            eprintln!("removing failed snapshot staging: {error:#}");
+        }
+    }
+}
+
+/// What [`Runtime::begin`] left: a result, or a capture to seal off the worker thread.
+pub enum Step {
+    Done(Result<Value>),
+    Seal(Staged),
+}
+
 #[derive(PartialEq, Eq)]
 struct Fingerprint {
     device: u64,
@@ -439,6 +502,9 @@ pub struct Runtime {
     closing: bool,
     /// Completed capture in this process; never persist Captured before its files are synced.
     capture_ready: BTreeMap<String, bool>,
+    /// Set by `begin`: a plain capture is staged in `staged` instead of hashed in place.
+    defer_seal: bool,
+    staged: Option<Staged>,
     #[cfg(test)]
     crash: Option<&'static str>,
 }
@@ -557,6 +623,8 @@ impl Runtime {
             idle: crate::idle::Idle::from_env()?,
             closing: false,
             capture_ready: BTreeMap::new(),
+            defer_seal: false,
+            staged: None,
             #[cfg(test)]
             crash: None,
         };
@@ -756,9 +824,9 @@ impl Runtime {
                 <= u64::from(max_disk_gib()?) * GIB,
             "host disk cap exhausted (OW_MAX_DISK_GIB)"
         );
-        // Shared reflink extents cannot establish exclusive ownership: reserve full sizes.
+        // Written blocks already left free space; reserve what the disks may still claim.
         self.storage_headroom(
-            self.disk_reserved()?
+            crate::cache::unwritten_disks(&self.root)?
                 .checked_add(additional)
                 .context("disk reservation overflow")?,
         )
@@ -775,7 +843,7 @@ impl Runtime {
                 self.storage_available()?
                     .saturating_sub(minimum_free_bytes()?)
                     .saturating_sub(crate::cache::staging_bytes(&self.root)?)
-                    .saturating_sub(self.disk_reserved()?),
+                    .saturating_sub(crate::cache::unwritten_disks(&self.root)?),
             ))
     }
 
@@ -895,24 +963,33 @@ impl Runtime {
         }
         crate::cache::touch(&self.root, image)?;
         fs::create_dir(&directory)?;
-        vm::reflink(&source_disk, &directory.join("disk.ext4"))?;
-        disk::extend(&directory.join("disk.ext4"), disk_bytes)?;
-        let image_digest = if let Some(name) = snapshot {
-            serde_json::from_slice::<Snapshot>(&fs::read(
-                self.snapshot_dir(name).join("manifest.json"),
-            )?)?
-            .image_digest
-        } else if !PROFILES.contains(&image) {
-            let manifest: Value = serde_json::from_slice(&fs::read(
-                self.root.join("images").join(image).join("manifest.json"),
-            )?)?;
-            manifest["image_digest"].as_str().map(str::to_owned)
-        } else {
-            None
-        };
-        if let Some(digest) = &image_digest {
-            crate::store::valid_digest(digest)?;
-        }
+        let prepared = (|| -> Result<Option<String>> {
+            vm::reflink(&source_disk, &directory.join("disk.ext4"))?;
+            disk::extend(&directory.join("disk.ext4"), disk_bytes)?;
+            let image_digest = if let Some(name) = snapshot {
+                serde_json::from_slice::<Snapshot>(&fs::read(
+                    self.snapshot_dir(name).join("manifest.json"),
+                )?)?
+                .image_digest
+            } else if !PROFILES.contains(&image) {
+                let manifest: Value = serde_json::from_slice(&fs::read(
+                    self.root.join("images").join(image).join("manifest.json"),
+                )?)?;
+                manifest["image_digest"].as_str().map(str::to_owned)
+            } else {
+                None
+            };
+            if let Some(digest) = &image_digest {
+                crate::store::valid_digest(digest)?;
+            }
+            Ok(image_digest)
+        })();
+        // Not yet registered: a half-made directory would block every retry of this ID.
+        let image_digest = prepared.inspect_err(|_| {
+            if let Err(error) = fs::remove_dir_all(&directory) {
+                eprintln!("removing unregistered workspace directory: {error:#}");
+            }
+        })?;
         let workspace = Workspace {
             id: id.into(),
             index: self.state.next_index,
@@ -1101,6 +1178,30 @@ impl Runtime {
         managed: bool,
         previous: Option<&Path>,
     ) -> Result<Value> {
+        let staged = match self.capture_stage(id, name, hibernate, managed, previous)? {
+            Ok(ready) => return Ok(ready),
+            Err(staged) => staged,
+        };
+        if self.defer_seal && !hibernate && !managed {
+            // The worker thread answers other requests while `begin`'s caller seals it.
+            self.staged = Some(staged);
+            return Ok(Value::Null);
+        }
+        let sealed = staged.seal();
+        self.capture_commit(staged, sealed)
+    }
+
+    /// Saves RAM, device state and a reflinked disk with the guest paused, then resumes it
+    /// (or, with `hibernate`, drops the VM). `Ok(Ok(_))` is an already sealed capture.
+    fn capture_stage(
+        &mut self,
+        id: &str,
+        name: &str,
+        hibernate: bool,
+        managed: bool,
+        previous: Option<&Path>,
+    ) -> Result<std::result::Result<Value, Staged>> {
+        let started = std::time::Instant::now();
         let captured_at = crate::recovery::now();
         identifier(name)?;
         ensure!(
@@ -1116,7 +1217,7 @@ impl Runtime {
                 previous.workspace == id,
                 "snapshot name belongs to another workspace"
             );
-            return Ok(previous.summary());
+            return Ok(Ok(previous.summary()));
         }
         // A capture reflinks an existing disk; only RAM is a new data allocation.
         self.storage_headroom(workspace.memory_mib as u64 * 1024 * 1024)?;
@@ -1133,36 +1234,9 @@ impl Runtime {
         self.running(id)?;
         let staging = self.snapshot_dir(&format!(".pending-{}", vm::nonce()?));
         fs::create_dir(&staging)?;
-        let result = (|| {
-            let disk = self.machine_dir(id).join("disk.ext4");
-            self.running(id)?.capture(&staging, &disk, !hibernate)?;
-            if hibernate {
-                self.machines.remove(id);
-                // Until the capture is sealed, the live disk is the machine's state.
-                self.state.workspaces.get_mut(id).unwrap().state = "stopped".into();
-                self.save()?;
-            }
-            // Recovery points are chunk-sealed so unchanged reflinked extents are not reread.
-            let (files, digest, stats) = if managed {
-                let (files, stats) = crate::snapshot_digest::seal_directory(
-                    &staging,
-                    &crate::snapshot_store::DATA_FILES,
-                    previous,
-                )?;
-                (
-                    files,
-                    Some(crate::snapshot_digest::CHUNKS_V1.into()),
-                    Some(stats),
-                )
-            } else {
-                let mut files = BTreeMap::new();
-                for file in ["state", "memory", "disk.ext4"] {
-                    files.insert(file.into(), hash(&staging.join(file))?);
-                }
-                (files, None, None)
-            };
-            let snapshot = Snapshot {
-                digest,
+        let mut staged = Staged {
+            snapshot: Snapshot {
+                digest: None,
                 managed_recovery: managed,
                 captured_at,
                 name: name.into(),
@@ -1175,28 +1249,165 @@ impl Runtime {
                 runtime: crate::common::RUNTIME.into(),
                 cpu: self.cpu.clone(),
                 kernel_sha256: self.kernel_hash.clone(),
-                files,
-            };
-            atomic_json(&staging.join("manifest.json"), &snapshot)?;
-            fs::rename(&staging, &destination)?;
+                files: BTreeMap::new(),
+            },
+            staging,
+            previous: previous.map(Path::to_path_buf),
+            started,
+            paused_ms: 0,
+            fork: None,
+        };
+        let result = (|| {
+            let disk = self.machine_dir(id).join("disk.ext4");
+            staged.paused_ms = self
+                .running(id)?
+                .capture(&staged.staging, &disk, !hibernate)?
+                .as_millis() as u64;
+            if hibernate {
+                self.machines.remove(id);
+                // Until the capture is sealed, the live disk is the machine's state.
+                self.state.workspaces.get_mut(id).unwrap().state = "stopped".into();
+                self.save()?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            staged.discard();
+            return Err(error);
+        }
+        Ok(Err(staged))
+    }
+
+    /// Publishes a staged capture under its name once its files are hashed.
+    fn capture_commit(&mut self, mut staged: Staged, sealed: Result<Sealed>) -> Result<Value> {
+        let result = (|| {
+            let (files, digest, stats) = sealed?;
+            let id = staged.snapshot.workspace.clone();
+            let name = staged.snapshot.name.clone();
+            // The worker served other requests while this was hashed: re-check what they may change.
+            self.workspace(&id)
+                .context("workspace was deleted during the capture")?;
+            let destination = self.snapshot_dir(&name);
+            if destination.join("manifest.json").exists() {
+                let existing: Snapshot =
+                    serde_json::from_slice(&fs::read(destination.join("manifest.json"))?)?;
+                ensure!(
+                    existing.workspace == id,
+                    "snapshot name belongs to another workspace"
+                );
+                staged.discard();
+                return Ok(existing.summary());
+            }
+            ensure!(
+                !destination.exists(),
+                "incomplete snapshot exists; preserve and inspect it"
+            );
+            staged.snapshot.files = files;
+            staged.snapshot.digest = digest;
+            atomic_json(&staged.staging.join("manifest.json"), &staged.snapshot)?;
+            fs::rename(&staged.staging, &destination)?;
             for file in ["state", "memory", "disk.ext4", "manifest.json"] {
                 fs::set_permissions(destination.join(file), fs::Permissions::from_mode(0o400))?;
             }
             File::open(self.root.join("snapshots"))?.sync_all()?;
             self.verified
-                .insert(name.into(), fingerprints(&destination)?);
-            let mut summary = snapshot.summary();
+                .insert(name.clone(), fingerprints(&destination)?);
+            let mut summary = staged.snapshot.summary();
             if let Some(stats) = stats {
                 summary["chunks"] = json!(stats);
             }
+            let total_ms = staged.started.elapsed().as_millis() as u64;
+            summary["timings"] = json!({"paused_ms":staged.paused_ms,"total_ms":total_ms});
+            eprintln!(
+                "capture {name} of {id}: guest paused {} ms, sealed in {total_ms} ms",
+                staged.paused_ms
+            );
             Ok(summary)
         })();
-        if result.is_err() && staging.exists() {
-            if let Err(error) = fs::remove_dir_all(&staging) {
-                eprintln!("removing failed snapshot staging: {error:#}");
-            }
+        if result.is_err() {
+            staged.discard();
         }
         result
+    }
+
+    /// Creates `child` from `parent`'s sealed capture `name`. A capture made only for this
+    /// fork (`generated`) is removed when no child came of it, so a failed fork leaves nothing.
+    pub fn fork_child(
+        &mut self,
+        parent: &str,
+        child: &str,
+        name: &str,
+        generated: bool,
+    ) -> Result<Value> {
+        let result = (|| {
+            if let Some(existing) = self.state.workspaces.get(child) {
+                // A retried fork whose first attempt made the child meanwhile.
+                ensure!(
+                    existing.source.as_deref() == Some(parent),
+                    "child ID already exists with another source"
+                );
+                return Ok(json!(existing));
+            }
+            let directory = self.validate_snapshot(name, true)?;
+            let snapshot: Snapshot =
+                serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+            ensure!(
+                snapshot.workspace == parent,
+                "snapshot belongs to another workspace"
+            );
+            self.create(
+                child,
+                snapshot.memory_mib,
+                snapshot.vcpu_count,
+                &snapshot.image,
+                Some(parent.into()),
+                Some(name),
+                None,
+            )
+        })();
+        let made = self
+            .state
+            .workspaces
+            .get(child)
+            .is_some_and(|w| w.source.as_deref() == Some(parent) && w.state != "failed");
+        if generated && (result.is_err() || !made) {
+            let directory = self.snapshot_dir(name);
+            if directory.exists()
+                && let Err(error) = fs::remove_dir_all(&directory)
+            {
+                eprintln!("removing unused fork capture {name}: {error:#}");
+            }
+            self.verified.remove(name);
+        }
+        result
+    }
+
+    /// Runs a request, but returns a plain snapshot or live fork's capture unsealed: the
+    /// caller hashes it off the worker thread ([`Staged::seal`]) and finishes it with
+    /// [`Runtime::finish`], so other machines' requests are not held for the hashing.
+    pub fn begin(&mut self, request: &Value) -> Step {
+        let deferrable = request["op"] == "snapshot"
+            || (request["op"] == "fork" && request["snapshot"].is_null());
+        if !deferrable {
+            return Step::Done(self.operation(request));
+        }
+        self.defer_seal = true;
+        let result = self.operation(request);
+        self.defer_seal = false;
+        match (result, self.staged.take()) {
+            (Ok(_), Some(staged)) => Step::Seal(staged),
+            (result, None) => Step::Done(result),
+            (Err(error), Some(staged)) => {
+                staged.discard();
+                Step::Done(Err(error))
+            }
+        }
+    }
+
+    /// Publishes a capture `begin` staged. A fork's child is then created by
+    /// [`Runtime::fork_child`], on the thread that owns the machines.
+    pub fn finish(&mut self, staged: Staged, sealed: Result<Sealed>) -> Result<Value> {
+        self.capture_commit(staged, sealed)
     }
 
     fn named_snapshot_count(&self) -> Result<usize> {
@@ -1459,7 +1670,7 @@ impl Runtime {
         }
         match op {
             "cache-inventory" => Ok(
-                json!({"entries":crate::cache::inventory(&self.root)?,"available_bytes":self.storage_available()?,"protected_bytes":self.disk_reserved()?.saturating_add(minimum_free_bytes()?).saturating_add(u64::from(max_memory())*1024*1024),"staging_bytes":crate::cache::staging_bytes(&self.root)?}),
+                json!({"entries":crate::cache::inventory(&self.root)?,"available_bytes":self.storage_available()?,"protected_bytes":crate::cache::unwritten_disks(&self.root)?.saturating_add(minimum_free_bytes()?).saturating_add(u64::from(max_memory())*1024*1024),"staging_bytes":crate::cache::staging_bytes(&self.root)?}),
             ),
             "cache-evict" => {
                 let url = fs::read_to_string(self.root.join("store-url"))
@@ -1491,7 +1702,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"snapshot_delete_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"snapshot_delete_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
@@ -1732,28 +1943,22 @@ impl Runtime {
                     return Ok(json!(existing));
                 }
                 self.capacity(parent.memory_mib, parent.vcpu_count)?;
-                let supplied = request["snapshot"].as_str();
-                let generated = format!("fork-{}", vm::nonce()?);
-                let name = supplied.unwrap_or(&generated);
-                if supplied.is_none() {
-                    self.capture(id, name, false)?;
-                }
-                let directory = self.validate_snapshot(name, true)?;
-                let snapshot: Snapshot =
-                    serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
-                ensure!(
-                    snapshot.workspace == id,
-                    "snapshot belongs to another workspace"
-                );
-                self.create(
-                    child,
-                    snapshot.memory_mib,
-                    snapshot.vcpu_count,
-                    &snapshot.image,
-                    Some(id.into()),
-                    Some(name),
-                    None,
-                )
+                let Some(name) = request["snapshot"].as_str() else {
+                    // A live fork captures the running box; a saved one forks from a snapshot.
+                    ensure!(
+                        self.machines.contains_key(id),
+                        "fork source is {}; start the box first (ow start), or fork from one of its snapshots",
+                        parent.state
+                    );
+                    let name = format!("fork-{}", vm::nonce()?);
+                    self.capture(id, &name, false)?;
+                    if let Some(staged) = self.staged.as_mut() {
+                        staged.fork = Some((id.into(), child.into()));
+                        return Ok(Value::Null);
+                    }
+                    return self.fork_child(id, child, &name, true);
+                };
+                self.fork_child(id, child, name, false)
             }
             "hibernate" => {
                 let workspace = self.workspace(id)?;
@@ -1829,6 +2034,8 @@ mod disk_tests {
             idle: crate::idle::Idle::from_env().unwrap(),
             closing: false,
             capture_ready: BTreeMap::new(),
+            defer_seal: false,
+            staged: None,
             crash: None,
         }
     }
@@ -1854,6 +2061,156 @@ mod disk_tests {
         );
         assert!(status["disk_observed_unix_s"].as_u64().unwrap() > 0);
         assert!(runtime.reserve_disk(1).is_err());
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    fn small_running() -> (Runtime, std::thread::JoinHandle<()>) {
+        let mut runtime = fixture();
+        File::options()
+            .write(true)
+            .open(runtime.machine_dir("legacy").join("disk.ext4"))
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+        // The fixture resumes the guest after the save and expects the clock resync.
+        let (machine, server) = vm::capture_fixture(&runtime.machine_dir("legacy"), true);
+        runtime.machines.insert("legacy".into(), machine);
+        (runtime, server)
+    }
+    fn pending(runtime: &Runtime) -> usize {
+        fs::read_dir(runtime.root.join("snapshots"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pending-")
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_snapshot_is_hashed_after_the_guest_resumes_and_off_the_worker_thread() {
+        let (mut runtime, server) = small_running();
+        let Step::Seal(staged) =
+            runtime.begin(&json!({"op":"snapshot","id":"legacy","name":"saved"}))
+        else {
+            panic!("a plain snapshot is sealed by the caller");
+        };
+        // The guest already ran again (the fixture saw Resumed) and the runtime serves others.
+        server.join().unwrap();
+        assert!(runtime.request(&json!({"op":"list"})).is_ok());
+        assert!(!runtime.snapshot_dir("saved").exists());
+        let sealed = std::thread::spawn(move || {
+            let sealed = staged.seal();
+            (staged, sealed)
+        })
+        .join()
+        .unwrap();
+        let summary = runtime.finish(sealed.0, sealed.1).unwrap();
+        assert_eq!(summary["name"], "saved");
+        assert!(summary["timings"]["paused_ms"].is_u64());
+        assert!(runtime.validate_snapshot("saved", false).is_ok());
+        assert_eq!(pending(&runtime), 0);
+        runtime.machines.clear();
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn a_box_deleted_while_its_capture_is_hashed_leaves_no_snapshot() {
+        let (mut runtime, server) = small_running();
+        let Step::Seal(staged) =
+            runtime.begin(&json!({"op":"snapshot","id":"legacy","name":"saved"}))
+        else {
+            panic!("a plain snapshot is sealed by the caller");
+        };
+        server.join().unwrap();
+        runtime.machines.clear();
+        runtime
+            .request(&json!({"op":"delete","id":"legacy"}))
+            .unwrap();
+        let sealed = staged.seal();
+        let error = runtime.finish(staged, sealed).unwrap_err();
+        assert!(error.to_string().contains("deleted during"), "{error:#}");
+        assert!(!runtime.snapshot_dir("saved").exists());
+        assert_eq!(pending(&runtime), 0);
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn a_stopped_or_hibernated_source_is_refused_before_any_capture() {
+        let mut runtime = fixture();
+        for state in ["stopped", "hibernated"] {
+            runtime.state.workspaces.get_mut("legacy").unwrap().state = state.into();
+            let error = runtime
+                .request(&json!({"op":"fork","id":"legacy","child":"copy"}))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("start the box first"),
+                "{error:#}"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(runtime.root.join("snapshots"))
+                .unwrap()
+                .count(),
+            0
+        );
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn a_fork_whose_child_cannot_be_made_removes_its_capture_and_directory() {
+        let (mut runtime, server) = small_running();
+        let Step::Seal(staged) = runtime.begin(&json!({"op":"fork","id":"legacy","child":"copy"}))
+        else {
+            panic!("a live fork's capture is sealed by the caller");
+        };
+        server.join().unwrap();
+        let (parent, child) = staged.fork.clone().unwrap();
+        assert_eq!((parent.as_str(), child.as_str()), ("legacy", "copy"));
+        let name = staged.snapshot.name.clone();
+        let sealed = staged.seal();
+        runtime.finish(staged, sealed).unwrap();
+        assert!(runtime.snapshot_dir(&name).exists());
+        // Disk admission now refuses the child.
+        File::options()
+            .write(true)
+            .open(runtime.machine_dir("legacy").join("disk.ext4"))
+            .unwrap()
+            .set_len(1024 * GIB)
+            .unwrap();
+        runtime
+            .fork_child(&parent, &child, &name, true)
+            .unwrap_err();
+        assert!(!runtime.snapshot_dir(&name).exists());
+        assert!(!runtime.machine_dir("copy").exists());
+        assert!(runtime.workspace("copy").is_err());
+        runtime.machines.clear();
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn written_disk_bytes_are_not_subtracted_from_free_space_twice() {
+        use std::io::{Seek, Write};
+        let mut runtime = fixture();
+        let before = runtime.disk_headroom().unwrap();
+        let mut disk = File::options()
+            .write(true)
+            .open(runtime.machine_dir("legacy").join("disk.ext4"))
+            .unwrap();
+        disk.seek(std::io::SeekFrom::Start(0)).unwrap();
+        disk.write_all(&vec![7u8; 64 << 20]).unwrap();
+        disk.sync_all().unwrap();
+        // Free space fell by the 64 MiB written and the unwritten reservation by as much:
+        // headroom holds (old accounting lost the 64 MiB a second time).
+        let after = runtime.disk_headroom().unwrap();
+        assert!(before.abs_diff(after) < 16 << 20, "{before} -> {after}");
+        let status = runtime.request(&json!({"op":"status"})).unwrap();
+        assert_eq!(status["reserved_disk_bytes"], 8 * GIB);
+        assert!(status["unwritten_disk_bytes"].as_u64().unwrap() <= 8 * GIB - (60 << 20));
+        assert!(status["free_disk_bytes"].as_u64().unwrap() >= after);
         fs::remove_dir_all(&runtime.root).unwrap();
     }
 
