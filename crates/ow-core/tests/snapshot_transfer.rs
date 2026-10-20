@@ -88,7 +88,10 @@ fn incremental_retry_integrity_and_legacy_restore() {
             .unwrap()
             .incremental()
             .index(&root.join("kill-index"));
-        store.push("abrupt", &root.join("abrupt")).unwrap();
+        store
+            .upload_unsealed(&root.join("abrupt"), None)
+            .unwrap()
+            .unwrap();
         panic!("upload was meant to be killed while blocked");
     }
     let endpoint = std::env::var("OW_TEST_ENDPOINT").unwrap();
@@ -353,7 +356,14 @@ fn abruptly_killed_upload_resumes(root: &Path) {
         .incremental()
         .index(&root.join("kill-index"));
     assert!(!store.list().unwrap().contains(&"abrupt".into()));
-    store.push("abrupt", &root.join("abrupt")).unwrap();
+    let directory = root.join("abrupt");
+    let (sealed, _) = store.upload_unsealed(&directory, None).unwrap().unwrap();
+    ow_core::snapshot_digest::write_sidecar(&directory, &sealed).unwrap();
+    let manifest = json!({"name":"abrupt","workspace":"box",
+        "files":ow_core::snapshot_digest::roots(&sealed),
+        "digest":ow_core::snapshot_digest::CHUNKS_V2});
+    fs::write(directory.join("manifest.json"), manifest.to_string()).unwrap();
+    assert_eq!(store.push("abrupt", &directory).unwrap()["bytes_read"], 0);
     let restored = root.join("abrupt-restored");
     store.pull("abrupt", &restored).unwrap();
     for file in ow_core::snapshot_store::DATA_FILES {

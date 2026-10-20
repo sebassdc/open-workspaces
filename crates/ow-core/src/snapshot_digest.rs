@@ -39,6 +39,8 @@ pub fn chunk_size(digest: Option<&str>) -> Result<usize> {
 }
 /// The chunk lists of a chunk-sealed snapshot, beside its manifest.
 pub const SIDECAR: &str = "chunks.json";
+/// Uploader seals in private staging, kept out of the bounded control message.
+pub const UPLOAD_SEALS: &str = "upload-seals.json";
 const MAX_CHUNKS: usize = 300_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -127,10 +129,13 @@ pub fn check(chunks: &[Chunk], size: usize) -> Result<u64> {
 
 /// The sidecar of a snapshot sealed in `size` chunks.
 pub fn read_sidecar(directory: &Path, size: usize) -> Result<BTreeMap<String, Sealed>> {
+    read_seals(&directory.join(SIDECAR), size)
+}
+
+/// Reads bounded uploader seals or a committed sidecar.
+pub fn read_seals(path: &Path, size: usize) -> Result<BTreeMap<String, Sealed>> {
     let mut bytes = Vec::new();
-    File::open(directory.join(SIDECAR))?
-        .take(64 << 20)
-        .read_to_end(&mut bytes)?;
+    File::open(path)?.take(64 << 20).read_to_end(&mut bytes)?;
     let sealed: BTreeMap<String, Sealed> =
         serde_json::from_slice(&bytes).context("invalid chunk sidecar")?;
     for seal in sealed.values() {

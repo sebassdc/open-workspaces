@@ -11,7 +11,7 @@ use aws_sdk_s3::{
     Client,
     config::{
         BehaviorVersion, Region, RequestChecksumCalculation, ResponseChecksumValidation,
-        http::HttpResponse, retry::RetryConfig,
+        http::HttpResponse, retry::RetryConfig, timeout::TimeoutConfig,
     },
     error::{DisplayErrorContext, ProvideErrorMetadata, SdkError},
     primitives::ByteStream,
@@ -96,6 +96,13 @@ fn s3_config(
         .region(Region::new(region))
         .force_path_style(path_style)
         .retry_config(RetryConfig::standard().with_max_attempts(ATTEMPTS))
+        .timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .operation_attempt_timeout(Duration::from_secs(600))
+                .operation_timeout(Duration::from_secs(2400))
+                .build(),
+        )
         // Bodies carry the SHA-256 we computed; no extra CRC pass or aws-chunked framing.
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
         .response_checksum_validation(ResponseChecksumValidation::WhenRequired)

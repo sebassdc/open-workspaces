@@ -189,7 +189,20 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
                     let mut seal = request.clone();
                     seal["op"] = json!("recovery-seal");
                     seal["snapshot"] = json!(name);
-                    seal["files"] = json!(files);
+                    // Large disks' seals exceed the control socket's 1 MiB frame.
+                    // Publish in private staging atomically so a killed writer can retry.
+                    let path = snapshots.join(staging);
+                    let temporary = path.join(format!(".seals-{}", ow_core::common::nonce()?));
+                    let mut output = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o400)
+                        .open(&temporary)?;
+                    use std::io::Write;
+                    output.write_all(&serde_json::to_vec(&files)?)?;
+                    output.sync_all()?;
+                    fs::rename(temporary, path.join(ow_core::snapshot_digest::UPLOAD_SEALS))?;
+                    fs::File::open(&path)?.sync_all()?;
                     seal["capture"] = sent["capture"].clone();
                     wire::request(runner, seal)?;
                     capture = sent["capture"].clone();

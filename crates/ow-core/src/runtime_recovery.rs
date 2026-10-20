@@ -301,8 +301,10 @@ impl Runtime {
                 staged.snapshot.workspace == id,
                 "capture of another machine"
             );
-            let sealed: BTreeMap<String, crate::snapshot_digest::Sealed> =
-                serde_json::from_value(request["files"].clone()).context("invalid seals")?;
+            let sealed = crate::snapshot_digest::read_seals(
+                &staged.staging.join(crate::snapshot_digest::UPLOAD_SEALS),
+                crate::snapshot_digest::CHUNK_V2,
+            )?;
             ensure!(
                 sealed.len() == crate::snapshot_store::DATA_FILES.len()
                     && crate::snapshot_store::DATA_FILES
@@ -317,7 +319,10 @@ impl Runtime {
                 );
             }
             let stats = serde_json::from_value(request["capture"].clone()).ok();
-            crate::snapshot_digest::write_sidecar(&staged.staging, &sealed)?;
+            fs::rename(
+                staged.staging.join(crate::snapshot_digest::UPLOAD_SEALS),
+                staged.staging.join(crate::snapshot_digest::SIDECAR),
+            )?;
             Ok((
                 crate::snapshot_digest::roots(&sealed),
                 Some(crate::snapshot_digest::CHUNKS_V2.into()),
@@ -555,8 +560,9 @@ mod client_seal_tests {
             if !valid {
                 seals.remove("memory");
             }
+            atomic_json(&staging.join(crate::snapshot_digest::UPLOAD_SEALS), &seals).unwrap();
             let seal = json!({"op":"recovery-seal","id":"legacy","store":store,
-                "snapshot":name,"files":seals,"capture":stats});
+                "snapshot":name,"capture":stats});
             let mut stale = seal.clone();
             stale["store"] = json!("b".repeat(64));
             assert!(runtime.request(&stale).is_err());

@@ -22,10 +22,12 @@ replace them. A fresh attempt uses a new token. Format 1 has one object per file
 with no cross-artifact chunk sharing. The existing snapshot adapter can evolve
 independently under its own backup namespace.
 
-Object transfers run in process: one `aws configure export-credentials` call
-takes the AWS CLI's usual credential chain (refreshed every five minutes), and
-each request is signed in process on a shared connection pool, with retries and
-backoff for throttling, server errors and lost connections. zstd compresses on
+Object transfers use the AWS SDK for Rust: its credential chain loads and
+refreshes environment, profile, SSO, process, web identity, container and instance
+role credentials. One client per store shares a connection pool, with retries
+and backoff for throttling, server errors and lost connections. No AWS CLI
+subprocess is needed for object transfers, safety checks or garbage collection.
+Interrupted download bodies are retried as well as failed requests. zstd compresses on
 several threads (the same zstd stream format) while the file is read ahead on
 its own thread. Uploads send compressed parts with SHA-256 checksums on
 `OW_S3_TRANSFERS` threads (1-128, default 16), with at most that many times
@@ -68,7 +70,7 @@ publication and retention stay separate. See [restore lifecycle](LIFECYCLE.md).
 These are trusted Linux operator commands on an initialized ownership controller.
 Use its normal `ow` wrapper, or set `--data-dir` to the host base directory and
 `OW_ASSET_DIR` to the worker's runtime assets. AWS credentials stay on the host,
-through its instance role or the normal CLI credential chain; they never enter a
+through its instance role or the AWS SDK credential chain; they never enter a
 guest or a job payload. There is no public image administration endpoint.
 
 ```sh
@@ -195,7 +197,7 @@ deduplication and scaling remain deferred. Prefetch currently covers all current
 32-image runner ceiling. There is no age-based eviction of working templates.
 
 Local checks cover directory-store round trips, conditional single/multipart
-retry and lost responses through a fake CLI, hash/key/format rejection, pull
+retry and lost responses through a loopback S3 fixture, hash/key/format rejection, pull
 cleanup, catalog concurrency/expiry/retirement, image installation and schema 3
 read/write compatibility. Live AWS IAM enforcement, real fresh-host timing and
 controller-placed golden-image guest execution require a dedicated acceptance run.
