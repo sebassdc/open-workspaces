@@ -45,9 +45,11 @@ The controller is an OpenID Connect identity provider for its boxes:
    `WorkloadIdentity`: box ID plus a counter in the new `aws_roles` table.
    Attaching or re-attaching a role, a move or wake to another placement epoch, and
    a fork of the box (a child naming it as source, here or through a cross-runner
-   transfer) advance it. The old generation's key is deleted when the new one is
-   created, so **its tokens stop verifying in AWS**, including copies in a fork's
-   RAM, a snapshot or anywhere else, as soon as AWS reads the new JWKS. Detach,
+   transfer) advance it. Re-attachment withdraws the old key immediately, even
+   while parked. Refresh also withdraws keys for parked, transferring or missing
+   placements without contacting a worker. Otherwise, the old key is deleted when
+   the new one is created, so **its tokens stop verifying in AWS**, including copies
+   in a fork's RAM, a snapshot or anywhere else, as soon as AWS reads the new JWKS. Detach,
    owner change, allow-list removal and deleting the box delete the box's key. AWS
    cannot ask the controller which incarnation is current; removing the key from
    the JWKS is the only revocation an OIDC issuer has, so `sub` stays stable and
@@ -58,7 +60,9 @@ The controller is an OpenID Connect identity provider for its boxes:
    attaches one allowed role; `use` grantees cannot. An attachment is pinned to the
    owner who made it: a box whose owner changes has no role until its new owner
    attaches one. Forks get a new box ID and no row, and the refresher removes the
-   token files a full-state fork copied from its parent. Removing a role from the
+   token files a full-state fork copied from its parent. Cleanup is repeated after
+   restore or start operations, including those dispatched by an admin grantee,
+   using the journal's physical box ID. Removing a role from the
    allow-list stops issuance, withdraws the key and clears the guest.
 6. **Refresh.** A controller thread checks attached boxes every minute and
    re-issues when less than 10 minutes remain or the incarnation changed. Each box

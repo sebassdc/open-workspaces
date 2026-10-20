@@ -367,6 +367,7 @@ impl Catalog {
             // A new attachment is a new credential authority: a new generation, key and token.
             // Forks made before it are not this attachment's concern.
             let mark = self.fork_mark(&physical)?;
+            revoke(&self.root, &physical)?;
             self.db.execute(
                 "INSERT INTO aws_roles(physical,owner,role_arn,generation,fork_mark) VALUES(?1,?2,?3,1,?4)
                  ON CONFLICT(physical) DO UPDATE SET owner=excluded.owner,role_arn=excluded.role_arn,generation=generation+1,node=NULL,epoch=NULL,fork_mark=excluded.fork_mark,expires_at=NULL,error=NULL,updated_at=CURRENT_TIMESTAMP",
@@ -414,8 +415,13 @@ impl Catalog {
                 |r| r.get(0),
             )
             .optional()?;
-        // Parked, mid-transfer or gone: nothing runs that could hold a token.
+        // Revoke even without a worker: copied tokens can outlive their placement.
         let Some(node) = node.filter(|n| !n.is_empty() && !moving) else {
+            revoke(&self.root, physical)?;
+            self.db.execute(
+                "UPDATE aws_roles SET expires_at=NULL WHERE physical=?1",
+                [physical],
+            )?;
             return Ok(false);
         };
         let Some((
@@ -545,7 +551,7 @@ impl Catalog {
             .query_map([], |r| r.get::<_, String>(0))?
             .map(|p| p.map(Work::Attached))
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let bare = self.db.prepare("SELECT physical,node,placement_epoch,(SELECT COALESCE(MAX(o.id),0) FROM operations o WHERE o.owner=r.owner AND o.resource=r.name AND o.op IN ('restore','start')) FROM resources r WHERE kind='machine' AND node<>'' AND json_extract(metadata,'$.state')='running' AND NOT EXISTS(SELECT 1 FROM aws_roles a WHERE a.physical=r.physical) AND NOT EXISTS(SELECT 1 FROM transfer_locks t WHERE t.machine=r.physical)")?
+        let bare = self.db.prepare("SELECT physical,node,placement_epoch,(SELECT COALESCE(MAX(o.id),0) FROM operations o WHERE (json_extract(o.request,'$.request.id')=r.physical OR (o.owner=r.owner AND o.resource=r.name)) AND o.op IN ('restore','start')) FROM resources r WHERE kind='machine' AND node<>'' AND json_extract(metadata,'$.state')='running' AND NOT EXISTS(SELECT 1 FROM aws_roles a WHERE a.physical=r.physical) AND NOT EXISTS(SELECT 1 FROM transfer_locks t WHERE t.machine=r.physical)")?
             .query_map([], |r| Ok(Work::Bare((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         work.extend(bare);

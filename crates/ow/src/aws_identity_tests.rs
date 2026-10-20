@@ -451,3 +451,82 @@ fn issuer_and_roles_are_validated() {
     assert!(config.allows(ROLE, "owner@example.test"));
     assert!(!config.allows(ROLE, "other@example.test"));
 }
+
+#[test]
+fn parked_boxes_withdraw_keys_without_contacting_a_worker() {
+    let f = Fixture::new();
+    f.configure(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":ROLE}]}));
+    let mut c = Catalog::open(&f.root, "test", None).unwrap();
+    let owner = c.user(&identity("a", "a@example.test")).unwrap();
+    running(&c, owner, "box", "m-box");
+    let attach = json!({"op":"aws-role","id":"box","role_arn":ROLE});
+    let mut cleared = HashSet::new();
+    // Exercise parking, re-attachment while parked, and allow-list removal while parked
+    // independently, each starting with a verifiable token.
+    for action in ["park", "reattach", "remove-role"] {
+        f.configure(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":ROLE}]}));
+        c.db.execute("UPDATE resources SET node='local'", [])
+            .unwrap();
+        c.operation(owner, attach.clone()).unwrap();
+        let old = f.requests().pop().unwrap();
+        verified(&f.root, &old);
+        c.db.execute(
+            "UPDATE resources SET node='',placement_epoch=placement_epoch+1",
+            [],
+        )
+        .unwrap();
+        match action {
+            "reattach" => {
+                c.operation(owner, attach.clone()).unwrap();
+                assert!(rejected(&f.root, &old), "re-attachment revokes immediately");
+            }
+            "remove-role" => f.configure(json!({"issuer":ISSUER,"allowed_roles":[]})),
+            _ => {}
+        }
+        for work in c.aws_work().unwrap() {
+            c.aws_step(work, &mut cleared);
+        }
+        assert!(rejected(&f.root, &old), "{action}: old key still published");
+        assert!(view(&c.db, "m-box").unwrap()["token_expires_at"].is_null());
+        assert!(f.requests().is_empty(), "{action}: must not contact worker");
+    }
+}
+
+#[test]
+fn admin_restore_invalidates_roleless_cleanup_cache() {
+    let f = Fixture::new();
+    let mut c = Catalog::open(&f.root, "test", None).unwrap();
+    let owner = c.user(&identity("a", "a@example.test")).unwrap();
+    let admin = c.user(&identity("admin", "admin@example.test")).unwrap();
+    running(&c, owner, "child", "m-child");
+    let mut cleared = HashSet::new();
+    let pass = |c: &mut Catalog, cleared: &mut HashSet<_>| {
+        for work in c.aws_work().unwrap() {
+            c.aws_step(work, cleared);
+        }
+    };
+    pass(&mut c, &mut cleared);
+    assert_eq!(f.requests().len(), 1);
+    pass(&mut c, &mut cleared);
+    assert!(f.requests().is_empty());
+    // Journal format used by the actual shared-box dispatch path: actor is the admin,
+    // resource is qualified, and the normalized request contains the physical ID.
+    for op in ["restore", "start"] {
+        c.db.execute(
+            "INSERT INTO operations(owner,op,resource,state,request) VALUES(?1,?2,'a@example.test/child','succeeded',?3)",
+            params![admin, op, json!({"request":{"op":op,"id":"m-child"},"node":"local"}).to_string()],
+        ).unwrap();
+        f.present.store(true, Ordering::SeqCst);
+        pass(&mut c, &mut cleared);
+        let requests = f.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "{op}: copied credentials must be cleared"
+        );
+        assert!(requests[0].get("token").is_none());
+        assert!(!f.present.load(Ordering::SeqCst));
+        pass(&mut c, &mut cleared);
+        assert!(f.requests().is_empty());
+    }
+}

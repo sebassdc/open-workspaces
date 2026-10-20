@@ -88,6 +88,9 @@ when its current token is valid, with **Detach**.
   moves the parent to a new generation with a new signing key; the copied token
   stops verifying once AWS re-reads the JWKS (and never lasts past its 15 minutes).
   The same happens to old tokens after a move or a wake on another runner.
+  Parked or transferring boxes have their keys withdrawn at the next refresh;
+  re-attaching withdraws the old key immediately even while parked. Cleanup of
+  role-less boxes runs again after a restore or start by the owner or an admin.
 - **A new owner starts without a role.** An attachment belongs to the owner who
   made it. If a box changes owner, it gets no new tokens and its files are removed
   at the next pass; the new owner, or an admin, attaches a role again.
