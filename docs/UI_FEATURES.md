@@ -48,6 +48,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Create dialog: name, image, memory, vCPU, disk | works | v0.9.22 | `machines.spec.mjs › create dialog creates a machine with the chosen shape` |
 | Refused create shown in the dialog | works | v0.9.22 | `machines.spec.mjs › create dialog shows a refused create and stays open` |
 | Rename in place, selection and console history follow | works | v0.9.22 | `machines.spec.mjs › rename keeps the machine selected under its new name` |
+| Recovery status: neutral while the first point is pending, warning only past the one-hour target or on an upload error, relative time | works | v0.9.26 | `states.spec.mjs › a new machine shows a neutral first recovery point`; `states.spec.mjs › recovery status warns only past the one-hour target and shows relative time` |
 | Navigation and resource usage view | works | v0.9.22 | `machines.spec.mjs › navigation switches between machines, snapshots and usage` |
 | Signed-in account shown in the top bar | missing | — | The page reads `user` from `/api/state`, which the API does not return, so it always shows "Your account"; the login is available at `discovery.identity.email`. |
 
@@ -73,8 +74,10 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | --- | --- | --- | --- |
 | Snapshot dialog and snapshot list | works | v0.9.22 | `snapshots.spec.mjs › snapshot dialog saves a named checkpoint` |
 | Fork a running machine (new capture) | works | v0.9.22 | `snapshots.spec.mjs › fork from a running machine creates an independent child` |
+| Live fork's own capture labelled with the fork it was taken for | works | v0.9.26 | `snapshots.spec.mjs › fork from a running machine creates an independent child` |
+| Failed capture names its machine and when it failed | works | v0.9.26 | `snapshots.spec.mjs › a failed capture names its machine and when it failed` |
 | Fork and restore from the snapshot list | works | v0.9.22 | `snapshots.spec.mjs › fork and restore from the snapshot list` |
-| Fork refused for room names the parent runner and the fork's shape, without CLI hints | works | v0.9.26 | `snapshots.spec.mjs › fork refused for room on the parent runner says so plainly` |
+| Fork refused for room names the parent runner and the fork's shape, without CLI hints | works | v0.9.27 | `snapshots.spec.mjs › fork refused for room on the parent runner says so plainly` |
 
 ## Sharing and previews
 
@@ -82,7 +85,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | --- | --- | --- | --- |
 | Share dialog, shared-with-me view, unshare | works | v0.9.22 | `sharing.spec.mjs › share dialog grants a teammate, who sees it under shared with me` |
 | Share dialog rejects an invalid email | works | v0.9.22 | `sharing.spec.mjs › share dialog refuses an invalid email` |
-| Share dialog refuses your own login in plain words | works | v0.9.26 | `sharing.spec.mjs › share dialog refuses your own login plainly` |
+| Share dialog refuses your own login in plain words | works | v0.9.27 | `sharing.spec.mjs › share dialog refuses your own login plainly` |
 | Publish and unpublish a port | partial | v0.9.22 | `previews.spec.mjs › publish port dialog publishes, links and unpublishes a preview`; `previews.spec.mjs › publish port is hidden when previews are not configured` |
 
 Previews need `tailscale serve` and a root-owned helper on the host, so the

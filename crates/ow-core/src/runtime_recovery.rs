@@ -271,6 +271,7 @@ mod tests {
                 kernel_sha256: "fixture".into(),
                 files,
                 digest: None,
+                fork: None,
             };
             atomic_json(&sleep.join("manifest.json"), &snapshot).unwrap();
             if sealed {

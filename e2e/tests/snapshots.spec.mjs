@@ -1,4 +1,5 @@
 import {test, expect, api, machines, card, detailAction, notice} from './fixtures.mjs';
+import {FAILING_CAPTURE_VCPUS} from '../harness/fake-worker.mjs';
 
 test('snapshot dialog saves a named checkpoint', async ({dashboard: page}) => {
   await machines(page, 'origin');
@@ -25,6 +26,19 @@ test('fork from a running machine creates an independent child', async ({dashboa
   await expect(notice(page)).toHaveText('Independent fork created.');
   await expect(card(page, 'child')).toContainText('Forked from parent');
   await expect(page.locator('#selected-name')).toHaveText('child');
+  await page.getByRole('button', {name: /Snapshots/}).click();
+  await expect(page.locator('.snapshot-row', {hasText: /^fork-[0-9a-f]{24}/})).toContainText('Taken for fork child · parent · 256 MiB');
+});
+
+test('a failed capture names its machine and when it failed', async ({dashboard: page}) => {
+  await api(page, {op: 'create', id: 'flaky', vcpu_count: FAILING_CAPTURE_VCPUS});
+  await expect(api(page, {op: 'snapshot', id: 'flaky', name: 'broken'})).rejects.toThrow();
+  await page.reload();
+  await page.getByRole('button', {name: /Snapshots/}).click();
+  const status = page.locator('.snapshot-row', {hasText: 'broken'}).locator('p');
+  await expect(status).toHaveText('Capture of flaky failed just now. Retry from the running machine.');
+  await expect(status).toHaveClass(/recovery-warning/);
+  await expect(status).toHaveAttribute('title', /\d/);
 });
 
 test('fork and restore from the snapshot list', async ({dashboard: page}) => {
