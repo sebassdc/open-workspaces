@@ -33,6 +33,20 @@ impl std::fmt::Display for ResourceNotFound {
 }
 impl std::error::Error for ResourceNotFound {}
 
+/// A new create intent for a name the user already has; a retry of the original create is not one.
+#[derive(Debug)]
+pub struct NameTaken(pub String);
+impl std::fmt::Display for NameTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "you already have a machine named '{}'; choose another name",
+            self.0
+        )
+    }
+}
+impl std::error::Error for NameTaken {}
+
 #[derive(Debug)]
 pub struct OperationFailure(pub Value);
 impl OperationFailure {
@@ -2186,6 +2200,17 @@ impl Catalog {
             )?;
             let metadata: Value = serde_json::from_str(&metadata)?;
             if op == "create" && metadata["state"] != "pending" {
+                let key = input["operation_key"]
+                    .as_str()
+                    .map_or_else(|| format!("c-{physical}"), str::to_owned);
+                let retry: bool = self.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM operations WHERE owner=?1 AND retry_key=?2)",
+                    params![user, key],
+                    |r| r.get(0),
+                )?;
+                if !retry {
+                    return Err(NameTaken(name.clone()).into());
+                }
                 ensure!(
                     metadata["memory_mib"].as_u64()
                         == Some(request["memory_mib"].as_u64().unwrap_or(256))
