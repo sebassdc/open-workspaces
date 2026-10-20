@@ -378,6 +378,12 @@ pub fn node_operation(v: &serde_json::Value, op: &str) -> Result<()> {
             "worker lacks move/fork support"
         );
     }
+    if op == "aws-token" {
+        ensure!(
+            v["aws_identity_v1"] == true,
+            "runner cannot deliver per-box AWS access; upgrade it first"
+        );
+    }
     if op == "snapshot-delete" {
         ensure!(
             v["snapshot_delete_v1"] == true,

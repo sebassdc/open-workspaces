@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod aws_identity;
+#[cfg(target_os = "linux")]
 mod backup;
 #[cfg(any(target_os = "linux", test))]
 mod cache_catalog;
@@ -357,6 +359,13 @@ enum Action {
         #[arg(long, default_value = "use", value_parser = ["use", "admin"])]
         role: String,
     },
+    /// Per-box AWS access (remote server only, off by default): attach one IAM role from the
+    /// operator's allow-list. Programs in the box get short-lived role credentials through the
+    /// standard AWS credential chain; no AWS secret is stored in the box. Forks start without one.
+    AwsRole {
+        #[command(subcommand)]
+        command: AwsRoleAction,
+    },
     /// Take a machine back from a teammate; closes their open shells and SSH sessions.
     Unshare {
         id: String,
@@ -404,6 +413,19 @@ enum Action {
     Supervisor,
     #[command(hide = true)]
     Gateway { id: String, port: u16 },
+}
+
+#[derive(Subcommand)]
+enum AwsRoleAction {
+    /// Attach a role (owner or admin); `ow inspect` shows it and its token expiry.
+    Set {
+        id: String,
+        /// An exact role ARN the server's operator allows for this box's owner.
+        #[arg(long)]
+        role_arn: String,
+    },
+    /// Detach the role and remove the box's token now.
+    Unset { id: String },
 }
 
 #[derive(Subcommand)]
@@ -955,6 +977,10 @@ fn main_result() -> anyhow::Result<i32> {
         !matches!(cli.command, Action::Share { .. } | Action::Unshare { .. }),
         "sharing is per user: run ow login <server> first"
     );
+    anyhow::ensure!(
+        !matches!(cli.command, Action::AwsRole { .. }),
+        "per-box AWS access is issued by a server: run ow login <server> first"
+    );
     // Remote commands are checked by the controller against the machine's node.
     #[cfg(target_os = "linux")]
     let (backend, capabilities) = (runtime::BACKEND, runtime::CAPABILITIES);
@@ -1024,6 +1050,22 @@ mod capability_tests {
                 .command,
             Action::Publish { port: 3000, .. }
         ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "ow",
+                "aws-role",
+                "set",
+                "demo",
+                "--role-arn",
+                "arn:aws:iam::111122223333:role/r"
+            ])
+            .unwrap()
+            .command,
+            Action::AwsRole {
+                command: AwsRoleAction::Set { .. }
+            }
+        ));
+        assert!(Cli::try_parse_from(["ow", "aws-role", "set", "demo"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["ow", "unpublish", "demo"])
                 .unwrap()

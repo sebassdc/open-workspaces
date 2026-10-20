@@ -212,6 +212,16 @@ takes it back and closes their open shells and SSH sessions. A teammate's fork
 copies everything on the machine, credentials included, and stays theirs. Roles,
 limits and the credential warning: [USERS.md](USERS.md#sharing-a-machine).
 
+## AWS access from a box
+
+If the server's operator turned on [per-box AWS access](AWS_ACCESS.md),
+`ow aws-role set demo --role-arn arn:aws:iam::111122223333:role/NAME` gives the box
+that role: the AWS CLI and SDKs inside it get short-lived credentials on their
+own (`aws sts get-caller-identity` shows the role). Only roles on the operator's
+allow-list are accepted; `ow inspect demo` shows the role and its token expiry,
+and `ow aws-role unset demo` removes it. Forks and a box's new owner start
+without a role.
+
 ## Evidence
 
 Observed on 2026-10-16 on a dedicated test host from `deploy/aws` (EC2

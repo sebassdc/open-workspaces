@@ -44,7 +44,10 @@ shares, previews and running state stay. **Delete** (owner only, on a
 stopped or hibernated machine) removes it with its disk and every snapshot taken
 from it, and closes the sessions of anyone it was shared with. A machine its
 runner no longer lists shows as `missing` and holds no capacity; deleting it
-only drops the entry. The API does not delete snapshots on their own, change host configuration, grant Cloudflare permissions, or serve
+only drops the entry. **AWS role** (owner or admin, when the operator configured
+[per-box AWS access](AWS_ACCESS.md)) attaches one role from the operator's
+allow-list; the machine details then show it with its token expiry and a
+**Detach** button. The API does not delete snapshots on their own, change host configuration, grant Cloudflare permissions, or serve
 arbitrary guest HTML on the dashboard origin. Public guest-app publishing remains
 a subsequent slice.
 

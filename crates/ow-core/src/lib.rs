@@ -7,7 +7,8 @@
 //! - [`Capabilities`]: the flags (`snapshot`, `live-fork`, `hibernate`, `exec`,
 //!   `ssh`) a provider supports, checked before each command.
 //! - [`SnapshotStore`]: off-host copies of sealed snapshots (S3 and compatible).
-//! - [`credential_broker`]: dormant per-box role/secret policy and host provider interfaces.
+//! - [`credential_broker`]: dormant per-box role/secret policy and host provider interfaces;
+//!   [`web_identity`] is its active per-box AWS role delivery into guests.
 #[cfg(target_os = "linux")]
 pub mod cache;
 pub mod capability;
@@ -32,6 +33,7 @@ pub mod ssh_guest;
 pub mod store;
 #[cfg(target_os = "linux")]
 pub mod vm;
+pub mod web_identity;
 
 pub use capability::{Capabilities, Capability};
 pub use compute::ComputeProvider;

@@ -25,6 +25,8 @@ fs.mkdirSync(data, {mode: 0o700});
 fs.writeFileSync(path.join(data, '.ow-data'), 'open-workspaces local prototype v1\n', {mode: 0o600});
 // A wholly self-hosted pool (docs/LIMITS.md), so the owner may invite hosts.
 fs.writeFileSync(path.join(data, 'limits.json'), JSON.stringify({pool: {hourly_cents: {'self-hosted': 0}, default_type: 'self-hosted'}}), {mode: 0o600});
+// Per-box AWS access with one allowed role (docs/AWS_ACCESS.md); nothing here reaches AWS.
+fs.writeFileSync(path.join(data, 'aws-identity.json'), JSON.stringify({issuer: `https://${HOSTNAME}`, allowed_roles: [{role_arn: 'arn:aws:iam::111122223333:role/open-workspaces/e2e-reader'}]}), {mode: 0o600});
 fs.mkdirSync(bin);
 fs.copyFileSync(path.join(here, 'tailscale'), path.join(bin, 'tailscale'));
 fs.chmodSync(path.join(bin, 'tailscale'), 0o755);

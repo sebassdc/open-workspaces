@@ -599,6 +599,9 @@ pub struct Runtime {
     /// by snapshot name; `recovery-seal` commits them. Lost on restart, when
     /// startup removes their staging.
     unsealed: BTreeMap<String, Staged>,
+    /// Per-box AWS access: the VMM process that last received a token, by box. A cold start
+    /// is a new process with an empty `/run`, so the controller's `check` then sees none.
+    aws_delivered: BTreeMap<String, u32>,
     #[cfg(test)]
     crash: Option<&'static str>,
 }
@@ -739,6 +742,7 @@ impl Runtime {
             defer_seal: false,
             staged: None,
             unsealed: BTreeMap::new(),
+            aws_delivered: BTreeMap::new(),
             #[cfg(test)]
             crash: None,
         };
@@ -1863,7 +1867,11 @@ impl Runtime {
         if !id.is_empty()
             && !matches!(
                 op,
-                "hibernate" | "recovery-prepare" | "recovery-result" | "recovery-seal"
+                "hibernate"
+                    | "recovery-prepare"
+                    | "recovery-result"
+                    | "recovery-seal"
+                    | "aws-token"
             )
         {
             self.idle.touch(id, std::time::Instant::now());
@@ -1905,7 +1913,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"snapshot_delete_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"snapshot_delete_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
@@ -2039,6 +2047,36 @@ impl Runtime {
                 let root = self.root.clone();
                 let upgrade = request["upgrade"].as_bool().unwrap_or(false);
                 crate::ssh_guest::enroll(self.running(id)?, &root, id, keys, upgrade)
+            }
+            // Per-box AWS access: refreshing a credential is not activity, so this neither
+            // wakes a hibernated box nor restarts its idle clock. Absent `token` clears.
+            "aws-token" => {
+                let Some(pid) = self.machines.get(id).map(|vm| vm.child.id()) else {
+                    return Ok(json!({"written":false}));
+                };
+                if request["check"] == true {
+                    return Ok(
+                        json!({"written":false,"present":self.aws_delivered.get(id) == Some(&pid)}),
+                    );
+                }
+                let delivery = match request["token"].as_str() {
+                    Some(token) => Some(crate::web_identity::Delivery {
+                        token,
+                        role_arn: request["role_arn"].as_str().context("missing role ARN")?,
+                        session_name: request["session_name"]
+                            .as_str()
+                            .context("missing session name")?,
+                    }),
+                    None => None,
+                };
+                let present = delivery.is_some();
+                let command = crate::web_identity::install_command("", delivery.as_ref())?;
+                self.aws_delivered.remove(id);
+                self.running(id)?.checked(&command)?;
+                if present {
+                    self.aws_delivered.insert(id.to_owned(), pid);
+                }
+                Ok(json!({"written":true}))
             }
             "exec" => {
                 let command = request["command"].as_str().context("missing command")?;
@@ -2249,6 +2287,7 @@ mod disk_tests {
             defer_seal: false,
             staged: None,
             unsealed: BTreeMap::new(),
+            aws_delivered: BTreeMap::new(),
             crash: None,
         }
     }
@@ -2803,6 +2842,32 @@ mod disk_tests {
         assert!(runtime.snapshot_dir("keep").join("manifest.json").exists());
         assert_eq!(
             runtime.request(&json!({"op":"status"})).unwrap()["snapshot_delete_v1"],
+            true
+        );
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
+    fn aws_token_never_wakes_a_box_and_validates_before_the_guest() {
+        let mut runtime = fixture();
+        let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
+        workspace.state = "hibernated".into();
+        workspace.hibernation = Some("sleep-fixture".into());
+        let token = json!({"op":"aws-token","id":"legacy","token":"eyJh.eyJz.c2ln-c2ln","role_arn":"arn:aws:iam::111122223333:role/box","session_name":"ow-1"});
+        assert_eq!(runtime.request(&token).unwrap(), json!({"written":false}));
+        let mut check = token.clone();
+        check["check"] = json!(true);
+        assert_eq!(runtime.request(&check).unwrap(), json!({"written":false}));
+        assert_eq!(
+            runtime
+                .request(&json!({"op":"aws-token","id":"legacy"}))
+                .unwrap(),
+            json!({"written":false})
+        );
+        assert_eq!(runtime.state.workspaces["legacy"].state, "hibernated");
+        assert!(!runtime.machines.contains_key("legacy"));
+        assert_eq!(
+            runtime.request(&json!({"op":"status"})).unwrap()["aws_identity_v1"],
             true
         );
         fs::remove_dir_all(runtime.root).unwrap();

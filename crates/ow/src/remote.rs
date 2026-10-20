@@ -505,6 +505,23 @@ async fn handle(app: &App, mut request: Request) -> Response {
     {
         return (StatusCode::MISDIRECTED_REQUEST, "Unknown hostname").into_response();
     }
+    // Per-box AWS access: AWS STS fetches the issuer's public keys without signing in.
+    if let Some(root) = &app.dashboard
+        && preview_port.is_none()
+        && matches!(*request.method(), Method::GET | Method::HEAD)
+        && request.uri().query().is_none()
+        && let Some(document) = crate::aws_identity::public_document(root, request.uri().path())
+    {
+        return (
+            [
+                ("content-type", "application/json"),
+                ("cache-control", "public, max-age=300"),
+                ("x-content-type-options", "nosniff"),
+            ],
+            document.to_string(),
+        )
+            .into_response();
+    }
     // The CLI signs in through Cloudflare Access only, so tailnet mode offers no installer.
     if app.dashboard.is_some()
         && app.config.auth == Auth::Access
@@ -947,6 +964,7 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
     if let Some(catalog) = &catalog {
         crate::transfers::recover(catalog);
         crate::scaler::start(catalog);
+        crate::aws_identity::start(catalog);
     }
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

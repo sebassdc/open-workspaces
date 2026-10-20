@@ -65,6 +65,8 @@ struct Operation {
     role: Option<String>,
     #[serde(default)]
     port: Option<u16>,
+    #[serde(default)]
+    role_arn: Option<String>,
 }
 
 fn validated(bytes: &[u8]) -> Result<Value> {
@@ -186,6 +188,13 @@ fn validated(bytes: &[u8]) -> Result<Value> {
                     "role must be use or admin"
                 );
                 request["role"] = json!(role);
+            }
+        }
+        "aws-role" => {
+            // Absent: detach. The controller also checks the operator allow-list.
+            if let Some(role) = operation.role_arn {
+                ow_core::credential_broker::role_arn(&role)?;
+                request["role_arn"] = json!(role);
             }
         }
         "ssh-keys" => {
@@ -546,6 +555,11 @@ pub async fn handle(
             .and_then(|r| r),
             None => Err(anyhow::anyhow!("ownership catalog unavailable")),
         }
+    } else if operation["op"] == "aws-role" {
+        with_catalog(catalog, identity, move |catalog, user| {
+            catalog.aws_role(user, &operation)
+        })
+        .await
     } else if matches!(operation["op"].as_str(), Some("publish" | "unpublish")) {
         match preview_host {
             Some(host) => {

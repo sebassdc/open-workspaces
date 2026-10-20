@@ -72,6 +72,7 @@ browser test that guards it are listed in the [UI feature matrix](docs/UI_FEATUR
 | Host reserve | Keep CPU and RAM per host that boxes never claim; on AWS hosts, systemd protects the controller/agent and kills a VM first under memory pressure. | Core | v0.9.24 | [Host reserve](docs/HOSTS.md#host-reserve-capacity-boxes-never-claim) |
 | User ownership and sharing | Scope boxes, snapshots and access to authenticated owners with explicit use/admin grants. | Core | v0.2.0 | [Users](docs/USERS.md) |
 | Guest isolation and egress | Run Linux guests under Firecracker/KVM with private host control and filtered guest networking. | Core | v0.1.0 | [Networking](docs/NETWORKING.md) |
+| Per-box AWS access | Attach one operator-allowed IAM role to a box (`ow aws-role set`, dashboard); the controller issues short-lived OIDC identity tokens bound to the box and its generation, and the guest's AWS SDK chain assumes the role. No AWS keys in the box. | Opt-in, not yet verified against real AWS | v0.9.37 | [Per-box AWS access](docs/AWS_ACCESS.md) |
 | CredentialBroker | Library-only per-box authorization for temporary AWS roles and secret writes; no live provider adapter or guest endpoint. | Not yet live | v0.8.0 (library only) | [Broker boundaries](docs/CREDENTIAL_BROKER.md) |
 
 Snapshots depend on runtime/CPU/kernel compatibility. External connections may

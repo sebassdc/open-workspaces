@@ -172,6 +172,9 @@ Gate: reproducible evidence and runtime decision, per HANDOFF.md.
   per-box policy and host provider interfaces tested with fakes. Guest transport,
   live AWS adapters, lifecycle fencing and approved IAM/secrets remain pending;
   existing boxes receive no broker access.
+  Its web-identity mode is implemented: [per-box AWS access](AWS_ACCESS.md) issues
+  controller-signed OIDC tokens to boxes with an operator-allowed role; the
+  real-AWS acceptance (OIDC provider and a test role) is the consumer's next step.
 - Persistent disk, initial immutable base images, protected HTTP publishing and explicit public routes.
 - Off-worker disk backup and restore onto a replacement worker; basic logs and operational metrics.
 

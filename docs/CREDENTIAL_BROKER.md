@@ -1,5 +1,13 @@
 # CredentialBroker
 
+**Web-identity mode is live (0.9.37, opt-in):** [per-box AWS access](AWS_ACCESS.md)
+reuses this module's `WorkloadIdentity` (physical box ID plus generation, hashed
+`SourceIdentity` as the role session name) and its exact role-ARN validation. The
+controller signs OIDC tokens and the guest's AWS SDK calls
+`AssumeRoleWithWebIdentity`, so no host AWS credential or guest-to-host channel is
+needed ([ADR 0008](adr/0008-per-box-aws-web-identity.md)). The host-side
+`AssumeRole` and secret-write broker described below remains dormant.
+
 **Implemented:** a dormant host-side library in
 `ow_core::credential_broker`, with fake-provider integration tests. It is not
 installed in the worker, controller, CLI, guest images or network listeners.

@@ -1,5 +1,5 @@
 //! Remote operator client: browser Access login, HTTPS API, and WSS native terminal.
-use crate::{Action, ImageAction, common};
+use crate::{Action, AwsRoleAction, ImageAction, common};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -368,6 +368,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Fork { .. }
                 | Action::Share { .. }
                 | Action::Unshare { .. }
+                | Action::AwsRole { .. }
                 | Action::Publish { .. }
                 | Action::Unpublish { .. }
                 | Action::Delete { .. }
@@ -505,6 +506,12 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         }
         Action::Share { id, with, role } => json!({"op":"share","id":id,"with":with,"role":role}),
         Action::Unshare { id, with } => json!({"op":"unshare","id":id,"with":with}),
+        Action::AwsRole { command } => match command {
+            AwsRoleAction::Set { id, role_arn } => {
+                json!({"op":"aws-role","id":id,"role_arn":role_arn})
+            }
+            AwsRoleAction::Unset { id } => json!({"op":"aws-role","id":id}),
+        },
         Action::Move {
             id,
             node,

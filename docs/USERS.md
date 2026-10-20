@@ -104,7 +104,7 @@ each machine, and the dashboard has Share and Unshare buttons.
 | Role | Allows |
 | --- | --- |
 | `use` (default) | exec, shell, SSH stream, `put`/`get`, `ssh-info`, start, hibernate, fork into their own namespace |
-| `admin` | `use`, plus stop, snapshot, restore, deleting their own snapshots and `ssh-keys` |
+| `admin` | `use`, plus stop, snapshot, restore, deleting their own snapshots, `ssh-keys` and the box's [AWS role](AWS_ACCESS.md) |
 
 Resize, rename, delete and sharing stay with the owner. After `ow rename demo
 web`, Bob uses `alice@example.com/web`; his grant, open shells and SSH sessions

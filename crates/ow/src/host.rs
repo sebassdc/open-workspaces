@@ -853,6 +853,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         | Action::Store { .. }
         | Action::Image { .. }
         | Action::Share { .. }
+        | Action::AwsRole { .. }
         | Action::Unshare { .. } => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;

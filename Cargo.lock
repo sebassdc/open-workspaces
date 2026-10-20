@@ -1558,7 +1558,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "ow"
-version = "0.9.35"
+version = "0.9.37"
 dependencies = [
  "anyhow",
  "axum",
@@ -1572,6 +1572,7 @@ dependencies = [
  "libc",
  "ow-core",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",
@@ -1585,10 +1586,11 @@ dependencies = [
 
 [[package]]
 name = "ow-core"
-version = "0.9.35"
+version = "0.9.37"
 dependencies = [
  "anyhow",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-s3",
  "aws-smithy-http-client",
  "base64 0.22.1",
@@ -1604,7 +1606,7 @@ dependencies = [
 
 [[package]]
 name = "ow-guest"
-version = "0.9.35"
+version = "0.9.37"
 dependencies = [
  "base64 0.22.1",
  "libc",

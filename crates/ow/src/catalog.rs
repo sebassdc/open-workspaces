@@ -482,6 +482,7 @@ impl Catalog {
         crate::drain::initialize(&db)?;
         crate::store_gc::initialize(&db)?;
         crate::scaler::initialize(&db)?;
+        crate::aws_identity::initialize(&db)?;
         if version < 7 {
             db.execute_batch("INSERT INTO settings(key,value) VALUES('min_reader_schema','7') ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),7);")?;
         }
@@ -1317,6 +1318,7 @@ impl Catalog {
                 reserved += memory;
                 value["shared_with"] = shared_with(&self.db, &physical)?;
                 value["published_ports"] = self.publications(&physical)?;
+                value["aws_role"] = crate::aws_identity::view(&self.db, &physical)?;
                 machines.push(value);
             } else {
                 snapshots.push(value);
@@ -1341,6 +1343,7 @@ impl Catalog {
             value["published_ports"] = self.publications(&physical)?;
             value["owner"] = json!(owner);
             value["role"] = json!(role);
+            value["aws_role"] = crate::aws_identity::view(&self.db, &physical)?;
             shared.push(value);
         }
         let mut running = BTreeMap::new();
@@ -1391,8 +1394,17 @@ impl Catalog {
             operations.push(self.operation_info(user, id?)?);
         }
         let discovery = self.discovery(user, &nodes)?;
+        let aws_identity = match crate::aws_identity::config(&self.root) {
+            Ok(Some(config)) => {
+                let email: String =
+                    self.db
+                        .query_row("SELECT email FROM users WHERE id=?1", [user], |r| r.get(0))?;
+                json!({"enabled":true,"issuer":config.issuer,"roles":config.roles_for(&email)})
+            }
+            _ => json!({"enabled":false}),
+        };
         Ok(
-            json!({"discovery":discovery,"owner_limits":limits::state(&self.root,&self.db,user)?,"operations":operations,"workspaces":machines,"shared":shared,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
+            json!({"discovery":discovery,"aws_identity":aws_identity,"owner_limits":limits::state(&self.root,&self.db,user)?,"operations":operations,"workspaces":machines,"shared":shared,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
         )
     }
     fn discovery(&self, user: i64, inventory: &Value) -> Result<Value> {
@@ -1470,6 +1482,7 @@ impl Catalog {
             [physical],
         )?;
         tx.execute("DELETE FROM grants WHERE physical=?1", [physical])?;
+        tx.execute("DELETE FROM aws_roles WHERE physical=?1", [physical])?;
         tx.execute(
             "DELETE FROM owner_allocations WHERE physical=?1",
             [physical],
@@ -2025,11 +2038,15 @@ impl Catalog {
                 "unshare",
                 "delete",
                 "snapshot-delete",
-                "rename"
+                "rename",
+                "aws-role"
             ]
             .contains(&op.as_str()),
             "unsupported user operation"
         );
+        if op == "aws-role" {
+            return self.aws_role(user, &request);
+        }
         if matches!(op.as_str(), "share" | "unshare") {
             return self.share(user, &op, &request);
         }

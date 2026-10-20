@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.37",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Optional per-box AWS access: the controller acts as an OIDC identity provider (ES256 key, discovery document and JWKS) and, for boxes with an operator-allowed role attached, signs 15-minute identity tokens bound to the box generation. The worker writes them into running guests on tmpfs through a new aws-token operation that never wakes a box or restarts its idle clock; the AWS SDK chain calls AssumeRoleWithWebIdentity itself. Off unless aws-identity.json exists. Additive catalog table aws_roles; catalog schema 7, worker interface 3, runtime, guest kernel and host layout remain unchanged. Class-2 worker upgrade; runners without aws_identity_v1 report the role as not delivered."
+    },
+    {
       "version": "0.9.35",
       "class": 2,
       "changes": [
