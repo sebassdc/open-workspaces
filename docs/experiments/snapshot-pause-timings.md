@@ -43,7 +43,17 @@ whole; an extent-reusing digest for named snapshots would remove that.
 Verified so far only without KVM: unit tests of the page merge (holes keep the
 base, changed pages replace it, the base file is never written) and of the capture
 request sequence against a fake Firecracker API (`Diff` when a base is known,
-`Full` otherwise). The field names (`track_dirty_pages` on `/machine-config` and
+`Full` otherwise).
+
+Failure-path fixtures also save a RAM diff, inject a disk-copy, resume API or
+post-resume clock error, discard the failed staging files, then take two more
+captures. The retry must save full RAM and preserve all three pages; the following
+incremental save must preserve that repaired base. Before each RAM save request,
+the old base is invalidated: even a lost API reply may follow a dirty-log reset.
+The base becomes usable only after disk capture, resume (when requested) and memory
+assembly succeed. A failed capture therefore costs one full save on retry.
+
+The field names (`track_dirty_pages` on `/machine-config` and
 `/snapshot/load`, `snapshot_type: Diff`) were checked against the Firecracker
 v1.17.0 API specification.
 

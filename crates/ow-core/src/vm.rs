@@ -59,7 +59,7 @@ fn reflink_from(src: &File, destination: &Path) -> Result<()> {
 /// What the guest's memory pages that are clean (not dirtied since then) hold, so a
 /// `Diff` snapshot's dirty pages can be laid over it to make a full memory image.
 enum MemoryBase {
-    /// Unknown (dirty tracking off): the next capture is `Full`.
+    /// No reliable base: the next capture is `Full`.
     Unknown,
     /// Booted with dirty tracking: clean pages are still zero.
     Zero,
@@ -432,6 +432,8 @@ impl Vm {
         };
         let paused = Instant::now();
         self.api("PATCH", "/vm", json!({"state":"Paused"}))?;
+        // Saving may reset the dirty log even if a later step or the API reply fails.
+        let base = std::mem::replace(&mut self.memory_base, MemoryBase::Unknown);
         let captured = (|| {
             self.api_waiting("PUT", "/snapshot/create", json!({"snapshot_type":if diff {"Diff"} else {"Full"},"snapshot_path":directory.join("state"),"mem_file_path":saved}), 900)?;
             reflink(disk, &directory.join("disk.ext4"))
@@ -446,12 +448,13 @@ impl Vm {
             paused_for
         };
         if !diff {
-            // No dirty tracking in this VMM: every capture stays `Full`.
+            // A complete save repairs the base after an interrupted capture.
+            self.memory_base = MemoryBase::Image(File::open(&memory)?);
             return Ok(paused_for);
         }
         // The dirty log restarted at this capture: the new image is the next base.
         let merged = (|| {
-            match &self.memory_base {
+            match &base {
                 MemoryBase::Image(base) => {
                     reflink_from(base, &memory)?;
                     lay_over(&saved, &memory)?;
@@ -672,6 +675,23 @@ mod clock_tests {
 /// A real child and the real capture API/serial protocol, without KVM or host networking.
 #[cfg(test)]
 pub(crate) fn capture_fixture(directory: &Path, resume: bool) -> (Vm, std::thread::JoinHandle<()>) {
+    capture_fixture_steps(directory, resume, vec![CaptureStep::default()])
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CaptureStep {
+    snapshot_type: Option<&'static str>,
+    resume_fails: bool,
+    clock_exit: i32,
+}
+
+#[cfg(test)]
+fn capture_fixture_steps(
+    directory: &Path,
+    resume: bool,
+    steps: Vec<CaptureStep>,
+) -> (Vm, std::thread::JoinHandle<()>) {
     use std::{
         io::{BufRead, BufReader},
         os::unix::net::{UnixListener, UnixStream},
@@ -681,7 +701,7 @@ pub(crate) fn capture_fixture(directory: &Path, resume: bool) -> (Vm, std::threa
     let (master, serial) = UnixStream::pair().unwrap();
     let fixture = std::thread::spawn(move || {
         let mut serial = BufReader::new(serial);
-        let mut reply = |prefix: &str| {
+        let mut reply = |prefix: &str, exit: i32| {
             let mut command = String::new();
             if serial.read_line(&mut command).unwrap() == 0 {
                 return false;
@@ -695,57 +715,85 @@ pub(crate) fn capture_fixture(directory: &Path, resume: bool) -> (Vm, std::threa
                 .next()
                 .unwrap();
             let marker = format!("OW_DONE_{suffix}");
-            write!(serial.get_mut(), "\n{marker}:0:{marker}\n").unwrap();
+            write!(serial.get_mut(), "\n{marker}:{exit}:{marker}\n").unwrap();
             true
         };
-        if !reply("sync;") {
-            return;
-        }
-        let endpoints = if resume {
-            vec!["/vm", "/snapshot/create", "/vm"]
-        } else {
-            vec!["/vm", "/snapshot/create"]
-        };
-        for (step, endpoint) in endpoints.into_iter().enumerate() {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert_eq!(line.split_whitespace().nth(1), Some(endpoint));
-            let mut length = 0;
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = n.trim().parse().unwrap();
-                }
+        for (capture_index, capture) in steps.into_iter().enumerate() {
+            if !reply("sync;", 0) {
+                return;
             }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-            let body: Value = serde_json::from_slice(&body).unwrap();
-            if endpoint == "/snapshot/create" {
-                // A diff goes to its own file and is merged after the guest resumes.
-                let diff = body["mem_file_path"]
-                    .as_str()
-                    .unwrap()
-                    .ends_with("memory.diff");
-                assert_eq!(body["snapshot_type"], if diff { "Diff" } else { "Full" });
-                std::fs::write(body["snapshot_path"].as_str().unwrap(), b"VM state").unwrap();
-                std::fs::write(body["mem_file_path"].as_str().unwrap(), b"VM memory").unwrap();
+            let endpoints = if resume {
+                vec!["/vm", "/snapshot/create", "/vm"]
             } else {
-                assert_eq!(body["state"], if step == 0 { "Paused" } else { "Resumed" });
+                vec!["/vm", "/snapshot/create"]
+            };
+            for (step, endpoint) in endpoints.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.split_whitespace().nth(1), Some(endpoint));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                if endpoint == "/snapshot/create" {
+                    // A diff goes to its own file and is merged after the guest resumes.
+                    let diff = body["mem_file_path"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("memory.diff");
+                    assert_eq!(body["snapshot_type"], if diff { "Diff" } else { "Full" });
+                    if let Some(expected) = capture.snapshot_type {
+                        assert_eq!(body["snapshot_type"], expected);
+                    }
+                    std::fs::write(body["snapshot_path"].as_str().unwrap(), b"VM state").unwrap();
+                    let memory = body["mem_file_path"].as_str().unwrap();
+                    if capture.snapshot_type.is_some() {
+                        use std::os::unix::fs::FileExt;
+                        let image = File::create(memory).unwrap();
+                        image.set_len(3 * 4096).unwrap();
+                        if diff {
+                            // Dirty log resets on each save: B then C then D, never both.
+                            let (page, value) = [(1, b'B'), (2, b'C'), (0, b'D')][capture_index];
+                            image.write_all_at(&[value; 4096], page * 4096).unwrap();
+                        } else {
+                            for (page, value) in [b'A', b'B', b'C'].into_iter().enumerate() {
+                                image
+                                    .write_all_at(&[value; 4096], page as u64 * 4096)
+                                    .unwrap();
+                            }
+                        }
+                    } else {
+                        std::fs::write(memory, b"VM memory").unwrap();
+                    }
+                } else {
+                    assert_eq!(body["state"], if step == 0 { "Paused" } else { "Resumed" });
+                }
+                let status = if step == 2 && capture.resume_fails {
+                    500
+                } else {
+                    204
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
             }
-            write!(
-                stream,
-                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
-        }
-        if resume {
-            assert!(reply("date -u -s "));
+            if resume && !capture.resume_fails {
+                assert!(reply("date -u -s ", capture.clock_exit));
+            }
         }
     });
     (
@@ -796,6 +844,83 @@ mod memory_tests {
         std::fs::write(&diff, b"short").unwrap();
         assert!(lay_over(&diff, &memory).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn capture_failure_forces_a_full_retry(failure: &str) {
+        let root = scratch();
+        let disk = root.join("disk.ext4");
+        std::fs::write(&disk, b"disk").unwrap();
+        let (mut vm, server) = capture_fixture_steps(
+            &root,
+            true,
+            vec![
+                CaptureStep {
+                    snapshot_type: Some("Diff"),
+                    resume_fails: failure == "resume",
+                    clock_exit: if failure == "clock" { 1 } else { 0 },
+                },
+                CaptureStep {
+                    snapshot_type: Some("Full"),
+                    ..Default::default()
+                },
+                CaptureStep {
+                    snapshot_type: Some("Diff"),
+                    ..Default::default()
+                },
+            ],
+        );
+        let base = root.join("base");
+        std::fs::write(&base, [b'A'; 3 * 4096]).unwrap();
+        vm.memory_base = MemoryBase::Image(File::open(&base).unwrap());
+        let failed = root.join("failed");
+        std::fs::create_dir(&failed).unwrap();
+        if failure == "disk" {
+            // Fail after the RAM save, when creating the disk reflink destination.
+            std::fs::create_dir(failed.join("disk.ext4")).unwrap();
+        }
+        let error = vm.capture(&failed, &disk, true).unwrap_err();
+        if failure == "clock" {
+            assert!(error.to_string().contains("synchronizing guest clock"));
+        }
+        assert!(matches!(vm.memory_base, MemoryBase::Unknown));
+        // The runtime discards failed staging directories; they cannot become a base.
+        std::fs::remove_dir_all(&failed).unwrap();
+        let retry = root.join("retry");
+        std::fs::create_dir(&retry).unwrap();
+        vm.capture(&retry, &disk, true).unwrap();
+        let expected: Vec<u8> = [b'A', b'B', b'C']
+            .into_iter()
+            .flat_map(|b| [b; 4096])
+            .collect();
+        assert_eq!(std::fs::read(retry.join("memory")).unwrap(), expected);
+        assert!(matches!(vm.memory_base, MemoryBase::Image(_)));
+        let incremental = root.join("incremental");
+        std::fs::create_dir(&incremental).unwrap();
+        vm.capture(&incremental, &disk, true).unwrap();
+        server.join().unwrap();
+        let expected: Vec<u8> = [b'D', b'B', b'C']
+            .into_iter()
+            .flat_map(|b| [b; 4096])
+            .collect();
+        assert_eq!(std::fs::read(incremental.join("memory")).unwrap(), expected);
+        assert_eq!(std::fs::read(base).unwrap(), [b'A'; 3 * 4096]);
+        drop(vm);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_disk_capture_forces_a_full_ram_retry() {
+        capture_failure_forces_a_full_retry("disk");
+    }
+
+    #[test]
+    fn failed_resume_api_forces_a_full_ram_retry() {
+        capture_failure_forces_a_full_retry("resume");
+    }
+
+    #[test]
+    fn failed_resume_clock_update_forces_a_full_ram_retry() {
+        capture_failure_forces_a_full_retry("clock");
     }
 
     #[test]
