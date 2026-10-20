@@ -60,7 +60,8 @@ class Render(unittest.TestCase):
 
     def test_runner_overcommit_uses_effective_budget_for_invitation(self):
         files = {k: v[0] for k, v in h.render(runner(vcpuOvercommit=2), BUDGET).items()}
-        self.assertIn("OW_MAX_VCPUS=8\n", files["/etc/open-workspaces/worker.env"])
+        # (4 CPUs - 0.5 reserved) * 2
+        self.assertIn("OW_MAX_VCPUS=7\n", files["/etc/open-workspaces/worker.env"])
         # Controller enrollment uses the runner's reported worker budget.
         self.assertNotIn("--cpus 4", files["/etc/systemd/system/open-workspaces.service"])
 
