@@ -205,3 +205,19 @@ fn store_image_selectors_are_bounded_paths_and_canonical_versions() {
         assert!(image_name(selector).is_err(), "{selector}");
     }
 }
+
+#[test]
+fn read_ahead_returns_every_byte_in_order_at_any_length() {
+    let f = Fixture::new();
+    let block = 4 << 20;
+    for length in [0, 1, block, 5 * block, 5 * block + 123] {
+        let bytes: Vec<u8> = (0..length).map(|i| (i / 4096 % 251) as u8).collect();
+        let path = f.0.join(format!("file-{length}"));
+        fs::write(&path, &bytes).unwrap();
+        let mut read = Vec::new();
+        let mut ahead = ReadAhead::new(File::open(&path).unwrap());
+        ahead.read_to_end(&mut read).unwrap();
+        assert!(read == bytes, "length {length}");
+        assert_eq!(ahead.read(&mut [0; 8]).unwrap(), 0, "read past the end");
+    }
+}

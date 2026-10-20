@@ -174,31 +174,56 @@ struct Hashing<'a> {
     hash: &'a mut Sha256,
     size: &'a mut u64,
 }
-/// Reads a file ahead on its own thread (up to 32 MiB), so disk reads overlap
-/// hashing and compression instead of alternating with them.
+/// Reads a file ahead on [`READERS`] threads (about 48 MiB), in order, so disk
+/// reads overlap hashing and compression and one stream does not cap them.
 struct ReadAhead {
-    blocks: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    blocks: Vec<std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    next: usize,
     current: std::io::Cursor<Vec<u8>>,
 }
+const READERS: usize = 4;
 impl ReadAhead {
-    fn new(mut file: File) -> Self {
-        let (sender, blocks) = std::sync::mpsc::sync_channel(8);
-        std::thread::spawn(move || {
-            loop {
-                let mut block = vec![0u8; 4 << 20];
-                let read = file.read(&mut block).map(|n| {
-                    block.truncate(n);
-                    block
+    fn new(file: File) -> Self {
+        use std::os::unix::fs::FileExt;
+        const BLOCK: u64 = 4 << 20;
+        let file = std::sync::Arc::new(file);
+        let blocks = (0..READERS)
+            .map(|reader| {
+                let (sender, blocks) = std::sync::mpsc::sync_channel(2);
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    // This reader takes every READERS-th block.
+                    for index in (reader as u64..).step_by(READERS) {
+                        let mut block = vec![0u8; BLOCK as usize];
+                        let mut filled = 0;
+                        let read = loop {
+                            if filled == block.len() {
+                                break Ok(());
+                            }
+                            match file.read_at(&mut block[filled..], index * BLOCK + filled as u64)
+                            {
+                                Ok(0) => break Ok(()),
+                                Ok(n) => filled += n,
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(e) => break Err(e),
+                            }
+                        };
+                        block.truncate(filled);
+                        let read = read.map(|()| block);
+                        // A short block is the file's end; later readers then find nothing.
+                        let end = !matches!(&read, Ok(block) if block.len() == BLOCK as usize);
+                        // Stops when the reader is dropped.
+                        if sender.send(read).is_err() || end {
+                            break;
+                        }
+                    }
                 });
-                let end = !matches!(&read, Ok(block) if !block.is_empty());
-                // Stops when the reader is dropped.
-                if sender.send(read).is_err() || end {
-                    break;
-                }
-            }
-        });
+                blocks
+            })
+            .collect();
         Self {
             blocks,
+            next: 0,
             current: std::io::Cursor::new(Vec::new()),
         }
     }
@@ -210,10 +235,15 @@ impl Read for ReadAhead {
             if n > 0 || bytes.is_empty() {
                 return Ok(n);
             }
-            match self.blocks.recv() {
-                Ok(block) => self.current = std::io::Cursor::new(block?),
+            let block = match self.blocks[self.next % READERS].recv() {
+                Ok(block) => block?,
                 Err(_) => return Ok(0),
+            };
+            self.next += 1;
+            if block.is_empty() {
+                return Ok(0);
             }
+            self.current = std::io::Cursor::new(block);
         }
     }
 }
