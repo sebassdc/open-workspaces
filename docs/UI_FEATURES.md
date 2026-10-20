@@ -43,6 +43,8 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Feature | Status | Last passed | Test |
 | --- | --- | --- | --- |
 | Machine list: cards, counts, selection | works | v0.9.22 | `machines.spec.mjs › machine list shows cards, counts and the selected machine` |
+| Card content top-aligned; page notice spaced from the card below | works | v0.9.27 | `machines.spec.mjs › cards keep their content at the top, whatever their height` |
+| Phone width: tapping a card scrolls its actions into view | works | v0.9.27 | `machines.spec.mjs › on a phone, tapping a card brings its actions into view` |
 | Empty sandbox and empty snapshot list | works | v0.9.22 | `machines.spec.mjs › empty sandbox invites a first machine` |
 | Memory counter: your usage against your owner limits | works | v0.9.23 | `machines.spec.mjs › memory counter shows your usage against your owner limits` |
 | Create dialog: name, image, memory, vCPU, disk | works | v0.9.22 | `machines.spec.mjs › create dialog creates a machine with the chosen shape` |
@@ -60,6 +62,8 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Stop with its warning, then start | works | v0.9.22 | `lifecycle.spec.mjs › stop explains what is lost, then start brings it back` |
 | Resize a stopped machine's disk | works | v0.9.22 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
 | Delete with snapshot warnings | works | v0.9.22 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `lifecycle.spec.mjs › delete of a machine without snapshots says so` |
+| Resize dialog prefilled with the current size; the same size answers "Already N GiB" | works | v0.9.27 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
+| Destructive confirms (delete, restore) lead with a warning and use a danger button | works | v0.9.27 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `snapshots.spec.mjs › fork and restore from the snapshot list` |
 
 ## Terminal and console
 
@@ -77,7 +81,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Live fork's own capture labelled with the fork it was taken for | works | v0.9.26 | `snapshots.spec.mjs › fork from a running machine creates an independent child` |
 | Failed capture names its machine and when it failed | works | v0.9.26 | `snapshots.spec.mjs › a failed capture names its machine and when it failed` |
 | Fork and restore from the snapshot list | works | v0.9.22 | `snapshots.spec.mjs › fork and restore from the snapshot list` |
-| Fork refused for room names the parent runner and the fork's shape, without CLI hints | works | v0.9.27 | `snapshots.spec.mjs › fork refused for room on the parent runner says so plainly` |
+| Fork refused for room names the parent runner and the fork's shape, without CLI hints | works | v0.9.28 | `snapshots.spec.mjs › fork refused for room on the parent runner says so plainly` |
 
 ## Sharing and previews
 
@@ -85,7 +89,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | --- | --- | --- | --- |
 | Share dialog, shared-with-me view, unshare | works | v0.9.22 | `sharing.spec.mjs › share dialog grants a teammate, who sees it under shared with me` |
 | Share dialog rejects an invalid email | works | v0.9.22 | `sharing.spec.mjs › share dialog refuses an invalid email` |
-| Share dialog refuses your own login in plain words | works | v0.9.27 | `sharing.spec.mjs › share dialog refuses your own login plainly` |
+| Share dialog refuses your own login in plain words | works | v0.9.28 | `sharing.spec.mjs › share dialog refuses your own login plainly` |
 | Publish and unpublish a port | partial | v0.9.22 | `previews.spec.mjs › publish port dialog publishes, links and unpublishes a preview`; `previews.spec.mjs › publish port is hidden when previews are not configured` |
 
 Previews need `tailscale serve` and a root-owned helper on the host, so the
