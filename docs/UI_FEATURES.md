@@ -47,15 +47,15 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Memory counter: your usage against your owner limits | works | v0.9.23 | `machines.spec.mjs › memory counter shows your usage against your owner limits` |
 | Create dialog: name, image, memory, vCPU, disk | works | v0.9.22 | `machines.spec.mjs › create dialog creates a machine with the chosen shape` |
 | Refused create shown in the dialog | works | v0.9.22 | `machines.spec.mjs › create dialog shows a refused create and stays open` |
-| Create dialog marks images the pool cannot run (disabled, "not available on this pool") | works | v0.9.25 | `machines.spec.mjs › create dialog marks images the pool cannot run` |
-| Create dialog shows each node's free vCPU and memory, disables a full node, and explains refusals in dashboard words | works | v0.9.25 | `machines.spec.mjs › create dialog shows free room per node, disables a full one and explains a refusal plainly` |
-| Create dialog offers only memory and vCPU sizes the chosen node (or any node, when automatic) can place | works | v0.9.25 | `machines.spec.mjs › create dialog offers only sizes the chosen node can place` |
-| Create dialog offers only images the chosen node has ready | works | v0.9.25 | `machines.spec.mjs › create dialog offers only images the chosen node has ready` |
-| Create dialog disables all sizes and blocks submission when the pool is full | works | v0.9.25 | `machines.spec.mjs › create dialog blocks a full pool without submitting a shape` |
-| Create dialog blocks a node with no eligible images, clears the unavailable selections, and recovers when a ready node is chosen | works | v0.9.25 | `machines.spec.mjs › create dialog blocks a node without images and recovers on a ready node` |
-| Create dialog on an ARM-only pool starts on a Mac runner shape (512 MiB or more, no disk size) | works | v0.9.25 | `machines.spec.mjs › create dialog starts an ARM-only pool on a shape its Mac runner accepts` |
-| Create with a name already in use says the name is taken and stays open | works | v0.9.25 | `machines.spec.mjs › create dialog says a name is taken and stays open` |
-| Create dialog starts with focus on the machine name | works | v0.9.25 | `machines.spec.mjs › create dialog starts on the machine name` |
+| Create dialog marks images the pool cannot run (disabled, "not available on this pool") | works | v0.9.26 | `machines.spec.mjs › create dialog marks images the pool cannot run` |
+| Create dialog shows each node's free vCPU and memory, disables a full node, and explains refusals in dashboard words | works | v0.9.26 | `machines.spec.mjs › create dialog shows free room per node, disables a full one and explains a refusal plainly` |
+| Create dialog offers only memory and vCPU sizes the chosen node (or any node, when automatic) can place | works | v0.9.26 | `machines.spec.mjs › create dialog offers only sizes the chosen node can place` |
+| Create dialog offers only images the chosen node has ready | works | v0.9.26 | `machines.spec.mjs › create dialog offers only images the chosen node has ready` |
+| Create dialog disables all sizes and blocks submission when the pool is full | works | v0.9.26 | `machines.spec.mjs › create dialog blocks a full pool without submitting a shape` |
+| Create dialog blocks a node with no eligible images, clears the unavailable selections, and recovers when a ready node is chosen | works | v0.9.26 | `machines.spec.mjs › create dialog blocks a node without images and recovers on a ready node` |
+| Create dialog on an ARM-only pool starts on a Mac runner shape (512 MiB or more, no disk size) | works | v0.9.26 | `machines.spec.mjs › create dialog starts an ARM-only pool on a shape its Mac runner accepts` |
+| Create with a name already in use says the name is taken and stays open | works | v0.9.26 | `machines.spec.mjs › create dialog says a name is taken and stays open` |
+| Create dialog starts with focus on the machine name | works | v0.9.26 | `machines.spec.mjs › create dialog starts on the machine name` |
 | Rename in place, selection and console history follow | works | v0.9.22 | `machines.spec.mjs › rename keeps the machine selected under its new name` |
 | Navigation and resource usage view | works | v0.9.22 | `machines.spec.mjs › navigation switches between machines, snapshots and usage` |
 | Signed-in account shown in the top bar | missing | — | The page reads `user` from `/api/state`, which the API does not return, so it always shows "Your account"; the login is available at `discovery.identity.email`. |
@@ -116,3 +116,4 @@ dashboard.
 | Expired login message | works | v0.9.22 | `states.spec.mjs › expired login asks the user to reload and sign in` |
 | CLI installer panel (hidden on tailnet sign-in) | partial | v0.9.22 | `states.spec.mjs › the tailnet dashboard offers no CLI installer` (the Access sign-in panel and its copy button are not covered) |
 | Phone width: no horizontal overflow, dialogs fit | works | v0.9.22 | `states.spec.mjs › narrow width › phone layout has no horizontal overflow and dialogs fit` |
+| Keyboard focus kept on the same card or button across the 5 s refresh | works | v0.9.25 | `focus.spec.mjs › focus stays on an action button and a machine card across a refresh`; `focus.spec.mjs › focus stays on a machine card when its disk usage changes`; `focus.spec.mjs › focus stays on the same port Unpublish when an earlier port goes away` |

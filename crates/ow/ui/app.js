@@ -40,7 +40,12 @@ function durability(item) {
 }
 function machine() { return [...data.workspaces, ...(data.shared || [])].find(item => item.id === selected); }
 function setView(next) { view = next; for (const id of ['machines', 'snapshots', 'usage']) $(id + '-view').hidden = id !== view; document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view)); const names = {machines: ['Your machines.', 'A place to build, experiment, and pick up where you left off.', 'Machines'], snapshots: ['Pick up from here.', 'Saved memory and disk state, ready to restore or fork.', 'Snapshots'], usage: ['Room to grow.', 'See what your machines use, and free capacity when you need it.', 'Resource usage']}; $('page-title').textContent = names[view][0]; $('page-description').textContent = names[view][1]; $('breadcrumb').textContent = 'Your sandbox / ' + names[view][2]; }
-function render() {
+// Cards have changing status text; use their machine id alone, and row identity plus label for actions.
+const controlKey = node => node.dataset.machine ?? `${node.closest('[data-key]')?.dataset.key || ''}\n${node.textContent}`;
+function focusKey() { const node = document.activeElement, box = node?.parentElement?.closest('[id]'); return box && node.matches('button, a') ? [box.id, controlKey(node)] : null; }
+function restoreFocus(key) { if (!key || (document.activeElement && document.activeElement !== document.body)) return; const matches = [...($(key[0])?.querySelectorAll('button, a') || [])].filter(other => controlKey(other) === key[1]); if (matches.length === 1) matches[0].focus({preventScroll: true}); }
+function render() { const focused = focusKey(); renderState(); restoreFocus(focused); }
+function renderState() {
   if (data.user) { $('account-email').textContent = data.user.email; $('account-avatar').textContent = data.user.email.slice(0,1).toUpperCase(); }
   if (!selected && data.workspaces.length) selected = data.workspaces[0].id;
   if (selected && !machine()) selected = null;
@@ -82,26 +87,26 @@ function render() {
     if (owned && !live) $('detail-actions').append(action('Delete', () => openDialog('delete', current.id), !supports('delete')));
     $('published-ports').replaceChildren();
     for (const port of current.published_ports || []) {
-      const row = element('span', `Port ${port.port}`, 'actions'), link = element('a', 'Open preview', 'button secondary');
+      const row = element('span', `Port ${port.port}`, 'actions'), link = element('a', 'Open preview', 'button secondary'); row.dataset.key = port.port;
       link.href = port.url; link.target = '_blank'; link.rel = 'noopener noreferrer'; row.append(link);
       if (owned) row.append(action('Unpublish', () => operate({op:'unpublish',id:current.id,port:port.port})));
       $('published-ports').append(row);
     }
     $('shared-with').replaceChildren(); $('shared-with').hidden = !(current.shared_with || []).length;
-    for (const grant of current.shared_with || []) { const row = element('span', `Shared with ${grant.email} · ${grant.role} `); row.append(action('Unshare', () => operate({op: 'unshare', id: current.id, with: grant.email}))); $('shared-with').append(row); }
+    for (const grant of current.shared_with || []) { const row = element('span', `Shared with ${grant.email} · ${grant.role} `); row.dataset.key = grant.email; row.append(action('Unshare', () => operate({op: 'unshare', id: current.id, with: grant.email}))); $('shared-with').append(row); }
     $('run-command').disabled = !live || busy; $('command').disabled = !live || busy;
     $('console-output').textContent = histories.get(current.id) || (live ? 'Ready. Run a command to get started.\n' : 'This machine is asleep or stopped. Start it to run commands.\n');
   }
   $('snapshot-list').replaceChildren();
   for (const item of data.snapshots.slice().reverse()) {
-    const row = element('article', undefined, 'snapshot-row'), info = element('div'); info.append(element('h3', item.name), element('p', item.state === 'ready' ? `${item.workspace} · ${mib(item.memory_mib)} · memory + disk` : item.state === 'failed' ? 'Capture failed. Retry from the running machine.' : `Capture ${item.state || 'pending'}. Check operation status before retrying.`));
+    const row = element('article', undefined, 'snapshot-row'), info = element('div'); row.dataset.key = `${item.workspace}/${item.name}`; info.append(element('h3', item.name), element('p', item.state === 'ready' ? `${item.workspace} · ${mib(item.memory_mib)} · memory + disk` : item.state === 'failed' ? 'Capture failed. Retry from the running machine.' : `Capture ${item.state || 'pending'}. Check operation status before retrying.`));
     const buttons = element('div', undefined, 'actions'); if (item.state === 'ready') buttons.append(action('Fork a machine', () => openDialog('fork', item.workspace, item.name)), action('Restore', () => openDialog('restore', item.workspace, item.name)));
     row.append(info, buttons); $('snapshot-list').append(row);
   }
   if (!data.snapshots.length) $('snapshot-list').append(element('div', 'No checkpoints yet. Select a running machine and capture a snapshot.', 'empty'));
   $('host-node-list').replaceChildren();
   if(data.host_controls) for(const node of (data.nodes||[]).filter(n=>!n.revoked)) {
-    const row=element('div'); row.append(element('span',`${node.id} · ${node.online?'online':'offline'} · ${mib(node.memory_mib)} `),action('Adjust budget',()=>hostDialog('budget',node.id))); $('host-node-list').append(row);
+    const row=element('div'); row.dataset.key=node.id; row.append(element('span',`${node.id} · ${node.online?'online':'offline'} · ${mib(node.memory_mib)} `),action('Adjust budget',()=>hostDialog('budget',node.id))); $('host-node-list').append(row);
   }
   $('create').disabled = busy || !loaded;
 }
