@@ -1280,6 +1280,7 @@ pub fn agent(
                     wire::reply_wait(&json!({"op":"hibernate"})),
                 )
                 .map(|(_, v)| v)
+                .map_err(|e| eprintln!("worker status unavailable: {e:#}"))
                 .ok();
                 let status = match status.map(|s| common::worker_compatible(&s).map(|()| s)) {
                     Some(Err(e)) => {
