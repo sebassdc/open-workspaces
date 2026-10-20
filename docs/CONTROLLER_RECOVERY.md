@@ -140,7 +140,9 @@ node ID and `node.json` credential stay identical. Preserve its worker unit,
 worker environment, budget, image/runtime, executable and `run/worker` symlink.
 Prepare a private runner config using the existing host config, change only the
 role/runner authority and remove dashboard settings. Preserve the existing
-release, tailnet, images, idle policy, overcommit, store and backup settings. Use an approved
+release, tailnet, images, idle policy, overcommit, store and backup settings, and
+set `hostReserve` to the host's (default `{"cpuMillis": 1000, "memoryMib": 2048}`):
+a runner's smaller default would change the worker budget, which is refused. Use an approved
 existing join-secret reference for the runner schema; the command does **not**
 read/redeem that secret or enroll again. Keep deployment's desired config in sync
 through its separately authorized workflow before re-enabling automation.
