@@ -9,6 +9,8 @@ const imageChoices = () => [...Object.entries(imageNames).map(([value,label]) =>
 const diskUsage = item => item.disk_bytes ? `${mib(item.disk_bytes / 1048576)} disk · ${item.disk_used_bytes == null ? 'use unknown' : mib(item.disk_used_bytes / 1048576) + ' used'}` : 'Disk size unavailable';
 const mib = value => value >= 1024 ? `${(value / 1024).toFixed(1)} GiB` : `${Math.round(value)} MiB`;
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
+// Refusals the server already words for people; shown without operation or retry-key detail.
+const plainRefusals = new Set(['fork_capacity', 'already_owner']);
 function notice(text, error = false) { $('notice').textContent = text; $('notice').className = `notice${error ? ' error' : ''}`; $('notice').hidden = !text; }
 async function api(path, body) {
   const response = await fetch(path, body ? {method: 'POST', headers: {'content-type': 'application/json', 'x-ow-request': 'dashboard'}, body: JSON.stringify(body)} : {});
@@ -16,7 +18,7 @@ async function api(path, body) {
   // Only a sign-in page (an auth redirect, 401 or 403) means the login expired; a proxy 5xx means the dashboard is busy or restarting.
   if (!kind.includes('application/json')) throw Error(response.status >= 500 ? `The server is not answering (HTTP ${response.status}); it may be busy or restarting. ${body ? 'Wait a moment, then try again.' : 'The page retries on its own.'}` : response.ok || response.status === 401 || response.status === 403 ? 'Your login may have expired. Reload the page to sign in again.' : `Unexpected response from the server (HTTP ${response.status}). Reload the page.`);
   const value = await response.json();
-  if (!response.ok || !value.ok) { const error = Error((value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : '')); error.operation = value.operation; throw error; }
+  if (!response.ok || !value.ok) { const error = Error(plainRefusals.has(value.error_code || value.operation?.error_code) ? value.error : (value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : '')); error.operation = value.operation; throw error; }
   return value.result;
 }
 let refreshError = null;

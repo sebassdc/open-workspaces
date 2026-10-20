@@ -81,6 +81,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Live fork's own capture labelled with the fork it was taken for | works | v0.9.26 | `snapshots.spec.mjs › fork from a running machine creates an independent child` |
 | Failed capture names its machine and when it failed | works | v0.9.26 | `snapshots.spec.mjs › a failed capture names its machine and when it failed` |
 | Fork and restore from the snapshot list | works | v0.9.22 | `snapshots.spec.mjs › fork and restore from the snapshot list` |
+| Fork refused for room names the parent runner and the fork's shape, without CLI hints | works | v0.9.28 | `snapshots.spec.mjs › fork refused for room on the parent runner says so plainly` |
 
 ## Sharing and previews
 
@@ -88,6 +89,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | --- | --- | --- | --- |
 | Share dialog, shared-with-me view, unshare | works | v0.9.22 | `sharing.spec.mjs › share dialog grants a teammate, who sees it under shared with me` |
 | Share dialog rejects an invalid email | works | v0.9.22 | `sharing.spec.mjs › share dialog refuses an invalid email` |
+| Share dialog refuses your own login in plain words | works | v0.9.28 | `sharing.spec.mjs › share dialog refuses your own login plainly` |
 | Publish and unpublish a port | partial | v0.9.22 | `previews.spec.mjs › publish port dialog publishes, links and unpublishes a preview`; `previews.spec.mjs › publish port is hidden when previews are not configured` |
 
 Previews need `tailscale serve` and a root-owned helper on the host, so the
@@ -115,17 +117,17 @@ dashboard.
 | CLI installer panel (hidden on tailnet sign-in) | partial | v0.9.22 | `states.spec.mjs › the tailnet dashboard offers no CLI installer` (the Access sign-in panel and its copy button are not covered) |
 | Phone width: no horizontal overflow, dialogs fit | works | v0.9.22 | `states.spec.mjs › narrow width › phone layout has no horizontal overflow and dialogs fit` |
 | Keyboard focus kept on the same card or button across the 5 s refresh | works | v0.9.25 | `focus.spec.mjs › focus stays on an action button and a machine card across a refresh`; `focus.spec.mjs › focus stays on a machine card when its disk usage changes`; `focus.spec.mjs › focus stays on the same port Unpublish when an earlier port goes away` |
-| Gateway error (502/504) says the server is not answering, clears on recovery | works | v0.9.28 | `dialogs.spec.mjs › a gateway error says the server is not answering, not that the login expired` |
-| No console errors on load and dialog open; name patterns compile | works | v0.9.28 | `dialogs.spec.mjs › no console errors on page load and dialog open` |
+| Gateway error (502/504) says the server is not answering, clears on recovery | works | v0.9.29 | `dialogs.spec.mjs › a gateway error says the server is not answering, not that the login expired` |
+| No console errors on load and dialog open; name patterns compile | works | v0.9.29 | `dialogs.spec.mjs › no console errors on page load and dialog open` |
 
 ## Dialogs and notices
 
 | Feature | Status | Last passed | Test |
 | --- | --- | --- | --- |
-| Invalid name refused in the browser, allowed characters named | works | v0.9.28 | `dialogs.spec.mjs › an invalid name is refused in the browser and names the allowed characters` |
-| Dialog shows its result and unlocks before the state reload answers | works | v0.9.28 | `dialogs.spec.mjs › a dialog unlocks with its result while the state reload is slow` |
-| Retry clears the previous error; busy label while it runs | works | v0.9.28 | `dialogs.spec.mjs › the snapshot dialog clears the last error and shows its progress` |
-| Cancelled dialog leaves no stale notice | works | v0.9.28 | `dialogs.spec.mjs › a refused operation leaves no notice behind once its dialog is cancelled` |
-| Result notice cleared on view or machine switch | works | v0.9.28 | `dialogs.spec.mjs › a result notice is cleared when the user switches view or machine` |
-| Command result not shown after leaving its view or machine mid-run | works | v0.9.28 | `dialogs.spec.mjs › a command result started elsewhere does not follow the user to another view or machine` |
-| Gateway error on an operation asks to try again | works | v0.9.28 | `dialogs.spec.mjs › a gateway error on an operation asks to try again, since an open dialog does not poll` |
+| Invalid name refused in the browser, allowed characters named | works | v0.9.29 | `dialogs.spec.mjs › an invalid name is refused in the browser and names the allowed characters` |
+| Dialog shows its result and unlocks before the state reload answers | works | v0.9.29 | `dialogs.spec.mjs › a dialog unlocks with its result while the state reload is slow` |
+| Retry clears the previous error; busy label while it runs | works | v0.9.29 | `dialogs.spec.mjs › the snapshot dialog clears the last error and shows its progress` |
+| Cancelled dialog leaves no stale notice | works | v0.9.29 | `dialogs.spec.mjs › a refused operation leaves no notice behind once its dialog is cancelled` |
+| Result notice cleared on view or machine switch | works | v0.9.29 | `dialogs.spec.mjs › a result notice is cleared when the user switches view or machine` |
+| Command result not shown after leaving its view or machine mid-run | works | v0.9.29 | `dialogs.spec.mjs › a command result started elsewhere does not follow the user to another view or machine` |
+| Gateway error on an operation asks to try again | works | v0.9.29 | `dialogs.spec.mjs › a gateway error on an operation asks to try again, since an open dialog does not poll` |

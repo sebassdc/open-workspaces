@@ -62,3 +62,22 @@ test('fork and restore from the snapshot list', async ({dashboard: page}) => {
   await page.getByRole('button', {name: /Machines/}).click();
   await expect(card(page, 'branch')).toContainText('Forked from base');
 });
+
+test('fork refused for room on the parent runner says so plainly', async ({dashboard: page}) => {
+  // The fake worker refuses forks of a 3 vCPU parent with its CPU reservation limit.
+  await api(page, {op: 'create', id: 'crowded', vcpu_count: 3, memory_mib: 512});
+  await api(page, {op: 'snapshot', id: 'crowded', name: 'crowded-saved'});
+  await page.reload();
+  const refusal = 'This host has no room for a 3 vCPU / 512 MiB fork. Forks stay on the parent machine\'s runner; free capacity there (hibernate or stop a machine) and try again.';
+  await card(page, 'crowded').click();
+  await detailAction(page, 'Fork').click();
+  await page.getByLabel('New machine name').fill('crowded-child');
+  await page.getByRole('button', {name: 'Create fork'}).click();
+  await expect(page.locator('#dialog-error')).toHaveText(refusal);
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', {name: /Snapshots/}).click();
+  await page.locator('.snapshot-row', {hasText: 'crowded-saved'}).getByRole('button', {name: 'Fork a machine'}).click();
+  await page.getByLabel('New machine name').fill('crowded-branch');
+  await page.getByRole('button', {name: 'Create fork'}).click();
+  await expect(page.locator('#dialog-error')).toHaveText(refusal);
+});
