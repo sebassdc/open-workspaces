@@ -83,7 +83,12 @@ fn overcommit() -> u32 {
 /// What box admission may claim on this host, whatever the configured budgets: RAM less
 /// the reserve, and logical CPUs less the reserve times the ratio.
 fn capacity() -> (u32, u32) {
+    #[cfg(not(test))]
     static HOST: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    // Unit fixtures must not depend on the machine running them; the math is tested apart.
+    #[cfg(test)]
+    let (memory, cpus) = (1u64 << 20, 64);
+    #[cfg(not(test))]
     let (memory, cpus) = *HOST.get_or_init(|| {
         let memory = fs::read_to_string("/proc/meminfo")
             .ok()
