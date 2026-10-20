@@ -1,0 +1,12 @@
+#!/usr/bin/env node
+// Stand-in for `tailscale whois --json PEER`: the TLS proxy (our `tailscale serve`)
+// gives each test user its own loopback peer address and records it here.
+const [, , command, , peer] = process.argv;
+const users = JSON.parse(require('node:fs').readFileSync(process.env.OW_E2E_WHOIS, 'utf8'));
+const user = users[peer];
+if (command !== 'whois' || !user) process.exit(1);
+process.stdout.write(JSON.stringify({
+  UserProfile: {ID: user.id, LoginName: user.login},
+  Node: {Tags: null},
+  CapMap: {'example.com/cap/open-workspaces': [{}]},
+}));
