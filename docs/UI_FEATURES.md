@@ -48,7 +48,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Refused create shown in the dialog | works | v0.9.22 | `machines.spec.mjs › create dialog shows a refused create and stays open` |
 | Rename in place, selection and console history follow | works | v0.9.22 | `machines.spec.mjs › rename keeps the machine selected under its new name` |
 | Navigation and resource usage view | works | v0.9.22 | `machines.spec.mjs › navigation switches between machines, snapshots and usage` |
-| Signed-in account shown in the top bar | missing | — | The page reads `user` from `/api/state`, which the API does not return, so it always shows "Your account"; the login is available at `discovery.identity.email`. |
+| Signed-in account shown in the top bar | works | v0.9.22 | `machines.spec.mjs › top bar shows the signed-in account` |
 
 ## Lifecycle
 
@@ -103,4 +103,5 @@ dashboard.
 | Worker outage error, recovery on refresh | works | v0.9.22 | `states.spec.mjs › worker outage shows an error and recovers on refresh` |
 | Expired login message | works | v0.9.22 | `states.spec.mjs › expired login asks the user to reload and sign in` |
 | CLI installer panel (hidden on tailnet sign-in) | partial | v0.9.22 | `states.spec.mjs › the tailnet dashboard offers no CLI installer` (the Access sign-in panel and its copy button are not covered) |
+| Sidebar CLI download link (hidden on tailnet sign-in) | partial | v0.9.22 | `states.spec.mjs › the tailnet dashboard hides the sidebar CLI download` (the link shown where the binary is served is not covered) |
 | Phone width: no horizontal overflow, dialogs fit | works | v0.9.22 | `states.spec.mjs › narrow width › phone layout has no horizontal overflow and dialogs fit` |

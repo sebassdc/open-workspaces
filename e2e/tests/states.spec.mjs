@@ -27,6 +27,12 @@ test('the tailnet dashboard offers no CLI installer', async ({dashboard: page}) 
   await expect(page.locator('#cli-install')).toBeHidden();
 });
 
+test('the tailnet dashboard hides the sidebar CLI download', async ({dashboard: page}) => {
+  // Tailnet sign-in serves no CLI binary, so the link would download a 404 page.
+  expect((await page.request.head('/cli/ow-linux-amd64')).ok()).toBe(false);
+  await expect(page.getByRole('link', {name: /Download CLI/})).toBeHidden();
+});
+
 test.describe('narrow width', () => {
   test.use({viewport: {width: 390, height: 844}, isMobile: true, hasTouch: true});
 

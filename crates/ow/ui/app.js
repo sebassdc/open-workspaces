@@ -31,7 +31,8 @@ function durability(item) {
 function machine() { return [...data.workspaces, ...(data.shared || [])].find(item => item.id === selected); }
 function setView(next) { view = next; for (const id of ['machines', 'snapshots', 'usage']) $(id + '-view').hidden = id !== view; document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view)); const names = {machines: ['Your machines.', 'A place to build, experiment, and pick up where you left off.', 'Machines'], snapshots: ['Pick up from here.', 'Saved memory and disk state, ready to restore or fork.', 'Snapshots'], usage: ['Room to grow.', 'See what your machines use, and free capacity when you need it.', 'Resource usage']}; $('page-title').textContent = names[view][0]; $('page-description').textContent = names[view][1]; $('breadcrumb').textContent = 'Your sandbox / ' + names[view][2]; }
 function render() {
-  if (data.user) { $('account-email').textContent = data.user.email; $('account-avatar').textContent = data.user.email.slice(0,1).toUpperCase(); }
+  const email = data.discovery?.identity?.email;
+  if (email) { $('account-email').textContent = email; $('account-avatar').textContent = email.slice(0,1).toUpperCase(); }
   if (!selected && data.workspaces.length) selected = data.workspaces[0].id;
   if (selected && !machine()) selected = null;
   const running = data.workspaces.filter(item => item.state === 'running').length, stats = data.stats;
@@ -183,6 +184,8 @@ $('cli-command').textContent = installCommand;
 $('cli-login').textContent = `ow login ${location.origin}`;
 // Tailnet sign-in serves no CLI installer: the CLI signs in through Access only.
 fetch('/cli/install.sh', {cache: 'no-store'}).then(r => { if (!r.ok) $('cli-install').hidden = true; }).catch(() => { $('cli-install').hidden = true; });
+// Hidden until the server confirms it serves the binary, so the link never downloads a 404 page.
+fetch('/cli/ow-linux-amd64', {method: 'HEAD', cache: 'no-store'}).then(r => { $('cli-download').hidden = !r.ok; }).catch(() => {});
 $('copy-install').addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(installCommand); $('copy-install').textContent = 'Copied'; setTimeout(() => { $('copy-install').textContent = 'Copy command'; }, 2000); }
   catch { notice('Select the install command and copy it to your terminal.'); }
