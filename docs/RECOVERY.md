@@ -140,18 +140,19 @@ read whole and checked against their whole-file hashes.
 
 ### Chunk index and resumed runs
 
-The uploader keeps the chunk hashes the store holds in
-`RUNNER/recovery-index/STORE_IDENTITY.chunks`: every chunk it uploaded, or found
-already stored, is appended as soon as the store confirms it. Known chunks need
-no request. A run killed or failed midway therefore resumes: the next run sends
-only chunks still missing, then the manifest. The index is rebuilt from a listing
-of `PREFIX/chunks/` (16 listings in parallel) when it is missing or a day old, so
-anything else that deleted chunks is noticed within a day; nothing in Open
-Workspaces deletes chunks. A lost index entry costs one conditional upload that
-finds the chunk stored. Each run prints, per point, what the capture read
-(`capture`: chunks read, reused, holes, bytes read) and what the upload sent
-(`transfer`: chunks, zero, new, uploaded, bytes uploaded and read, index source,
-seconds).
+Before each point the uploader lists `PREFIX/chunks/` (16 listings in parallel,
+1000 keys per request) and takes that listing, not any local memory, as what the
+store holds. It records the listing in `RUNNER/recovery-index/STORE_IDENTITY.chunks`
+and appends each chunk as soon as the store confirms it. No chunk is checked with
+its own request. A run killed or failed midway therefore resumes: the next run
+sends only chunks still missing, then the manifest. A chunk removed from the store
+by anything else is sent again before a new manifest names it, and a point whose
+manifest is already stored has any missing chunks sent again from its sealed
+files (`index_dropped` counts recorded chunks the listing no longer shows).
+Nothing in Open Workspaces deletes chunks. Each run prints, per point, what the
+capture read (`capture`: chunks read, reused, holes, bytes read) and what the
+upload sent (`transfer`: chunks, zero, new, uploaded, bytes uploaded and read,
+already_stored, index_dropped, seconds).
 
 Managed points use the existing internal `sleep-` namespace, so an older worker
 still excludes them from named-snapshot admission after rollback.

@@ -59,5 +59,10 @@ had stored 53 chunk objects and no manifest. The next run (after the documented
 one-minute retry wait) reused the sealed point, uploaded only the remaining 444
 chunks in 11.5 s wall time, and committed the manifest.
 
+The measured build (commit `7c5856d`) trusted its local chunk index for a day.
+The released change instead lists the store's chunks before every point (for this
+store, 16 parallel listing requests of about 340 keys each); that listing was not
+timed here.
+
 Not measured: a full restore onto a second runner (needs a second worker), restore
 time, many boxes per run, slower volumes or networks, and a non-reflink filesystem.

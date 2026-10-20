@@ -1161,7 +1161,7 @@ pub fn agent(
     };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
     #[cfg(target_os = "linux")]
-    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true,"disk_resize_v1":status["disk_resize_v1"]==true});
+    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true,"disk_resize_v1":status["disk_resize_v1"]==true,"snapshot_delete_v1":status["snapshot_delete_v1"]==true});
     #[cfg(target_os = "macos")]
     let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
@@ -1261,6 +1261,7 @@ pub fn agent(
                     #[cfg(target_os = "linux")]
                     cache_extension(&mut beat, &status, root, cache_negotiated)?;
                     beat["disk_resize_v1"] = json!(status["disk_resize_v1"] == true);
+                    beat["snapshot_delete_v1"] = json!(status["snapshot_delete_v1"] == true);
                     #[cfg(target_os = "linux")]
                     {
                         beat["move_fork_v1"] = json!(
@@ -1443,6 +1444,7 @@ fn agent_job(
             "put",
             "get",
             "snapshot",
+            "snapshot-delete",
             "fork",
             "restore",
             "hibernate",
@@ -1481,6 +1483,9 @@ fn agent_job(
             checked["cache_eviction_v1"] == true,
             "worker lacks cache eviction support"
         );
+    }
+    if op == "snapshot-delete" {
+        common::node_operation(&checked, op)?;
     }
     #[cfg(target_os = "linux")]
     let _drain_guard = crate::drain::job_guard(root, &request)?;

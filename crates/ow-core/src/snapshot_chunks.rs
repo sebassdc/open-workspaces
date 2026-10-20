@@ -2,9 +2,10 @@
 //! overwritten or deleted here. No chain of older recovery points is required.
 //!
 //! A run sends only chunks the store lacks, in parallel and in process. What the
-//! store holds comes from a local index per store (every chunk this runner
-//! uploaded or listed), rebuilt from a listing when missing or a day old, so
-//! known chunks need no request and a killed run resumes where it stopped.
+//! store holds comes from one parallel listing per upload, never from per-chunk
+//! requests or local memory alone: a killed run resumes where it stopped, and a
+//! chunk removed from the store is sent again before any manifest names it. The
+//! local index records that listing and each upload.
 use super::http::Http;
 use super::*;
 use crate::snapshot_digest::{CHUNK, CHUNKS_V1, Chunk, check, read_sidecar, root, zero_hash};
@@ -17,7 +18,6 @@ use std::sync::{
 
 const MAX_MANIFEST: u64 = 32 << 20;
 const TRANSFERS: usize = 8;
-const RECONCILE_SECONDS: u64 = 24 * 3600;
 const INDEX_HEADER: &str = "ow-chunk-index-v1";
 
 impl S3Store {
@@ -99,12 +99,12 @@ impl S3Store {
         );
         let http = self.http()?;
         let manifest_key = format!("{}{name}/manifest.json", http.prefix);
-        if http.exists(&manifest_key)? {
+        let stored = http.exists(&manifest_key)?;
+        if stored {
             ensure!(
                 public_manifest(http, &manifest_key)? == manifest,
                 "store already has a different snapshot named {name}"
             );
-            return Ok(json!({"already_stored":true}));
         }
         let mut bytes_read = 0;
         let files: BTreeMap<String, Vec<Chunk>> = match manifest["digest"].as_str() {
@@ -153,15 +153,16 @@ impl S3Store {
                 offset += chunk.length as u64;
             }
         }
+        // A stored manifest whose chunks went missing is repaired from the same bytes.
         let sent = upload(http, directory, &needed, &index)?;
-        let mut stored = manifest.clone();
-        stored["ow_chunks_v2"] = serde_json::to_value(&files)?;
-        let body = serde_json::to_vec(&stored)?;
+        let mut descriptor = manifest.clone();
+        descriptor["ow_chunks_v2"] = serde_json::to_value(&files)?;
+        let body = serde_json::to_vec(&descriptor)?;
         ensure!(
             body.len() as u64 <= MAX_MANIFEST,
             "snapshot exceeds chunk index limit"
         );
-        if !http.put_new(&manifest_key, body)? {
+        if !stored && !http.put_new(&manifest_key, body)? {
             ensure!(
                 public_manifest(http, &manifest_key)? == manifest,
                 "concurrent different snapshot named {name}"
@@ -174,7 +175,8 @@ impl S3Store {
             "uploaded": sent.created,
             "bytes_uploaded": sent.bytes,
             "bytes_read": bytes_read + sent.read,
-            "index": index.source,
+            "already_stored": stored,
+            "index_dropped": index.dropped,
             "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
         }))
     }
@@ -386,54 +388,43 @@ fn parallel(count: usize, job: impl Fn(usize) -> Result<()> + Sync) -> Result<()
 struct Index {
     known: Mutex<HashSet<String>>,
     log: Option<Mutex<File>>,
-    source: &'static str,
+    /// Entries the local record had that the store no longer holds.
+    dropped: usize,
 }
 
 impl Index {
     fn open(directory: Option<&Path>, identity: &str, http: &Http) -> Result<Self> {
-        let now = crate::recovery::now();
         let path = directory.map(|d| d.join(format!("{identity}.chunks")));
-        if let Some(path) = &path
-            && let Ok(text) = fs::read_to_string(path)
-        {
-            let mut lines = text.lines();
-            let fresh = lines
-                .next()
-                .and_then(|h| h.strip_prefix(INDEX_HEADER)?.trim().parse::<u64>().ok())
-                .is_some_and(|at| at <= now && now - at < RECONCILE_SECONDS);
-            if fresh {
-                // A torn final line from a killed run is simply not trusted.
-                let known = lines.filter(|l| valid_hash(l)).map(str::to_owned).collect();
-                let log = OpenOptions::new().append(true).open(path)?;
-                return Ok(Self {
-                    known: Mutex::new(known),
-                    log: Some(Mutex::new(log)),
-                    source: "local",
-                });
-            }
-        }
         let known = listed(http)?;
-        let log = match &path {
-            Some(path) => {
-                fs::create_dir_all(path.parent().unwrap())?;
-                let staging = path.with_extension(format!("tmp-{}", crate::common::nonce()?));
-                let mut file = private_file(&staging)?;
-                let mut text = format!("{INDEX_HEADER} {now}\n");
-                for hash in &known {
-                    text.push_str(hash);
-                    text.push('\n');
-                }
-                file.write_all(text.as_bytes())?;
-                file.sync_all()?;
-                fs::rename(&staging, path)?;
-                Some(Mutex::new(OpenOptions::new().append(true).open(path)?))
-            }
-            None => None,
+        let Some(path) = path else {
+            return Ok(Self {
+                known: Mutex::new(known),
+                log: None,
+                dropped: 0,
+            });
         };
+        let dropped = fs::read_to_string(&path)
+            .map(|text| {
+                text.lines()
+                    .filter(|l| valid_hash(l) && !known.contains(*l))
+                    .count()
+            })
+            .unwrap_or(0);
+        fs::create_dir_all(path.parent().unwrap())?;
+        let staging = path.with_extension(format!("tmp-{}", crate::common::nonce()?));
+        let mut file = private_file(&staging)?;
+        let mut text = format!("{INDEX_HEADER} {}\n", crate::recovery::now());
+        for hash in &known {
+            text.push_str(hash);
+            text.push('\n');
+        }
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&staging, &path)?;
         Ok(Self {
             known: Mutex::new(known),
-            log,
-            source: "listed",
+            log: Some(Mutex::new(OpenOptions::new().append(true).open(&path)?)),
+            dropped,
         })
     }
 

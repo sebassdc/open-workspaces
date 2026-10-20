@@ -208,7 +208,7 @@ fn killed_runs_resume_and_lost_indexes_reconcile(root: &Path, store: &S3Store) {
     // Six new disk chunks (state and memory are stored already); the killed run sent two.
     assert_eq!(resumed["new"], 4, "{resumed}");
     assert_eq!(resumed["uploaded"], 4, "{resumed}");
-    assert_eq!(resumed["index"], "local");
+    assert_eq!(resumed["index_dropped"], 0);
 
     // A runner that lost its index lists the store instead of resending.
     fs::remove_dir_all(root.join("index")).unwrap();
@@ -223,11 +223,42 @@ fn killed_runs_resume_and_lost_indexes_reconcile(root: &Path, store: &S3Store) {
     .incremental()
     .index(&root.join("index"));
     let report = fresh.push("big2", &root.join("big2")).unwrap();
-    assert_eq!(report["index"], "listed", "{report}");
     assert_eq!(report["new"], 1, "{report}");
     let back = root.join("big2-restored");
     fresh.pull("big2", &back).unwrap();
     assert_eq!(fs::read(back.join("disk.ext4")).unwrap(), changed);
+
+    // A chunk removed from the store behind the index's back is never trusted:
+    // a new point sends it again before its manifest names it ...
+    let remote = root.join("bucket/snapshots");
+    let descriptor: Value =
+        serde_json::from_slice(&fs::read(remote.join("big2/manifest.json")).unwrap()).unwrap();
+    let hash = descriptor["ow_chunks_v2"]["disk.ext4"][3]["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let chunk = remote.join(format!("chunks/{hash}.zst"));
+    fs::remove_file(&chunk).unwrap();
+    capture(&root.join("big3"), "big3", &changed);
+    let report = fresh.push("big3", &root.join("big3")).unwrap();
+    assert_eq!(
+        (&report["uploaded"], &report["index_dropped"]),
+        (&json!(1), &json!(1)),
+        "{report}"
+    );
+    let back = root.join("big3-restored");
+    fresh.pull("big3", &back).unwrap();
+    assert_eq!(fs::read(back.join("disk.ext4")).unwrap(), changed);
+    // ... and a stored point that lost one is repaired from the same sealed bytes.
+    fs::remove_file(&chunk).unwrap();
+    assert!(fresh.pull("big2", &root.join("big2-broken")).is_err());
+    let report = fresh.push("big2", &root.join("big2")).unwrap();
+    assert_eq!(
+        (&report["already_stored"], &report["uploaded"]),
+        (&json!(true), &json!(1)),
+        "{report}"
+    );
+    fresh.pull("big2", &root.join("big2-repaired")).unwrap();
 }
 
 /// A worker-sealed point is sent from its chunk sidecar; bytes are still checked.
