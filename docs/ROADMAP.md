@@ -223,6 +223,21 @@ Gate: end-to-end automation survives sleeping guests and service restarts, uses 
   See [disk semantics and acceptance](DISKS.md). Local filesystem and unit
   acceptance is separate from the dedicated KVM rollout check.
 
+## Configuration debt
+
+The controller is the single source of configuration and state (see
+[contributing](../CONTRIBUTING.md#configuration-the-controller-is-the-single-source)).
+These settings are still deploy-only inputs of the `deploy/aws/` component
+or set per runner. Each moves to controller-held, versioned configuration that
+changes with one command and reaches runners without a redeploy, as laid out
+in the config-architecture design.
+
+- [ ] Per runner: `vcpuOvercommit`, `hostReserveCpuMillis`,
+  `hostReserveMemoryMib` and `imageArtifacts` on each Runner.
+- [ ] Deploy-only on the Host: `idleMinutes`, `recoveryPoints`,
+  `backupSchedule`, `developerImages`, `imageArtifacts`, `dashboardLogins`,
+  `poolAdmins` and `storeGc`.
+
 ## Release discipline
 
 - Track capability completion by WS IDs in RESEARCH.md.
