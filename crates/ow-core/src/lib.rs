@@ -17,6 +17,8 @@ pub mod connect;
 pub mod credential_broker;
 #[cfg(target_os = "linux")]
 pub mod disk;
+#[cfg(test)]
+mod fake_s3;
 pub mod idle;
 #[cfg(target_os = "linux")]
 pub mod network;

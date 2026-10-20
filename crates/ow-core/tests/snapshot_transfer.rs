@@ -36,15 +36,13 @@ fn capture(dir: &Path, name: &str, disk: &[u8]) {
 
 #[test]
 fn incremental_retry_integrity_and_legacy_restore() {
-    // Each child has its own PATH; parallel tests never mutate process environment.
+    // Each child has its own environment; parallel tests never mutate this process's.
     if std::env::var_os("OW_STORE_CHILD").is_none() {
         let root =
             std::env::temp_dir().join(format!("ow-transfer-{}", ow_core::common::nonce().unwrap()));
         fs::create_dir(&root).unwrap();
         let bin = root.join("bin");
         fs::create_dir(&bin).unwrap();
-        fs::write(bin.join("aws"), include_bytes!("fake_aws.py")).unwrap();
-        fs::set_permissions(bin.join("aws"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(bin.join("s3"), include_bytes!("fake_s3.py")).unwrap();
         let mut server = Command::new("python3")
             .arg(bin.join("s3"))
@@ -62,10 +60,13 @@ fn incremental_retry_integrity_and_legacy_restore() {
                 "incremental_retry_integrity_and_legacy_restore",
                 "--nocapture",
             ])
-            .env(
-                "PATH",
-                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
-            )
+            // The SDK's credential chain finds fixture keys first; no profile, no instance role.
+            .env("AWS_ACCESS_KEY_ID", "AKIDFIXTURE")
+            .env("AWS_SECRET_ACCESS_KEY", "fixture")
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_CONFIG_FILE", root.join("no-config"))
+            .env("AWS_SHARED_CREDENTIALS_FILE", root.join("no-credentials"))
+            .env("AWS_EC2_METADATA_DISABLED", "true")
             .env("OW_STORE_CHILD", "1")
             .env("OW_TEST_STORE", &root)
             .env(
@@ -81,6 +82,18 @@ fn incremental_retry_integrity_and_legacy_restore() {
         return;
     }
     let root = std::path::PathBuf::from(std::env::var_os("OW_TEST_STORE").unwrap());
+    if std::env::var_os("OW_KILL_UPLOAD").is_some() {
+        let endpoint = std::env::var("OW_TEST_ENDPOINT").unwrap();
+        let store = S3Store::new("s3://bucket/snapshots", Some(&endpoint))
+            .unwrap()
+            .incremental()
+            .index(&root.join("kill-index"));
+        store
+            .upload_unsealed(&root.join("abrupt"), None)
+            .unwrap()
+            .unwrap();
+        panic!("upload was meant to be killed while blocked");
+    }
     let endpoint = std::env::var("OW_TEST_ENDPOINT").unwrap();
     let store = S3Store::new("s3://bucket/snapshots", Some(&endpoint))
         .unwrap()
@@ -124,13 +137,6 @@ fn incremental_retry_integrity_and_legacy_restore() {
     store.push("two", &root.join("two")).unwrap();
     assert_eq!(count_puts(), 5, "retry reuploaded chunks");
     assert_eq!(calls("HEAD"), 0, "checked chunks one request at a time");
-    assert!(
-        fs::read_to_string(root.join("calls.jsonl"))
-            .unwrap()
-            .lines()
-            .all(|l| !l.contains("put-object") && !l.contains("head-object")),
-        "spawned a CLI process per object"
-    );
     let remote = root.join("bucket/snapshots");
     let descriptor: Value =
         serde_json::from_slice(&fs::read(remote.join("two/manifest.json")).unwrap()).unwrap();
@@ -180,8 +186,9 @@ fn incremental_retry_integrity_and_legacy_restore() {
     let broken = root.join("broken");
     assert!(store.pull("two", &broken).is_err());
     assert!(!broken.exists());
-    killed_runs_resume_and_lost_indexes_reconcile(&root, &store);
+    failed_runs_resume_and_lost_indexes_reconcile(&root, &store);
     chunk_seals_transfer_without_rereading(&root, &store);
+    abruptly_killed_upload_resumes(&root);
     println!(
         "Observed: first capture 4 nonzero chunks; one changed disk chunk added 1; interrupted commit + replay added 0; no chunk HEAD requests; second-runner bytes and legacy reads verified."
     );
@@ -197,7 +204,7 @@ fn distinct(count: usize, salt: u8) -> Vec<u8> {
     disk
 }
 
-fn killed_runs_resume_and_lost_indexes_reconcile(root: &Path, store: &S3Store) {
+fn failed_runs_resume_and_lost_indexes_reconcile(root: &Path, store: &S3Store) {
     let disk = distinct(6, 7);
     capture(&root.join("big"), "big", &disk);
     fs::write(root.join("put-budget"), "2").unwrap();
@@ -205,7 +212,7 @@ fn killed_runs_resume_and_lost_indexes_reconcile(root: &Path, store: &S3Store) {
     fs::remove_file(root.join("put-budget")).unwrap();
     assert!(!store.list().unwrap().contains(&"big".to_owned()));
     let resumed = store.push("big", &root.join("big")).unwrap();
-    // Six new disk chunks (state and memory are stored already); the killed run sent two.
+    // Six new disk chunks (state and memory are stored already); the failed run sent two.
     assert_eq!(resumed["new"], 4, "{resumed}");
     assert_eq!(resumed["uploaded"], 4, "{resumed}");
     assert_eq!(resumed["index_dropped"], 0);
@@ -273,9 +280,13 @@ fn chunk_seals_transfer_without_rereading(root: &Path, store: &S3Store) {
     ] {
         fs::write(dir.join(file), data).unwrap();
     }
-    let (files, _) =
-        ow_core::snapshot_digest::seal_directory(&dir, &ow_core::snapshot_store::DATA_FILES, None)
-            .unwrap();
+    let (files, _) = ow_core::snapshot_digest::seal_directory(
+        &dir,
+        &ow_core::snapshot_store::DATA_FILES,
+        None,
+        ow_core::snapshot_digest::CHUNKS_V1,
+    )
+    .unwrap();
     let manifest = json!({"name":"sealed","workspace":"box","files":files,"digest":ow_core::snapshot_digest::CHUNKS_V1});
     fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
     // Bytes changed after sealing are never sent under the sealed hash.
@@ -308,4 +319,72 @@ fn chunk_seals_transfer_without_rereading(root: &Path, store: &S3Store) {
     assert_eq!(fs::read(back.join("disk.ext4")).unwrap(), original);
     let public: Value = serde_json::from_slice(&store.manifest("sealed").unwrap()).unwrap();
     assert_eq!(public, manifest);
+}
+
+/// Kill after the store has committed a chunk but before answering that PUT.
+fn abruptly_killed_upload_resumes(root: &Path) {
+    capture(&root.join("abrupt"), "abrupt", &distinct(6, 19));
+    fs::write(root.join("pause-after-put"), "").unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "incremental_retry_integrity_and_legacy_restore",
+            "--nocapture",
+        ])
+        .env("OW_KILL_UPLOAD", "1")
+        .env("OW_S3_TRANSFERS", "1")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !fs::read_to_string(root.join("put-paused")).is_ok_and(|key| !key.is_empty()) {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "uploader exited before kill"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "uploader did not reach committed PUT"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let committed = fs::read_to_string(root.join("put-paused")).unwrap();
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    fs::remove_file(root.join("pause-after-put")).unwrap();
+    let endpoint = std::env::var("OW_TEST_ENDPOINT").unwrap();
+    let store = S3Store::new("s3://bucket/snapshots", Some(&endpoint))
+        .unwrap()
+        .incremental()
+        .index(&root.join("kill-index"));
+    assert!(!store.list().unwrap().contains(&"abrupt".into()));
+    let directory = root.join("abrupt");
+    let (sealed, sent) = store.upload_unsealed(&directory, None).unwrap().unwrap();
+    assert_eq!(
+        sent["uploaded"], 1,
+        "only the other disk chunk should be sent: {sent}"
+    );
+    let puts = fs::read_to_string(root.join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
+        .filter(|call| call[1] == "PUT" && call[2] == committed)
+        .count();
+    assert_eq!(
+        puts, 1,
+        "resent the chunk committed just before process death"
+    );
+    ow_core::snapshot_digest::write_sidecar(&directory, &sealed).unwrap();
+    let manifest = json!({"name":"abrupt","workspace":"box",
+        "files":ow_core::snapshot_digest::roots(&sealed),
+        "digest":ow_core::snapshot_digest::CHUNKS_V2});
+    fs::write(directory.join("manifest.json"), manifest.to_string()).unwrap();
+    assert_eq!(store.push("abrupt", &directory).unwrap()["bytes_read"], 0);
+    let restored = root.join("abrupt-restored");
+    store.pull("abrupt", &restored).unwrap();
+    for file in ow_core::snapshot_store::DATA_FILES {
+        assert_eq!(
+            fs::read(restored.join(file)).unwrap(),
+            fs::read(root.join("abrupt").join(file)).unwrap()
+        );
+    }
 }

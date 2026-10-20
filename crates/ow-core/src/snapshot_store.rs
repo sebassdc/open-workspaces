@@ -11,11 +11,11 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::OnceLock,
 };
 
@@ -32,16 +32,31 @@ pub trait SnapshotStore {
     /// Downloads `name` into `directory`, which must not exist yet. Every file is
     /// checked against the stored manifest; on any failure `directory` is removed.
     fn pull(&self, name: &str, directory: &Path) -> Result<()>;
+    /// Whether [`Self::upload_unsealed`] works for this store.
+    fn seals_while_uploading(&self) -> bool {
+        false
+    }
+    /// Seals a capture its worker left unsealed while sending the chunks the store
+    /// lacks (each byte read once), for the worker to commit before [`Self::push`].
+    /// None when this store cannot.
+    #[allow(clippy::type_complexity)]
+    fn upload_unsealed(
+        &self,
+        _directory: &Path,
+        _previous: Option<&Path>,
+    ) -> Option<Result<(BTreeMap<String, crate::snapshot_digest::Sealed>, Value)>> {
+        None
+    }
 }
 
-/// S3 or an S3-compatible store (MinIO, R2), with the AWS CLI's usual
-/// credential chain. Chunk transfers sign their requests in process.
+/// S3 or an S3-compatible store (MinIO, R2), through the AWS SDK for Rust and
+/// its usual credential chain.
 pub struct S3Store {
     url: String,
     endpoint: Option<String>,
     incremental: bool,
     index: Option<PathBuf>,
-    http: OnceLock<http::Http>,
+    http: OnceLock<std::sync::Arc<http::Http>>,
     retention: OnceLock<()>,
 }
 
@@ -82,50 +97,45 @@ impl S3Store {
     fn push_full(&self, name: &str, directory: &Path) -> Result<Value> {
         crate::common::identifier(name)?;
         let manifest = read_manifest(&directory.join("manifest.json"), name)?;
+        let http = self.http()?;
         for file in DATA_FILES {
-            let mut source = File::open(directory.join(file))?;
-            let size = source.metadata()?.len();
-            let mut child = self
-                .aws()
-                .args(["s3", "cp", "--only-show-errors", "-"])
-                .arg(self.key(name, &format!("{file}.zst")))
-                // Multipart part sizes for streams larger than 50 GB.
-                .args(["--expected-size", &size.to_string()])
-                .stdin(Stdio::piped())
-                .spawn()
-                .context("the AWS CLI (aws) is required for snapshot stores")?;
             let mut hasher = Sha256::new();
-            let encoded = (|| -> Result<()> {
-                let mut encoder = zstd::Encoder::new(child.stdin.take().unwrap(), 3)?;
-                let mut buffer = vec![0; 1 << 20];
-                loop {
-                    let n = source.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..n]);
-                    encoder.write_all(&buffer[..n])?;
-                }
-                encoder.finish()?;
-                Ok(())
-            })();
-            let uploaded = finished(child, &format!("uploading {file}"));
-            encoded?;
-            uploaded?;
+            let source = Hashing {
+                input: File::open(directory.join(file))?,
+                hash: &mut hasher,
+            };
+            let mut encoder = zstd::stream::read::Encoder::new(source, 3)?;
+            http.put_stream(
+                &self.object(name, &format!("{file}.zst")),
+                &mut encoder,
+                http::RANGE,
+                false,
+            )
+            .with_context(|| format!("uploading {file}"))?;
+            drop(encoder);
             // The bytes sent are the sealed bytes.
             ensure!(
                 manifest["files"][file] == hex(&hasher.finalize()),
                 "snapshot {name}: {file} does not match its manifest"
             );
         }
-        let status = self
-            .aws()
-            .args(["s3", "cp", "--only-show-errors"])
-            .arg(directory.join("manifest.json"))
-            .arg(self.key(name, "manifest.json"))
-            .status()?;
-        ensure!(status.success(), "uploading manifest failed ({status})");
+        http.put_stream(
+            &self.object(name, "manifest.json"),
+            &mut File::open(directory.join("manifest.json"))?,
+            http::RANGE,
+            false,
+        )
+        .context("uploading manifest")?;
         Ok(Value::Null)
+    }
+
+    /// Once per process: a run checks the bucket's retention once, not once per box.
+    fn retention(&self) -> Result<()> {
+        if self.retention.get().is_none() {
+            self.check_recovery_retention()?;
+            let _ = self.retention.set(());
+        }
+        Ok(())
     }
 
     /// Opt-in chunk format for managed recovery. Existing manual backups keep
@@ -141,12 +151,12 @@ impl S3Store {
         self
     }
 
-    fn http(&self) -> Result<&http::Http> {
+    fn http(&self) -> Result<std::sync::Arc<http::Http>> {
         if let Some(http) = self.http.get() {
-            return Ok(http);
+            return Ok(http.clone());
         }
-        let _ = self.http.set(http::Http::new(self)?);
-        Ok(self.http.get().unwrap())
+        let _ = self.http.set(std::sync::Arc::new(http::Http::new(self)?));
+        Ok(self.http.get().unwrap().clone())
     }
 
     pub fn identity(&self) -> String {
@@ -155,79 +165,94 @@ impl S3Store {
         ))
     }
 
-    fn key(&self, name: &str, file: &str) -> String {
-        format!("{}/{name}/{file}", self.url)
-    }
-
-    /// The AWS CLI with only the checked endpoint: it would otherwise also read
-    /// AWS_ENDPOINT_URL* and a profile's `endpoint_url`, which are never checked.
-    pub fn aws(&self) -> Command {
-        aws(self.endpoint.as_deref())
-    }
-
-    fn get(&self, key: &str) -> Result<std::process::Child> {
-        self.aws()
-            .args(["s3", "cp", "--only-show-errors", key, "-"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .context("the AWS CLI (aws) is required for snapshot stores")
-    }
-}
-
-fn aws(endpoint: Option<&str>) -> Command {
-    let mut command = Command::new("aws");
-    command.env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true");
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("AWS_ENDPOINT_URL") {
-            command.env_remove(name);
+    /// The object key of `file` of snapshot `name`.
+    fn object(&self, name: &str, file: &str) -> String {
+        let path = self.url.strip_prefix("s3://").unwrap_or_default();
+        match path.split_once('/') {
+            Some((_, prefix)) => format!("{prefix}/{name}/{file}"),
+            None => format!("{name}/{file}"),
         }
     }
-    if let Some(endpoint) = endpoint {
-        command.args(["--endpoint-url", endpoint]);
+
+    /// The key under this store's bucket that `url` (`s3://bucket/key`) names.
+    fn same_bucket<'a>(&self, url: &'a str) -> Result<&'a str> {
+        let bucket = self.url["s3://".len()..]
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        url.strip_prefix("s3://")
+            .and_then(|rest| rest.strip_prefix(bucket))
+            .and_then(|rest| rest.strip_prefix('/').or((rest.is_empty()).then_some(rest)))
+            .with_context(|| format!("{url} is not in this store's bucket"))
     }
-    command
+
+    /// (Last modified, key) of every object under `url` in this store's bucket.
+    pub fn objects(&self, url: &str) -> Result<Vec<(i64, String)>> {
+        let prefix = self.same_bucket(url.trim_end_matches('/'))?;
+        let prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}/")
+        };
+        Ok(self
+            .http()?
+            .list(&prefix)?
+            .into_iter()
+            .map(|o| (o.modified, o.key))
+            .collect())
+    }
+
+    /// Downloads the object `url` (in this store's bucket) into a new private file.
+    pub fn download(&self, url: &str, path: &Path) -> Result<()> {
+        let key = self.same_bucket(url)?;
+        let mut reader = self.http()?.reader(key)?;
+        let mut output = private_file(path)?;
+        std::io::copy(&mut reader, &mut output)?;
+        output.sync_all()?;
+        Ok(())
+    }
 }
 
-fn finished(child: std::process::Child, what: &str) -> Result<()> {
-    let output = child.wait_with_output()?;
-    ensure!(output.status.success(), "{what} failed ({})", output.status);
-    Ok(())
+/// Hashes what is read through it.
+struct Hashing<'a> {
+    input: File,
+    hash: &'a mut Sha256,
+}
+impl Read for Hashing<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.input.read(bytes)?;
+        self.hash.update(&bytes[..n]);
+        Ok(n)
+    }
 }
 
 impl SnapshotStore for S3Store {
     fn list(&self) -> Result<Vec<String>> {
-        let output = self
-            .aws()
-            .args(["s3", "ls", "--recursive", &format!("{}/", self.url)])
-            .stderr(Stdio::inherit())
-            .output()
-            .context("the AWS CLI (aws) is required for snapshot stores")?;
-        // `aws s3 ls` exits 1 for an empty prefix; other failures (credentials,
-        // network) must not read as an empty store.
-        if !output.status.success()
-            && !(output.status.code() == Some(1) && output.stdout.is_empty())
-        {
-            bail!("listing {} failed ({})", self.url, output.status);
-        }
-        let prefix = self.url.split_once("s3://").unwrap().1;
-        let prefix = prefix.split_once('/').map_or("", |(_, p)| p);
-        Ok(parse_listing(
-            &String::from_utf8_lossy(&output.stdout),
-            prefix,
-        ))
+        let http = self.http()?;
+        let keys = http.list(&http.prefix)?.into_iter().map(|o| o.key);
+        Ok(snapshot_names(keys, &http.prefix))
     }
 
     fn push(&self, name: &str, directory: &Path) -> Result<Value> {
         if self.incremental {
-            // Once per process: a run checks the bucket once, not once per box.
-            if self.retention.get().is_none() {
-                self.check_recovery_retention()?;
-                let _ = self.retention.set(());
-            }
+            self.retention()?;
             self.push_chunks(name, directory)
         } else {
             self.push_full(name, directory)
         }
+    }
+
+    fn seals_while_uploading(&self) -> bool {
+        self.incremental
+    }
+
+    fn upload_unsealed(
+        &self,
+        directory: &Path,
+        previous: Option<&Path>,
+    ) -> Option<Result<(BTreeMap<String, crate::snapshot_digest::Sealed>, Value)>> {
+        self.incremental
+            .then(|| S3Store::upload_unsealed(self, directory, previous))
     }
 
     fn manifest(&self, name: &str) -> Result<Vec<u8>> {
@@ -257,16 +282,13 @@ impl SnapshotStore for S3Store {
                 self.pull_chunks(chunks, &manifest, directory)?;
             } else {
                 // Original whole-file representation remains readable.
+                let http = self.http()?;
                 for file in DATA_FILES {
-                    let mut child = self.get(&self.key(name, &format!("{file}.zst")))?;
-                    let decoded = (|| -> Result<String> {
-                        let mut output = private_file(&directory.join(file))?;
-                        let decoder = zstd::Decoder::new(child.stdout.take().unwrap())?;
-                        write_sparse(decoder, &mut output)
-                    })();
-                    finished(child, &format!("downloading {file}"))?;
+                    let reader = http.reader(&self.object(name, &format!("{file}.zst")))?;
+                    let mut output = private_file(&directory.join(file))?;
+                    let decoded = write_sparse(zstd::Decoder::new(reader)?, &mut output)?;
                     ensure!(
-                        manifest["files"][file] == decoded?,
+                        manifest["files"][file] == decoded,
                         "snapshot {name}: downloaded {file} does not match its manifest"
                     );
                 }
@@ -286,7 +308,7 @@ impl SnapshotStore for S3Store {
 #[path = "snapshot_chunks.rs"]
 mod chunks;
 #[path = "snapshot_http.rs"]
-mod http;
+pub(crate) mod http;
 
 pub(crate) fn valid_hash(hash: &str) -> bool {
     hash.len() == 64
@@ -326,54 +348,85 @@ use crate::snapshot_digest::hex;
 /// Copies `reader` into `output`, seeking over all-zero 4 KiB blocks so the file
 /// stays sparse. Returns the SHA-256 of all bytes.
 pub fn write_sparse(mut reader: impl Read, output: &mut File) -> Result<String> {
+    const BUFFER: usize = 1 << 20;
     let mut hasher = Sha256::new();
     let mut length = 0u64;
-    let mut block = [0u8; 4096];
-    loop {
-        let mut filled = 0;
-        while filled < block.len() {
-            match reader.read(&mut block[filled..])? {
-                0 => break,
-                n => filled += n,
+    // Read and hash here, write on a second thread: neither waits for the other.
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    let out = &mut *output;
+    std::thread::scope(|scope| -> Result<()> {
+        let writer = scope.spawn(move || -> Result<()> {
+            for data in receiver {
+                write_runs(out, &data)?;
             }
-        }
-        if filled == 0 {
-            break;
-        }
-        let data = &block[..filled];
-        hasher.update(data);
-        if data.iter().all(|b| *b == 0) {
-            output.seek(SeekFrom::Current(filled as i64))?;
-        } else {
-            output.write_all(data)?;
-        }
-        length += filled as u64;
-        if filled < block.len() {
-            break;
-        }
-    }
+            Ok(())
+        });
+        let read = (|| -> Result<()> {
+            loop {
+                let mut buffer = vec![0u8; BUFFER];
+                let mut filled = 0;
+                while filled < BUFFER {
+                    match reader.read(&mut buffer[filled..])? {
+                        0 => break,
+                        n => filled += n,
+                    }
+                }
+                buffer.truncate(filled);
+                hasher.update(&buffer);
+                length += filled as u64;
+                // A closed channel means the writer failed; its error is returned.
+                if filled == 0 || sender.send(buffer).is_err() || filled < BUFFER {
+                    return Ok(());
+                }
+            }
+        })();
+        drop(sender);
+        writer.join().expect("sparse writer thread panicked")?;
+        read
+    })?;
     output.set_len(length)?;
     output.sync_all()?;
     Ok(hex(&hasher.finalize()))
 }
 
-/// Snapshot names with a stored manifest, from `aws s3 ls --recursive` output.
-fn parse_listing(listing: &str, prefix: &str) -> Vec<String> {
-    let prefix = if prefix.is_empty() {
-        String::new()
-    } else {
-        format!("{}/", prefix.trim_end_matches('/'))
+/// Writes `data` at the current offset: one write or seek per run of data or
+/// all-zero 4 KiB blocks, not per block.
+fn write_runs(output: &mut File, data: &[u8]) -> Result<()> {
+    const BLOCK: usize = 4096;
+    let zero = |at: usize| {
+        data[at..(at + BLOCK).min(data.len())]
+            .iter()
+            .all(|b| *b == 0)
     };
-    let mut names: Vec<String> = listing
-        .lines()
-        // "2026-10-16 10:00:00       1234 prefix/name/manifest.json"
-        .filter_map(|line| line.split_whitespace().nth(3))
+    let mut start = 0;
+    while start < data.len() {
+        let hole = zero(start);
+        let mut end = (start + BLOCK).min(data.len());
+        while end < data.len() && zero(end) == hole {
+            end = (end + BLOCK).min(data.len());
+        }
+        if hole {
+            output.seek(SeekFrom::Current((end - start) as i64))?;
+        } else {
+            output.write_all(&data[start..end])?;
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+/// Snapshot names with a stored manifest, from the keys under `prefix` (a key
+/// prefix ending in `/`, or empty).
+fn snapshot_names(keys: impl Iterator<Item = String>, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = keys
         .filter_map(|key| {
-            key.strip_prefix(prefix.as_str())?
-                .strip_suffix("/manifest.json")
+            Some(
+                key.strip_prefix(prefix)?
+                    .strip_suffix("/manifest.json")?
+                    .to_owned(),
+            )
         })
         .filter(|name| crate::common::identifier(name).is_ok())
-        .map(str::to_owned)
         .collect();
     names.sort();
     names.dedup();
@@ -399,29 +452,31 @@ mod tests {
             assert!(S3Store::new(url, endpoint).is_err(), "{url} {endpoint:?}");
         }
         let store = S3Store::new("s3://b/p/", None).unwrap();
-        assert_eq!(store.key("snap", "state.zst"), "s3://b/p/snap/state.zst");
-        let envs: Vec<_> = store
-            .aws()
-            .get_envs()
-            .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
-            .collect();
-        assert!(envs.contains(&(
-            "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS".into(),
-            Some("true".into())
-        )));
+        assert_eq!(store.object("snap", "state.zst"), "p/snap/state.zst");
+        assert_eq!(store.same_bucket("s3://b/p/catalog").unwrap(), "p/catalog");
+        assert!(store.same_bucket("s3://bb/p").is_err());
+        assert_eq!(
+            S3Store::new("s3://b", None)
+                .unwrap()
+                .object("snap", "state.zst"),
+            "snap/state.zst"
+        );
     }
 
     #[test]
     fn listing_keeps_complete_snapshots_under_the_prefix() {
-        let listing = "2026-10-16 10:00:00   900 ow/r1/a/manifest.json\n\
-            2026-10-16 10:00:00   900 ow/r1/a/state.zst\n\
-            2026-10-16 10:00:00   900 ow/r1/partial/memory.zst\n\
-            2026-10-16 10:00:00   900 ow/r1/b/manifest.json\n\
-            2026-10-16 10:00:00   900 ow/r1/x/y/manifest.json\n\
-            2026-10-16 10:00:00   900 ow/r2/c/manifest.json\n";
-        assert_eq!(parse_listing(listing, "ow/r1"), ["a", "b"]);
+        let keys = [
+            "ow/r1/a/manifest.json",
+            "ow/r1/a/state.zst",
+            "ow/r1/partial/memory.zst",
+            "ow/r1/b/manifest.json",
+            "ow/r1/x/y/manifest.json",
+            "ow/r2/c/manifest.json",
+        ];
+        let keys = || keys.iter().map(|k| k.to_string());
+        assert_eq!(snapshot_names(keys(), "ow/r1/"), ["a", "b"]);
         assert_eq!(
-            parse_listing("2026-10-16 10:00:00 9 s/manifest.json\n", ""),
+            snapshot_names(["s/manifest.json".to_string()].into_iter(), ""),
             ["s"]
         );
     }

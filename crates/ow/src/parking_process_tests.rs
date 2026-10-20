@@ -49,34 +49,9 @@ pub(super) fn park_fixture(ram: bool) -> (Processes, i64, i64) {
     ow_core::runtime::atomic_json(&path, &state).unwrap();
     (p, user, park.id)
 }
+/// The fixture store also answers with a write-once bucket policy, so publication passes its checks.
 fn writable_store(p: &Processes) {
-    fs::write(p.root.join("bin/aws"),r##"#!/usr/bin/env python3
-import sys,json,hashlib,base64,pathlib
-root=pathlib.Path(__file__).parent.parent/'objects'
-a=sys.argv[1:]
-def arg(k):return a[a.index(k)+1]
-def digest(b):return base64.b64encode(hashlib.sha256(b).digest()).decode()
-if a[:3]==['s3','cp','--only-show-errors']:
- sys.stdout.buffer.write((root/a[3][5:]).read_bytes());sys.exit(0)
-assert a[0]=='s3api'
-op=a[1]
-if op=='get-bucket-versioning':print('{"Status":"Enabled"}')
-elif op=='get-bucket-lifecycle-configuration':print('{"Rules":[{"Status":"Enabled","Filter":{"Prefix":"root/store/v1/"},"NoncurrentVersionExpiration":{"NoncurrentDays":7}}]}')
-elif op=='get-bucket-policy':print(json.dumps({'Policy':json.dumps({'Statement':[{'Effect':'Deny','Principal':'*','Action':'s3:PutObject','Resource':'arn:aws:s3:::bucket/root/store/v1/*','Condition':{'Null':{'s3:if-none-match':'true'},'Bool':{'s3:ObjectCreationOperation':'true'}}}]})}))
-else:
- dest=root/arg('--bucket')/arg('--key')
- if op=='put-object':
-  assert arg('--if-none-match')=='*'
-  data=pathlib.Path(arg('--body')).read_bytes();assert digest(data)==arg('--checksum-sha256')
-  dest.parent.mkdir(parents=True,exist_ok=True)
-  try:
-   with dest.open('xb') as f:f.write(data);f.flush();__import__('os').fsync(f.fileno())
-  except FileExistsError:sys.exit(1)
-  print('{}')
- elif op=='head-object':
-  data=dest.read_bytes();print(json.dumps({'ChecksumSHA256':digest(data),'ContentLength':len(data)}))
- else:raise Exception(op)
-"##).unwrap();
+    fs::write(p.root.join("objects/write-once-policy"), b"").unwrap();
 }
 fn wait_transfer(p: &Processes, id: i64) {
     let start = Instant::now();

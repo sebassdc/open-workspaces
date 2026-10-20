@@ -1,20 +1,26 @@
 use super::*;
-use crate::snapshot_store::S3Store;
-use base64::{Engine, engine::general_purpose::STANDARD};
+use crate::snapshot_store::{
+    S3Store,
+    http::{Http, RANGE},
+};
 use serde_json::json;
-use std::process::{Child, ChildStdout, Stdio};
+use std::sync::{Arc, OnceLock};
 
-/// The deployment backup root, not `store/v1` itself. Uses the normal AWS CLI role chain.
+/// The deployment backup root, not `store/v1` itself. Requests go through the
+/// AWS SDK and its credential chain; objects move in parallel parts and ranges.
 pub struct S3Objects {
     transport: S3Store,
+    http: OnceLock<Arc<Http>>,
     bucket: String,
     prefix: String,
     part_size: u64,
-    #[cfg(test)]
-    program: Option<PathBuf>,
 }
 impl S3Objects {
     pub fn new(url: &str, endpoint: Option<&str>) -> Result<Self> {
+        #[cfg(feature = "test-endpoint")]
+        let fixture = std::env::var("OW_TEST_S3_ENDPOINT").ok();
+        #[cfg(feature = "test-endpoint")]
+        let endpoint = endpoint.or(fixture.as_deref());
         let transport = S3Store::new(url, endpoint)?;
         let root = url
             .strip_prefix("s3://")
@@ -41,55 +47,44 @@ impl S3Objects {
         );
         Ok(Self {
             transport,
+            http: OnceLock::new(),
             bucket: bucket.into(),
             prefix: if prefix.is_empty() {
                 "store/v1/".into()
             } else {
                 format!("{prefix}/store/v1/")
             },
-            part_size: 64 * 1024 * 1024,
-            #[cfg(test)]
-            program: None,
+            part_size: RANGE,
         })
     }
-    fn aws(&self) -> std::process::Command {
-        let command = self.transport.aws();
-        #[cfg(test)]
-        if let Some(program) = &self.program {
-            let mut fake = std::process::Command::new(program);
-            for (name, value) in command.get_envs() {
-                if let Some(value) = value {
-                    fake.env(name, value);
-                } else {
-                    fake.env_remove(name);
-                }
-            }
-            return fake;
+    fn http(&self) -> Result<Arc<Http>> {
+        if let Some(http) = self.http.get() {
+            return Ok(http.clone());
         }
-        command
+        let _ = self.http.set(Arc::new(Http::new(&self.transport)?));
+        Ok(self.http.get().unwrap().clone())
+    }
+    /// Full key of a store-relative `key`, checked.
+    fn key(&self, key: &str) -> Result<String> {
+        key_path(key)?;
+        Ok(format!("{}{key}", self.prefix))
     }
     /// Fail closed before publishing into a bucket that could expire live artifacts.
     pub fn configuration_snapshot(&self) -> Result<Value> {
-        let read = |operation: &str| -> Result<Value> {
-            let output = self
-                .aws()
-                .args([
-                    "s3api",
-                    operation,
-                    "--bucket",
-                    &self.bucket,
-                    "--output",
-                    "json",
-                ])
-                .output()?;
-            ensure!(
-                output.status.success(),
-                "cannot verify artifact bucket safety ({operation})"
-            );
-            Ok(serde_json::from_slice(&output.stdout)?)
-        };
+        let http = self.http()?;
+        let unverifiable = |what: &str| format!("cannot verify artifact bucket safety ({what})");
+        let versioning = http
+            .versioning()
+            .with_context(|| unverifiable("get-bucket-versioning"))?;
+        let lifecycle = http
+            .lifecycle()
+            .with_context(|| unverifiable("get-bucket-lifecycle-configuration"))?
+            .with_context(|| unverifiable("get-bucket-lifecycle-configuration"))?;
+        let policy = http
+            .policy()
+            .with_context(|| unverifiable("get-bucket-policy"))?;
         Ok(
-            json!({"versioning":read("get-bucket-versioning")?,"lifecycle":read("get-bucket-lifecycle-configuration")?,"policy":read("get-bucket-policy")?}),
+            json!({"versioning":{"Status":versioning},"lifecycle":lifecycle,"policy":{"Policy":policy}}),
         )
     }
     pub fn verify_configuration(&self) -> Result<()> {
@@ -117,74 +112,6 @@ impl S3Objects {
         );
         Ok(())
     }
-    fn command(&self, operation: &str, key: &str) -> Result<std::process::Command> {
-        key_path(key)?;
-        let mut command = self.aws();
-        command
-            .env("AWS_PAGER", "")
-            .env("AWS_CLI_AUTO_PROMPT", "off");
-        command.args([
-            "s3api",
-            operation,
-            "--bucket",
-            &self.bucket,
-            "--key",
-            &format!("{}{key}", self.prefix),
-            "--output",
-            "json",
-        ]);
-        Ok(command)
-    }
-    fn call(&self, operation: &str, key: &str, args: &[&str]) -> Result<Value> {
-        let output = self
-            .command(operation, key)?
-            .args(args)
-            .output()
-            .context("AWS CLI required for artifact store")?;
-        // CLI stderr can contain deployment details; keep it out of public responses.
-        ensure!(
-            output.status.success(),
-            "S3 {operation} failed ({})",
-            output.status
-        );
-        let value = if output.stdout.is_empty() {
-            json!({})
-        } else {
-            serde_json::from_slice(&output.stdout)?
-        };
-        ensure!(
-            value.get("Error").is_none(),
-            "S3 {operation} returned an error"
-        );
-        Ok(value)
-    }
-    fn same(&self, key: &str, checksum: &str, length: u64) -> Result<()> {
-        let head = self.call("head-object", key, &["--checksum-mode", "ENABLED"])?;
-        ensure!(
-            head["ChecksumSHA256"] == checksum && head["ContentLength"] == length,
-            "write-once object mismatch"
-        );
-        Ok(())
-    }
-    fn complete(&self, key: &str, upload: &str, parts: &[Value], path: &Path) -> Result<Value> {
-        // The 10,000-part document exceeds Linux's per-argument limit; keep it out of argv.
-        serde_json::to_writer(private_file(path)?, &json!({"Parts":parts}))?;
-        let manifest = format!("file://{}", path.display());
-        self.call(
-            "complete-multipart-upload",
-            key,
-            &[
-                "--upload-id",
-                upload,
-                "--multipart-upload",
-                &manifest,
-                "--if-none-match",
-                "*",
-                "--checksum-type",
-                "COMPOSITE",
-            ],
-        )
-    }
 }
 impl gc::ControllerObjects for S3Objects {
     fn configuration(&self) -> Result<()> {
@@ -192,421 +119,239 @@ impl gc::ControllerObjects for S3Objects {
     }
     fn marker(&self, run: &str) -> Result<i64> {
         attempt_prefix(run)?;
-        let key = format!("gc/runs/{run}.json");
-        let scratch = Scratch::new()?;
-        let body = scratch.0.join("marker");
-        private_file(&body)?.write_all(b"{\"format\":1}")?;
-        let call = |op: &str, args: &[&str]| -> Result<Value> {
-            let output = self
-                .aws()
-                .args([
-                    "s3api",
-                    op,
-                    "--bucket",
-                    &self.bucket,
-                    "--key",
-                    &format!("{}{key}", self.prefix),
-                    "--output",
-                    "json",
-                ])
-                .args(args)
-                .output()?;
-            ensure!(output.status.success(), "S3 run marker failed");
-            Ok(serde_json::from_slice(&output.stdout)?)
-        };
-        call(
-            "put-object",
-            &[
-                "--body",
-                body.to_str().context("marker path")?,
-                "--if-none-match",
-                "*",
-            ],
-        )?;
-        let head = call("head-object", &[])?;
-        gc::timestamp(
-            head["LastModified"]
-                .as_str()
-                .context("run marker has no server timestamp")?,
-        )
+        let key = format!("{}gc/runs/{run}.json", self.prefix);
+        let http = self.http()?;
+        ensure!(
+            http.put_new(&key, &b"{\"format\":1}"[..])
+                .context("S3 run marker failed")?,
+            "S3 run marker already exists"
+        );
+        http.head(&key, false)
+            .context("S3 run marker failed")?
+            .and_then(|head| head.modified)
+            .context("run marker has no server timestamp")
     }
     fn list(&self) -> Result<Vec<gc::ListedObject>> {
-        let prefix = format!("{}u/", self.prefix);
-        let mut continuation: Option<String> = None;
         let mut objects = Vec::new();
-        loop {
-            let mut command = self.aws();
-            command.args([
-                "s3api",
-                "list-objects-v2",
-                "--bucket",
-                &self.bucket,
-                "--prefix",
-                &prefix,
-                "--no-paginate",
-                "--output",
-                "json",
-            ]);
-            if let Some(token) = &continuation {
-                command.args(["--continuation-token", token]);
-            }
-            let output = command.output()?;
-            ensure!(output.status.success(), "S3 candidate enumeration failed");
-            let value: Value = serde_json::from_slice(&output.stdout)?;
-            if let Some(contents) = value.get("Contents") {
-                for object in contents.as_array().context("invalid listing")? {
-                    let key = object["Key"]
-                        .as_str()
-                        .context("listing key missing")?
-                        .strip_prefix(&self.prefix)
-                        .context("listing escaped store")?;
-                    key_path(key)?;
-                    objects.push(gc::ListedObject {
-                        key: key.into(),
-                        bytes: object["Size"].as_u64().context("listing size missing")?,
-                        modified: gc::timestamp(
-                            object["LastModified"]
-                                .as_str()
-                                .context("listing timestamp missing")?,
-                        )?,
-                    });
-                }
-            }
-            if value["IsTruncated"] == false {
-                break;
-            }
-            let next = value["NextContinuationToken"]
-                .as_str()
-                .context("incomplete listing")?
-                .to_owned();
-            ensure!(
-                continuation.as_ref() != Some(&next),
-                "listing did not advance"
-            );
-            continuation = Some(next);
+        for object in self
+            .http()?
+            .list(&format!("{}u/", self.prefix))
+            .context("S3 candidate enumeration failed")?
+        {
+            let key = object
+                .key
+                .strip_prefix(&self.prefix)
+                .context("listing escaped store")?;
+            key_path(key)?;
+            objects.push(gc::ListedObject {
+                key: key.into(),
+                bytes: object.size,
+                modified: object.modified,
+            });
         }
         Ok(objects)
     }
     fn head(&self, key: &str) -> Result<Option<gc::ObjectVersion>> {
-        let output = self.command("head-object", key)?.output()?;
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            if error.contains("(404)") || error.contains("(NoSuchKey)") {
-                return Ok(None);
-            }
-            anyhow::bail!("S3 verification HEAD failed");
-        }
-        let head: Value = serde_json::from_slice(&output.stdout)?;
-        let version = head["VersionId"]
-            .as_str()
-            .context("versioning proof missing")?;
+        let key = self.key(key)?;
+        let Some(head) = self
+            .http()?
+            .head(&key, false)
+            .context("S3 verification HEAD failed")?
+        else {
+            return Ok(None);
+        };
+        let version = head.version.context("versioning proof missing")?;
         ensure!(
             !version.is_empty() && version != "null",
             "unversioned artifact"
         );
         Ok(Some(gc::ObjectVersion {
-            bytes: head["ContentLength"]
-                .as_u64()
-                .context("HEAD size missing")?,
-            version: version.into(),
+            bytes: head.length,
+            version,
         }))
     }
     fn delete(&self, key: &str) -> Result<String> {
-        let value = self.call("delete-object", key, &[])?;
-        ensure!(
-            value["DeleteMarker"] == true,
-            "delete did not return a versioned marker"
-        );
-        let version = value["VersionId"]
-            .as_str()
-            .context("delete marker version missing")?;
+        let key = self.key(key)?;
+        let (marker, version) = self.http()?.delete(&key)?;
+        ensure!(marker, "delete did not return a versioned marker");
+        let version = version.context("delete marker version missing")?;
         ensure!(
             !version.is_empty() && version != "null",
             "unversioned deletion"
         );
-        Ok(version.into())
+        Ok(version)
     }
-}
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new() -> Result<Self> {
-        let path = std::env::temp_dir().join(format!("ow-upload-{}", token()?));
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(Self(path))
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-fn part(source: &mut dyn Read, path: &Path, size: u64) -> Result<(u64, Vec<u8>)> {
-    let mut output = private_file(path)?;
-    let mut hash = Sha256::new();
-    let mut bytes = vec![0; 1024 * 1024];
-    let mut length = 0;
-    let mut input = source.take(size);
-    loop {
-        let n = input.read(&mut bytes)?;
-        if n == 0 {
-            break;
-        }
-        output.write_all(&bytes[..n])?;
-        hash.update(&bytes[..n]);
-        length += n as u64;
-    }
-    Ok((length, hash.finalize().to_vec()))
 }
 impl Objects for S3Objects {
     fn put_once(&self, key: &str, source: &mut dyn Read) -> Result<()> {
-        key_path(key)?;
-        let scratch = Scratch::new()?;
-        let path = scratch.0.join("part");
-        let body = path.to_str().context("non UTF-8 staging path")?;
-        let (mut length, mut hash) = part(source, &path, self.part_size)?;
-        if length < self.part_size {
-            let checksum = STANDARD.encode(&hash);
-            if self
-                .call(
-                    "put-object",
-                    key,
-                    &[
-                        "--body",
-                        body,
-                        "--if-none-match",
-                        "*",
-                        "--checksum-algorithm",
-                        "SHA256",
-                        "--checksum-sha256",
-                        &checksum,
-                    ],
-                )
-                .is_err()
-            {
-                self.same(key, &checksum, length)?;
-            }
-            return Ok(());
-        }
-        let created = self.call(
-            "create-multipart-upload",
-            key,
-            &[
-                "--checksum-algorithm",
-                "SHA256",
-                "--checksum-type",
-                "COMPOSITE",
-            ],
-        )?;
-        let upload = created["UploadId"].as_str().context("missing upload ID")?;
-        let result = (|| {
-            let mut parts = Vec::new();
-            let mut total = 0;
-            let mut composite = Sha256::new();
-            loop {
-                let number = parts.len() + 1;
-                // shortcut: 64 MiB parts cap compressed objects at 625 GiB; raise part size before supporting larger ones.
-                ensure!(number <= 10000, "multipart limit exceeded");
-                let checksum = STANDARD.encode(&hash);
-                let uploaded = self.call(
-                    "upload-part",
-                    key,
-                    &[
-                        "--upload-id",
-                        upload,
-                        "--part-number",
-                        &number.to_string(),
-                        "--body",
-                        body,
-                        "--checksum-sha256",
-                        &checksum,
-                    ],
-                )?;
-                ensure!(
-                    uploaded["ChecksumSHA256"] == checksum,
-                    "part checksum mismatch"
-                );
-                let etag = uploaded["ETag"].as_str().context("missing part ETag")?;
-                parts.push(json!({"PartNumber":number,"ETag":etag,"ChecksumSHA256":checksum}));
-                total += length;
-                composite.update(&hash);
-                fs::remove_file(&path)?;
-                (length, hash) = part(source, &path, self.part_size)?;
-                if length == 0 {
-                    break;
-                }
-            }
-            let checksum = format!("{}-{}", STANDARD.encode(composite.finalize()), parts.len());
-            if self
-                .complete(key, upload, &parts, &scratch.0.join("complete.json"))
-                .is_err()
-            {
-                self.same(key, &checksum, total)?;
-            }
-            Ok(())
-        })();
-        // Also harmless after a lost completion response or successful completion.
-        let _ = self.call("abort-multipart-upload", key, &["--upload-id", upload]);
-        result
+        let key = self.key(key)?;
+        self.http()?.put_stream(&key, source, self.part_size, true)
     }
     fn get(&self, key: &str) -> Result<Box<dyn Read>> {
-        key_path(key)?;
-        // High-level cp is read-only here; its stdout streams without staging a full disk.
-        let mut child = self
-            .aws()
-            .args([
-                "s3",
-                "cp",
-                "--only-show-errors",
-                &format!("s3://{}/{}{key}", self.bucket, self.prefix),
-                "-",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let stdout = child.stdout.take().context("download stdout")?;
-        Ok(Box::new(Download {
-            child,
-            stdout,
-            finished: false,
-        }))
-    }
-}
-struct Download {
-    child: Child,
-    stdout: ChildStdout,
-    finished: bool,
-}
-impl Read for Download {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        let n = self.stdout.read(bytes)?;
-        if n == 0 && !self.finished {
-            self.finished = true;
-            if !self.child.wait()?.success() {
-                return Err(std::io::Error::other("S3 download failed"));
-            }
-        }
-        Ok(n)
-    }
-}
-impl Drop for Download {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
+        let key = self.key(key)?;
+        Ok(Box::new(self.http()?.reader(&key)?))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn s3_completes_ten_thousand_parts_without_large_arguments() {
-        let scratch = Scratch::new().unwrap();
-        let script = scratch.0.join("aws");
-        fs::write(
-            &script,
-            r#"#!/usr/bin/env python3
-import sys,json,pathlib,stat
-a=sys.argv[1:]
-def arg(k):return a[a.index(k)+1]
-assert max(map(len,a))<4096
-uri=arg('--multipart-upload');assert uri.startswith('file://')
-p=pathlib.Path(uri[7:]);assert stat.S_IMODE(p.stat().st_mode)==0o600
-assert p.stat().st_size>1024*1024
-parts=json.loads(p.read_text())['Parts'];assert len(parts)==10000
-for i,part in enumerate(parts,1):
-    assert part=={'PartNumber':i,'ETag':'"'+'a'*32+'"','ChecksumSHA256':'b'*43+'='}
-assert arg('--if-none-match')=='*' and arg('--checksum-type')=='COMPOSITE'
-print('{}')
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    use crate::fake_s3::FakeS3;
+    use crate::snapshot_store::http::transfers;
+    use std::sync::atomic::Ordering;
+    pub(super) fn objects(fake: &FakeS3, part_size: u64) -> S3Objects {
         let mut objects = S3Objects::new("s3://bucket/root", None).unwrap();
-        objects.program = Some(script);
-        let parts: Vec<_> = (1..=10000).map(|n|json!({"PartNumber":n,"ETag":format!("\"{}\"","a".repeat(32)),"ChecksumSHA256":format!("{}=","b".repeat(43))})).collect();
-        let key = format!(
+        let _ = objects
+            .http
+            .set(Arc::new(Http::fixed(&fake.endpoint, "bucket", "root/")));
+        objects.part_size = part_size;
+        objects
+    }
+    fn key() -> String {
+        format!(
             "{}disk.ext4.zst",
             attempt_prefix(&token().unwrap()).unwrap()
-        );
-        let path = scratch.0.join("complete upload.json");
-        objects.complete(&key, "upload", &parts, &path).unwrap();
-        let directory = scratch.0.clone();
-        drop(scratch);
-        assert!(!directory.exists());
+        )
     }
     #[test]
-    fn s3_conditional_single_and_multipart_retries_verify_checksums() {
-        let scratch = Scratch::new().unwrap();
-        let script = scratch.0.join("aws");
-        fs::write(&script, r##"#!/usr/bin/env python3
-import sys,json,hashlib,base64,pathlib
-root=pathlib.Path(__file__).parent
-args=sys.argv[1:]
-def arg(k): return args[args.index(k)+1]
-def digest(b): return base64.b64encode(hashlib.sha256(b).digest()).decode()
-op=args[1]
-key=arg('--key'); dest=root/'object'; state=root/'state'
-with (root/'calls').open('a') as f: f.write(json.dumps(args)+'\n')
-if op=='put-object':
- assert arg('--if-none-match')=='*'
- data=pathlib.Path(arg('--body')).read_bytes(); assert digest(data)==arg('--checksum-sha256')
- if dest.exists():sys.exit(1)
- dest.write_bytes(data);state.write_text(json.dumps({'ChecksumSHA256':digest(data),'ContentLength':len(data)}));print('{}')
-elif op=='head-object':
- if not dest.exists():sys.exit(1)
- print(state.read_text())
-elif op=='create-multipart-upload':print(json.dumps({'UploadId':'test-upload'}))
-elif op=='upload-part':
- data=pathlib.Path(arg('--body')).read_bytes();h=digest(data);assert h==arg('--checksum-sha256')
- (root/('part'+arg('--part-number'))).write_bytes(data);print(json.dumps({'ETag':'etag','ChecksumSHA256':h}))
-elif op=='complete-multipart-upload':
- assert arg('--if-none-match')=='*'
- uri=arg('--multipart-upload');assert uri.startswith('file://')
- parts=json.loads(pathlib.Path(uri[7:]).read_text())['Parts'];data=b''.join((root/('part'+str(p['PartNumber']))).read_bytes() for p in parts)
- if dest.exists():sys.exit(1)
- composite=digest(b''.join(base64.b64decode(p['ChecksumSHA256']) for p in parts))+'-'+str(len(parts))
- dest.write_bytes(data);state.write_text(json.dumps({'ChecksumSHA256':composite,'ContentLength':len(data)}))
- # Deliberately lose the completion response after the effect.
- sys.exit(1)
-elif op=='abort-multipart-upload': print('{}')
-else:raise Exception(op)
-"##).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut store = S3Objects::new("s3://bucket/root", None).unwrap();
-        store.program = Some(script);
-        store.part_size = 8; // Exercise the protocol with tiny parts, not S3's real size floor.
-        let key = format!(
-            "{}disk.ext4.zst",
-            attempt_prefix(&token().unwrap()).unwrap()
-        );
-        for bytes in [&b"short"[..], &b"multipart-content"[..]] {
-            let _ = fs::remove_file(scratch.0.join("object"));
+    fn s3_conditional_single_and_multipart_writes_verify_checksums() {
+        let fake = FakeS3::start();
+        // Tiny parts exercise the protocol, not S3's real size floor.
+        let store = objects(&fake, 8);
+        for bytes in [&b"short"[..], &b"multipart-content-in-several-parts"[..]] {
+            let key = key();
             store.put_once(&key, &mut &bytes[..]).unwrap();
+            // Retrying the same bytes succeeds; different bytes never replace them.
             store.put_once(&key, &mut &bytes[..]).unwrap();
             assert!(store.put_once(&key, &mut &b"wrong"[..]).is_err());
-            assert_eq!(fs::read(scratch.0.join("object")).unwrap(), bytes);
+            assert!(
+                store
+                    .put_once(&key, &mut &b"wrong-and-long-enough"[..])
+                    .is_err()
+            );
+            let stored = fake.state.objects.lock().unwrap()[&format!("root/store/v1/{key}")]
+                .bytes
+                .clone();
+            assert_eq!(stored, bytes);
+            let mut read = Vec::new();
+            store.get(&key).unwrap().read_to_end(&mut read).unwrap();
+            assert_eq!(read, bytes);
         }
-        let calls = fs::read_to_string(scratch.0.join("calls")).unwrap();
-        assert!(calls.contains("head-object") && calls.contains("abort-multipart-upload"));
-        assert!(calls.contains("root/store/v1/u/"));
-        assert!(!calls.contains("delete-object") && !calls.contains("list-objects"));
-        for call in calls
-            .lines()
-            .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
-        {
-            if let Some(index) = call.iter().position(|arg| arg == "--multipart-upload") {
-                let path = call[index + 1].strip_prefix("file://").unwrap();
-                assert!(
-                    !Path::new(path).exists(),
-                    "completion scratch survives upload"
-                );
-            }
-        }
+        assert!(fake.calls("part") >= 5 && fake.calls("abort") >= 1);
+        assert!(store.get(&key()).is_err(), "missing object read as empty");
+    }
+    #[test]
+    fn s3_lost_completion_is_checked_not_repeated_and_failed_parts_fail_closed() {
+        let fake = FakeS3::start();
+        let store = objects(&fake, 1 << 10);
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let key = key();
+        // The completion takes effect but every response is lost.
+        fake.state.lose_completions.store(4, Ordering::SeqCst);
+        store.put_once(&key, &mut &data[..]).unwrap();
+        assert_eq!(
+            fake.state.objects.lock().unwrap()[&format!("root/store/v1/{key}")].bytes,
+            data
+        );
+        // A refused part fails the upload without committing anything.
+        fake.state.lose_completions.store(0, Ordering::SeqCst);
+        fake.state.refuse_puts.store(1, Ordering::SeqCst);
+        let other = self::key();
+        assert!(store.put_once(&other, &mut &data[..]).is_err());
+        assert!(
+            !fake
+                .state
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!("root/store/v1/{other}"))
+        );
+    }
+    #[test]
+    fn s3_parts_grow_every_thousand_to_raise_the_object_limit() {
+        let fake = FakeS3::start();
+        let store = objects(&fake, 8);
+        let data: Vec<u8> = (0..1000 * 8 + 3 * 16).map(|i| (i % 249) as u8).collect();
+        let key = key();
+        store.put_once(&key, &mut &data[..]).unwrap();
+        assert_eq!(fake.calls("part"), 1003);
+        assert_eq!(
+            fake.state.objects.lock().unwrap()[&format!("root/store/v1/{key}")].bytes,
+            data
+        );
+    }
+    #[test]
+    fn s3_parts_and_ranges_run_in_parallel_within_their_limits() {
+        let fake = FakeS3::start();
+        let store = objects(&fake, 64 << 10);
+        let data: Vec<u8> = (0..(RANGE as usize * 3 + 12_345))
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let key = key();
+        store.put_once(&key, &mut &data[..]).unwrap();
+        let parts = fake.calls("part");
+        assert_eq!(parts, data.len().div_ceil(64 << 10));
+        assert!(fake.peak("part") > 1, "parts were sent one at a time");
+        assert!(fake.peak("part") <= transfers());
+        let mut read = Vec::new();
+        store.get(&key).unwrap().read_to_end(&mut read).unwrap();
+        assert!(read == data, "ranged download reassembled wrong bytes");
+        assert_eq!(fake.calls("range"), 4);
+        assert!(fake.peak("range") > 1 && fake.peak("range") <= transfers());
+        // A replaced object is never stitched from two versions.
+        let mut download = store.get(&key).unwrap();
+        fake.state
+            .objects
+            .lock()
+            .unwrap()
+            .get_mut(&format!("root/store/v1/{key}"))
+            .unwrap()
+            .etag = "\"other\"".into();
+        assert!(download.read_to_end(&mut Vec::new()).is_err());
+    }
+    #[test]
+    fn s3_a_range_cut_short_is_fetched_again() {
+        let fake = FakeS3::start();
+        let store = objects(&fake, 64 << 10);
+        let data: Vec<u8> = (0..(RANGE as usize + 4321))
+            .map(|i| (i % 241) as u8)
+            .collect();
+        let key = key();
+        store.put_once(&key, &mut &data[..]).unwrap();
+        // Each range's first response sends half its body and drops the connection.
+        fake.state.cut_ranges.store(2, Ordering::SeqCst);
+        let mut read = Vec::new();
+        store.get(&key).unwrap().read_to_end(&mut read).unwrap();
+        assert!(read == data);
+        assert_eq!(
+            fake.calls("range"),
+            4,
+            "two cut ranges, each asked again once"
+        );
+    }
+    #[test]
+    fn s3_bucket_safety_is_read_through_the_sdk_and_fails_closed() {
+        let fake = FakeS3::start();
+        let store = objects(&fake, RANGE);
+        // Nothing configured: unverifiable, so refused.
+        assert!(store.verify_configuration().is_err());
+        *fake.state.versioning.lock().unwrap() = Some("Enabled".into());
+        *fake.state.lifecycle.lock().unwrap() = Some("<Rule><ID>undo</ID><Filter><Prefix>root/store/</Prefix></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration></Rule>".into());
+        *fake.state.policy.lock().unwrap() = Some(json!({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/root/store/v1/*","Condition":{"Null":{"s3:if-none-match":"true"},"Bool":{"s3:ObjectCreationOperation":"true"}}}]}).to_string());
+        store.verify_configuration().unwrap();
+        let evidence = store.configuration_snapshot().unwrap();
+        assert_eq!(evidence["versioning"]["Status"], "Enabled");
+        assert_eq!(
+            evidence["lifecycle"]["Rules"][0]["Filter"]["Prefix"],
+            "root/store/"
+        );
+        // An expiring rule, a tag-scoped undo rule or suspended versioning are refused.
+        *fake.state.lifecycle.lock().unwrap() = Some("<Rule><ID>undo</ID><Filter><Prefix>root/store/</Prefix></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration></Rule><Rule><ID>age</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule>".into());
+        assert!(store.verify_configuration().is_err());
+        *fake.state.lifecycle.lock().unwrap() = Some("<Rule><ID>undo</ID><Filter><And><Prefix>root/store/</Prefix><Tag><Key>k</Key><Value>v</Value></Tag></And></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration></Rule>".into());
+        assert!(store.verify_configuration().is_err());
+        *fake.state.versioning.lock().unwrap() = Some("Suspended".into());
+        assert!(store.verify_configuration().is_err());
     }
 }
 
@@ -709,54 +454,35 @@ fn s3_store_requires_write_once_policy_for_every_principal() {
 
 #[cfg(test)]
 #[test]
-fn controller_gc_uses_server_marker_paged_listing_and_only_current_deletes() {
+fn controller_gc_uses_server_marker_listing_and_only_current_deletes() {
     use gc::ControllerObjects;
-    let scratch = Scratch::new().unwrap();
-    let script = scratch.0.join("aws");
-    fs::write(&script,r#"#!/usr/bin/env python3
-import sys,json,pathlib
-root=pathlib.Path(__file__).parent
-a=sys.argv[1:]
-def arg(k):return a[a.index(k)+1]
-op=a[1]
-with (root/'gc-calls').open('a') as f:f.write(json.dumps(a)+'\n')
-assert '--version-id' not in a
-assert arg('--bucket')=='bucket'
-if op=='put-object':
- assert arg('--if-none-match')=='*'
- assert arg('--key').startswith('root/store/v1/gc/runs/')
- assert pathlib.Path(arg('--body')).read_text()=='{"format":1}'
- print('{}')
-elif op=='head-object':
- key=arg('--key')
- if key.endswith('memory.zst'):
-  print('An error occurred (404) when calling the HeadObject operation',file=sys.stderr);sys.exit(1)
- if key.endswith('state.zst'):
-  print('An error occurred (403) when calling the HeadObject operation',file=sys.stderr);sys.exit(1)
- print(json.dumps({'LastModified':'2026-10-19T12:34:56+00:00','ContentLength':9,'VersionId':'original'}))
-elif op=='list-objects-v2':
- assert arg('--prefix')=='root/store/v1/u/' and '--no-paginate' in a
- page=1 if '--continuation-token' not in a else 2
- if page==2:assert arg('--continuation-token')=='page2'
- print(json.dumps({'Contents':[{'Key':'root/store/v1/u/aa/'+'a'*32+('/manifest.json' if page==1 else '/disk.ext4.zst'),'Size':page*10,'LastModified':'2026-10-19T10:00:00Z'}], 'IsTruncated':page==1,**({'NextContinuationToken':'page2'} if page==1 else {})}))
-elif op=='delete-object':print(json.dumps({'DeleteMarker':True,'VersionId':'marker'}))
-else:raise Exception(op)
-"#).unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-    let mut s3 = S3Objects::new("s3://bucket/root", None).unwrap();
-    s3.program = Some(script);
-    assert_eq!(s3.marker(&token().unwrap()).unwrap(), 1792413296);
-    let listed = s3.list().unwrap();
-    assert_eq!(listed.len(), 2);
-    assert_eq!(listed.iter().map(|o| o.bytes).sum::<u64>(), 30);
+    let fake = crate::fake_s3::FakeS3::start();
+    let s3 = tests::objects(&fake, RANGE);
     assert_eq!(
-        s3.head(&listed[0].key).unwrap().unwrap().version,
-        "original"
+        s3.marker(&token().unwrap()).unwrap(),
+        crate::fake_s3::MODIFIED
     );
     let prefix = attempt_prefix(&"a".repeat(32)).unwrap();
+    for (file, bytes) in [
+        ("manifest.json", &b"0123456789"[..]),
+        ("disk.ext4.zst", &[7; 20][..]),
+    ] {
+        s3.put_once(&format!("{prefix}{file}"), &mut &bytes[..])
+            .unwrap();
+    }
+    let listed = s3.list().unwrap();
+    assert_eq!(listed.len(), 2, "run markers are not candidates");
+    assert_eq!(listed.iter().map(|o| o.bytes).sum::<u64>(), 30);
+    assert!(
+        listed
+            .iter()
+            .all(|o| o.modified == crate::fake_s3::MODIFIED)
+    );
+    let head = s3.head(&listed[0].key).unwrap().unwrap();
+    assert!(head.version.starts_with('v') && head.bytes == listed[0].bytes);
     assert!(s3.head(&format!("{prefix}memory.zst")).unwrap().is_none());
-    assert!(s3.head(&format!("{prefix}state.zst")).is_err());
-    assert_eq!(s3.delete(&listed[0].key).unwrap(), "marker");
+    assert!(s3.delete(&listed[0].key).unwrap().starts_with("marker-"));
+    assert!(s3.head(&listed[0].key).unwrap().is_none());
     for bad in [
         "../catalog/saved.json",
         "u/aa/wrong/disk.ext4.zst",
@@ -764,6 +490,9 @@ else:raise Exception(op)
     ] {
         assert!(s3.delete(bad).is_err());
     }
-    let calls = fs::read_to_string(scratch.0.join("gc-calls")).unwrap();
-    assert!(!calls.contains("--version-id") && !calls.contains("delete-object-version"));
+    assert_eq!(
+        fake.calls("delete"),
+        1,
+        "only the checked current object was deleted"
+    );
 }

@@ -14,8 +14,7 @@ ow backup recover --from /path/to/runner --to s3://bucket/private-prefix/snapsho
 ```
 
 Run that command once a minute as the worker owner. It uses the existing AWS
-CLI credential chain (one `aws configure export-credentials` call, refreshed
-every five minutes; object requests are then signed in process), with checked
+SDK for Rust credential chain (credentials are cached and refreshed by the SDK), with checked
 `--endpoint-url` support. Each runner needs its own prefix. A local advisory lock prevents overlapping recovery uploaders;
 the worker serializes capture with other runtime operations. Uploading happens
 outside the worker lock. Recovery operations do not count as guest activity and
@@ -101,7 +100,7 @@ boxes through the existing upgrade policy; adding this timer never restarts it.
 recovery format; ordinary `backup snapshots` still writes the original compressed
 whole-file representation so existing backup consumers keep working.
 
-The recovery representation splits each sealed file into fixed 8 MiB chunks,
+The recovery representation splits each sealed file into fixed 32 MiB chunks (8 MiB for older points),
 hashes the uncompressed bytes, and uploads only absent nonzero chunks to
 `PREFIX/chunks/SHA256.zst`. Zero chunks are represented without an object. The
 unique `PREFIX/RECOVERY_NAME/manifest.json` contains `ow_chunks_v2`, the ordered
@@ -113,10 +112,11 @@ on a chain of older captures.
 
 ### Chunk seals: reading only what changed
 
-Since 0.9.20 the worker seals each managed recovery point while capturing it:
+Since 0.9.20 each managed recovery point has a chunk seal:
 it writes the chunk list of every file to `chunks.json` beside the manifest and
 seals each file under the SHA-256 of that ordered list (`"digest":
-"sha256-chunks-8m-v1"` in the manifest; without that field a file hash is its
+"sha256-chunks-32m-v2"` from 0.9.35, `"sha256-chunks-8m-v1"` in older
+points; without that field a file hash is its
 whole-file SHA-256, as for every other snapshot). The disk is a reflink of the
 live disk, so after both disk files are flushed (pending writes are not in the
 extent map until then) a disk chunk is not read when:
@@ -133,20 +133,43 @@ it. Anything else is read and hashed in parallel: changed disk and RAM ranges, t
 device state file (written whole by every capture), and every range whose
 mapping is unknown, delayed, compressed, encrypted or inline. Without an earlier
 seal (first point, a changed destination, or a durable point from an older
-worker) every chunk is read; zero chunks are still recognized without hashing. This trusts the
+worker) the disk and RAM files are flushed and only their holes are skipped (zero
+chunks, unread, from 0.9.35); every mapped chunk is read, and zero chunks are still
+recognized without hashing. This trusts the
 filesystem's extent sharing, as changed-block tracking does; a worker that
 verifies such a snapshot again (after a restart, or for import) reads every byte
 and compares the result with the seal.
 
-The uploader sends the chunks of `chunks.json` that the store lacks. It reads
-only those, checks each against its hash (a changed file fails the upload; nothing
-else is sent under a sealed hash), and runs up to eight compressed transfers at
-once (about 16 MiB of memory each). Points sealed by an older worker are still
-read whole and checked against their whole-file hashes.
+From 0.9.35 a capable worker advertises `recovery_client_seal_v1`. The uploader
+requests a pinned unpublished capture, then hashes changed chunks on parallel
+threads, compresses them with zstd level 3 and sends missing chunks immediately:
+one disk read rather than a seal pass followed by an upload pass. It returns the
+file seals to the worker, which checks their file identities and complete chunk
+lists before committing the local snapshot. Only then does the uploader publish
+the remote manifest. An upload interruption leaves no published recovery point;
+a retry uses the same pinned capture while the worker is alive. Worker restart
+discards unsealed staging and recaptures from an available source; already stored
+content-addressed chunks remain reusable. A lost seal response is reconciled
+through the committed local manifest. The worker still checks placement authority
+for sealing and acknowledgment.
+
+Older clients and workers use the existing seal-then-upload path and 8 MiB seals. Both
+`sha256-chunks-8m-v1` and `sha256-chunks-32m-v2` points are readable by this
+release, as are original whole-file backups. A format transition hashes the first
+point in the new chunk size; subsequent points reuse its unchanged extents.
+
+`OW_S3_TRANSFERS` (1-128, default 16) bounds upload and download parallelism.
+Recovery workers are additionally limited to `transfers × 16 MiB / chunk size`
+(at least one), so default 32 MiB points use eight workers. Each holds one chunk
+and its compressed copy, plus SDK buffers. Hashing and network I/O overlap across
+workers; the optional compression and SHA-256 format remain unchanged.
+Points already sealed by the worker read only missing chunks, checking each
+against its hash before upload. Restore verifies every downloaded chunk and the
+file seal, and removes an incomplete destination on failure.
 
 ### Chunk index and resumed runs
 
-Before each point the uploader lists `PREFIX/chunks/` (16 listings in parallel,
+Before each point the uploader lists `PREFIX/chunks/` (16 prefix listings with bounded parallelism,
 1000 keys per request) and takes that listing, not any local memory, as what the
 store holds. It records the listing in `RUNNER/recovery-index/STORE_IDENTITY.chunks`
 and appends each chunk as soon as the store confirms it. No chunk is checked with
@@ -226,9 +249,9 @@ not terminate instances, detach volumes or change running workspaces.
 ## Validation boundary
 
 The credential-free transfer integration test exercises the real adapters
-against a filesystem AWS CLI fixture and a local S3 HTTP fixture: a one-chunk edit
+against loopback S3 fixtures: a one-chunk edit
 transfers one new chunk, manifest failure/retry transfers no unchanged chunks, no
-chunk is checked with its own request and no CLI process runs per object, a run
+chunk is checked with its own request and no AWS CLI process runs, a run
 killed after two uploads resumes with only the rest, a lost index is rebuilt from
 a listing, a chunk-sealed point whose bytes changed after sealing is refused,
 another runner directory receives identical bytes, legacy reads work and

@@ -169,17 +169,107 @@ pub struct Source {
     pub path: PathBuf,
     pub sha256: String,
 }
-struct Hashing<'a> {
-    input: File,
-    hash: &'a mut Sha256,
-    size: &'a mut u64,
+/// Reads a file ahead on [`READERS`] threads and hashes it in order on another
+/// (about 56 MiB in flight), so disk reads, hashing and compression overlap.
+struct ReadAhead {
+    blocks: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    current: std::io::Cursor<Vec<u8>>,
+    digest: std::sync::mpsc::Receiver<(u64, String)>,
+    ended: bool,
 }
-impl Read for Hashing<'_> {
+const READERS: usize = 4;
+impl ReadAhead {
+    fn new(file: File) -> Self {
+        use std::os::unix::fs::FileExt;
+        use std::sync::mpsc::sync_channel;
+        const BLOCK: u64 = 4 << 20;
+        let file = std::sync::Arc::new(file);
+        let readers: Vec<_> = (0..READERS)
+            .map(|reader| {
+                let (sender, blocks) = sync_channel(2);
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    // This reader takes every READERS-th block.
+                    for index in (reader as u64..).step_by(READERS) {
+                        let mut block = vec![0u8; BLOCK as usize];
+                        let mut filled = 0;
+                        let read = loop {
+                            if filled == block.len() {
+                                break Ok(());
+                            }
+                            match file.read_at(&mut block[filled..], index * BLOCK + filled as u64)
+                            {
+                                Ok(0) => break Ok(()),
+                                Ok(n) => filled += n,
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(e) => break Err(e),
+                            }
+                        };
+                        block.truncate(filled);
+                        let read = read.map(|()| block);
+                        // A short block is the file's end; later readers then find nothing.
+                        let end = !matches!(&read, Ok(block) if block.len() == BLOCK as usize);
+                        // Stops when the reader is dropped.
+                        if sender.send(read).is_err() || end {
+                            break;
+                        }
+                    }
+                });
+                blocks
+            })
+            .collect();
+        let (sender, blocks) = sync_channel(4);
+        let (done, digest) = sync_channel(1);
+        std::thread::spawn(move || {
+            let (mut hash, mut size) = (Sha256::new(), 0u64);
+            for reader in readers.iter().cycle() {
+                let block = match reader.recv() {
+                    Ok(Ok(block)) => block,
+                    Ok(Err(error)) => {
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                    Err(_) => return,
+                };
+                if block.is_empty() {
+                    let _ = done.send((size, format!("{:x}", hash.finalize())));
+                    let _ = sender.send(Ok(block));
+                    return;
+                }
+                hash.update(&block);
+                size += block.len() as u64;
+                if sender.send(Ok(block)).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            blocks,
+            current: std::io::Cursor::new(Vec::new()),
+            digest,
+            ended: false,
+        }
+    }
+    /// The file's size and SHA-256, only once every byte has been read from here.
+    fn finish(self) -> Result<(u64, String)> {
+        ensure!(self.ended, "upload stopped before the end of its file");
+        Ok(self.digest.recv()?)
+    }
+}
+impl Read for ReadAhead {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.input.read(bytes)?;
-        self.hash.update(&bytes[..n]);
-        *self.size += n as u64;
-        Ok(n)
+        loop {
+            let n = self.current.read(bytes)?;
+            if n > 0 || bytes.is_empty() || self.ended {
+                return Ok(n);
+            }
+            match self.blocks.recv() {
+                Ok(Ok(block)) if block.is_empty() => self.ended = true,
+                Ok(Ok(block)) => self.current = std::io::Cursor::new(block),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(std::io::Error::other("read-ahead stopped")),
+            }
+        }
     }
 }
 
@@ -228,16 +318,14 @@ pub fn push(
             .custom_flags(libc::O_NOFOLLOW)
             .open(&source.path)?;
         let before = input.metadata()?;
-        let mut hash = Sha256::new();
-        let mut size = 0;
-        let reader = Hashing {
-            input: input.try_clone()?,
-            hash: &mut hash,
-            size: &mut size,
-        };
-        let mut encoded = zstd::stream::read::Encoder::new(reader, 3)?;
+        let mut ahead = ReadAhead::new(input.try_clone()?);
+        let mut encoded = zstd::stream::read::Encoder::new(&mut ahead, 3)?;
+        // Same zstd stream format; compression keeps pace with parallel uploads.
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+        encoded.multithread(workers as u32)?;
         store.put_once(&manifest.files[name].objects[0].key, &mut encoded)?;
         drop(encoded);
+        let (size, hash) = ahead.finish()?;
         let after = input.metadata()?;
         ensure!(
             before.dev() == after.dev()
@@ -250,7 +338,7 @@ pub fn push(
             "sealed source changed while uploading"
         );
         ensure!(
-            size == manifest.files[name].size && format!("{:x}", hash.finalize()) == source.sha256,
+            size == manifest.files[name].size && hash == source.sha256,
             "sealed file hash mismatch: {name}"
         );
     }

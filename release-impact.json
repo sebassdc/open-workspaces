@@ -2,6 +2,45 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.35",
+      "class": 2,
+      "changes": [
+        "worker",
+        "agent"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "S3 calls use the AWS SDK for Rust and its refreshing credential chain with pooled connections, bounded parallel transfers and retries. Recovery points use 32 MiB SHA-256 chunks (sha256-chunks-32m-v2), reading changed reflink extents and uploading while sealing in one pass; 8 MiB chunk seals and whole-file backups remain readable. Recovery client sealing is capability negotiated; older clients use worker sealing. Artifact multipart uploads and ETag-pinned ranged downloads run in parallel; interrupted response bodies retry. Retention and GC semantics, worker interface 3, catalog schema 7, runtime, guest kernel and host layout remain unchanged. Class-2 worker and agent upgrade; upgrade restore readers before using new recovery points.",
+      "waivers": {
+        "dashboard": "Only a refusal test adds recovery-seal to private worker operations; dashboard behavior is unchanged."
+      }
+    },
+    {
       "version": "0.9.34",
       "class": 1,
       "changes": [

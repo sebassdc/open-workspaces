@@ -12,7 +12,14 @@ libc = "0.2"
 url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bytes = "1"
 sha2 = "0.10"
-zstd = { version = "=0.13.3", default-features = false }
-rusty-s3 = "0.10.2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "blocking"] }
+zstd = { version = "=0.13.3", default-features = false, features = ["zstdmt"] }
+aws-config = { version = "1.12.0", default-features = false, features = ["rt-tokio", "behavior-version-latest", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1.152.0", default-features = false, features = ["rt-tokio", "http-1x", "behavior-version-latest"] }
+aws-smithy-http-client = { version = "1.5.0", default-features = false, features = ["rustls-ring", "rt-tokio"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "time"] }
+
+[features]
+# Dependent crates' tests reach a loopback fixture store through OW_TEST_S3_ENDPOINT.
+test-endpoint = []

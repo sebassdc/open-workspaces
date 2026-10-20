@@ -3,7 +3,7 @@
 //! onto another runner. This operator-local path never grants catalog ownership;
 //! managed remote restore consumes authorized catalog artifacts in `transfers`.
 use crate::{BackupAction, common, selfhost, wire};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use ow_core::snapshot_store::{S3Store, SnapshotStore};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -12,7 +12,6 @@ use std::{
     fs,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
 
@@ -136,6 +135,9 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
         status["recovery_points_v1"] == true,
         "worker does not support recovery points; complete its normal class-2 upgrade first"
     );
+    // A worker that can take its uploader's seals leaves captures unsealed, so
+    // each byte is read once: hashed and sent in the same pass.
+    let client_seal = status["recovery_client_seal_v1"] == true && store.seals_while_uploading();
     let machines = wire::request(runner, json!({"op":"list"}))?;
     let mut machines = machines.as_array().context("invalid machine list")?.clone();
     // An interrupted long transfer must not always leave later boxes at the back.
@@ -159,11 +161,59 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
             if let Some(placement) = machine.get("placement") {
                 request["placement"] = placement.clone();
             }
+            if client_seal {
+                request["client_seal"] = json!(true);
+            }
             let point = wire::request(runner, request.clone())?;
             let Some(name) = point["snapshot"].as_str() else {
                 return Ok(());
             };
-            let uploaded = store.push(name, &runner.join("snapshots").join(name));
+            let mut capture = point["chunks"].clone();
+            let uploaded = (|| -> Result<Value> {
+                let snapshots = runner.join("snapshots");
+                if let Some(staging) = point["unsealed"].as_str() {
+                    ensure!(
+                        staging.starts_with(".pending-") && !staging.contains('/'),
+                        "invalid unsealed capture"
+                    );
+                    let previous = match point["previous"].as_str() {
+                        Some(previous) => {
+                            common::identifier(previous)?;
+                            Some(snapshots.join(previous))
+                        }
+                        None => None,
+                    };
+                    let (files, sent) = store
+                        .upload_unsealed(&snapshots.join(staging), previous.as_deref())
+                        .context("store cannot seal captures")??;
+                    let mut seal = request.clone();
+                    seal["op"] = json!("recovery-seal");
+                    seal["snapshot"] = json!(name);
+                    // Large disks' seals exceed the control socket's 1 MiB frame.
+                    // Publish in private staging atomically so a killed writer can retry.
+                    let path = snapshots.join(staging);
+                    let temporary = path.join(format!(".seals-{}", ow_core::common::nonce()?));
+                    let mut output = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o400)
+                        .open(&temporary)?;
+                    use std::io::Write;
+                    output.write_all(&serde_json::to_vec(&files)?)?;
+                    output.sync_all()?;
+                    fs::rename(temporary, path.join(ow_core::snapshot_digest::UPLOAD_SEALS))?;
+                    fs::File::open(&path)?.sync_all()?;
+                    seal["capture"] = sent["capture"].clone();
+                    wire::request(runner, seal)?;
+                    capture = sent["capture"].clone();
+                    // Every chunk was sent while sealing; this commits the manifest.
+                    let mut transfer = store.push(name, &snapshots.join(name))?;
+                    transfer["sealed_while_sending"] = sent;
+                    Ok(transfer)
+                } else {
+                    store.push(name, &snapshots.join(name))
+                }
+            })();
             request["op"] = json!("recovery-result");
             request["snapshot"] = json!(name);
             request["uploaded"] = json!(uploaded.is_ok());
@@ -172,7 +222,7 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
             println!(
                 "{}",
                 json!({"workspace":id,"snapshot":name,"last_durable_at":point["captured_at"],
-                       "capture":point["chunks"],"transfer":transfer})
+                       "capture":capture,"transfer":transfer})
             );
             Ok(())
         })();
@@ -221,27 +271,34 @@ fn listing(
     Ok(rows)
 }
 
-/// `(date time, key)` of every object under `url`, through `aws s3 ls --recursive`.
+/// `(UTC date time, key)` of every object under `url`.
 fn ls(store: &S3Store, url: &str) -> Result<Vec<(String, String)>> {
-    let output = store
-        .aws()
-        .args(["s3", "ls", "--recursive", &format!("{url}/")])
-        .stderr(Stdio::inherit())
-        .output()
-        .context("the AWS CLI (aws) is required for snapshot stores")?;
-    // As S3Store::list: exit 1 with no output is an empty prefix, anything else fails.
-    if !output.status.success() && !(output.status.code() == Some(1) && output.stdout.is_empty()) {
-        bail!("listing {url} failed ({})", output.status);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let at = format!("{} {}", parts.next()?, parts.next()?);
-            parts.next()?;
-            Some((at, parts.next()?.to_owned()))
-        })
+    Ok(store
+        .objects(url)?
+        .into_iter()
+        .map(|(at, key)| (utc(at), key))
         .collect())
+}
+
+/// `YYYY-MM-DD HH:MM:SS` of a Unix time, in UTC.
+fn utc(at: i64) -> String {
+    let (days, secs) = (at.div_euclid(86400), at.rem_euclid(86400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
 }
 
 /// Where the catalog copies for a `…/snapshots` store live: beside it, or for a
@@ -284,13 +341,9 @@ fn owners_from_s3(store: &S3Store, key: &str) -> Result<HashMap<String, (String,
     fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let result = (|| {
         let path = dir.join("catalog.sqlite3");
-        let status = store
-            .aws()
-            .args(["s3", "cp", "--only-show-errors", key])
-            .arg(&path)
-            .status()
-            .context("the AWS CLI (aws) is required for snapshot stores")?;
-        ensure!(status.success(), "downloading {key} failed ({status})");
+        store
+            .download(key, &path)
+            .with_context(|| format!("downloading {key}"))?;
         owners(&path)
     })();
     fs::remove_dir_all(&dir)?;
