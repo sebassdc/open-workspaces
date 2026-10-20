@@ -41,6 +41,8 @@ test('fork and restore from the snapshot list', async ({dashboard: page}) => {
   await row.getByRole('button', {name: 'Restore'}).click();
   await expect(page.locator('#dialog-title')).toHaveText('Return to this checkpoint?');
   await expect(page.locator('#dialog-description')).toHaveText(/Changes made since that snapshot will be lost/);
+  await expect(page.locator('#dialog-eyebrow')).toHaveText('CANNOT BE UNDONE');
+  await expect(page.locator('#dialog-submit')).toHaveClass('button danger');
   await page.getByRole('button', {name: 'Restore snapshot'}).click();
   await expect(notice(page)).toHaveText('Snapshot restored.');
   await page.getByRole('button', {name: /Machines/}).click();
