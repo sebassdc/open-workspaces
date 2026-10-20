@@ -84,7 +84,9 @@ A durable point matching the current frozen sleep state stays protected even
 when its capture timestamp is older than an hour; no newer writes exist there.
 The one-hour target is **not a measured service guarantee**: full RAM capture,
 a first full upload, busy disks, serialized captures, queueing, network throughput
-or failures can exceed it. Overdue status stays visible and never advances on
+or failures can exceed it. One measured box (64 GiB disk, 4 GiB RAM, n=1) took
+29 s per incremental point and 205 s for its first full point with 0.9.20
+([timings](experiments/recovery-upload-timings.md)). Overdue status stays visible and never advances on
 failure. Measure each intended host/cohort including capture, queue and upload
 time before relying on that target. A worker upgrade still pauses that worker's
 boxes through the existing upgrade policy; adding this timer never restarts it.
