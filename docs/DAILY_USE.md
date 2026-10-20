@@ -345,6 +345,21 @@ its `ProxyCommand`; run `ow ssh-config web` again. Teammates switch to
 `alice@example.com/web`; their open sessions stay up. The old name is free for a
 new box. In the dashboard, select the box and choose Rename.
 
+### Give a box to someone else
+
+```sh
+ow --server URL transfer demo --to bob@example.com [--keep-access]
+ow --server URL create demo --owner bob@example.com        # pool admins
+ow --server URL fork demo copy --owner bob@example.com     # owner or pool admin
+ow --server URL audit
+```
+
+Transfer hands over the box itself: same disk, snapshots and running state, now
+Bob's `demo`. Its shares end; `--keep-access` leaves you an admin share. Create
+and fork with `--owner` make a new box directly in Bob's name space, counted
+against his limits. Bob and you both see the change in `ow audit` and the
+dashboard's Ownership changes list. Details: [USERS.md](USERS.md#pool-admins-and-transfers).
+
 ### Move or fork to an explicit runner
 
 Owners can use `ow --server URL move BOX --node RUNNER`; existing fork permissions

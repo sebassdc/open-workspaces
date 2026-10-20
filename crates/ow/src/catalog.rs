@@ -21,6 +21,8 @@ pub struct Identity {
 pub struct Catalog {
     pub(crate) db: Connection,
     pub(crate) root: PathBuf,
+    /// Login emails of pool admins (gateway config `pool_admins`); empty means none.
+    pub(crate) pool_admins: Vec<String>,
     _lock: std::fs::File,
 }
 
@@ -354,12 +356,13 @@ pub fn share_unlocked(root: &Path, identity: &Identity, request: &Value) -> Resu
     share_on(&mut db, user, op, request)
 }
 
-/// What a grantee may do on a machine shared with them. Resize, delete, rename and sharing
-/// stay with the owner.
+/// What a grantee may do on a machine shared with them. Resize, delete, rename, transfer and
+/// sharing stay with the owner. A pool admin reaches any box only to transfer or fork it.
 fn permitted(role: &str, op: &str) -> bool {
     match role {
         "owner" => true,
-        "admin" => !matches!(op, "resize" | "delete" | "rename"),
+        "pool-admin" => matches!(op, "transfer" | "fork"),
+        "admin" => !matches!(op, "resize" | "delete" | "rename" | "transfer"),
         "use" => matches!(
             op,
             "exec"
@@ -436,6 +439,9 @@ impl Catalog {
           -- Never reassign an origin to another box/port: browser storage and service workers persist.
           CREATE TABLE IF NOT EXISTS publications(https_port INTEGER PRIMARY KEY CHECK(https_port BETWEEN 11000 AND 65535),physical TEXT NOT NULL,guest_port INTEGER NOT NULL CHECK(guest_port BETWEEN 1 AND 65535),active INTEGER NOT NULL DEFAULT 0,UNIQUE(physical,guest_port));
           CREATE TABLE IF NOT EXISTS grants(physical TEXT NOT NULL, grantee INTEGER NOT NULL REFERENCES users(id), role TEXT NOT NULL CHECK(role IN ('use','admin')), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(physical,grantee));
+          -- Additive too: ownership changes (transfer, create or fork for another owner), shown to
+          -- the actor and both owners. An older binary neither writes nor shows it.
+          CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, operation INTEGER NOT NULL UNIQUE, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, actor INTEGER NOT NULL REFERENCES users(id), action TEXT NOT NULL CHECK(action IN ('transfer','create','fork')), machine TEXT NOT NULL, source TEXT, from_owner INTEGER REFERENCES users(id), to_owner INTEGER NOT NULL REFERENCES users(id), keep_access INTEGER NOT NULL DEFAULT 0);
           ")?;
         if version == 1 {
             // Machine and snapshot IDs occupy separate worker directories and may match.
@@ -502,6 +508,7 @@ impl Catalog {
         let mut catalog = Self {
             db,
             root: root.into(),
+            pool_admins: Vec::new(),
             _lock: lock,
         };
         let migrated: bool = catalog.db.query_row(
@@ -605,24 +612,93 @@ impl Catalog {
     /// Physical ID of a machine the user owns (`name`) or that was shared with them
     /// (`owner@example.com/name`), when their role allows `op`.
     pub(crate) fn machine(&self, user: i64, address: &str, op: &str) -> Result<String> {
+        Ok(self.access(user, address, op)?.0)
+    }
+    /// `machine`, with the role it was reached by: owner, a grant's role, or pool-admin.
+    fn access(&self, user: i64, address: &str, op: &str) -> Result<(String, String)> {
         let Some((owner, name)) = address.split_once('/') else {
-            return self.physical(user, "machine", address);
+            return Ok((self.physical(user, "machine", address)?, "owner".into()));
         };
         common::address(address)?;
+        let admin = permitted("pool-admin", op) && self.pool_admin(user)?;
         let (physical, role): (String, String) = self
             .db
             .query_row(
-                "SELECT r.physical, CASE WHEN r.owner=?1 THEN 'owner' ELSE g.role END FROM resources r JOIN users u ON u.id=r.owner LEFT JOIN grants g ON g.physical=r.physical AND g.grantee=?1 WHERE r.kind='machine' AND u.issuer=(SELECT issuer FROM users WHERE id=?1) AND u.email=?2 AND r.name=?3 AND (r.owner=?1 OR g.role IS NOT NULL)",
-                params![user, owner.to_ascii_lowercase(), name],
+                "SELECT r.physical, CASE WHEN r.owner=?1 THEN 'owner' ELSE COALESCE(g.role,'pool-admin') END FROM resources r JOIN users u ON u.id=r.owner LEFT JOIN grants g ON g.physical=r.physical AND g.grantee=?1 WHERE r.kind='machine' AND u.issuer=(SELECT issuer FROM users WHERE id=?1) AND u.email=?2 AND r.name=?3 AND (r.owner=?1 OR g.role IS NOT NULL OR ?4)",
+                params![user, owner.to_ascii_lowercase(), name, admin],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| ResourceNotFound(format!("machine '{address}'")))?;
+        // A pool admin a box is also shared with still acts as pool admin.
+        let role = if admin && !permitted(&role, op) {
+            "pool-admin".into()
+        } else {
+            role
+        };
         ensure!(
             permitted(&role, op),
             "{op} is not allowed on a machine shared with you as {role}"
         );
-        Ok(physical)
+        Ok((physical, role))
+    }
+    /// Whether this signed-in user's bound login email is a configured pool admin.
+    pub(crate) fn pool_admin(&self, user: i64) -> Result<bool> {
+        let email: Option<String> = self
+            .db
+            .query_row(
+                "SELECT email FROM users WHERE id=?1 AND subject IS NOT NULL",
+                [user],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(email.is_some_and(|e| self.pool_admins.iter().any(|a| a.eq_ignore_ascii_case(&e))))
+    }
+    /// The user a login email names, in the caller's identity namespace. An email nobody has
+    /// used yet is reserved, as for sharing: its first verified login binds it.
+    fn user_by_email(&self, user: i64, email: &str) -> Result<i64> {
+        let email = email.to_ascii_lowercase();
+        common::email(&email)?;
+        let issuer: String =
+            self.db
+                .query_row("SELECT issuer FROM users WHERE id=?1", [user], |r| r.get(0))?;
+        self.db.execute(
+            "INSERT INTO users(issuer,email) VALUES(?1,?2) ON CONFLICT(issuer,email) DO NOTHING",
+            params![issuer, email],
+        )?;
+        Ok(self.db.query_row(
+            "SELECT id FROM users WHERE issuer=?1 AND email=?2",
+            params![issuer, email],
+            |r| r.get(0),
+        )?)
+    }
+    fn email(&self, user: i64) -> Result<String> {
+        Ok(self
+            .db
+            .query_row("SELECT email FROM users WHERE id=?1", [user], |r| r.get(0))?)
+    }
+    /// Record an ownership change for the actor and both owners to see. A replay keeps one row.
+    #[allow(clippy::too_many_arguments)]
+    fn audit(
+        &self,
+        operation: i64,
+        actor: i64,
+        action: &str,
+        machine: &str,
+        source: Option<&str>,
+        from: Option<i64>,
+        to: i64,
+        keep_access: bool,
+    ) -> Result<()> {
+        self.db.execute("INSERT INTO audit(operation,actor,action,machine,source,from_owner,to_owner,keep_access) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(operation) DO NOTHING",params![operation,actor,action,machine,source,from,to,keep_access])?;
+        Ok(())
+    }
+    fn audit_log(&self, user: i64) -> Result<Value> {
+        let mut stmt = self.db.prepare("SELECT CAST(strftime('%s',a.at) AS INTEGER),a.action,a.machine,a.source,ua.email,uf.email,ut.email,a.keep_access FROM audit a JOIN users ua ON ua.id=a.actor LEFT JOIN users uf ON uf.id=a.from_owner JOIN users ut ON ut.id=a.to_owner WHERE ?1 IN (a.actor,a.from_owner,a.to_owner) ORDER BY a.id DESC LIMIT 100")?;
+        let rows = stmt.query_map([user], |r| {
+            Ok(json!({"at":r.get::<_,i64>(0)?,"action":r.get::<_,String>(1)?,"machine":r.get::<_,String>(2)?,"source":r.get::<_,Option<String>>(3)?,"by":r.get::<_,String>(4)?,"from":r.get::<_,Option<String>>(5)?,"to":r.get::<_,String>(6)?,"keep_access":r.get::<_,bool>(7)?}))
+        })?;
+        Ok(json!(rows.collect::<rusqlite::Result<Vec<_>>>()?))
     }
     fn share(&mut self, user: i64, op: &str, request: &Value) -> Result<Value> {
         share_on(&mut self.db, user, op, request)
@@ -1392,7 +1468,7 @@ impl Catalog {
         }
         let discovery = self.discovery(user, &nodes)?;
         Ok(
-            json!({"discovery":discovery,"owner_limits":limits::state(&self.root,&self.db,user)?,"operations":operations,"workspaces":machines,"shared":shared,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
+            json!({"discovery":discovery,"owner_limits":limits::state(&self.root,&self.db,user)?,"pool_admin":self.pool_admin(user)?,"audit":self.audit_log(user)?,"operations":operations,"workspaces":machines,"shared":shared,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
         )
     }
     fn discovery(&self, user: i64, inventory: &Value) -> Result<Value> {
@@ -1609,6 +1685,156 @@ impl Catalog {
         match renamed {
             Ok(value) => {
                 self.db.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.db.execute_batch("ROLLBACK")?;
+                Err(error)
+            }
+        }
+    }
+    /// Give a machine to another owner. Only its catalog owner changes, with the snapshots its
+    /// owner took of it: physical ID, disk, placement, previews, SSH keys and running state
+    /// stay, with no worker contact. Grants go (the old owner keeps an admin grant only with
+    /// `keep_access`) and the open streams of everyone who lost access close. The owner or a
+    /// pool admin may do it; the new owner's name space and limits must have room.
+    fn hand_over(&mut self, user: i64, request: &Value) -> Result<Value> {
+        let address = request["id"].as_str().context("id")?;
+        common::address(address)?;
+        let to = request["to"]
+            .as_str()
+            .context("new owner email required")?
+            .to_ascii_lowercase();
+        common::email(&to)?;
+        let keep = request["keep_access"].as_bool().unwrap_or(false);
+        let fingerprint =
+            json!({"request":{"op":"transfer","id":address,"to":to,"keep_access":keep}})
+                .to_string();
+        let key = request["operation_key"].as_str();
+        if let Some(key) = key {
+            common::identifier(key)?;
+        }
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let moved = (|| -> Result<(Value, String, Vec<i64>)> {
+            // The address may not resolve after the first success: answer a retry by its key.
+            if let Some(key) = key {
+                let previous: Option<(String, String, Option<String>)> = self.db.query_row("SELECT op,request,response FROM operations WHERE owner=?1 AND retry_key=?2",params![user,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                if let Some((op, previous, response)) = previous {
+                    ensure!(
+                        op == "transfer" && previous == fingerprint,
+                        "operation key conflicts with original parameters"
+                    );
+                    let value = serde_json::from_str(&response.context("missing result")?)?;
+                    return Ok((value, String::new(), Vec::new()));
+                }
+            }
+            let (physical, _) = self.access(user, address, "transfer")?;
+            let (old, name): (i64, String) = self.db.query_row(
+                "SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1",
+                [&physical],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let new = self.user_by_email(user, &to)?;
+            if new == old {
+                return Err(Refusal {
+                    code: "already_owner",
+                    message: format!("{to} already owns this machine."),
+                }
+                .into());
+            }
+            let refuse = |why: String| -> Result<(Value, String, Vec<i64>)> {
+                Err(limits::Rejection(why).into())
+            };
+            if self.unmade(&physical)? {
+                return refuse(format!(
+                    "machine '{name}' was never made or is still being created; transfer it once it exists"
+                ));
+            }
+            // A transfer step re-authorizes by owner and name; an unresolved capture would leave
+            // its snapshot with the old owner.
+            let busy: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1) OR EXISTS(SELECT 1 FROM operations WHERE state IN ('pending','uncertain') AND op IN ('create','fork','resize','restore','start','snapshot') AND (json_extract(request,'$.request.id')=?1 OR json_extract(request,'$.request.child')=?1))",[&physical],|r|r.get(0))?;
+            if busy {
+                return refuse(format!(
+                    "machine '{name}' has an unfinished operation (a move, park, wake, fork or snapshot); transfer it when that finishes"
+                ));
+            }
+            if self.physical(new, "machine", &name).is_ok() {
+                return refuse(format!(
+                    "{to} already has a machine named '{name}'; rename one of them first"
+                ));
+            }
+            const SNAPSHOTS: &str =
+                "owner=?1 AND kind='snapshot' AND json_extract(metadata,'$.workspace')=?2";
+            let clash: Option<String> = self.db.query_row(&format!("SELECT name FROM resources WHERE {SNAPSHOTS} AND name IN (SELECT name FROM resources WHERE owner=?3 AND kind='snapshot') LIMIT 1"),params![old,physical,new],|r|r.get(0)).optional()?;
+            if let Some(clash) = clash {
+                return refuse(format!(
+                    "{to} already has a snapshot named '{clash}', like one of this machine's; delete or keep one of them first"
+                ));
+            }
+            limits::admit_owner(&self.root, &self.db, &physical, new, &to)?;
+            let snapshots = self
+                .db
+                .prepare(&format!(
+                    "SELECT name FROM resources WHERE {SNAPSHOTS} ORDER BY name"
+                ))?
+                .query_map(params![old, physical], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // The old owner's history stays but stops claiming the names, which are free again.
+            self.db.execute("UPDATE operations SET resource='transferred:'||resource WHERE owner=?1 AND resource=?2 AND op<>'snapshot'",params![old,name])?;
+            self.db.execute(&format!("UPDATE operations SET resource='transferred:'||resource WHERE owner=?1 AND op='snapshot' AND resource IN (SELECT name FROM resources WHERE {SNAPSHOTS})"),params![old,physical])?;
+            self.db.execute(
+                &format!(
+                    "UPDATE resources SET owner=?3,updated_at=CURRENT_TIMESTAMP WHERE {SNAPSHOTS}"
+                ),
+                params![old, physical, new],
+            )?;
+            self.db.execute("UPDATE resources SET owner=?1,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND physical=?2",params![new,physical])?;
+            let mut cut = self
+                .db
+                .prepare("SELECT grantee FROM grants WHERE physical=?1 AND grantee<>?2")?
+                .query_map(params![physical, new], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            self.db
+                .execute("DELETE FROM grants WHERE physical=?1", [&physical])?;
+            if keep {
+                self.db.execute(
+                    "INSERT INTO grants(physical,grantee,role) VALUES(?1,?2,'admin')",
+                    params![physical, old],
+                )?;
+            } else {
+                cut.push(old);
+            }
+            let node = self.placement("machine", &physical)?;
+            self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,finished_at) VALUES(?1,'transfer',?2,'succeeded',?3,?4,?5,CURRENT_TIMESTAMP)",params![user,format!("transferred:{name}"),node,key,fingerprint])?;
+            let operation = self.db.last_insert_rowid();
+            self.audit(
+                operation,
+                user,
+                "transfer",
+                &name,
+                Some(&name),
+                Some(old),
+                new,
+                keep,
+            )?;
+            let id = if new == user {
+                name.clone()
+            } else {
+                format!("{to}/{name}")
+            };
+            let value = json!({"id":id,"owner":to,"transferred_from":self.email(old)?,"keep_access":keep,"snapshots":snapshots,"operation_id":operation});
+            self.db.execute(
+                "UPDATE operations SET response=?1 WHERE id=?2",
+                params![value.to_string(), operation],
+            )?;
+            Ok((value, physical, cut))
+        })();
+        match moved {
+            Ok((value, physical, losers)) => {
+                self.db.execute_batch("COMMIT")?;
+                for loser in losers {
+                    cut(loser, &physical);
+                }
                 Ok(value)
             }
             Err(error) => {
@@ -2025,7 +2251,8 @@ impl Catalog {
                 "unshare",
                 "delete",
                 "snapshot-delete",
-                "rename"
+                "rename",
+                "transfer"
             ]
             .contains(&op.as_str()),
             "unsupported user operation"
@@ -2036,12 +2263,49 @@ impl Catalog {
         if op == "rename" {
             return self.rename(user, &request);
         }
+        if op == "transfer" {
+            return self.hand_over(user, &request);
+        }
         if matches!(op.as_str(), "create" | "resize") {
             common::requested_resources(&request)?;
             common::requested_disk(&request)?;
         }
         let name = request["id"].as_str().context("id")?.to_owned();
         common::address(&name)?;
+        // Create or fork for another owner: the new box, its operation and quota are theirs.
+        let owner = match request.as_object_mut().context("request")?.remove("owner") {
+            None | Some(Value::Null) => user,
+            Some(email) => {
+                let email = email.as_str().context("owner email")?;
+                ensure!(
+                    matches!(op.as_str(), "create" | "fork"),
+                    "only create and fork take an owner"
+                );
+                if op == "create" && !self.pool_admin(user)? {
+                    return Err(limits::Rejection(
+                        "only a pool admin can create a machine for someone else".into(),
+                    )
+                    .into());
+                }
+                if op == "fork" {
+                    let (physical, role) = self.access(user, &name, "fork")?;
+                    if !matches!(role.as_str(), "owner" | "pool-admin") && !self.pool_admin(user)? {
+                        return Err(limits::Rejection(
+                            "only the machine's owner or a pool admin can fork it for someone else"
+                                .into(),
+                        )
+                        .into());
+                    }
+                    if self.managed_placement(&physical)?.is_some() {
+                        return Err(limits::Rejection(
+                            "this machine was moved, parked or woken; forking it for someone else works only on its original runner for now".into(),
+                        )
+                        .into());
+                    }
+                }
+                self.user_by_email(user, email)?
+            }
+        };
         let input = request.clone();
         // A finished delete has no row left to resolve: answer its key before looking.
         if op == "delete"
@@ -2169,7 +2433,7 @@ impl Catalog {
         if op == "create" {
             let selector = request["image"].as_str().unwrap_or("alpine").to_owned();
             // Keep the first image version without rewriting omitted legacy defaults in retry fingerprints.
-            let previous: Option<String> = self.db.query_row("SELECT json_extract(metadata,'$.image') FROM resources WHERE owner=?1 AND kind='machine' AND name=?2", params![user,name], |r| r.get(0)).optional()?.flatten();
+            let previous: Option<String> = self.db.query_row("SELECT json_extract(metadata,'$.image') FROM resources WHERE owner=?1 AND kind='machine' AND name=?2", params![owner,name], |r| r.get(0)).optional()?.flatten();
             if let Some(previous) =
                 previous.filter(|p| p == &selector || crate::image_catalog::same_name(p, &selector))
             {
@@ -2205,7 +2469,7 @@ impl Catalog {
         let mut prior_reservation = (0i64, 0i64);
         let prepared = (|| -> Result<(String, String, String, i64, Option<Value>)> {
             let physical = if op == "create" {
-                self.reserve(user, "machine", &name)?
+                self.reserve(owner, "machine", &name)?
             } else {
                 self.machine(user, &name, &op)?
             };
@@ -2222,7 +2486,7 @@ impl Catalog {
                     .map_or_else(|| format!("c-{physical}"), str::to_owned);
                 let retry: bool = self.db.query_row(
                     "SELECT EXISTS(SELECT 1 FROM operations WHERE owner=?1 AND retry_key=?2)",
-                    params![user, key],
+                    params![owner, key],
                     |r| r.get(0),
                 )?;
                 if !retry {
@@ -2246,7 +2510,7 @@ impl Catalog {
             let mut node = self.placement("machine", &physical)?;
             if op == "create" && metadata["state"] == "pending" {
                 // Choose exactly once: nonlocal placement and an existing create operation pin it.
-                let chosen:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE owner=?1 AND resource=?2 AND op IN ('create','fork'))",params![user,name],|r|r.get(0))?;
+                let chosen:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE owner=?1 AND resource=?2 AND op IN ('create','fork'))",params![owner,name],|r|r.get(0))?;
                 if !chosen {
                     node = self.choose(
                         request["node"].as_str(),
@@ -2326,9 +2590,9 @@ impl Catalog {
                         request["snapshot"] = json!(snapshot);
                     }
                     let child = request["child"].as_str().context("child")?;
-                    let new_child = self.physical(user, "machine", child).is_err();
-                    target = self.reserve(user, "machine", child)?;
-                    let existing:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE owner=?1 AND resource=?2 AND op='fork')",params![user,child],|r|r.get(0))?;
+                    let new_child = self.physical(owner, "machine", child).is_err();
+                    target = self.reserve(owner, "machine", child)?;
+                    let existing:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE owner=?1 AND resource=?2 AND op='fork')",params![owner,child],|r|r.get(0))?;
                     // A live fork captures the running box; say so before anything is reserved.
                     if !existing
                         && request["snapshot"].is_null()
@@ -2369,7 +2633,7 @@ impl Catalog {
                 } else {
                     &name
                 };
-                let prior:Option<String>=self.db.query_row("SELECT request FROM operations WHERE owner=?1 AND op=?2 AND resource=?3 AND state<>'failed' ORDER BY id LIMIT 1",params![user,op,identifier],|r|r.get(0)).optional()?;
+                let prior:Option<String>=self.db.query_row("SELECT request FROM operations WHERE owner=?1 AND op=?2 AND resource=?3 AND state<>'failed' ORDER BY id LIMIT 1",params![owner,op,identifier],|r|r.get(0)).optional()?;
                 let mut normalized = request.clone();
                 normalized.as_object_mut().unwrap().remove("operation_key");
                 if let Some(prior) = prior {
@@ -2392,7 +2656,7 @@ impl Catalog {
                     _ => common::nonce()?,
                 }
             };
-            let previous:Option<(i64,String,String,Option<String>)>=self.db.query_row("SELECT id,request,state,response FROM operations WHERE owner=?1 AND retry_key=?2",params![user,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+            let previous:Option<(i64,String,String,Option<String>)>=self.db.query_row("SELECT id,request,state,response FROM operations WHERE owner=?1 AND retry_key=?2",params![owner,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
             request.as_object_mut().unwrap().remove("operation_key");
             let fingerprint = json!({"request":request,"node":node}).to_string();
             if let Some((id, previous, state, response)) = previous {
@@ -2415,10 +2679,10 @@ impl Catalog {
                     && matches!(state.as_str(), "pending" | "uncertain")
                     && !matches!(op.as_str(), "create" | "fork" | "snapshot")
                 {
-                    return Err(self.outcome_error(user, id));
+                    return Err(self.outcome_error(owner, id));
                 }
                 if state == "failed" {
-                    return Err(self.outcome_error(user, id));
+                    return Err(self.outcome_error(owner, id));
                 }
                 if state == "not_dispatched" {
                     self.admit(&node, &target, &op, &request, &metadata, &local_status)?;
@@ -2437,7 +2701,7 @@ impl Catalog {
             } else {
                 &name
             };
-            self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,?2,?3,'pending',?4,?5,?6)",params![user,op,resource,node,key,fingerprint])?;
+            self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,?2,?3,'pending',?4,?5,?6)",params![owner,op,resource,node,key,fingerprint])?;
             if op == "snapshot" {
                 // A new capture supersedes a failed reservation, not a known sealed artifact.
                 self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','pending'),updated_at=CURRENT_TIMESTAMP WHERE owner=?1 AND kind='snapshot' AND physical=?2 AND json_extract(metadata,'$.state')='failed'",params![user,request["name"].as_str().context("snapshot ID")?])?;
@@ -2487,7 +2751,7 @@ impl Catalog {
                     tx.execute("UPDATE resources SET reserved_mib=?1,reserved_cpus=?2 WHERE kind='machine' AND physical=?3",params![prior_reservation.0,prior_reservation.1,target])?;
                 }
                 tx.commit()?;
-                return Err(self.outcome_error(user, operation));
+                return Err(self.outcome_error(owner, operation));
             }
         };
         if node != "local" {
@@ -2506,7 +2770,7 @@ impl Catalog {
                     ],
                 )?;
                 eprintln!("operation {operation} transport: {e:#}");
-                return Err(self.outcome_error(user, operation));
+                return Err(self.outcome_error(owner, operation));
             }
         };
         let uncertain = envelope["uncertain"] == true;
@@ -2538,7 +2802,7 @@ impl Catalog {
             if let Err(error) = self.reconcile() {
                 eprintln!("operation {operation} reconciliation: {error:#}");
             }
-            return Err(self.outcome_error(user, operation));
+            return Err(self.outcome_error(owner, operation));
         }
         if op == "ssh-keys" && request.get("placement").is_some() {
             let current = wire::request(
@@ -2591,7 +2855,7 @@ impl Catalog {
             eprintln!(
                 "operation {operation}: worker response did not match the requested resource"
             );
-            return Err(self.outcome_error(user, operation));
+            return Err(self.outcome_error(owner, operation));
         }
         if request.get("placement").is_some()
             && matches!(op.as_str(), "start" | "stop" | "hibernate")
@@ -2619,7 +2883,7 @@ impl Catalog {
                             operation
                         ],
                     )?;
-                    return Err(self.outcome_error(user, operation));
+                    return Err(self.outcome_error(owner, operation));
                 }
             };
             if op == "stop" {
@@ -2655,12 +2919,39 @@ impl Catalog {
             value = json!({"deleted":snapshot,"workspace":name});
         } else {
             self.save_node(&node, "machine", &target, &value)?;
-            value = self.public(user, "machine", &value)?;
+            value = self.public(owner, "machine", &value)?;
         }
-        value["operation"] = self.operation_info(user, operation)?;
+        value["operation"] = self.operation_info(owner, operation)?;
         value["operation"]["state"] = json!("succeeded");
         value["operation_id"] = json!(operation);
         value["node"] = json!(node);
+        // A box made for someone else, or a pool admin's fork of another owner's box.
+        let admin_fork =
+            op == "fork" && owner == user && self.access(user, &name, "fork")?.1 == "pool-admin";
+        if owner != user || admin_fork {
+            let (from, source): (i64, String) = self.db.query_row(
+                "SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1",
+                [&physical],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let fork = op == "fork";
+            let child = if fork {
+                input["child"].as_str().unwrap_or(&name)
+            } else {
+                &name
+            };
+            self.audit(
+                operation,
+                user,
+                &op,
+                child,
+                fork.then_some(source.as_str()),
+                fork.then_some(from),
+                owner,
+                false,
+            )?;
+            value["owner"] = json!(self.email(owner)?);
+        }
         self.db.execute("UPDATE operations SET state='succeeded',response=?1,finished_at=CURRENT_TIMESTAMP WHERE id=?2",params![value.to_string(),operation])?;
         if matches!(op.as_str(), "stop" | "hibernate") {
             self.db.execute("UPDATE resources SET reserved_mib=0,reserved_cpus=0 WHERE kind='machine' AND physical=?1",[&physical])?;

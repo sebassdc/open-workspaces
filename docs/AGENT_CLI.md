@@ -152,6 +152,21 @@ print one JSON value on stdout, without an interactive prompt or progress banner
   the new name: rerun `ssh-config NEW_NAME`. Teammates use
   `owner@example.com/NEW_NAME`. Preview URLs do not contain the name and do not
   change.
+- `transfer NAME --to EMAIL [--keep-access]`: give a box to another owner (the
+  owner, or a pool admin with `OWNER@example.com/NAME`). Physical ID, disk, the
+  snapshots its owner took of it, placement, published ports, SSH keys and
+  running state stay; no worker contact. The new owner addresses it as `NAME`.
+  Its shares end and open shells of everyone who lost access close; with
+  `--keep-access` the old owner keeps an admin share. Refused while it is being
+  created, moved, parked, woken, forked or captured, when the new owner already
+  has a machine (or snapshot) of that name, or when it would exceed the new
+  owner's limits. Idempotent with `--operation-key`.
+- `create NAME --owner EMAIL` (pool admins) and `fork NAME CHILD --owner EMAIL`
+  (the machine's owner or a pool admin; not with `--node`): the new box is made in
+  that owner's name space and counts against their limits. A fork inherits no
+  shares or SSH keys.
+- `audit`: ownership changes that involve you (as actor, old or new owner), newest
+  first: who, what, when, from and to.
 - `delete-snapshot NAME SNAPSHOT`: delete one of your named snapshots of that
   workspace (the machine it captured). Workspaces forked or restored from it keep
   their own disks, and the snapshot name can be used again. It needs the
@@ -188,7 +203,8 @@ Recognizable failure codes are:
 - `fork_capacity`: the parent's runner has no room for the fork (other runners'
   room does not help, since a fork stays with its parent). Hibernate or stop a
   machine there, then retry.
-- `already_owner`: a share named your own login; share with a teammate instead.
+- `already_owner`: a share named your own login, or a transfer named the current
+  owner; name a teammate instead.
 - `node_unavailable`: wait for the intended runner; existing placement stays fixed.
 - `name_taken`: you already have a machine with that name; choose another
   (HTTP 409). Retrying the original create with its operation key is not a new

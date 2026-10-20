@@ -103,6 +103,8 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Share dialog, shared-with-me view, unshare | works | v0.9.22 | `sharing.spec.mjs › share dialog grants a teammate, who sees it under shared with me` |
 | Share dialog rejects an invalid email | works | v0.9.22 | `sharing.spec.mjs › share dialog refuses an invalid email` |
 | Share dialog refuses your own login in plain words | works | v0.9.28 | `sharing.spec.mjs › share dialog refuses your own login plainly` |
+| Transfer dialog gives a machine to another owner; both see it under Ownership changes | works | v0.9.36 | `admin.spec.mjs › transfer dialog gives a machine to another owner, and both see the change` |
+| Pool admin creates a machine for someone; the owner forks it for a teammate (owner field in create and fork dialogs) | works | v0.9.36 | `admin.spec.mjs › pool admin creates a machine for someone, who forks it for a teammate` |
 | Publish and unpublish a port | partial | v0.9.22 | `previews.spec.mjs › publish port dialog publishes, links and unpublishes a preview`; `previews.spec.mjs › publish port is hidden when previews are not configured` |
 
 Previews need `tailscale serve` and a root-owned helper on the host, so the

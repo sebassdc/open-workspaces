@@ -7,16 +7,7 @@ export const test = base.extend({
     const name = `u${info.workerIndex}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     await signIn(context, name);
     await use(name);
-    const page = await context.newPage();
-    await page.goto('/');
-    const state = await api(page);
-    // One machine that will not go must not keep the others running for later tests.
-    for (const machine of state.workspaces) {
-      try {
-        if (machine.state === 'running') await api(page, {op: 'stop', id: machine.id});
-        await api(page, {op: 'delete', id: machine.id});
-      } catch (error) { console.warn(`cleanup of ${machine.id}: ${error.message}`); }
-    }
+    await deleteMachines(context);
   }, {auto: true}],
   // The dashboard page with its first state load finished.
   dashboard: async ({page}, use) => {
@@ -26,6 +17,20 @@ export const test = base.extend({
   },
 });
 export {expect};
+
+// Stops and deletes the signed-in user's machines.
+export async function deleteMachines(context) {
+  const page = await context.newPage();
+  await page.goto('/');
+  const state = await api(page);
+  // One machine that will not go must not keep the others running for later tests.
+  for (const machine of state.workspaces) {
+    try {
+      if (machine.state === 'running') await api(page, {op: 'stop', id: machine.id});
+      await api(page, {op: 'delete', id: machine.id});
+    } catch (error) { console.warn(`cleanup of ${machine.id}: ${error.message}`); }
+  }
+}
 
 export async function signIn(context, name) {
   await context.addCookies([{name: 'ow-e2e-user', value: name, url: 'https://dashboard.e2e.ts.net'}]);

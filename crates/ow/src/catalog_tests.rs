@@ -1843,7 +1843,8 @@ fn owner_quota_shared_fork_charges_recipient_and_snapshot_shape() {
     .unwrap();
     assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 1);
     assert_eq!(c.state(b).unwrap()["owner_limits"]["usage"]["boxes"], 1);
-    assert!(c.operation(b,json!({"op":"fork","id":"alice@example.test/one","child":"extra","owner":a,"admin_override":true})).unwrap_err().to_string().contains("limit exceeded"));
+    // A grantee cannot pick whose quota a fork is charged to.
+    assert!(c.operation(b,json!({"op":"fork","id":"alice@example.test/one","child":"extra","owner":"alice@example.test"})).unwrap_err().to_string().contains("owner or a pool admin"));
 }
 
 #[test]
@@ -2467,6 +2468,7 @@ fn transfer_operation_join_conflict_and_atomic_competing_requests() {
         .map(|_| Catalog {
             db: nodes::db(&c.root).unwrap(),
             root: c.root.clone(),
+            pool_admins: Vec::new(),
             _lock: c._lock.try_clone().unwrap(),
         })
         .collect::<Vec<_>>();
@@ -4197,5 +4199,314 @@ fn fork_refused_for_room_names_the_parent_runner_and_shape() {
     assert_eq!(
         (refusal.code, refusal.message.as_str()),
         ("fork_capacity", expected)
+    );
+}
+
+/// Whether a gateway stream's revocation fired within 50 ms.
+fn closed(stream: &Arc<tokio::sync::Notify>) -> bool {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_millis(50), stream.notified()).await
+        })
+        .is_ok()
+}
+
+#[test]
+fn transfer_by_owner_or_pool_admin_keeps_the_box_and_moves_its_owner() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    quota_node(&fake);
+    c.pool_admins = vec!["Admin@example.test".into()];
+    let a = c.user(&identity("alice")).unwrap();
+    let b = c.user(&identity("bob")).unwrap();
+    let s = c.user(&identity("sam")).unwrap();
+    let e = c.user(&identity("eve")).unwrap();
+    let p = c.user(&identity("admin")).unwrap();
+    assert!(c.pool_admin(p).unwrap() && !c.pool_admin(a).unwrap());
+    c.operation(
+        a,
+        json!({"op":"create","id":"demo","memory_mib":256,"vcpu_count":1}),
+    )
+    .unwrap();
+    let physical = c.physical(a, "machine", "demo").unwrap();
+    c.operation(a, json!({"op":"snapshot","id":"demo","name":"saved"}))
+        .unwrap();
+    c.operation(
+        a,
+        json!({"op":"share","id":"demo","with":"sam@example.test","role":"admin"}),
+    )
+    .unwrap();
+    let (_, _, owner_stream) = c.terminal_target(a, "demo").unwrap();
+    let (_, _, grantee_stream) = c.terminal_target(s, "alice@example.test/demo").unwrap();
+    let transfer = |id: &str, to: &str| json!({"op":"transfer","id":id,"to":to});
+    // A shared admin, a stranger, a missing box or a bad email cannot.
+    for (user, request) in [
+        (s, transfer("alice@example.test/demo", "sam@example.test")),
+        (e, transfer("alice@example.test/demo", "eve@example.test")),
+        (a, transfer("missing", "bob@example.test")),
+        (a, transfer("demo", "not-an-email")),
+    ] {
+        assert!(c.operation(user, request.clone()).is_err(), "{request}");
+    }
+    let mine = c
+        .operation(a, transfer("demo", "alice@example.test"))
+        .unwrap_err();
+    assert_eq!(
+        mine.downcast_ref::<Refusal>().unwrap().code,
+        "already_owner"
+    );
+    // The new owner's names and limits must have room.
+    c.operation(
+        b,
+        json!({"op":"create","id":"demo","memory_mib":256,"vcpu_count":1}),
+    )
+    .unwrap();
+    let taken = c
+        .operation(a, transfer("demo", "bob@example.test"))
+        .unwrap_err();
+    assert!(
+        taken
+            .downcast_ref::<limits::Rejection>()
+            .is_some_and(|r| r.0.contains("already has a machine named 'demo'")),
+        "{taken:#}"
+    );
+    c.operation(b, json!({"op":"rename","id":"demo","name":"other"}))
+        .unwrap();
+    quota_config(
+        &fake.root,
+        json!({"cpus":16,"memory_mib":32768,"disk_gib":256,"boxes":1}),
+    );
+    let full = c
+        .operation(a, transfer("demo", "bob@example.test"))
+        .unwrap_err();
+    assert!(
+        full.downcast_ref::<limits::Rejection>().is_some_and(|r| r
+            .0
+            .contains("bob@example.test would exceed their boxes limit")),
+        "{full:#}"
+    );
+    std::fs::remove_file(fake.root.join("limits.json")).unwrap();
+    assert_eq!(c.physical(a, "machine", "demo").unwrap(), physical);
+    // The owner hands it over: no worker contact, so the running box keeps running.
+    let before = fake.calls.load(Ordering::SeqCst);
+    let mut keyed = transfer("demo", "Bob@example.test");
+    keyed["operation_key"] = json!("give-one");
+    let moved = c.operation(a, keyed.clone()).unwrap();
+    assert_eq!(moved["id"], "bob@example.test/demo");
+    assert_eq!(moved["owner"], "bob@example.test");
+    assert_eq!(moved["snapshots"], json!(["saved"]));
+    assert_eq!(fake.calls.load(Ordering::SeqCst), before);
+    // The key replays the result although alice no longer has the box.
+    assert_eq!(c.operation(a, keyed.clone()).unwrap(), moved);
+    keyed["to"] = json!("eve@example.test");
+    assert!(c.operation(a, keyed).is_err());
+    assert_eq!(c.physical(b, "machine", "demo").unwrap(), physical);
+    let state = c.state(b).unwrap();
+    let machine = state["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "demo")
+        .unwrap()
+        .clone();
+    assert_eq!(machine["state"], "running");
+    assert_eq!(machine["shared_with"], json!([]));
+    assert_eq!(state["snapshots"][0]["name"], "saved");
+    assert_eq!(state["snapshots"][0]["workspace"], "demo");
+    assert_eq!(state["audit"][0]["action"], "transfer");
+    assert_eq!(state["audit"][0]["by"], "alice@example.test");
+    assert_eq!(state["audit"][0]["from"], "alice@example.test");
+    assert_eq!(state["audit"][0]["to"], "bob@example.test");
+    assert_eq!(state["audit"][0]["machine"], "demo");
+    assert!(
+        c.operation(b, json!({"op":"exec","id":"demo","command":"id"}))
+            .is_ok()
+    );
+    // Alice and sam lost it, and their open streams closed; eve sees nothing of it.
+    assert!(
+        c.operation(a, json!({"op":"exec","id":"demo","command":"id"}))
+            .is_err()
+    );
+    assert!(
+        c.operation(
+            s,
+            json!({"op":"exec","id":"alice@example.test/demo","command":"id"})
+        )
+        .is_err()
+    );
+    assert!(closed(&owner_stream) && closed(&grantee_stream));
+    assert_eq!(c.state(a).unwrap()["audit"][0]["to"], "bob@example.test");
+    assert_eq!(c.state(a).unwrap()["snapshots"], json!([]));
+    assert_eq!(c.state(e).unwrap()["audit"], json!([]));
+    // Alice's name is free again.
+    c.operation(
+        a,
+        json!({"op":"create","id":"demo","memory_mib":256,"vcpu_count":1}),
+    )
+    .unwrap();
+    assert_ne!(c.physical(a, "machine", "demo").unwrap(), physical);
+    // A pool admin moves anyone's box, here to a login nobody has used yet, and the old owner
+    // keeps an admin share. Pool admin is not a way into the guest.
+    assert!(
+        c.operation(
+            p,
+            json!({"op":"exec","id":"bob@example.test/demo","command":"id"})
+        )
+        .is_err()
+    );
+    let mut kept = transfer("bob@example.test/demo", "carol@example.test");
+    kept["keep_access"] = json!(true);
+    assert_eq!(
+        c.operation(p, kept).unwrap()["id"],
+        "carol@example.test/demo"
+    );
+    let shared = c.state(b).unwrap()["shared"][0].clone();
+    assert_eq!(
+        (
+            shared["id"].as_str(),
+            shared["role"].as_str(),
+            shared["state"].as_str()
+        ),
+        (
+            Some("carol@example.test/demo"),
+            Some("admin"),
+            Some("running")
+        )
+    );
+    assert_eq!(c.state(b).unwrap()["audit"][0]["by"], "admin@example.test");
+    assert_eq!(c.state(p).unwrap()["audit"][0]["to"], "carol@example.test");
+    // A non-admin cannot reach someone else's box to transfer it.
+    assert!(
+        c.operation(e, transfer("carol@example.test/demo", "eve@example.test"))
+            .is_err()
+    );
+    // Carol's first login binds the reserved email; the transfer survives a restart.
+    drop(c);
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let carol = c.user(&identity("carol")).unwrap();
+    assert_eq!(c.physical(carol, "machine", "demo").unwrap(), physical);
+    assert_eq!(c.state(carol).unwrap()["audit"][0]["action"], "transfer");
+}
+
+#[test]
+fn pool_admins_create_and_fork_for_others_and_owners_fork_for_others() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    quota_node(&fake);
+    c.pool_admins = vec!["admin@example.test".into()];
+    let a = c.user(&identity("alice")).unwrap();
+    let s = c.user(&identity("sam")).unwrap();
+    let e = c.user(&identity("eve")).unwrap();
+    let p = c.user(&identity("admin")).unwrap();
+    let gift = json!({"op":"create","id":"gift","memory_mib":256,"vcpu_count":1,"owner":"alice@example.test"});
+    let refused = c.operation(e, gift.clone()).unwrap_err();
+    assert!(
+        refused
+            .downcast_ref::<limits::Rejection>()
+            .is_some_and(|r| r.0.contains("only a pool admin")),
+        "{refused:#}"
+    );
+    let made = c.operation(p, gift).unwrap();
+    assert_eq!(
+        (made["id"].as_str(), made["owner"].as_str()),
+        (Some("gift"), Some("alice@example.test"))
+    );
+    assert!(c.physical(p, "machine", "gift").is_err());
+    let state = c.state(a).unwrap();
+    assert_eq!(state["workspaces"][0]["id"], "gift");
+    assert_eq!(state["owner_limits"]["usage"]["boxes"], 1);
+    assert_eq!(state["operations"][0]["op"], "create");
+    assert_eq!(state["audit"][0]["action"], "create");
+    assert_eq!(state["audit"][0]["by"], "admin@example.test");
+    assert_eq!(c.state(p).unwrap()["owner_limits"]["usage"]["boxes"], 0);
+    // An owner forks into someone else's name space; a shared user and a stranger cannot.
+    c.operation(
+        a,
+        json!({"op":"share","id":"gift","with":"sam@example.test"}),
+    )
+    .unwrap();
+    let fork = |id: &str, child: &str| json!({"op":"fork","id":id,"child":child,"owner":"eve@example.test"});
+    assert!(
+        c.operation(s, fork("alice@example.test/gift", "x"))
+            .unwrap_err()
+            .to_string()
+            .contains("owner or a pool admin")
+    );
+    assert!(
+        c.operation(e, fork("alice@example.test/gift", "x"))
+            .is_err()
+    );
+    let copy = c.operation(a, fork("gift", "copy")).unwrap();
+    assert_eq!(copy["owner"], "eve@example.test");
+    assert_eq!(c.state(e).unwrap()["workspaces"][0]["id"], "copy");
+    // A fork inherits no grants.
+    assert_eq!(
+        c.state(e).unwrap()["workspaces"][0]["shared_with"],
+        json!([])
+    );
+    // A pool admin forks another owner's box for someone, or for themself.
+    c.operation(p, fork("alice@example.test/gift", "admin-copy"))
+        .unwrap();
+    c.operation(
+        p,
+        json!({"op":"fork","id":"alice@example.test/gift","child":"peek"}),
+    )
+    .unwrap();
+    assert!(
+        c.physical(e, "machine", "admin-copy").is_ok() && c.physical(p, "machine", "peek").is_ok()
+    );
+    let audit = c.state(a).unwrap()["audit"].clone();
+    assert_eq!(
+        audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| format!(
+                "{} {} {}->{} {} by {}",
+                r["action"].as_str().unwrap(),
+                r["source"].as_str().unwrap_or("-"),
+                r["from"].as_str().unwrap_or("-"),
+                r["to"].as_str().unwrap(),
+                r["machine"].as_str().unwrap(),
+                r["by"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            "fork gift alice@example.test->admin@example.test peek by admin@example.test",
+            "fork gift alice@example.test->eve@example.test admin-copy by admin@example.test",
+            "fork gift alice@example.test->eve@example.test copy by alice@example.test",
+            "create - -->alice@example.test gift by admin@example.test",
+        ]
+    );
+    // A sharee's own fork is no admin action.
+    c.operation(
+        s,
+        json!({"op":"fork","id":"alice@example.test/gift","child":"mine"}),
+    )
+    .unwrap();
+    assert_eq!(c.state(s).unwrap()["audit"], json!([]));
+    // The child name must be free in the new owner's name space.
+    c.operation(
+        e,
+        json!({"op":"create","id":"own","memory_mib":256,"vcpu_count":1}),
+    )
+    .unwrap();
+    assert!(c.operation(a, fork("gift", "own")).is_err());
+    assert_eq!(
+        c.state(e).unwrap()["workspaces"].as_array().unwrap().len(),
+        3
+    );
+    // Only create and fork take an owner.
+    assert!(
+        c.operation(
+            p,
+            json!({"op":"start","id":"alice@example.test/gift","owner":"eve@example.test"})
+        )
+        .is_err()
     );
 }

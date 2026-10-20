@@ -1558,7 +1558,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "ow"
-version = "0.9.35"
+version = "0.9.36"
 dependencies = [
  "anyhow",
  "axum",
@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "ow-core"
-version = "0.9.35"
+version = "0.9.36"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1604,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "ow-guest"
-version = "0.9.35"
+version = "0.9.36"
 dependencies = [
  "base64 0.22.1",
  "libc",

@@ -53,6 +53,9 @@ struct Config {
     upstream: String,
     #[serde(default)]
     bootstrap_owner_email: Option<String>,
+    /// Login emails that may transfer and fork any box, and create boxes for others.
+    #[serde(default)]
+    pool_admins: Vec<String>,
     #[serde(default)]
     node_owner_subject: Option<String>,
     #[serde(default)]
@@ -173,6 +176,10 @@ impl Config {
             !self.allowed_emails.is_empty() || self.allowed_capability.is_some(),
             "an explicit email allowlist or tailnet capability is required"
         );
+        for admin in &self.pool_admins {
+            crate::common::email(&admin.to_ascii_lowercase())
+                .context("invalid pool_admins email")?;
+        }
         if let Some(owner) = &self.bootstrap_owner_email {
             ensure!(
                 self.allowed_emails
@@ -943,7 +950,10 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
             )
         })
         .transpose()?
-        .map(|c| Arc::new(std::sync::Mutex::new(c)));
+        .map(|mut c| {
+            c.pool_admins = config.pool_admins.clone();
+            Arc::new(std::sync::Mutex::new(c))
+        });
     if let Some(catalog) = &catalog {
         crate::transfers::recover(catalog);
         crate::scaler::start(catalog);
@@ -1074,6 +1084,7 @@ mod tests {
             allowed_capability: None,
             upstream,
             bootstrap_owner_email: None,
+            pool_admins: Vec::new(),
             node_owner_subject: None,
             node_owner_user_id: None,
             previews: false,
@@ -1121,6 +1132,11 @@ mod tests {
             cfg.upstream = upstream.into();
             assert!(cfg.validate().is_err());
         }
+        cfg = config("http://127.0.0.1:1234".into());
+        cfg.pool_admins = vec!["Admin@example.test".into()];
+        assert!(cfg.validate().is_ok());
+        cfg.pool_admins.push("not-an-email".into());
+        assert!(cfg.validate().is_err());
         cfg = config("http://127.0.0.1:1234".into());
         cfg.allowed_emails.clear();
         assert!(cfg.validate().is_err());

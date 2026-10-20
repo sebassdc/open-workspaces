@@ -84,7 +84,7 @@ part of implementing this feature.
 `ow exec`, `ow shell` and lifecycle operations use that account's logical names.
 The local operator CLI/socket remains trusted maintenance access to all physical
 worker IDs. Local host access is not a restricted tenant login. Machine sharing
-is below; teams, administration roles and workload tokens are not implemented.
+and pool admins are below; teams and workload tokens are not implemented.
 
 ## Sharing a machine
 
@@ -149,6 +149,59 @@ resize, and forked a copy holding the owner's file; `unshare` closed the open
 terminal in under 1 ms, then exec and terminal were refused, the fork stayed
 the grantee's and the owner was unaffected. One sample per host; signed test tokens
 stand in for two real Cloudflare or tailnet logins.
+
+## Pool admins and transfers
+
+Owners are the unit of ownership; there are no teams or tenants. Moving a box
+"to another team" means transferring or forking it to an owner there. Pool admins
+are login emails in the gateway config's `pool_admins` list (default empty: no
+admins). Their verified login, bound in the catalog like any other, is checked;
+listing an email admits nobody who is not already admitted. A pool admin is
+different from a machine's `admin` share role.
+
+| Action | Owner | Pool admin | Shared `admin` / `use` | Stranger |
+| --- | --- | --- | --- | --- |
+| `ow transfer BOX --to EMAIL [--keep-access]` | yes | yes, any box | no | no |
+| `ow fork BOX CHILD --owner EMAIL` | yes | yes, any box | no | no |
+| `ow create NAME --owner EMAIL` | no | yes | no | no |
+
+A pool admin reaches another owner's box (`alice@example.com/BOX`) only to transfer
+or fork it: exec, shells, SSH, lifecycle and sharing still need ownership or a
+share. A pool admin's fork of another owner's box copies everything on it into a
+box the admin chooses the owner of, so the list should hold only people trusted
+with every box in the pool.
+
+**Transfer** changes only catalog rows, in one SQLite transaction, with no worker
+contact: the box keeps its physical ID, disk, placement, published ports, SSH keys
+and running state, and the snapshots its owner took of it move with it. The new
+owner gets full owner rights and addresses it as `NAME`; others use
+`new@example.com/NAME`. Every share ends (a teammate's or the new owner's), and
+the open terminals and SSH streams of everyone who lost access close; with
+`--keep-access` the old owner gets an `admin` share. The old owner's name is free
+again; their operation history stays, renamed `transferred:NAME`. Snapshots a
+grantee took stay theirs. It is refused when the new owner already has a machine
+or snapshot of the same name, when the box is still being created, or has an
+unfinished move, park, wake, fork, capture, start, resize or restore, and when the
+box would push the new owner past any of their CPU, RAM, disk or box limits. An
+email nobody has used yet is reserved, as for sharing.
+
+**Create and fork for someone else** reserve the new box, its operation and its
+quota in that owner's name space; the result names the `owner`. A fork for another
+owner works on boxes still on their original runner (not after a move, park or
+wake) and not with `--node`. Like every fork, it inherits no shares or SSH keys.
+
+**Audit.** Every transfer, create for someone else, fork into someone else's name
+space and pool admin fork is a row in the catalog's `audit` table (actor, action,
+machine, source, old and new owner, keep-access, time). The actor and both owners
+see it in `ow audit` and the dashboard's Ownership changes list. The table is
+additive: catalog schema 7 is unchanged and an older controller ignores it.
+
+Evidence (2026-10-20): `catalog::multinode_tests::transfer_by_owner_or_pool_admin_keeps_the_box_and_moves_its_owner`
+and `catalog::multinode_tests::pool_admins_create_and_fork_for_others_and_owners_fork_for_others`
+(permissions for owner, pool admin, shared admin and stranger; quotas; a running
+box keeps running with no worker call; name collisions; streams closed; restart),
+and the dashboard tests in `e2e/tests/admin.spec.mjs` against a fake worker.
+No real VM or second real login was used.
 
 ## Acceptance evidence
 

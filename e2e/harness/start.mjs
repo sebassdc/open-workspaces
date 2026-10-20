@@ -29,8 +29,9 @@ fs.mkdirSync(bin);
 fs.copyFileSync(path.join(here, 'tailscale'), path.join(bin, 'tailscale'));
 fs.chmodSync(path.join(bin, 'tailscale'), 0o755);
 const config = path.join(root, 'dashboard.json');
-// The `owner` test user (whois ID 1001, the first catalog user) is the host pool owner.
-fs.writeFileSync(config, JSON.stringify({auth: 'tailscale', hostname: HOSTNAME, allowed_capability: 'example.com/cap/open-workspaces', upstream: 'http://127.0.0.1:9/', node_owner_subject: '1001', node_owner_user_id: 1}), {mode: 0o600});
+// The `owner` test user (whois ID 1001, the first catalog user) is the host pool owner;
+// `pooladmin` is a pool admin.
+fs.writeFileSync(config, JSON.stringify({auth: 'tailscale', hostname: HOSTNAME, allowed_capability: 'example.com/cap/open-workspaces', upstream: 'http://127.0.0.1:9/', node_owner_subject: '1001', node_owner_user_id: 1, pool_admins: ['pooladmin@example.test']}), {mode: 0o600});
 execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', `/CN=${HOSTNAME}`, '-keyout', path.join(root, 'tls.key'), '-out', path.join(root, 'tls.crt')], {stdio: 'ignore'});
 
 const whois = path.join(root, 'whois.json'), users = new Map();

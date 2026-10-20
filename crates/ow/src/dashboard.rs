@@ -65,6 +65,12 @@ struct Operation {
     role: Option<String>,
     #[serde(default)]
     port: Option<u16>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    keep_access: Option<bool>,
+    #[serde(default)]
+    owner: Option<String>,
 }
 
 fn validated(bytes: &[u8]) -> Result<Value> {
@@ -95,6 +101,14 @@ fn validated(bytes: &[u8]) -> Result<Value> {
     if let Some(node) = operation.node {
         runtime::identifier(&node)?;
         request["node"] = json!(node);
+    }
+    if let Some(owner) = operation.owner {
+        ensure!(
+            operation.op == "create" || operation.op == "fork" && request.get("node").is_none(),
+            "only create and same-runner fork take an owner"
+        );
+        crate::common::email(&owner.to_ascii_lowercase())?;
+        request["owner"] = json!(owner);
     }
     match operation.op.as_str() {
         "create" => {
@@ -205,6 +219,12 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             );
             request["artifact"] = json!(artifact);
             request["accept_cold"] = json!(operation.accept_cold.unwrap_or(false));
+        }
+        "transfer" => {
+            let to = operation.to.context("new owner email required")?;
+            crate::common::email(&to.to_ascii_lowercase())?;
+            request["to"] = json!(to);
+            request["keep_access"] = json!(operation.keep_access.unwrap_or(false));
         }
         "rename" => {
             let name = operation.name.context("new name required")?;
@@ -481,7 +501,7 @@ pub async fn handle(
         }
     };
     // A moved child's ordinary fork keeps its existing use-role permission and defaults to its runner.
-    if operation["op"] == "fork" && !operation["node"].is_string() {
+    if operation["op"] == "fork" && !operation["node"].is_string() && operation["owner"].is_null() {
         let target = catalog.as_ref().and_then(|shared| {
             let mut c=shared.lock().ok()?;
             let user=c.user(&identity).ok()?;
@@ -680,6 +700,35 @@ mod tests {
         assert!(validated(br#"{"op":"restore","id":"box","name":"local-snapshot"}"#).is_ok());
         assert!(validated(br#"{"op":"snapshot-delete","id":"box","name":"old"}"#).is_ok());
         assert!(validated(br#"{"op":"snapshot-delete","id":"box"}"#).is_err());
+    }
+
+    #[test]
+    fn transfer_and_owner_take_a_valid_email() {
+        assert_eq!(
+            validated(
+                br#"{"op":"transfer","id":"box","to":"bob@example.test","keep_access":true}"#
+            )
+            .unwrap(),
+            json!({"op":"transfer","id":"box","to":"bob@example.test","keep_access":true})
+        );
+        assert_eq!(
+            validated(br#"{"op":"fork","id":"box","child":"copy","owner":"bob@example.test"}"#)
+                .unwrap(),
+            json!({"op":"fork","id":"box","child":"copy","owner":"bob@example.test"})
+        );
+        assert_eq!(
+            validated(br#"{"op":"create","id":"box","owner":"bob@example.test"}"#).unwrap()["owner"],
+            "bob@example.test"
+        );
+        for bad in [
+            json!({"op":"transfer","id":"box"}),
+            json!({"op":"transfer","id":"box","to":"bob"}),
+            json!({"op":"create","id":"box","owner":"bob"}),
+            json!({"op":"fork","id":"box","child":"copy","owner":"bob@example.test","node":"n","operation_key":"k"}),
+            json!({"op":"start","id":"box","owner":"bob@example.test"}),
+        ] {
+            assert!(validated(bad.to_string().as_bytes()).is_err(), "{bad}");
+        }
     }
 
     #[test]

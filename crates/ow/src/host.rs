@@ -853,7 +853,9 @@ pub fn run(cli: Cli) -> Result<i32> {
         | Action::Store { .. }
         | Action::Image { .. }
         | Action::Share { .. }
-        | Action::Unshare { .. } => unreachable!(),
+        | Action::Unshare { .. }
+        | Action::Transfer { .. }
+        | Action::Audit => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;
             return Ok(0);
@@ -906,8 +908,12 @@ pub fn run(cli: Cli) -> Result<i32> {
             cpus,
             disk,
             node,
+            owner,
         } => {
-            ensure!(node.is_none(), "--node requires a remote controller");
+            ensure!(
+                node.is_none() && owner.is_none(),
+                "--node and --owner require a remote controller"
+            );
             json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"disk_gib":disk.unwrap_or(common::DEFAULT_DISK_GIB)})
         }
         Action::Resize {
@@ -991,8 +997,12 @@ pub fn run(cli: Cli) -> Result<i32> {
             snapshot,
             node,
             accept_cold: _,
+            owner,
         } => {
-            ensure!(node.is_none(), "targeted fork requires a remote controller");
+            ensure!(
+                node.is_none() && owner.is_none(),
+                "targeted fork and --owner require a remote controller"
+            );
             json!({"op":"fork","id":id,"child":child,"snapshot":snapshot})
         }
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),

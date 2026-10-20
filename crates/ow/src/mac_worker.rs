@@ -1084,8 +1084,12 @@ pub fn run(cli: Cli) -> Result<i32> {
             cpus,
             disk,
             node,
+            owner,
         } => {
-            ensure!(node.is_none(), "local placement is this Mac");
+            ensure!(
+                node.is_none() && owner.is_none(),
+                "local placement is this Mac; --owner requires a remote controller"
+            );
             ensure!(
                 disk.is_none(),
                 "--disk is only supported by Linux Firecracker runners"
