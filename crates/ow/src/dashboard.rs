@@ -613,6 +613,15 @@ pub async fn handle(
                         .into_response(),
                 );
             }
+            if let Some(refusal) = error.downcast_ref::<crate::catalog::Refusal>() {
+                return secure(
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({"ok":false,"error_code":refusal.code,"error":refusal.message})),
+                    )
+                        .into_response(),
+                );
+            }
             if let Some(failure) = error.downcast_ref::<crate::catalog::OperationFailure>() {
                 return secure(
                     (

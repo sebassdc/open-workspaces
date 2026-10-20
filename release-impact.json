@@ -2,7 +2,7 @@
   "schema": 1,
   "releases": [
     {
-      "version": "0.9.28",
+      "version": "0.9.29",
       "class": 2,
       "changes": [
         "worker",
@@ -35,7 +35,43 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "Faster S3 transfers. The artifact store behind cross-runner fork, move, park and restore no longer runs an AWS CLI process per 64 MiB part: uploads and downloads are signed in process on one connection pool, with OW_S3_TRANSFERS (default 16) parallel parts or 16 MiB ranges, multithreaded zstd (same stream format), read-ahead with hashing on its own thread and a separate sparse-file writer. Parts start at 16 MiB and double every 1000 parts up to 128 MiB (object cap about 987 GiB, was 625 GiB). Recovery chunk transfers use the same OW_S3_TRANSFERS setting (default 16, was 8), the stored manifest is read in process, and a first recovery capture skips holes in reflinked files. Storage formats, manifests, retention and GC are unchanged. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout are unchanged. Class-2 worker and agent upgrade."
+      "notes": "S3 calls use the AWS SDK for Rust and its refreshing credential chain with pooled connections, bounded parallel transfers and retries. Recovery points use 32 MiB SHA-256 chunks (sha256-chunks-32m-v2), reading changed reflink extents and uploading while sealing in one pass; 8 MiB chunk seals and whole-file backups remain readable. Recovery client sealing is capability negotiated; older clients use worker sealing. Artifact multipart uploads and ETag-pinned ranged downloads run in parallel; interrupted response bodies retry. Retention and GC semantics, worker interface 3, catalog schema 7, runtime, guest kernel and host layout remain unchanged. Class-2 worker and agent upgrade; upgrade restore readers before using new recovery points."
+    },
+    {
+      "version": "0.9.28",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Plain refusal reasons: a fork that does not fit on its parent's runner is refused with error code fork_capacity and a sentence naming the runner and the fork's shape (catalog admission, same-runner managed fork reservation, or the worker's own reservation limit); sharing a machine with your own login is refused with error code already_owner. The dashboard shows both without operation or retry-key details; the CLI shows the same text. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-1 upgrade: the controller and dashboard restart; workers and guests are untouched."
     },
     {
       "version": "0.9.27",
@@ -1435,14 +1471,35 @@
     {
       "version": "0.6.2",
       "class": 1,
-      "changes": ["controller", "agent", "dashboard"],
-      "protocol": { "speaks": 1, "accepts": [1, 1] },
-      "worker_protocol": { "speaks": 1, "accepts": [1, 1] },
-      "catalog": { "schema": 3, "min_reader": 3 },
+      "changes": [
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "catalog": {
+        "schema": 3,
+        "min_reader": 3
+      },
       "runtime": {
         "vmm": "firecracker-v1.17.0",
         "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
-        "resumes": ["firecracker-v1.17.0"]
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
@@ -1451,14 +1508,33 @@
     {
       "version": "0.6.1",
       "class": 0,
-      "changes": ["component"],
-      "protocol": { "speaks": 1, "accepts": [1, 1] },
-      "worker_protocol": { "speaks": 1, "accepts": [1, 1] },
-      "catalog": { "schema": 3, "min_reader": 3 },
+      "changes": [
+        "component"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "catalog": {
+        "schema": 3,
+        "min_reader": 3
+      },
       "runtime": {
         "vmm": "firecracker-v1.17.0",
         "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
-        "resumes": ["firecracker-v1.17.0"]
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
@@ -1467,31 +1543,78 @@
     {
       "version": "0.6.0",
       "class": 1,
-      "changes": ["controller", "agent", "host-layout", "component"],
-      "protocol": { "speaks": 1, "accepts": [1, 1] },
-      "worker_protocol": { "speaks": 1, "accepts": [1, 1] },
-      "catalog": { "schema": 3, "min_reader": 3 },
+      "changes": [
+        "controller",
+        "agent",
+        "host-layout",
+        "component"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "catalog": {
+        "schema": 3,
+        "min_reader": 3
+      },
       "runtime": {
         "vmm": "firecracker-v1.17.0",
         "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
-        "resumes": ["firecracker-v1.17.0"]
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "waivers": { "worker": "crates/ow/src/host.rs changes only `ow node agent` (a runner host's agent drains on SIGTERM), not the worker" },
+      "waivers": {
+        "worker": "crates/ow/src/host.rs changes only `ow node agent` (a runner host's agent drains on SIGTERM), not the worker"
+      },
       "notes": "Runner component: a runner host joins an existing controller (#24). Controller, agent and host-layout changes; the worker is unchanged, so boxes keep running."
     },
     {
       "version": "0.5.0",
       "class": 3,
-      "changes": ["controller", "agent", "worker", "host-layout", "stage0"],
-      "protocol": { "speaks": 1, "accepts": [1, 1] },
-      "worker_protocol": { "speaks": 1, "accepts": [1, 1] },
-      "catalog": { "schema": 3, "min_reader": 3 },
+      "changes": [
+        "controller",
+        "agent",
+        "worker",
+        "host-layout",
+        "stage0"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "catalog": {
+        "schema": 3,
+        "min_reader": 3
+      },
       "runtime": {
         "vmm": "firecracker-v1.17.0",
         "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
-        "resumes": ["firecracker-v1.17.0"]
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
       },
       "host_layout": 2,
       "in_place_from": null,
@@ -1500,14 +1623,33 @@
     {
       "version": "0.4.1",
       "class": 3,
-      "changes": ["stage0"],
-      "protocol": { "speaks": 1, "accepts": [1, 1] },
-      "worker_protocol": { "speaks": 1, "accepts": [1, 1] },
-      "catalog": { "schema": 3, "min_reader": 3 },
+      "changes": [
+        "stage0"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "catalog": {
+        "schema": 3,
+        "min_reader": 3
+      },
       "runtime": {
         "vmm": "firecracker-v1.17.0",
         "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
-        "resumes": ["firecracker-v1.17.0"]
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
       },
       "host_layout": 1,
       "in_place_from": null,

@@ -42,3 +42,11 @@ test('share dialog refuses an invalid email', async ({dashboard: page}) => {
   expect(await page.getByLabel('Teammate email').evaluate(input => input.validity.valid)).toBe(false);
   await expect(card(page, 'solo')).toBeVisible();
 });
+
+test('share dialog refuses your own login plainly', async ({dashboard: page, user}) => {
+  await machines(page, 'mine');
+  await detailAction(page, 'Share').click();
+  await page.getByLabel('Teammate email').fill(`${user}@example.test`);
+  await page.getByRole('button', {name: 'Share machine'}).click();
+  await expect(page.locator('#dialog-error')).toHaveText('You already own this machine; share it with a teammate login.');
+});
