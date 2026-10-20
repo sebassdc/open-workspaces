@@ -61,6 +61,8 @@ export function fakeWorker(socketPath, log = () => {}) {
     },
     restore: r => Object.assign(get(r.id), {state: 'running'}),
     fork: r => {
+      // Forks of a 3 vCPU parent are refused as the real worker refuses one on a full runner.
+      if (get(r.id).vcpu_count === 3) throw Error('CPU reservation limit (16 vCPUs) reached');
       const child = {...get(r.id), id: r.child, source: r.id, state: 'running'};
       machines.set(r.child, child);
       // Like the real worker, a fork of the running machine keeps its own capture, named for no one.
