@@ -65,6 +65,9 @@ users through email PIN requires preserving other apps' login behavior first.
 
 - `GET /api/state` returns workspace summaries, snapshot summaries and memory
   measurements. It omits worker/hypervisor socket paths and worker PID details.
+  Machines carry `created_at`; a live fork's own capture names its child as
+  `fork`; a failed capture names its machine (`workspace`, null once deleted)
+  and `failed_at`. Times are Unix seconds.
 - `POST /api/operation` accepts only create/start/stop/hibernate/snapshot/fork/
   restore/exec, with typed fields, strict unknown-field rejection, validated IDs,
   bounded memory profiles, 2,000-byte commands and 16 KiB operation bodies.
