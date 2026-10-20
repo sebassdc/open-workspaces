@@ -50,6 +50,8 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Create dialog shows each node's free vCPU and memory, disables a full node, and explains refusals in dashboard words | works | v0.9.22 | `machines.spec.mjs › create dialog shows free room per node, disables a full one and explains a refusal plainly` |
 | Create dialog offers only memory and vCPU sizes the chosen node (or any node, when automatic) can place | works | v0.9.22 | `machines.spec.mjs › create dialog offers only sizes the chosen node can place` |
 | Create dialog offers only images the chosen node has ready | works | v0.9.22 | `machines.spec.mjs › create dialog offers only images the chosen node has ready` |
+| Create dialog disables all sizes and blocks submission when the pool is full | works | v0.9.22 | `machines.spec.mjs › create dialog blocks a full pool without submitting a shape` |
+| Create dialog blocks a node with no eligible images, clears the unavailable selections, and recovers when a ready node is chosen | works | v0.9.22 | `machines.spec.mjs › create dialog blocks a node without images and recovers on a ready node` |
 | Create dialog on an ARM-only pool starts on a Mac runner shape (512 MiB or more, no disk size) | works | v0.9.22 | `machines.spec.mjs › create dialog starts an ARM-only pool on a shape its Mac runner accepts` |
 | Create with a name already in use says the name is taken and stays open | works | v0.9.22 | `machines.spec.mjs › create dialog says a name is taken and stays open` |
 | Create dialog starts with focus on the machine name | works | v0.9.22 | `machines.spec.mjs › create dialog starts on the machine name` |

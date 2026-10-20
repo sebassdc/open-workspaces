@@ -149,6 +149,49 @@ test('create dialog offers only images the chosen node has ready', async ({dashb
   await expect(option(page, 'image', 'ubuntu')).toHaveJSProperty('disabled', false);
 });
 
+test('create dialog blocks a full pool without submitting a shape', async ({dashboard: page}) => {
+  await twoNodePool(page, {nodes: [free('node-a', 0, 0, 0), free('node-b', 0, 0, 0)], ready: twoNodes.ready});
+  const sent = createsSent(page);
+  await page.getByRole('button', {name: '＋ New machine'}).click();
+  await page.getByLabel('Machine name').fill('no-room');
+  for (const field of ['image', 'memory_mib', 'vcpu_count']) {
+    await expect(page.locator(`select[name=${field}] option:enabled`)).toHaveCount(0);
+    await expect(page.locator(`select[name=${field}]`)).toHaveValue('');
+  }
+  await expect(page.getByRole('button', {name: 'Create machine'})).toBeDisabled();
+  await expect(page.locator('#dialog-error')).toContainText('No operating system and machine size are available');
+  // Enter and a direct submit event must not send defaults for the empty selects.
+  await page.getByLabel('Machine name').press('Enter');
+  await page.locator('#operation-form').evaluate(form => form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true})));
+  expect(sent).toEqual([]);
+  await expect(dialog(page)).toBeVisible();
+});
+
+test('create dialog blocks a node without images and recovers on a ready node', async ({dashboard: page}) => {
+  await twoNodePool(page, {nodes: [free('node-a', 4096, 4), free('node-c', 4096, 4)], ready: {ubuntu: ['node-a']}});
+  const sent = createsSent(page);
+  await page.getByRole('button', {name: '＋ New machine'}).click();
+  await expect(page.getByLabel('Operating system')).toHaveValue('ubuntu');
+  await page.getByLabel('Machine name').fill('no-image');
+  await page.getByLabel('Pool node').selectOption('node-c');
+  for (const field of ['image', 'memory_mib', 'vcpu_count']) {
+    await expect(page.locator(`select[name=${field}] option:enabled`)).toHaveCount(0);
+    await expect(page.locator(`select[name=${field}]`)).toHaveValue('');
+  }
+  await expect(page.getByRole('button', {name: 'Create machine'})).toBeDisabled();
+  await expect(page.locator('#dialog-error')).toBeVisible();
+  await page.getByLabel('Machine name').press('Enter');
+  await page.locator('#operation-form').evaluate(form => form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true})));
+  expect(sent).toEqual([]);
+  await page.getByLabel('Pool node').selectOption('node-a');
+  await expect(page.getByRole('button', {name: 'Create machine'})).toBeEnabled();
+  await expect(page.locator('#dialog-error')).toBeHidden();
+  await expect(page.getByLabel('Operating system')).toHaveValue('ubuntu');
+  await page.getByRole('button', {name: 'Create machine'}).click();
+  await expect(page.locator('#dialog-error')).toBeVisible();
+  expect(sent).toMatchObject([{node: 'node-a', image: 'ubuntu', memory_mib: 256, vcpu_count: 1}]);
+});
+
 test('create dialog starts an ARM-only pool on a shape its Mac runner accepts', async ({dashboard: page}) => {
   await twoNodePool(page, {nodes: [{...free('mac-a', 4096, 4), per_guest: {memory_mib: [512, 1024, 2048], max_vcpus: 4}}], ready: {'ubuntu-arm64': ['mac-a']}});
   const sent = createsSent(page);
