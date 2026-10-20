@@ -187,6 +187,12 @@ pub(crate) fn drain(limit: Duration) {
     }
 }
 
+/// The host reserve of a controller host (see docs/HOSTS.md); a runner's is the worker's default.
+const CONTROLLER_RESERVE: [(&str, &str); 2] = [
+    ("OW_HOST_RESERVE_CPU_MILLIS", "1000"),
+    ("OW_HOST_RESERVE_MEMORY_MIB", "2048"),
+];
+
 #[allow(clippy::too_many_arguments)]
 pub fn up(
     base: Option<PathBuf>,
@@ -281,7 +287,8 @@ pub fn up(
             // The worker has its own unit and limits; restarting this process leaves its VMs running.
             wait_worker(&runner, Duration::from_secs(60))?;
         } else {
-            let started = Command::new(std::env::current_exe()?)
+            let mut worker = Command::new(std::env::current_exe()?);
+            worker
                 .arg("--local")
                 .arg("--data-dir")
                 .arg(&runner)
@@ -290,8 +297,14 @@ pub fn up(
                 .env("OW_MAX_RUNNING", slots.to_string())
                 .env("OW_MAX_VCPUS", cpus.to_string())
                 .env(ow_core::idle::ENV, (idle_minutes * 60).to_string())
-                .stdout(Stdio::null())
-                .status()?;
+                .stdout(Stdio::null());
+            // This host also runs the controller: it keeps more than a plain runner's reserve.
+            for (name, default) in CONTROLLER_RESERVE {
+                if std::env::var_os(name).is_none() {
+                    worker.env(name, default);
+                }
+            }
+            let started = worker.status()?;
             ensure!(
                 started.success(),
                 "local runner failed to start; see {}",
