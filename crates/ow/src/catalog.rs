@@ -55,6 +55,55 @@ impl std::fmt::Display for OperationFailure {
 }
 impl std::error::Error for OperationFailure {}
 
+/// A refusal before any effect, in words for the person who asked: `code` lets the
+/// dashboard recognise it, `message` is shown as is by the dashboard and the CLI.
+#[derive(Debug)]
+pub struct Refusal {
+    pub code: &'static str,
+    pub message: String,
+}
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for Refusal {}
+
+/// A fork lands on its parent's runner, so another runner's free room does not help.
+fn fork_room(node: &str, cpus: u64, memory_mib: u64) -> String {
+    let runner = if node == "local" {
+        "This host".to_owned()
+    } else {
+        format!("Runner {node}")
+    };
+    let memory = if memory_mib % 1024 == 0 {
+        format!("{} GiB", memory_mib / 1024)
+    } else {
+        format!("{memory_mib} MiB")
+    };
+    format!(
+        "{runner} has no room for a {cpus} vCPU / {memory} fork. Forks stay on the parent machine's runner; free capacity there (hibernate or stop a machine) and try again."
+    )
+}
+fn fork_refusal(node: &str, cpus: u64, memory_mib: u64) -> anyhow::Error {
+    Refusal {
+        code: "fork_capacity",
+        message: fork_room(node, cpus, memory_mib),
+    }
+    .into()
+}
+/// The worker's own reservation limits (ow-core runtime capacity); only matched, never shown.
+fn worker_capacity_refusal(diagnostic: &str) -> bool {
+    diagnostic.ends_with(" reached")
+        && [
+            "running workspace limit (",
+            "CPU reservation limit (",
+            "memory reservation limit (",
+        ]
+        .iter()
+        .any(|p| diagnostic.starts_with(p))
+}
+
 /// Only known diagnostics cross the human API boundary. Raw errors stay in the private
 /// operation response and host journal, where the operation ID makes them discoverable.
 /// Metadata of a fork child that was never made: failed, flagged so quotas skip it. A
@@ -245,7 +294,13 @@ fn share_on(db: &mut Connection, user: i64, op: &str, request: &Value) -> Result
             |r| r.get(0),
         )
         .optional()?;
-    ensure!(grantee != Some(user), "you already own this machine");
+    if grantee == Some(user) {
+        return Err(Refusal {
+            code: "already_owner",
+            message: "You already own this machine; share it with a teammate login.".into(),
+        }
+        .into());
+    }
     if let Some(grantee) = grantee {
         if op == "share" {
             let role = request["role"].as_str().unwrap_or("use");
@@ -767,10 +822,18 @@ impl Catalog {
         let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(|| limits::Rejection(format!("Runner {target} is offline, draining or has no registered budget.")))?;
         let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1 AND (?2=0 OR physical<>?3)",params![target,t.kind==crate::transfers::Kind::Move && target==t.source_node,t.source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         let (extra_mib, extra_cpus, extra_slots) = c.extra_usage(target)?;
+        let fits = used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64
+            && used_cpus as u64 + extra_cpus + intent.cpus as u64 <= cpus as u64
+            && used_slots as u64 + extra_slots < slots as u64;
+        if !fits && t.kind == crate::transfers::Kind::Fork && target == t.source_node {
+            return Err(fork_refusal(
+                target,
+                intent.cpus.into(),
+                intent.memory_mib.into(),
+            ));
+        }
         ensure!(
-            used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64
-                && used_cpus as u64 + extra_cpus + intent.cpus as u64 <= cpus as u64
-                && used_slots as u64 + extra_slots < slots as u64,
+            fits,
             limits::Rejection(format!(
                 "Runner {target} lacks free memory, vCPUs or box slots for this box."
             ))
@@ -1040,10 +1103,15 @@ impl Catalog {
             if let Some((code, _)) = first_use_error(response["error"].as_str().unwrap_or("")) {
                 info["error_code"] = json!(code);
             }
+            // Written by the controller itself when the worker refused a fork for room.
+            if let Some(room) = response["fork_room"].as_str() {
+                info["error"] = json!(room);
+                info["error_code"] = json!("fork_capacity");
+            }
             // Refusals carry only controller-written public reasons.
             if response["refused"] == true {
                 info["error"] = response["error"].clone();
-                info["error_code"] = json!("refused");
+                info["error_code"] = json!(response["code"].as_str().unwrap_or("refused"));
             }
         }
         if let Some((id, epoch, step)) = self
@@ -1906,7 +1974,14 @@ impl Catalog {
             } else {
                 shape["image"].as_str().unwrap_or("alpine")
             };
-            self.capacity(node, target, memory, cpus, image, local_status)?;
+            self.capacity(node, target, memory, cpus, image, local_status)
+                .map_err(|e| {
+                    if op == "fork" && e.to_string() == "node capacity exhausted" {
+                        fork_refusal(node, cpus, memory)
+                    } else {
+                        e
+                    }
+                })?;
             self.db.execute("UPDATE resources SET reserved_mib=?1,reserved_cpus=?2 WHERE kind='machine' AND physical=?3",params![memory as i64,cpus as i64,target])?;
         }
         Ok(())
@@ -2407,6 +2482,14 @@ impl Catalog {
         };
         let uncertain = envelope["uncertain"] == true;
         if envelope["ok"] != true {
+            let mut envelope = envelope;
+            if !uncertain
+                && op == "fork"
+                && worker_capacity_refusal(envelope["error"].as_str().unwrap_or(""))
+            {
+                let (memory, cpus): (i64, i64) = self.db.query_row("SELECT reserved_mib,reserved_cpus FROM resources WHERE kind='machine' AND physical=?1",[&target],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                envelope["fork_room"] = json!(fork_room(&node, cpus as u64, memory as u64));
+            }
             self.db.execute(
                 "UPDATE operations SET state=?1,response=?3,finished_at=CASE WHEN ?1='failed' THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id=?2",
                 params![if uncertain { "uncertain" } else { "failed" }, operation, envelope.to_string()],

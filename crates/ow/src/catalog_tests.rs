@@ -4136,3 +4136,61 @@ fn a_live_fork_of_a_stopped_or_hibernated_box_asks_to_start_it_first() {
         assert!(!machine_states(&mut c, a).contains_key("copy"));
     }
 }
+
+#[test]
+fn sharing_with_your_own_login_is_refused_plainly() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let owner = c.user(&identity("alice")).unwrap();
+    c.operation(owner, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    let error = c
+        .operation(
+            owner,
+            json!({"op":"share","id":"demo","with":"Alice@Example.test"}),
+        )
+        .unwrap_err();
+    let refusal = error.downcast_ref::<Refusal>().unwrap();
+    assert_eq!(refusal.code, "already_owner");
+    assert_eq!(
+        refusal.message,
+        "You already own this machine; share it with a teammate login."
+    );
+}
+
+#[test]
+fn fork_refused_for_room_names_the_parent_runner_and_shape() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let owner = c.user(&identity("alice")).unwrap();
+    c.operation(owner, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    let expected = "Runner alpha has no room for a 1 vCPU / 256 MiB fork. Forks stay on the parent machine's runner; free capacity there (hibernate or stop a machine) and try again.";
+    // The worker's own reservation limit, whose text never reaches the user.
+    *fake.reject.lock().unwrap() = Some("fork".into());
+    *fake.diagnostic.lock().unwrap() = "CPU reservation limit (16 vCPUs) reached".into();
+    let error = c
+        .operation(owner, json!({"op":"fork","id":"demo","child":"refused"}))
+        .unwrap_err();
+    let failure = error.downcast_ref::<OperationFailure>().unwrap();
+    assert_eq!(failure.0["state"], "failed");
+    assert_eq!(failure.0["error_code"], "fork_capacity");
+    assert_eq!(failure.message(), expected);
+    *fake.reject.lock().unwrap() = None;
+    // The catalog's own admission: the parent already holds the runner's only vCPU.
+    nodes::db(&fake.root)
+        .unwrap()
+        .execute(
+            "UPDATE nodes SET capabilities=json_set(capabilities,'$.vcpus',1) WHERE id='alpha'",
+            [],
+        )
+        .unwrap();
+    let error = c
+        .operation(owner, json!({"op":"fork","id":"demo","child":"full"}))
+        .unwrap_err();
+    let refusal = error.downcast_ref::<Refusal>().unwrap();
+    assert_eq!(
+        (refusal.code, refusal.message.as_str()),
+        ("fork_capacity", expected)
+    );
+}

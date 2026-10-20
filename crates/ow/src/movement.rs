@@ -21,13 +21,17 @@ fn capable_move(c: &Catalog, node: &str, disk: u64) -> Result<()> {
 /// operation carrying its public reason, so the requester can see why in ow status.
 pub(crate) fn relocate(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> {
     admit(shared.clone(), identity, request).or_else(|error| {
-        let Some(refusal) = error.downcast_ref::<crate::limits::Rejection>() else {
+        let (reason, code) = if let Some(r) = error.downcast_ref::<crate::limits::Rejection>() {
+            (r.0.clone(), "refused")
+        } else if let Some(r) = error.downcast_ref::<crate::catalog::Refusal>() {
+            (r.message.clone(), r.code)
+        } else {
             return Err(error);
         };
         let mut c = shared.lock().unwrap();
         let user = c.user(identity)?;
         let resource = request["child"].as_str().or(request["id"].as_str());
-        c.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,response,finished_at) VALUES(?1,?2,?3,'failed',?4,?5,?6,?7,CURRENT_TIMESTAMP)",params![user,request["op"].as_str(),resource,request["node"].as_str(),request["operation_key"].as_str(),json!({"request":request}).to_string(),json!({"error":refusal.0,"refused":true}).to_string()])?;
+        c.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,response,finished_at) VALUES(?1,?2,?3,'failed',?4,?5,?6,?7,CURRENT_TIMESTAMP)",params![user,request["op"].as_str(),resource,request["node"].as_str(),request["operation_key"].as_str(),json!({"request":request}).to_string(),json!({"error":reason,"refused":true,"code":code}).to_string()])?;
         let id = c.db.last_insert_rowid();
         Err(crate::catalog::OperationFailure(c.operation_info(user, id)?).into())
     })
