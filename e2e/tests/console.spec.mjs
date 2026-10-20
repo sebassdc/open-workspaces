@@ -1,4 +1,4 @@
-import {test, expect, machines, detailAction, notice} from './fixtures.mjs';
+import {test, expect, api, machines, detailAction, notice} from './fixtures.mjs';
 
 test('terminal opens, echoes input and reports the shell exit', async ({dashboard: page}) => {
   await machines(page, 'tty');
@@ -7,16 +7,44 @@ test('terminal opens, echoes input and reports the shell exit', async ({dashboar
   await expect(terminal).toBeVisible();
   await expect(page.locator('#terminal-title')).toHaveText('tty / Terminal');
   await expect(page.locator('#terminal-status')).toHaveText('Connected');
+  await expect(terminal.getByRole('button', {name: 'New session'})).toBeHidden();
   await expect(terminal.locator('.xterm-rows')).toContainText('fake-shell$');
+  // The dark dialog asks for dark native scrollbars on the xterm viewport.
+  expect(await terminal.locator('.xterm-viewport').evaluate(node => getComputedStyle(node).colorScheme)).toBe('dark');
   await terminal.locator('.xterm').click();
   await page.keyboard.type('hello-from-e2e');
   await page.keyboard.press('Enter');
   // The fake shell echoes the typed line, then prints it again as its output.
   await expect(terminal.locator('.xterm-rows')).toContainText(/hello-from-e2e[\s\S]*hello-from-e2e/);
-  await page.keyboard.type('exit');
+  await page.keyboard.type('exit 3');
   await page.keyboard.press('Enter');
-  await expect(page.locator('#terminal-status')).toHaveText('Shell exited · 0');
-  await page.getByRole('button', {name: 'Disconnect'}).click();
+  await expect(page.locator('#terminal-status')).toHaveText('Shell exited · 3');
+  await expect(terminal.getByRole('button', {name: 'Disconnect'})).toBeHidden();
+  await expect(terminal.getByRole('button', {name: 'Close'})).toBeVisible();
+  // A new session reconnects in the same dialog.
+  await terminal.getByRole('button', {name: 'New session'}).click();
+  await expect(page.locator('#terminal-status')).toHaveText('Connected');
+  await expect(terminal.locator('.xterm-rows')).toContainText('fake-shell$');
+  await expect(terminal.locator('.xterm-rows')).not.toContainText('hello-from-e2e');
+  await terminal.getByRole('button', {name: 'Disconnect'}).click();
+  await expect(terminal).toBeHidden();
+});
+
+test('terminal notices a machine hibernated elsewhere and blocks input', async ({dashboard: page}) => {
+  await machines(page, 'napper');
+  await detailAction(page, 'Open Terminal').click();
+  const terminal = page.locator('#terminal-dialog'), rows = terminal.locator('.xterm-rows');
+  await expect(page.locator('#terminal-status')).toHaveText('Connected');
+  await expect(rows).toContainText('fake-shell$');
+  // Another client hibernates it; the fake worker keeps the terminal stream open, as a frozen guest would.
+  await api(page, {op: 'hibernate', id: 'napper'});
+  await expect(page.locator('#terminal-status')).toHaveText('Machine hibernated. Start it, then choose New session.', {timeout: 10_000});
+  await expect(terminal.getByRole('button', {name: 'Close'})).toBeVisible();
+  await expect(terminal.getByRole('button', {name: 'New session'})).toBeVisible();
+  await terminal.locator('.xterm').click();
+  await page.keyboard.type('lost-input');
+  await expect(rows).not.toContainText('lost-input');
+  await terminal.getByRole('button', {name: 'Close'}).click();
   await expect(terminal).toBeHidden();
 });
 

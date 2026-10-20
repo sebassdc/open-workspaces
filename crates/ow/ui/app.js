@@ -18,7 +18,7 @@ async function api(path, body) {
   if (!response.ok || !value.ok) { const error = Error((value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : '')); error.operation = value.operation; throw error; }
   return value.result;
 }
-async function refresh() { try { data = await api('/api/state'); $('host-controls').hidden = !data.host_controls; $('pool-policy').textContent = data.pool_policy || ''; render(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; } }
+async function refresh() { try { data = await api('/api/state'); $('host-controls').hidden = !data.host_controls; $('pool-policy').textContent = data.pool_policy || ''; render(); checkTerminal(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; } }
 function action(label, callback, disabled = false) { const button = element('button', label, 'button secondary'); button.disabled = disabled || busy; button.addEventListener('click', () => Promise.resolve(callback()).catch(() => {})); return button; }
 function select(id) { selected = id; render(); }
 function durability(item) {
@@ -138,7 +138,20 @@ $('operation-dialog').addEventListener('cancel', event => { if (busy) event.prev
 document.querySelectorAll('.nav').forEach(button => button.addEventListener('click', () => setView(button.dataset.view)));
 refresh(); setInterval(() => { if (!busy && !document.hidden && !$('operation-dialog').open) refresh(); }, 5000);
 
-let terminalSocket = null, terminalView = null, terminalFit = null, terminalObserver = null;
+let terminalSocket = null, terminalView = null, terminalFit = null, terminalObserver = null, terminalId = null;
+// Ends the session but keeps the dialog: input stops, and the user can close or start a new shell.
+function endTerminal(message) {
+  $('terminal-status').textContent = message;
+  if (terminalSocket) { const socket = terminalSocket; terminalSocket = null; socket.close(); }
+  if (terminalView) { terminalView.options.cursorBlink = false; terminalView.options.disableStdin = true; }
+  $('terminal-close').textContent = 'Close'; $('terminal-new').hidden = false;
+}
+// A machine hibernated or stopped elsewhere may leave the socket open with nobody reading it.
+function checkTerminal() {
+  if (!terminalSocket) return;
+  const item = [...data.workspaces, ...(data.shared || [])].find(entry => entry.id === terminalId);
+  if (!item || item.state !== 'running') endTerminal(`Machine ${item ? item.state : 'removed'}. Start it, then choose New session.`);
+}
 function closeTerminal() {
   if (terminalSocket) { terminalSocket.close(); terminalSocket = null; }
   if (terminalObserver) { terminalObserver.disconnect(); terminalObserver = null; }
@@ -147,7 +160,8 @@ function closeTerminal() {
   if ($('terminal-dialog').open) $('terminal-dialog').close();
 }
 function openTerminal(id) {
-  closeTerminal(); $('terminal-title').textContent = `${id} / Terminal`; $('terminal-status').textContent = 'Connecting…';
+  closeTerminal(); terminalId = id; $('terminal-title').textContent = `${id} / Terminal`; $('terminal-status').textContent = 'Connecting…';
+  $('terminal-close').textContent = 'Disconnect'; $('terminal-new').hidden = true;
   $('terminal-dialog').showModal();
   const terminal = new Terminal({cursorBlink:true, fontSize:14, scrollback:2000, theme:{background:'#101c18',foreground:'#e7f1eb'}});
   const fit = new FitAddon.FitAddon(); terminal.loadAddon(fit); terminal.open($('terminal-screen')); fit.fit();
@@ -160,21 +174,22 @@ function openTerminal(id) {
   socket.onmessage = event => {
     if (terminalSocket !== socket) return;
     if (typeof event.data === 'string') {
-      const control = JSON.parse(event.data); if (control.type === 'exit') $('terminal-status').textContent = `Shell exited · ${control.code}`;
+      const control = JSON.parse(event.data); if (control.type === 'exit') endTerminal(`Shell exited · ${control.code}`);
     } else {
       const bytes = new Uint8Array(event.data); terminal.write(bytes, () => { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type:'ack',bytes:bytes.length})); });
     }
   };
-  socket.onerror = () => { if (terminalSocket === socket) $('terminal-status').textContent = 'Connection failed. Check the machine and reload to sign in.'; };
-  socket.onclose = () => { if (terminalSocket === socket && $('terminal-status').textContent === 'Connected') $('terminal-status').textContent = 'Disconnected. Reopen Terminal to reconnect.'; };
+  socket.onerror = () => { if (terminalSocket === socket) endTerminal('Connection failed. Check the machine and reload to sign in.'); };
+  socket.onclose = () => { if (terminalSocket === socket) endTerminal('Disconnected.'); };
   terminal.onData(text => {
     if (socket.readyState !== WebSocket.OPEN) return;
     const bytes = new TextEncoder().encode(text);
-    if (socket.bufferedAmount + bytes.length > 65536) { socket.close(); $('terminal-status').textContent = 'Input exceeded connection capacity. Reconnect to continue.'; return; }
+    if (socket.bufferedAmount + bytes.length > 65536) { endTerminal('Input exceeded connection capacity. Start a new session to continue.'); return; }
     for (let offset=0; offset<bytes.length; offset+=4096) socket.send(bytes.slice(offset,offset+4096));
   });
 }
 $('terminal-close').addEventListener('click', closeTerminal);
+$('terminal-new').addEventListener('click', () => openTerminal(terminalId));
 $('terminal-dialog').addEventListener('cancel', event => { event.preventDefault(); closeTerminal(); });
 window.addEventListener('pagehide', closeTerminal);
 

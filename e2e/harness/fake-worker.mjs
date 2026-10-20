@@ -105,7 +105,7 @@ export function fakeWorker(socketPath, log = () => {}) {
       header[0] = kind; header.writeUInt32BE(bytes.length, 1);
       socket.write(Buffer.concat([header, bytes]));
     }
-    // A cooked-mode echo shell: typed bytes come back; "exit" ends with code 0.
+    // A cooked-mode echo shell: typed bytes come back; "exit [code]" ends with that code.
     let line = '';
     function frames() {
       while (pending.length >= 5 && pending.length >= 5 + pending.readUInt32BE(1)) {
@@ -114,7 +114,8 @@ export function fakeWorker(socketPath, log = () => {}) {
         if (kind !== 0) continue;
         for (const ch of bytes.toString()) {
           if (ch !== '\r') { line += ch; send(0, Buffer.from(ch)); continue; }
-          if (line.trim() === 'exit') { send(2, Buffer.from([0, 0, 0, 0])); socket.end(); return; }
+          const exit = /^exit(?:\s+(\d+))?$/.exec(line.trim());
+          if (exit) { const code = Buffer.alloc(4); code.writeInt32BE(Number(exit[1] ?? 0)); send(2, code); socket.end(); return; }
           send(0, Buffer.from(`\r\n${line}\r\nfake-shell$ `)); line = '';
         }
       }
