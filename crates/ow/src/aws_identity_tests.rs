@@ -9,6 +9,7 @@ use std::{
 
 const ROLE: &str = "arn:aws:iam::111122223333:role/open-workspaces/box-reader";
 const OTHER: &str = "arn:aws:iam::111122223333:role/open-workspaces/b-only";
+const OWNED: &str = "arn:aws:iam::111122223333:role/open-workspaces/a-only";
 const ISSUER: &str = "https://ow.example.test";
 
 struct Fixture {
@@ -114,6 +115,28 @@ fn running(c: &Catalog, owner: i64, name: &str, physical: &str) {
     .unwrap();
 }
 
+/// A fork child: the worker records its parent as `source`.
+fn forked(c: &Catalog, owner: i64, name: &str, physical: &str, parent: &str) {
+    c.db.execute(
+        "INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'machine',?2,?3,?4,'local')",
+        params![owner, name, physical, json!({"id":physical,"state":"running","source":parent}).to_string()],
+    )
+    .unwrap();
+}
+
+/// What AWS STS concludes from the JWKS published now: the token no longer verifies.
+fn rejected(root: &Path, request: &Value) -> bool {
+    let token = request["token"].as_str().unwrap();
+    let jwks: JwkSet = serde_json::from_value(public_document(root, JWKS).unwrap()).unwrap();
+    let Some(key) = jwks.find(decode_header(token).unwrap().kid.as_deref().unwrap()) else {
+        return true;
+    };
+    let mut validation = Validation::new(Algorithm::ES256);
+    validation.set_audience(&[AUDIENCE]);
+    validation.set_issuer(&[ISSUER]);
+    decode::<Value>(token, &DecodingKey::from_jwk(key).unwrap(), &validation).is_err()
+}
+
 fn refusal(error: anyhow::Error) -> &'static str {
     error.downcast_ref::<Refusal>().expect("a refusal").code
 }
@@ -153,7 +176,7 @@ fn roles_need_the_allow_list_and_owner_or_admin() {
     );
     assert!(public_document(&f.root, DISCOVERY).is_none());
     assert_eq!(c.state(a).unwrap()["aws_identity"]["enabled"], false);
-    f.configure(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":ROLE},{"role_arn":OTHER,"owners":["b@example.test"]}]}));
+    f.configure(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":ROLE},{"role_arn":OTHER,"owners":["b@example.test"]},{"role_arn":OWNED,"owners":["a@example.test"]}]}));
     let unlisted = "arn:aws:iam::111122223333:role/admin";
     assert_eq!(
         refusal(c.operation(a, set(unlisted)).unwrap_err()),
@@ -167,7 +190,7 @@ fn roles_need_the_allow_list_and_owner_or_admin() {
     assert!(f.requests().is_empty());
     assert_eq!(
         c.state(a).unwrap()["aws_identity"],
-        json!({"enabled":true,"issuer":ISSUER,"roles":[ROLE]})
+        json!({"enabled":true,"issuer":ISSUER,"roles":[ROLE,OWNED]})
     );
     for (grantee, role) in [(use_grantee, "use"), (admin, "admin")] {
         let email = if role == "use" {
@@ -185,11 +208,35 @@ fn roles_need_the_allow_list_and_owner_or_admin() {
     assert_eq!(attached["role_arn"], ROLE);
     assert_eq!(attached["state"], "active");
     assert_eq!(attached["subject"], "owner/a@example.test/box/m-box");
-    // A grantee sees it too.
-    assert_eq!(
-        c.state(admin).unwrap()["shared"][0]["aws_role"]["role_arn"],
-        ROLE
+    // A grantee sees it too. An admin is offered the owner's roles, not their own: an
+    // owner-only role is attachable by the admin and listed for them.
+    let shared = c.state(admin).unwrap();
+    assert_eq!(shared["shared"][0]["aws_role"]["role_arn"], ROLE);
+    assert_eq!(shared["aws_identity"]["roles"], json!([ROLE]));
+    assert_eq!(shared["shared"][0]["aws_roles"], json!([ROLE, OWNED]));
+    c.operation(
+        admin,
+        json!({"op":"aws-role","id":"a@example.test/box","role_arn":OWNED}),
+    )
+    .unwrap();
+    assert!(
+        c.state(use_grantee).unwrap()["shared"][0]
+            .get("aws_roles")
+            .is_none()
     );
+
+    // One issuer publishes at most 100 EC keys: the anchor plus 99 attachments.
+    for i in 1..MAX_ATTACHED {
+        c.db.execute(
+            "INSERT INTO aws_roles(physical,owner,role_arn,generation) VALUES(?1,?2,?3,1)",
+            params![format!("m-filler-{i}"), a, ROLE],
+        )
+        .unwrap();
+    }
+    c.operation(a, set(ROLE)).unwrap(); // the box itself is already counted
+    running(&c, a, "more", "m-more");
+    let more = json!({"op":"aws-role","id":"more","role_arn":ROLE});
+    assert_eq!(refusal(c.operation(a, more).unwrap_err()), "aws_role_limit");
     // Bad config fails closed.
     f.configure(json!({"issuer":"http://ow.example.test","allowed_roles":[]}));
     assert!(c.operation(a, set(ROLE)).is_err());
@@ -268,11 +315,17 @@ fn tokens_are_short_lived_rotate_and_follow_the_incarnation() {
     let moved = f.requests();
     assert_eq!(verified(&f.root, &moved[0])["ow_generation"], 2);
     assert_eq!(moved[0]["session_name"], session(2));
+    // The old incarnation's key left the JWKS: its tokens, wherever copied, stop verifying.
+    for old in [&first[0], &restarted[0], &rotated[0]] {
+        assert!(rejected(&f.root, old));
+    }
 
     // Re-attaching is a new credential authority too.
     c.operation(a, json!({"op":"aws-role","id":"box","role_arn":ROLE}))
         .unwrap();
-    assert_eq!(verified(&f.root, &f.requests()[0])["ow_generation"], 3);
+    let reattached = f.requests();
+    assert_eq!(verified(&f.root, &reattached[0])["ow_generation"], 3);
+    assert!(rejected(&f.root, &moved[0]));
 
     // A stopped box gets nothing written and shows pending; it is retried once it runs.
     f.written.store(false, Ordering::SeqCst);
@@ -286,19 +339,39 @@ fn tokens_are_short_lived_rotate_and_follow_the_incarnation() {
     );
     f.written.store(true, Ordering::SeqCst);
 
-    // A fork copies RAM but not the role: its guest files are cleared once per incarnation.
-    running(&c, a, "child", "m-child");
+    // A fork copies RAM but not the role: its guest files are cleared once per incarnation,
+    // and the parent moves to a new generation, so the copied token stops verifying.
+    let before_fork = reattached[0].clone();
+    forked(&c, a, "child", "m-child", "m-box");
     pass(&mut c, &mut cleared);
-    let cleared_child: Vec<_> = f
-        .requests()
-        .into_iter()
-        .filter(|r| r["id"] == "m-child")
-        .collect();
+    let after_fork = f.requests();
+    let cleared_child: Vec<_> = after_fork.iter().filter(|r| r["id"] == "m-child").collect();
     assert_eq!(cleared_child.len(), 1);
     assert!(cleared_child[0].get("token").is_none());
+    let parent: Vec<_> = after_fork.iter().filter(|r| r["id"] == "m-box").collect();
+    assert_eq!(verified(&f.root, parent[0])["ow_generation"], 4);
+    assert!(rejected(&f.root, &before_fork));
     assert!(c.state(a).unwrap()["workspaces"][1]["aws_role"].is_null());
     pass(&mut c, &mut cleared);
     assert!(f.requests().iter().all(|r| r["id"] != "m-child"));
+    // A restore keeps node and epoch but brings back RAM: checked again.
+    c.db.execute(
+        "INSERT INTO operations(owner,op,resource,state) VALUES(?1,'restore','child','succeeded')",
+        [a],
+    )
+    .unwrap();
+    // (The fake runner lists no machines, so the state() above marked the child missing.)
+    c.db.execute(
+        "UPDATE resources SET metadata=json_set(metadata,'$.state','running') WHERE physical='m-child'",
+        [],
+    )
+    .unwrap();
+    pass(&mut c, &mut cleared);
+    assert_eq!(
+        f.requests().iter().filter(|r| r["id"] == "m-child").count(),
+        1
+    );
+    let latest = parent[0].clone();
 
     // An operator removing the role stops issuance and clears the guest.
     f.configure(json!({"issuer":ISSUER,"allowed_roles":[]}));
@@ -308,6 +381,10 @@ fn tokens_are_short_lived_rotate_and_follow_the_incarnation() {
     let revoked = f.requests();
     assert_eq!(revoked.len(), 1);
     assert!(revoked[0].get("token").is_none());
+    assert!(rejected(&f.root, &latest));
+    // Cleared once, not on every pass.
+    pass(&mut c, &mut cleared);
+    assert!(f.requests().is_empty());
     assert_eq!(
         c.state(a).unwrap()["workspaces"][0]["aws_role"]["state"],
         "error"
@@ -334,13 +411,14 @@ fn tokens_are_short_lived_rotate_and_follow_the_incarnation() {
     assert!(detached[0].get("token").is_none());
     assert!(c.state(a).unwrap()["workspaces"][0]["aws_role"].is_null());
 
-    // The signing key is private and stable across loads.
-    let key = f.root.join(KEY);
-    assert_eq!(std::fs::metadata(&key).unwrap().mode() & 0o777, 0o600);
-    assert_eq!(
-        Signer::load(&f.root).unwrap().jwks(),
-        Signer::load(&f.root).unwrap().jwks()
-    );
+    // Only the never-signing anchor key is left; keys are private files.
+    assert_eq!(jwks(&f.root).unwrap()["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(jwks(&f.root).unwrap(), jwks(&f.root).unwrap());
+    let dir = f.root.join(KEYS);
+    assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+    for entry in std::fs::read_dir(dir).unwrap() {
+        assert_eq!(entry.unwrap().metadata().unwrap().mode() & 0o777, 0o600);
+    }
 }
 
 #[test]

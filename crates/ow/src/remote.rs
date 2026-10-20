@@ -515,7 +515,7 @@ async fn handle(app: &App, mut request: Request) -> Response {
         return (
             [
                 ("content-type", "application/json"),
-                ("cache-control", "public, max-age=300"),
+                ("cache-control", "public, max-age=60"),
                 ("x-content-type-options", "nosniff"),
             ],
             document.to_string(),

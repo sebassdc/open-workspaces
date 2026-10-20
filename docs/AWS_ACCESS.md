@@ -52,7 +52,8 @@ sequenceDiagram
    terminal sessions (through `/etc/profile.d/ow-aws.sh`, also sourced from
    `/etc/bash.bashrc` where it exists) export these variables. A systemd service can
    use `EnvironmentFile=-/run/ow/aws/env`. On developer images the files belong to
-   `dev`.
+   `dev`; on images without one (Alpine) `ow exec` reads the env file before your
+   command, and terminals get the variables from the guest agent.
 3. The SDK calls `AssumeRoleWithWebIdentity` itself and re-reads the token file
    whenever it refreshes credentials. The role session name is `ow-` plus a hash of
    the box ID and generation, so each incarnation shows separately in CloudTrail.
@@ -83,14 +84,18 @@ when its current token is valid, with **Detach**.
   delivered: an old runner, or the role was removed from the allow-list) or
   `inactive` (the box changed owner; its new owner must attach a role).
 - **Forks start without a role.** A full-state fork's RAM holds a copy of its
-  parent's token files; the controller removes them within about a minute, and
-  that copied token stays valid for AWS until it expires (at most 15 minutes).
+  parent's token files. Within about a minute the controller removes them and
+  moves the parent to a new generation with a new signing key; the copied token
+  stops verifying once AWS re-reads the JWKS (and never lasts past its 15 minutes).
+  The same happens to old tokens after a move or a wake on another runner.
 - **A new owner starts without a role.** An attachment belongs to the owner who
   made it. If a box changes owner, it gets no new tokens and its files are removed
   at the next pass; the new owner, or an admin, attaches a role again.
-- Unset, owner change and allow-list removal stop new tokens and remove the files.
-  They do **not** revoke AWS sessions already issued (one hour by default) or a
-  token copied out of the box (15 minutes). Use short role session durations and
+- Unset, owner change, allow-list removal and deleting the box withdraw the box's
+  signing key from the JWKS and remove the files: its tokens, copies included, stop
+  verifying once AWS re-reads the JWKS (served with `max-age=60`; AWS's own cache
+  time is not documented and not verified here; at most 15 minutes in any case).
+  This does **not** revoke AWS sessions already issued (one hour by default). Use short role session durations and
   [revoke sessions](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_revoke-sessions.html)
   in IAM when it matters.
 - Guest root can read the token: anyone with a shell in the box can act as its
@@ -115,14 +120,17 @@ Write `aws-identity.json` next to the catalog in the controller's data directory
 
 - `issuer`: the public `https://` URL (no port, query or trailing slash; a path is
   allowed) where AWS can fetch the discovery document. It is the `iss` of every token.
-- `allowed_roles`: the only role ARNs anyone may attach, at most 100. Exact ARNs, no
+- `allowed_roles`: the only role ARNs anyone may attach, at most 100. At most 99
+  boxes can have a role at once (AWS reads up to 100 EC keys from a JWKS). Exact ARNs, no
   wildcards. `owners` limits a role to boxes owned by those login emails; without
   it any user of this controller may attach it to their boxes.
 
 Restart the dashboard/gateway once so the refresher starts (the allow-list itself
 is re-read on every request and pass, so later edits need no restart). The first
-token or discovery request creates the signing key `aws-identity-key.p8`
-(owner-only) beside it; back it up with the catalog. Removing a role from the list,
+signing keys live in the owner-only `aws-identity-keys/` directory beside it: one
+per box generation plus an anchor key that never signs. They need no backup: a
+controller restored without them creates new keys, and boxes hold tokens that no
+longer verify until their next refresh (within about 6 minutes). Removing a role from the list,
 or deleting `aws-identity.json`, refuses new attachments at once and clears the
 boxes' token files at the next pass.
 

@@ -157,6 +157,19 @@ fn guest_files_drive_the_sdk_chain_to_assume_role_with_web_identity() {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8(read.stdout).unwrap(), FIRST);
+        // Images without a dev user (Alpine): the worker's exact `ow exec` wrapper, as root.
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::remove_file("/etc/ow-developer").unwrap();
+            let root_env = sh(&ow_core::runtime::exec_command("env"));
+            std::fs::write("/etc/ow-developer", "").unwrap();
+            for (key, value) in &vars {
+                assert!(
+                    root_env.lines().any(|l| l == format!("{key}={value}")),
+                    "{key} missing from a root ow exec: {root_env}"
+                );
+            }
+        }
     } else {
         vars.insert(
             "AWS_WEB_IDENTITY_TOKEN_FILE".into(),

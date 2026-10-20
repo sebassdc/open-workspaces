@@ -8,7 +8,8 @@
         "worker",
         "controller",
         "agent",
-        "dashboard"
+        "dashboard",
+        "guest-agent"
       ],
       "protocol": {
         "speaks": 1,
@@ -37,7 +38,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "Optional per-box AWS access: the controller acts as an OIDC identity provider (ES256 key, discovery document and JWKS) and, for boxes with an operator-allowed role attached, signs 15-minute identity tokens bound to the box generation. The worker writes them into running guests on tmpfs through a new aws-token operation that never wakes a box or restarts its idle clock; the AWS SDK chain calls AssumeRoleWithWebIdentity itself. Off unless aws-identity.json exists. Additive catalog table aws_roles; catalog schema 7, worker interface 3, runtime, guest kernel and host layout remain unchanged. Class-2 worker upgrade; runners without aws_identity_v1 report the role as not delivered."
+      "notes": "Optional per-box AWS access: the controller acts as an OIDC identity provider (ES256 key, discovery document and JWKS) and, for boxes with an operator-allowed role attached, signs 15-minute identity tokens with one key per box generation; a move, fork, owner change or detach withdraws the old key from the JWKS so its tokens stop verifying. The worker writes them into running guests on tmpfs through a new aws-token operation (ow exec on images without dev and the terminal agent export them too) that never wakes a box or restarts its idle clock; the AWS SDK chain calls AssumeRoleWithWebIdentity itself. Off unless aws-identity.json exists. Additive catalog table aws_roles; catalog schema 7, worker interface 3, runtime, guest kernel and host layout remain unchanged. Class-2 worker upgrade; runners without aws_identity_v1 report the role as not delivered."
     },
     {
       "version": "0.9.35",

@@ -13,6 +13,10 @@ pub const DIR: &str = "/run/ow/aws";
 /// Static login-shell hook that exports the variables in `DIR/env` when present.
 pub const HOOK: &str = "/etc/profile.d/ow-aws.sh";
 
+/// Exports the role's variables when a role is attached. Login shells get it from [`HOOK`];
+/// shells nothing else prepares (Alpine's `ow exec`) run it first.
+pub const SOURCE: &str = "if [ -r /run/ow/aws/env ]; then set -a; . /run/ow/aws/env; set +a; fi";
+
 /// What one box generation receives: the signed token and the role it may assume.
 pub struct Delivery<'a> {
     pub token: &'a str,
@@ -73,9 +77,7 @@ pub fn install_command(root: &str, delivery: Option<&Delivery>) -> Result<String
     let hook = format!(
         "printf '%s\\n' {} {}",
         shell_quote("# Open Workspaces per-box AWS access: exports only while a role is attached."),
-        shell_quote(&format!(
-            "if [ -r {DIR}/env ]; then set -a; . {DIR}/env; set +a; fi"
-        ))
+        shell_quote(SOURCE)
     );
     let rc = format!("{root}/etc/bash.bashrc");
     let line = format!("[ -r {HOOK} ] && . {HOOK}");

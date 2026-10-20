@@ -1344,6 +1344,12 @@ impl Catalog {
             value["owner"] = json!(owner);
             value["role"] = json!(role);
             value["aws_role"] = crate::aws_identity::view(&self.db, &physical)?;
+            // An admin attaches from the owner's allow-list, which is what attach checks.
+            if role == "admin"
+                && let Ok(Some(config)) = crate::aws_identity::config(&self.root)
+            {
+                value["aws_roles"] = json!(config.roles_for(&owner));
+            }
             shared.push(value);
         }
         let mut running = BTreeMap::new();
@@ -1493,6 +1499,7 @@ impl Catalog {
             [physical],
         )?;
         tx.commit()?;
+        crate::aws_identity::revoke(&self.root, physical)?;
         cut(user, physical);
         for grantee in grantees {
             cut(grantee, physical);

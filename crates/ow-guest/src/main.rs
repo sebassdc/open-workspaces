@@ -168,6 +168,18 @@ fn terminal(mut tcp: TcpStream) -> io::Result<()> {
             Ok(())
         });
     }
+    // Per-box AWS access: the attached role's variables, which an interactive non-login
+    // shell would not read from /etc/profile.d.
+    for line in fs::read_to_string("/run/ow/aws/env")
+        .unwrap_or_default()
+        .lines()
+    {
+        if let Some((key, value)) = line.split_once('=')
+            && key.starts_with("AWS_")
+        {
+            command.env(key, value);
+        }
+    }
     let mut session = Session(command.spawn()?, false);
     drop(command); // Release the parent's slave FDs so EOF follows shell exit.
     nonblock(master_fd)?;

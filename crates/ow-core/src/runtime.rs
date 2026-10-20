@@ -144,10 +144,12 @@ const MAX_SNAPSHOTS: usize = 24;
 const MAX_WORKSPACES: usize = 32;
 
 // Keep the login shell in the serial command's group so timeout cleanup reaches dev children.
-pub(crate) fn exec_command(command: &str) -> String {
+// dev's login shell reads the AWS profile hook; the plain root shell sources it first.
+pub fn exec_command(command: &str) -> String {
     format!(
-        "OW_COMMAND={}; if [ -f /etc/ow-developer ]; then su - dev --session-command \"$OW_COMMAND\"; else /bin/sh -c \"$OW_COMMAND\"; fi",
-        shell_quote(command)
+        "OW_COMMAND={}; if [ -f /etc/ow-developer ]; then su - dev --session-command \"$OW_COMMAND\"; else {}; /bin/sh -c \"$OW_COMMAND\"; fi",
+        shell_quote(command),
+        crate::web_identity::SOURCE
     )
 }
 
