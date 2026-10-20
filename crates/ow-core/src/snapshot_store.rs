@@ -326,13 +326,14 @@ use crate::snapshot_digest::hex;
 /// Copies `reader` into `output`, seeking over all-zero 4 KiB blocks so the file
 /// stays sparse. Returns the SHA-256 of all bytes.
 pub fn write_sparse(mut reader: impl Read, output: &mut File) -> Result<String> {
+    const BLOCK: usize = 4096;
     let mut hasher = Sha256::new();
     let mut length = 0u64;
-    let mut block = [0u8; 4096];
+    let mut buffer = vec![0u8; 256 * BLOCK];
     loop {
         let mut filled = 0;
-        while filled < block.len() {
-            match reader.read(&mut block[filled..])? {
+        while filled < buffer.len() {
+            match reader.read(&mut buffer[filled..])? {
                 0 => break,
                 n => filled += n,
             }
@@ -340,15 +341,26 @@ pub fn write_sparse(mut reader: impl Read, output: &mut File) -> Result<String> 
         if filled == 0 {
             break;
         }
-        let data = &block[..filled];
+        let data = &buffer[..filled];
         hasher.update(data);
-        if data.iter().all(|b| *b == 0) {
-            output.seek(SeekFrom::Current(filled as i64))?;
-        } else {
-            output.write_all(data)?;
+        // One write or seek per run of data or zero blocks, not per block.
+        let zero = |at: usize| data[at..(at + BLOCK).min(filled)].iter().all(|b| *b == 0);
+        let mut start = 0;
+        while start < filled {
+            let hole = zero(start);
+            let mut end = (start + BLOCK).min(filled);
+            while end < filled && zero(end) == hole {
+                end = (end + BLOCK).min(filled);
+            }
+            if hole {
+                output.seek(SeekFrom::Current((end - start) as i64))?;
+            } else {
+                output.write_all(&data[start..end])?;
+            }
+            start = end;
         }
         length += filled as u64;
-        if filled < block.len() {
+        if filled < buffer.len() {
             break;
         }
     }
