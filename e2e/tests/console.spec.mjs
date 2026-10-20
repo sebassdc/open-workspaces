@@ -95,3 +95,20 @@ test('command console shows output and exit status as text', async ({dashboard: 
   await page.getByRole('button', {name: 'Clear'}).click();
   await expect(output).toHaveText(/Ready\. Run a command/);
 });
+
+test('a command past the 30 s limit shows a plain message, not the operation journal', async ({dashboard: page}) => {
+  await machines(page, 'slow');
+  await expect(page.locator('.console-note')).toContainText('up to 30 s');
+  const output = page.locator('#console-output');
+  await page.locator('#command').fill('sleep 34; echo leftover-from-slow');
+  await page.locator('#command').press('Enter');
+  await expect(output).toContainText('Stopped after 30 s: commands in the console are limited to 30 s');
+  await expect(output).toContainText('Use Open Terminal');
+  await expect(output).not.toContainText('journal');
+  await page.locator('#command').fill('echo next-command');
+  await page.locator('#command').press('Enter');
+  await expect(output).toContainText('$ echo next-command\nnext-command\n[exit 0]');
+  await expect(output).not.toContainText('OW_DONE_');
+  await expect(output).not.toContainText('OW>');
+  await expect(output).not.toContainText(/\nleftover-from-slow(?:\n|$)/);
+});
