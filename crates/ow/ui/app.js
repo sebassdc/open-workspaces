@@ -62,7 +62,8 @@ function focusKey() { const node = document.activeElement, box = node?.parentEle
 function restoreFocus(key) { if (!key || (document.activeElement && document.activeElement !== document.body)) return; const matches = [...($(key[0])?.querySelectorAll('button, a') || [])].filter(other => controlKey(other) === key[1]); if (matches.length === 1) matches[0].focus({preventScroll: true}); }
 function render() { const focused = focusKey(); renderState(); restoreFocus(focused); }
 function renderState() {
-  if (data.user) { $('account-email').textContent = data.user.email; $('account-avatar').textContent = data.user.email.slice(0,1).toUpperCase(); }
+  const email = data.discovery?.identity?.email;
+  if (email) { $('account-email').textContent = $('account-email').title = email; $('account-avatar').textContent = email.slice(0,1).toUpperCase(); }
   if (!selected && data.workspaces.length) selected = data.workspaces[0].id;
   if (selected && !machine()) selected = null;
   const running = data.workspaces.filter(item => item.state === 'running').length, stats = data.stats;
@@ -259,6 +260,8 @@ $('cli-command').textContent = installCommand;
 $('cli-login').textContent = `ow login ${location.origin}`;
 // Tailnet sign-in serves no CLI installer: the CLI signs in through Access only.
 fetch('/cli/install.sh', {cache: 'no-store'}).then(r => { if (!r.ok) $('cli-install').hidden = true; }).catch(() => { $('cli-install').hidden = true; });
+// Hidden until the server confirms it serves the binary, so the link never downloads a 404 page.
+fetch('/cli/ow-linux-amd64', {method: 'HEAD', cache: 'no-store'}).then(r => { $('cli-download').hidden = !r.ok; }).catch(() => {});
 $('copy-install').addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(installCommand); $('copy-install').textContent = 'Copied'; setTimeout(() => { $('copy-install').textContent = 'Copy command'; }, 2000); }
   catch { notice('Select the install command and copy it to your terminal.'); }
