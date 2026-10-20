@@ -352,7 +352,12 @@ fn failed_snapshots_keep_the_cause_reconcile_legacy_pending_and_retry() {
         )
         .unwrap()
     );
-    assert_eq!(c.state(owner).unwrap()["snapshots"][0]["state"], "failed");
+    let state = c.state(owner).unwrap();
+    assert_eq!(state["snapshots"][0]["state"], "failed");
+    // The failed row names its machine and when its capture failed.
+    assert_eq!(state["snapshots"][0]["workspace"], "demo");
+    assert!(state["snapshots"][0]["failed_at"].as_i64().unwrap() > 0);
+    assert!(state["workspaces"][0]["created_at"].as_i64().unwrap() > 0);
     // Simulate a failed reservation written by an older controller, then reopen it.
     c.db.execute(
         "UPDATE resources SET metadata='{\"state\":\"pending\"}' WHERE kind='snapshot'",
