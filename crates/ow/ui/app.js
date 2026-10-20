@@ -4,8 +4,16 @@ let data = {workspaces: [], snapshots: [], stats: {}}, loaded = false, selected 
 const histories = new Map();
 const imageNames = {alpine:'Alpine Linux',arch:'Arch Linux',ubuntu:'Ubuntu 24.04', 'ubuntu-arm64':'Ubuntu 24.04 ARM64'};
 // Built-in images, then golden images that the runners advertise (`ow image build`).
-const imageChoices = () => [...Object.entries(imageNames).map(([value,label]) => [value,value === 'alpine' ? label : `${label} · developer tools`]),
-  ...[...new Set((data.nodes || []).flatMap(n => n.capabilities?.images || []))].filter(i => !Object.hasOwn(imageNames, i)).sort().map(i => [i, `${i} · golden image`])];
+// Discovery decides availability once the pool has nodes; a lone local host has none and decides itself.
+const imageChoices = () => { const pool = data.discovery?.nodes?.length ? data.discovery.images || [] : null;
+  return [...Object.entries(imageNames).map(([value,label]) => [value,value === 'alpine' ? label : `${label} · developer tools`]),
+  ...[...new Set((data.nodes || []).flatMap(n => n.capabilities?.images || []))].filter(i => !Object.hasOwn(imageNames, i)).sort().map(i => [i, `${i} · golden image`])]
+  .map(([value,label]) => pool && !pool.some(i => i.name === value && i.available) ? [value, `${imageNames[value] || value} · not available on this pool`, true] : [value,label]); };
+// Online pool nodes with their free room; a full or draining node stays listed but cannot be picked.
+const nodeChoices = () => (data.discovery?.nodes || []).filter(n => n.online).map(n => { const free = n.available, full = free && (!free.slots || !free.vcpus || free.memory_mib < 256 || n.workspaces?.available === 0);
+  return n.draining ? [n.id, `${n.id} · draining`, true] : full ? [n.id, `${n.id} · full`, true] : [n.id, free ? `${n.id} · ${free.vcpus} vCPU · ${mib(free.memory_mib)} free` : n.id]; });
+// Refusals the dashboard can explain in its own words; other errors keep the server's text.
+const refusals = {name_taken: 'You already have a machine with that name. Choose another name.', unavailable_image: 'That operating system is not available on this pool right now. Choose another one.', insufficient_capacity: 'The pool has no room for a machine this size right now. Choose less memory or fewer vCPUs, another node, or try again later.', unsupported_capability: 'This pool cannot run a machine of that shape. Choose another operating system or size.', node_unavailable: 'No pool node is online right now. Try again in a moment.'};
 const diskUsage = item => item.disk_bytes ? `${mib(item.disk_bytes / 1048576)} disk · ${item.disk_used_bytes == null ? 'use unknown' : mib(item.disk_used_bytes / 1048576) + ' used'}` : 'Disk size unavailable';
 const mib = value => value >= 1024 ? `${(value / 1024).toFixed(1)} GiB` : `${Math.round(value)} MiB`;
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
@@ -18,7 +26,7 @@ async function api(path, body) {
   // Only a sign-in page (an auth redirect, 401 or 403) means the login expired; a proxy 5xx means the dashboard is busy or restarting.
   if (!kind.includes('application/json')) throw Error(response.status >= 500 ? `The server is not answering (HTTP ${response.status}); it may be busy or restarting. ${body ? 'Wait a moment, then try again.' : 'The page retries on its own.'}` : response.ok || response.status === 401 || response.status === 403 ? 'Your login may have expired. Reload the page to sign in again.' : `Unexpected response from the server (HTTP ${response.status}). Reload the page.`);
   const value = await response.json();
-  if (!response.ok || !value.ok) { const error = Error(plainRefusals.has(value.error_code || value.operation?.error_code) ? value.error : (value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : '')); error.operation = value.operation; throw error; }
+  if (!response.ok || !value.ok) { const code = value.error_code || value.operation?.error_code; const plain = refusals[code] || (plainRefusals.has(code) ? value.error : null); const error = Error(plain || (value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : '')); error.operation = value.operation; throw error; }
   return value.result;
 }
 let refreshError = null;
@@ -121,13 +129,14 @@ function renderState() {
   }
   $('create').disabled = busy || !loaded;
 }
-function field(name, label, value, choices) { const wrapper = element('label', label, 'field'); let input; if (choices) { input = element('select'); for (const [v, title] of choices) { const option = element('option', title); option.value = v; input.append(option); } } else { input = element('input'); input.pattern = '[A-Za-z0-9_\\-]{1,32}'; input.title = 'Letters, digits, - and _, up to 32 characters.'; input.maxLength = 32; input.required = true; input.autocomplete = 'off'; } input.name = name; if (value) input.value = value; wrapper.append(input); return wrapper; }
+function field(name, label, value, choices) { const wrapper = element('label', label, 'field'); let input; if (choices) { input = element('select'); for (const [v, title, disabled] of choices) { const option = element('option', title); option.value = v; option.disabled = !!disabled; input.append(option); } } else { input = element('input'); input.pattern = '[A-Za-z0-9_\\-]{1,32}'; input.title = 'Letters, digits, - and _, up to 32 characters.'; input.maxLength = 32; input.required = true; input.autocomplete = 'off'; } input.name = name; if (value) input.value = value; wrapper.append(input); return wrapper; }
 function openDialog(op, id, snapshot) {
   if (busy) return; dialogOperation = {op, id, snapshot}; $('dialog-fields').replaceChildren(); $('dialog-error').hidden = true;
   const defaults = {publish: ['Publish a port.', 'Open a guest HTTP server over tailnet HTTPS. Only you and teammates with a share can access it. The server must listen on 0.0.0.0; preview cookies are disabled.', 'Publish port'], resize: ['Grow this machine.', 'The machine must be stopped. Disk growth is permanent; its filesystem expands on the next start.', 'Resize machine'], create: ['A fresh place to build.', 'Start a persistent Linux machine. Your disk stays with it when you stop.', 'Create machine'], snapshot: ['Save this moment.', 'Capture this machine’s memory and disk together. You can return to this checkpoint later.', 'Capture snapshot'], fork: ['Try another direction.', 'Create an independent machine from this checkpoint. Changes stay separate from the parent.', 'Create fork'], restore: ['Return to this checkpoint?', 'This replaces the machine’s current memory and disk with the saved snapshot. Changes made since that snapshot will be lost.', 'Restore snapshot'], stop: ['Stop this machine?', 'Disk changes are saved. Running processes and memory state are lost. Choose Hibernate instead to keep them.', 'Stop machine'], share: ['Share this machine.', 'Your teammate gets in with their own login. A fork they make copies everything on this machine, including your credentials, and stays theirs after you unshare.', 'Share machine'], rename: ['Rename this machine.', 'Only the name changes: disk, snapshots, shares, previews and running state stay. SSH config and teammates use the new name from now on.', 'Rename machine'], delete: ['Delete this machine?', 'Its disk and every snapshot taken from it are removed for good, and anyone it is shared with loses it. Forks made earlier stay.', 'Delete machine']};
   const destructive = op === 'delete' || op === 'restore'; $('dialog-eyebrow').textContent = destructive ? 'CANNOT BE UNDONE' : 'YOUR SANDBOX'; $('dialog-eyebrow').classList.toggle('warning', destructive); $('dialog-submit').className = `button ${destructive ? 'danger' : 'primary'}`;
-  $('dialog-title').textContent = defaults[op][0]; $('dialog-description').textContent = defaults[op][1]; $('dialog-submit').textContent = defaults[op][2];
-  if (op === 'create') $('dialog-fields').append(field('id', 'Machine name', '', null), field('image', 'Operating system', 'alpine', imageChoices()), field('memory_mib', 'Memory', '256', [['256','256 MiB'],['512','512 MiB'],['1024','1 GiB'],['2048','2 GiB'],['4096','4 GiB'],['8192','8 GiB'],['16384','16 GiB']]), field('vcpu_count', 'vCPU', '1', Array.from({length:16},(_,i)=>[String(i+1),String(i+1)])), field('node', 'Pool node', '', [['','Automatic placement'], ...(data.nodes || []).filter(n => n.online).map(n => [n.id, n.id])]));
+  $('dialog-title').textContent = defaults[op][0]; $('dialog-description').textContent = defaults[op][1]; $('dialog-submit').textContent = defaults[op][2]; $('dialog-submit').disabled = false;
+  const images = imageChoices();
+  if (op === 'create') $('dialog-fields').append(field('id', 'Machine name', '', null), field('image', 'Operating system', images.find(choice => !choice[2])?.[0] || 'alpine', images), field('memory_mib', 'Memory', '256', [['256','256 MiB'],['512','512 MiB'],['1024','1 GiB'],['2048','2 GiB'],['4096','4 GiB'],['8192','8 GiB'],['16384','16 GiB']]), field('vcpu_count', 'vCPU', '1', Array.from({length:16},(_,i)=>[String(i+1),String(i+1)])), field('node', 'Pool node', '', [['','Automatic placement'], ...nodeChoices()]));
   if (op === 'create' || op === 'resize') {
     const size = op === 'resize' ? Math.ceil((machine()?.disk_bytes || 0) / 1073741824) : 32;
     const disk = field('disk_gib', 'Root disk (GiB)', String(size || 32));
@@ -136,9 +145,31 @@ function openDialog(op, id, snapshot) {
   }
   if (op === 'create') {
     const form=$('operation-form'), image=form.elements.image, memory=form.elements.memory_mib, node=form.elements.node;
-    const fitShape=()=>{const mac=image.value==='ubuntu-arm64'; if(mac && Number(memory.value)<512) memory.value='512'; form.elements.disk_gib.disabled=mac; form.elements.disk_gib.parentElement.hidden=mac;};
-    image.addEventListener('change',fitShape);
-    node.addEventListener('change',()=>{const selectedNode=(data.nodes||[]).find(n=>n.id===node.value);const images=selectedNode?.capabilities?.images;if(images?.length===1) image.value=images[0];fitShape();});
+    const fitShape=()=>{const mac=image.value==='ubuntu-arm64'; if(mac && memory.value && Number(memory.value)<512) memory.value='512'; form.elements.disk_gib.disabled=mac; form.elements.disk_gib.parentElement.hidden=mac;};
+    const vcpu=form.elements.vcpu_count, pool=data.discovery?.nodes?.length ? data.discovery : null;
+    // Offer only what some eligible node can place: the chosen node (or any, when automatic) must
+    // have the image ready and room for memory and vCPU together. A lone local host decides itself.
+    const ready=(name,id)=>pool.images?.find(i=>i.name===name)?.nodes?.some(c=>c.node===id&&c.availability==='available');
+    const room=(n,mem,cpu)=>{const f=n.available,g=n.per_guest; return (!f||(f.memory_mib>=mem&&f.vcpus>=cpu&&f.slots>0)) && (!g?.memory_mib||g.memory_mib.includes(mem)) && (g?.max_vcpus==null||g.max_vcpus>=cpu);};
+    const allow=(select,ok)=>{for(const o of select.options) o.disabled=!ok(o.value); if(!select.value || select.selectedOptions[0]?.disabled) select.value=[...select.options].find(o=>!o.disabled)?.value ?? '';};
+    const constrain=()=>{
+      if(pool){
+        const nodes=pool.nodes.filter(n=>n.online&&!n.draining&&(!node.value||n.id===node.value));
+        allow(image,v=>nodes.some(n=>ready(v,n.id)));
+        const here=nodes.filter(n=>ready(image.value,n.id)), fits=(mem,cpu)=>mem>0&&cpu>0&&(image.value!=='ubuntu-arm64'||mem>=512)&&here.some(n=>room(n,mem,cpu));
+        // An unplaceable pair restarts from the smallest shape that fits; then each list offers what fits with the other.
+        if(!fits(+memory.value,+vcpu.value)){vcpu.value='1'; memory.value=[...memory.options].find(o=>fits(+o.value,1))?.value ?? memory.value;}
+        allow(memory,v=>fits(+v,+vcpu.value)); allow(vcpu,v=>fits(+memory.value,+v));
+        const placeable=!!image.value&&fits(+memory.value,+vcpu.value);
+        $('dialog-submit').disabled=!placeable;
+        $('dialog-error').textContent=placeable ? '' : 'No operating system and machine size are available here right now. Choose another pool node or try again later.';
+        $('dialog-error').hidden=placeable;
+      }
+      fitShape();
+    };
+    for(const select of [image,memory,vcpu]) select.required=true;
+    for(const select of [image,node,memory,vcpu]) select.addEventListener('change',constrain);
+    constrain();
   }
   if (op === 'publish') { const port = field('port', 'Guest HTTP port', '3000'), input = port.querySelector('input'); input.type = 'number'; input.removeAttribute('pattern'); input.removeAttribute('title'); input.removeAttribute('maxlength'); input.min = '1'; input.max = '65535'; input.step = '1'; $('dialog-fields').append(port); }
   if (op === 'share') { const email = field('with', 'Teammate email', '', null), input = email.querySelector('input'); input.type = 'email'; input.removeAttribute('pattern'); input.removeAttribute('title'); input.maxLength = 254; $('dialog-fields').append(email, field('role', 'Role', 'use', [['use','Use · terminal, SSH, commands, fork'],['admin','Admin · also stop, snapshot, restore, SSH keys']])); }
@@ -148,6 +179,8 @@ function openDialog(op, id, snapshot) {
   if (op === 'fork') { $('dialog-fields').append(field('child', 'New machine name', '', null)); if (!snapshot) { const choices = [['','Capture a new snapshot now'], ...data.snapshots.filter(item => item.workspace === id).map(item => [item.name,item.name])]; $('dialog-fields').append(field('snapshot', 'Start from', '', choices)); } }
   if (id) $('dialog-fields').append(element('p', `Machine: ${id}${snapshot ? ` · Snapshot: ${snapshot}` : ''}`, 'muted'));
   $('operation-dialog').showModal();
+  // Start on the first field (the machine name when creating), not the close button.
+  $('dialog-fields').querySelector('input, select')?.focus();
 }
 async function operate(operation) {
   const {operation_key: suppliedKey, ...parameters} = operation; const intent = JSON.stringify(parameters); const storageKey = 'ow-operation:' + intent; operation.operation_key ||= sessionStorage.getItem(storageKey) || crypto.randomUUID().replaceAll('-',''); sessionStorage.setItem(storageKey, operation.operation_key);
@@ -160,7 +193,7 @@ async function operate(operation) {
   finally { busy = false; refresh(); }
 }
 const busyLabels = {create: 'Creating…', snapshot: 'Capturing…', fork: 'Forking…', restore: 'Restoring…', resize: 'Resizing…', delete: 'Deleting…'};
-$('operation-form').addEventListener('submit', async event => { event.preventDefault(); const fields = Object.fromEntries(new FormData(event.currentTarget)); const op = {...dialogOperation, ...fields}; if (op.port) op.port = Number(op.port); if (op.disk_gib) op.disk_gib = Number(op.disk_gib); if (op.memory_mib) op.memory_mib = Number(op.memory_mib); if (op.vcpu_count) op.vcpu_count = Number(op.vcpu_count); if (op.op === 'resize' && op.disk_gib === Math.ceil((machine()?.disk_bytes || 0) / 1073741824)) { $('dialog-error').textContent = `Already ${op.disk_gib} GiB. Choose a larger size to grow it.`; $('dialog-error').hidden = false; return; } if (op.op === 'restore') op.name = op.snapshot; if (!op.node) delete op.node; if (!op.snapshot) delete op.snapshot; if (!op.id) delete op.id; if (op.op === 'restore') delete op.snapshot; const label = $('dialog-submit').textContent; $('dialog-error').hidden = true; $('dialog-submit').textContent = busyLabels[op.op] || 'Working…'; $('dialog-submit').disabled = true; $('cancel-dialog').disabled = true; $('close-dialog').disabled = true; try { await operate(op); $('operation-dialog').close(); } catch (error) { $('dialog-error').textContent = error.message; $('dialog-error').hidden = false; } finally { $('dialog-submit').textContent = label; $('dialog-submit').disabled = false; $('cancel-dialog').disabled = false; $('close-dialog').disabled = false; } });
+$('operation-form').addEventListener('submit', async event => { event.preventDefault(); if (!event.currentTarget.reportValidity()) return; const fields = Object.fromEntries(new FormData(event.currentTarget)); const op = {...dialogOperation, ...fields}; if (op.port) op.port = Number(op.port); if (op.disk_gib) op.disk_gib = Number(op.disk_gib); if (op.memory_mib) op.memory_mib = Number(op.memory_mib); if (op.vcpu_count) op.vcpu_count = Number(op.vcpu_count); if (op.op === 'resize' && op.disk_gib === Math.ceil((machine()?.disk_bytes || 0) / 1073741824)) { $('dialog-error').textContent = `Already ${op.disk_gib} GiB. Choose a larger size to grow it.`; $('dialog-error').hidden = false; return; } if (op.op === 'restore') op.name = op.snapshot; if (!op.node) delete op.node; if (!op.snapshot) delete op.snapshot; if (!op.id) delete op.id; if (op.op === 'restore') delete op.snapshot; const label = $('dialog-submit').textContent; $('dialog-error').hidden = true; $('dialog-submit').textContent = busyLabels[op.op] || 'Working…'; $('dialog-submit').disabled = true; $('cancel-dialog').disabled = true; $('close-dialog').disabled = true; try { await operate(op); $('operation-dialog').close(); } catch (error) { $('dialog-error').textContent = error.message; $('dialog-error').hidden = false; } finally { $('dialog-submit').textContent = label; $('dialog-submit').disabled = false; $('cancel-dialog').disabled = false; $('close-dialog').disabled = false; } });
 $('console-form').addEventListener('submit', async event => { event.preventDefault(); const current = machine(); if (!current || busy) return; const command = $('command').value.trim(); if (!command) return; let history = histories.get(current.id) || ''; history += `$ ${command}\n`; histories.set(current.id, history); try { const result = await operate({op:'exec',id:current.id,command}); history += result.output + `\n[exit ${result.exit_code}]\n`; histories.set(current.id, history.slice(-200000)); $('command').value = ''; render(); $('console-output').scrollTop = $('console-output').scrollHeight; } catch (error) { histories.set(current.id, history + error.message + '\n'); render(); } });
 $('command').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('console-form').requestSubmit(); } });
 $('clear-console').addEventListener('click', () => { if (selected) histories.delete(selected); render(); });
