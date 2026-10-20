@@ -1,6 +1,7 @@
 // Fails when docs/UI_FEATURES.md and the last Playwright run disagree: every row
-// marked "works" must name tests, and each named test must exist and have passed.
-// Usage: node check-matrix.mjs [matrix.md] [results.json]
+// marked "works" must name tests, and every named test must exist and have passed.
+// With --base OLD.md, a row marked "works" there must still be "works" here.
+// Usage: node check-matrix.mjs [--base OLD.md] [matrix.md] [results.json]
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -45,19 +46,29 @@ export function check(rows, results) {
     if (row.status === 'works' && !/^v\d+\.\d+\.\d+$/.test(row.version)) errors.push(`${row.feature}: marked works but has no last-passed version`);
     for (const test of row.tests) {
       if (!results.has(test)) errors.push(`${row.feature}: test not found in this run: ${test}`);
-      else if (!results.get(test) && row.status === 'works') errors.push(`${row.feature}: marked works but its test did not pass: ${test}`);
+      else if (!results.get(test)) errors.push(`${row.feature}: marked ${row.status} but its test did not pass: ${test}`);
     }
   }
   return errors;
 }
 
+// A working feature may not quietly lose its row or status.
+export function downgrades(base, rows) {
+  const now = new Map(rows.map(row => [row.feature, row.status]));
+  return base.filter(row => row.status === 'works' && now.get(row.feature) !== 'works')
+    .map(row => `${row.feature}: was works, now ${now.get(row.feature) ?? 'removed'}`);
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const matrix = process.argv[2] || path.join(here, '../docs/UI_FEATURES.md');
-  const report = process.argv[3] || path.join(here, 'playwright-report/results.json');
+  const args = process.argv.slice(2), at = args.indexOf('--base');
+  const base = at < 0 ? null : args.splice(at, 2)[1];
+  const matrix = args[0] || path.join(here, '../docs/UI_FEATURES.md');
+  const report = args[1] || path.join(here, 'playwright-report/results.json');
   const rows = parseMatrix(fs.readFileSync(matrix, 'utf8'));
   const results = testResults(JSON.parse(fs.readFileSync(report, 'utf8')));
   const errors = check(rows, results);
+  if (base) errors.push(...downgrades(parseMatrix(fs.readFileSync(base, 'utf8')), rows));
   const named = new Set(rows.flatMap(row => row.tests));
   for (const test of results.keys()) if (!named.has(test)) console.warn(`note: no matrix row names ${test}`);
   for (const error of errors) console.error(`UI feature matrix: ${error}`);

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {parseMatrix, testResults, check} from './check-matrix.mjs';
+import {parseMatrix, testResults, check, downgrades} from './check-matrix.mjs';
 
 const matrix = `
 | Feature | Status | Last passed | Test |
@@ -10,15 +10,26 @@ const matrix = `
 | Budget | partial | v0.9.22 | \`a.spec.mjs › budget\` (refusal only) |
 | Account | missing | — | not offered |
 `;
-const report = status => ({suites: [{title: 'a.spec.mjs', file: 'a.spec.mjs',
+const report = (status, budget = 'passed') => ({suites: [{title: 'a.spec.mjs', file: 'a.spec.mjs',
   specs: [{title: 'creates', file: 'a.spec.mjs', tests: [{expectedStatus: 'passed', results: [{status}]}]},
-    {title: 'budget', file: 'a.spec.mjs', tests: [{expectedStatus: 'passed', results: [{status: 'failed'}]}]}],
+    {title: 'budget', file: 'a.spec.mjs', tests: [{expectedStatus: 'passed', results: [{status: budget}]}]}],
   suites: [{title: 'narrow', file: 'a.spec.mjs', specs: [{title: 'fits', file: 'a.spec.mjs', tests: [{expectedStatus: 'passed', results: [{status: 'failed'}, {status: 'passed'}]}]}]}]}]});
 
-test('a passing run matches the matrix; partial rows may fail', () => {
+test('a passing run matches the matrix', () => {
   const rows = parseMatrix(matrix);
   assert.deepEqual(rows.map(r => [r.feature, r.status, r.tests.length]), [['Create', 'works', 1], ['Phone', 'works', 2], ['Budget', 'partial', 1], ['Account', 'missing', 0]]);
   assert.deepEqual(check(rows, testResults(report('passed'))), []);
+});
+
+test('every named test must pass, partial rows too', () => {
+  assert.deepEqual(check(parseMatrix(matrix), testResults(report('passed', 'failed'))), ['Budget: marked partial but its test did not pass: a.spec.mjs › budget']);
+});
+
+test('a works row may not be downgraded or removed against the base matrix', () => {
+  const base = parseMatrix(matrix);
+  const edited = parseMatrix(matrix.replace('| Create | works', '| Create | partial').replace(/\| Phone .*\n/, ''));
+  assert.deepEqual(downgrades(base, edited), ['Create: was works, now partial', 'Phone: was works, now removed']);
+  assert.deepEqual(downgrades(base, base), []);
 });
 
 test('a works row fails when its test fails, is skipped or is gone', () => {

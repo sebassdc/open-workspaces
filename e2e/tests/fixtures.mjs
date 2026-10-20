@@ -10,9 +10,12 @@ export const test = base.extend({
     const page = await context.newPage();
     await page.goto('/');
     const state = await api(page);
+    // One machine that will not go must not keep the others running for later tests.
     for (const machine of state.workspaces) {
-      if (machine.state === 'running') await api(page, {op: 'stop', id: machine.id});
-      await api(page, {op: 'delete', id: machine.id});
+      try {
+        if (machine.state === 'running') await api(page, {op: 'stop', id: machine.id});
+        await api(page, {op: 'delete', id: machine.id});
+      } catch (error) { console.warn(`cleanup of ${machine.id}: ${error.message}`); }
     }
   }, {auto: true}],
   // The dashboard page with its first state load finished.

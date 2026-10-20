@@ -4,6 +4,8 @@
 name: dashboard-e2e
 on:
   pull_request:
+    # Labeled/unlabeled reruns the matrix check when the downgrade label changes.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths: [crates/**, e2e/**, docs/UI_FEATURES.md, Cargo.toml, Cargo.lock, .github/workflows/dashboard-e2e.yml]
   push:
     branches: [main]
@@ -13,6 +15,7 @@ permissions:
 jobs:
   browser:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: e2e
@@ -34,7 +37,19 @@ jobs:
         run: npx playwright test
       - name: Check the UI feature matrix against this run
         if: success() || failure()
-        run: node check-matrix.mjs
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          # A deliberate downgrade of a working feature needs this label on the pull request.
+          ALLOW_DOWNGRADE: ${{ contains(github.event.pull_request.labels.*.name, 'ui-matrix-downgrade') }}
+        run: |
+          base=()
+          if [ -n "$BASE_REF" ] && [ "$ALLOW_DOWNGRADE" != true ]; then
+            git fetch --depth=1 origin "$BASE_REF"
+            if git show "origin/$BASE_REF:docs/UI_FEATURES.md" > "$RUNNER_TEMP/base-matrix.md" 2>/dev/null; then
+              base=(--base "$RUNNER_TEMP/base-matrix.md")
+            fi
+          fi
+          node check-matrix.mjs "${base[@]}"
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

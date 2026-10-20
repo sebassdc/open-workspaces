@@ -2,12 +2,14 @@
 
 Every browser dashboard feature and action, its status, the release it last
 passed in, and the browser test that covers it. CI keeps this table honest: a
-row marked **works** must name a test, and that test must pass, or the
-`dashboard-e2e` workflow fails. Removing, skipping or breaking the test of a
-working feature therefore fails the build.
+row marked **works** must name a test, and every test a row names must pass,
+or the `dashboard-e2e` workflow fails. Removing, skipping or breaking the test
+of a working feature therefore fails the build, and so does a pull request that
+removes a **works** row or changes its status, unless it carries the
+`ui-matrix-downgrade` label.
 
 - **works**: the test exercises the feature end to end and passes.
-- **partial**: only part of the feature works or is covered; the note says which.
+- **partial**: only part of the feature works or is tested end to end; the note says which.
 - **missing**: the dashboard does not offer it yet (or the code exists but does nothing).
 
 **Last passed** is the release version whose dashboard code the test passed
@@ -46,7 +48,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Refused create shown in the dialog | works | v0.9.22 | `machines.spec.mjs › create dialog shows a refused create and stays open` |
 | Rename in place, selection and console history follow | works | v0.9.22 | `machines.spec.mjs › rename keeps the machine selected under its new name` |
 | Navigation and resource usage view | works | v0.9.22 | `machines.spec.mjs › navigation switches between machines, snapshots and usage` |
-| Signed-in account shown in the top bar | missing | — | The page reads `user` from `/api/state`, which the API does not return, so it always shows "Your account". |
+| Signed-in account shown in the top bar | missing | — | The page reads `user` from `/api/state`, which the API does not return, so it always shows "Your account"; the login is available at `discovery.identity.email`. |
 
 ## Lifecycle
 
@@ -78,11 +80,12 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | --- | --- | --- | --- |
 | Share dialog, shared-with-me view, unshare | works | v0.9.22 | `sharing.spec.mjs › share dialog grants a teammate, who sees it under shared with me` |
 | Share dialog rejects an invalid email | works | v0.9.22 | `sharing.spec.mjs › share dialog refuses an invalid email` |
-| Publish and unpublish a port | works | v0.9.22 | `previews.spec.mjs › publish port dialog publishes, links and unpublishes a preview`; `previews.spec.mjs › publish port is hidden when previews are not configured` |
+| Publish and unpublish a port | partial | v0.9.22 | `previews.spec.mjs › publish port dialog publishes, links and unpublishes a preview`; `previews.spec.mjs › publish port is hidden when previews are not configured` |
 
 Previews need `tailscale serve` and a root-owned helper on the host, so the
-publish test answers only the publish/unpublish calls and the `previews` flag;
-the machine list and every other call reach the real dashboard.
+publish test answers only the publish/unpublish calls and the `previews` flag
+itself (hence partial); the machine list and every other call reach the real
+dashboard.
 
 ## Host pool
 
@@ -90,7 +93,7 @@ the machine list and every other call reach the real dashboard.
 | --- | --- | --- | --- |
 | Invite a Linux host (one-use invitation, cleared on close) | works | v0.9.22 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` |
 | Adjust an enrolled host's budget | partial | v0.9.22 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` (refusal for a host that never enrolled; the success path needs an enrolled runner) |
-| Revoke a host | works | v0.9.22 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` |
+| Revoke a host | partial | v0.9.22 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` (revokes an invited host that never enrolled) |
 | Host controls only for the pool owner | works | v0.9.22 | `hosts.spec.mjs › host controls are hidden from other users` |
 
 ## Errors, sign-in and layout
