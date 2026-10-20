@@ -105,7 +105,12 @@ pub fn line(stream: &mut UnixStream) -> Result<Value> {
             )
         };
         if count < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            let error = std::io::Error::last_os_error();
+            // A signal (a child process exiting) interrupts the wait; it is not an answer.
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
         }
         ensure!(count > 0, "control connection closed");
         let available = &buffer[..count as usize];

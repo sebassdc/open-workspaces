@@ -296,5 +296,68 @@ owner cap, rather than deleting the field from an overcommitted configuration.
 Low-level `ow host up --cpus N`, SSH `ow node add --cpus N`, and
 `OW_MAX_VCPUS=N ow supervisor` already take an **effective** guest budget. Set N
 explicitly to the intended ratio's budget; these operator interfaces do not
-multiply it or discover disjoint capacity. Worker status `max_vcpus` and the node
-heartbeat advertise that same effective budget for scheduler admission.
+multiply it or discover disjoint capacity. Since 0.9.24 the worker caps it at the
+[host reserve](#host-reserve-capacity-boxes-never-claim) limit, so an overcommitted N
+also needs `OW_VCPU_OVERCOMMIT=2`. Worker status `max_vcpus` and the node heartbeat
+advertise the capped budget for scheduler admission.
+
+## Host reserve: capacity boxes never claim
+
+A host keeps CPU and RAM for its controller and node agent, so boxes can neither
+starve nor out-of-memory-kill the control path, overcommit included. Box admission
+budgets are computed **after** the reserve:
+
+- RAM budget = min(¾ of host RAM, host RAM − reserved RAM, 64 GiB).
+- vCPU budget = min((logical CPUs − reserved vCPUs) × overcommit ratio, 64), rounded down.
+
+| Host role | Reserved vCPU | Reserved RAM |
+| --- | --- | --- |
+| Controller host (controller with local runner, or controller only) | 1 | 2 GiB |
+| Runner | 0.5 | 1 GiB |
+
+Example: an 8-vCPU, 32 GiB runner with ratio 2 admits (8 − 0.5) × 2 = 15 guest
+vCPUs and min(24, 31) = 24 GiB. A 2-vCPU controller host admits one vCPU at ratio
+1.
+
+Every Linux worker enforces this, whatever budget it was given (`ow host join`,
+`ow host up`, `ow node add`, `ow supervisor`, AWS): it caps `OW_MAX_MEMORY_MIB` at
+host RAM − reserved RAM and `OW_MAX_VCPUS` at (logical CPUs − reserved vCPUs) ×
+`OW_VCPU_OVERCOMMIT`, and reports the capped budgets to placement. The reserve is
+`OW_HOST_RESERVE_CPU_MILLIS` and `OW_HOST_RESERVE_MEMORY_MIB`; unset, a worker
+keeps a runner's, and the worker `ow host up` starts keeps a controller host's.
+`ow host join` passes its saved `--vcpu-overcommit`; low-level interfaces (`ow host
+up --cpus`, `ow node add --cpus`, `ow supervisor`) need `OW_VCPU_OVERCOMMIT=2` in
+their environment to keep an overcommitted budget, else it is capped at ratio 1.
+A worker whose reserve leaves less than 256 MiB or one vCPU refuses to start and
+says which settings to lower; on AWS, `apply` refuses such a reserve before
+changing anything, and the controller keeps running.
+
+The disk reserve (`OW_MIN_FREE_GIB`, default 5 GiB) is unchanged. `ow nodes` shows
+all three as `host_reserve` (`cpu_millis`, `memory_mib`, `disk_gib`); workers
+older than 0.9.24 report the CPU/RAM fields as null.
+
+The AWS components set the reserve (`hostReserveCpuMillis`, `hostReserveMemoryMib`;
+see [AWS](../deploy/aws/README.md#host-reserve)) and also make the kernel enforce it:
+
+- The controller/node agent unit runs in its own top-level slice `owcontrol.slice`
+  with `CPUWeight=1000` (boxes have the default 100), `MemoryLow` = reserved RAM
+  and `MemoryMin` = half of it, and `OOMScoreAdjust=-900`.
+- The worker and its VMs run in `owguests.slice`, capped at `MemoryMax` = host RAM
+  − reserved RAM. Within it the worker is protected from its own VMs: its unit has
+  `OOMScoreAdjust=-900` and a delegated cgroup, and the worker puts itself in a
+  `control` child (`cpu.weight` 1000, `memory.min` 64 MiB, `memory.low` 256 MiB)
+  and every VMM in a `guests` child. Each VMM raises its own OOM score to 500 at
+  start, so under memory pressure the kernel kills a VM before the worker,
+  controller or agent. Losing the worker would also stop its VMs (each VMM exits
+  with its worker), so its protection matters as much as the controller's.
+
+On every Linux host the VMMs raise their OOM score to 500 at start; the cgroup
+split needs the delegated unit the AWS components install.
+
+The node agent also sends heartbeats independently of the worker: worker status
+and the beat built from it (which may hash a newly cached image) refresh on their
+own thread, and its fsynced status files are written on another. A long capture
+(hibernate, snapshot, fork) or a slow disk no longer makes the runner look
+offline. A beat not refreshed for 1500 s closes the channel; worker requests time
+out after 1200 s.
+
