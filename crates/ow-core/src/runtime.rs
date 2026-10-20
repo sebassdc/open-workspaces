@@ -325,6 +325,9 @@ struct Snapshot {
     /// How `files` were hashed; absent is whole-file SHA-256 (see `snapshot_digest`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     digest: Option<String>,
+    /// The child a live fork took this capture for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fork: Option<String>,
 }
 
 impl Snapshot {
@@ -337,7 +340,7 @@ impl Snapshot {
     }
 
     fn summary(&self) -> Value {
-        json!({"name":self.name,"workspace":self.workspace,"memory_mib":self.memory_mib,"vcpu_count":self.vcpu_count,"image":self.image,"image_digest":self.image_digest,"state":"ready"})
+        json!({"name":self.name,"workspace":self.workspace,"memory_mib":self.memory_mib,"vcpu_count":self.vcpu_count,"image":self.image,"image_digest":self.image_digest,"fork":self.fork,"state":"ready"})
     }
 }
 
@@ -1380,6 +1383,13 @@ impl Runtime {
         let mut staged = Staged {
             snapshot: Snapshot {
                 digest: None,
+                // A live fork records its capture before taking it.
+                fork: self
+                    .state
+                    .pending_forks
+                    .iter()
+                    .find(|(_, capture)| *capture == name)
+                    .map(|(child, _)| child.clone()),
                 managed_recovery: managed,
                 captured_at,
                 name: name.into(),
@@ -2357,7 +2367,12 @@ mod disk_tests {
         let name = staged.snapshot.name.clone();
         let sealed = staged.seal();
         runtime.finish(staged, sealed).unwrap();
-        assert!(runtime.snapshot_dir(&name).exists());
+        // The capture names the fork it was taken for.
+        let manifest: Value = serde_json::from_slice(
+            &fs::read(runtime.snapshot_dir(&name).join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["fork"], "copy");
         // Disk admission now refuses the child.
         File::options()
             .write(true)
@@ -2604,6 +2619,7 @@ mod disk_tests {
             kernel_sha256: "old kernel".into(),
             files,
             digest: None,
+            fork: None,
         };
         atomic_json(&sleep.join("manifest.json"), &snapshot).unwrap();
         let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
@@ -2737,6 +2753,7 @@ mod disk_tests {
                 )]
                 .into(),
                 digest: None,
+                fork: None,
             };
             atomic_json(&directory.join("manifest.json"), &snapshot).unwrap();
         };
@@ -2862,6 +2879,7 @@ mod disk_tests {
             kernel_sha256: String::new(),
             files: BTreeMap::new(),
             digest: None,
+            fork: None,
         };
         let directory = runtime.snapshot_dir("saved");
         fs::create_dir(&directory).unwrap();
@@ -3080,6 +3098,7 @@ mod disk_tests {
             ]
             .into(),
             digest: None,
+            fork: None,
         };
         atomic_json(&saved.join("manifest.json"), &snapshot).unwrap();
         runtime
