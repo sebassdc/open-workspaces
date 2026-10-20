@@ -2024,6 +2024,25 @@ impl Catalog {
                     ))
                     .into());
                 }
+                // A create or fork interrupted before the runner registered the box can leave
+                // its files there; the runner removes them (or has none) before the row goes.
+                let swept = wire::request_envelope(
+                    &nodes::route(&self.root, &node)?,
+                    &json!({"op":"delete","id":physical}),
+                )
+                .context("runner unreachable; the machine may be back, try again")?;
+                if swept["ok"] != true && swept["error"] != "workspace not found" {
+                    eprintln!(
+                        "delete of never-made {physical} on {node}: {}",
+                        swept["error"]
+                            .as_str()
+                            .unwrap_or("worker returned no error")
+                    );
+                    return Err(limits::Rejection(format!(
+                        "the runner could not remove what the unfinished creation of machine '{name}' left; retry the delete"
+                    ))
+                    .into());
+                }
                 return self.delete_missing(user, &name, &physical, &input);
             }
         }

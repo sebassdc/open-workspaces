@@ -70,9 +70,19 @@ arrives once the manifest is published, and a live fork's child is created after
 that. Whole-file SHA-256 digests stay the snapshot format, so backups and
 cross-runner moves read them unchanged. Each snapshot reply carries
 `timings.paused_ms` (guest paused: RAM/state save and disk reflink) and
-`timings.total_ms` (until the manifest is published); the worker logs both. RAM
-is still written whole on every capture (no incremental memory snapshots), so the
-pause grows with guest memory and data-volume write speed; see
+`timings.total_ms` (until the manifest is published); the worker logs both.
+
+From 0.9.22 VMMs boot and load snapshots with Firecracker dirty-page tracking, and
+a capture saves only the RAM pages written since that VMM's last boot, load or
+capture (a `Diff` snapshot, written while the guest is paused). After the guest
+resumes, the worker lays those pages over a reflink of the previous memory image
+(held open, so deleting that earlier snapshot does not lose it), so each published
+`memory` file is still a complete image that restores, verifies and uploads like
+before. The first capture after a boot writes only the pages the guest has
+touched; one after a load or a capture writes only what changed since. Dirty-page
+tracking has a runtime cost for guest writes (KVM write-protects pages after each
+capture). A failed merge makes the next capture of that VMM a full one. Hashing
+still reads the whole memory and disk files; see
 [snapshot pause timings](experiments/snapshot-pause-timings.md). A capture does
 not guarantee application-consistent transactions with external databases or
 services. Process state can duplicate external side effects.
@@ -80,7 +90,10 @@ services. Process state can duplicate external side effects.
 A live fork needs a running parent: a stopped or hibernated box is refused before
 any capture (start it, or fork one of its snapshots). A fork whose child cannot be
 made removes the capture taken for it, and a create that fails before the box is
-registered removes its partial directory, so retries with the same ID work.
+registered removes its partial directory, so retries with the same ID work. When
+the worker itself stops between making a box's directory and registering the box,
+`delete` of that ID removes the leftover directory; the controller sends that
+delete before it drops a never-made machine's catalog row.
 
 Snapshots are made read-only. SHA-256 verification is cached inside a worker
 after capture/verification, with inode, size, modification/change timestamps and

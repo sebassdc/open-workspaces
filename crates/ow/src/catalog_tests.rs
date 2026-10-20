@@ -4022,8 +4022,15 @@ fn a_rejected_fork_ends_failed_releases_its_reservation_and_deletes_without_the_
     let states = machine_states(&mut c, a);
     assert_eq!(states["copy"], "failed");
     assert_eq!(c.state(a).unwrap()["stats"]["reserved_memory_mib"], 256);
-    // The runner never had it: a dispatched delete would be rejected.
+    // The runner is asked to remove leftovers; one that cannot keeps the row.
     *fake.reject.lock().unwrap() = Some("delete".into());
+    let kept = c
+        .operation(a, json!({"op":"delete","id":"copy"}))
+        .unwrap_err();
+    assert!(kept.is::<limits::Rejection>(), "{kept:#}");
+    assert_eq!(machine_states(&mut c, a)["copy"], "failed");
+    // A runner with nothing under that ID (or an older worker) lets the row go.
+    *fake.diagnostic.lock().unwrap() = "workspace not found".into();
     let deleted = c.operation(a, json!({"op":"delete","id":"copy"})).unwrap();
     assert_eq!(deleted["deleted"], "copy");
     assert!(!machine_states(&mut c, a).contains_key("copy"));
@@ -4048,7 +4055,7 @@ fn an_interrupted_fork_times_out_visibly_and_its_ghost_can_be_deleted() {
     c.operation(a, json!({"op":"fork","id":"one","child":"copy"}))
         .unwrap_err();
     fake.uncertain.store(false, Ordering::SeqCst);
-    *fake.reject.lock().unwrap() = Some("delete".into());
+    *fake.reject.lock().unwrap() = None;
     assert_eq!(machine_states(&mut c, a)["copy"], "pending");
     let early = c
         .operation(a, json!({"op":"delete","id":"copy"}))
@@ -4072,6 +4079,7 @@ fn an_interrupted_fork_times_out_visibly_and_its_ghost_can_be_deleted() {
     assert_eq!(fork["state"], "failed");
     assert_eq!(fork["error"], CREATION_TIMEOUT);
     assert_eq!(c.state(a).unwrap()["stats"]["reserved_memory_mib"], 256);
+    // The runner removes what the interrupted fork left (here it answers the delete).
     let deleted = c.operation(a, json!({"op":"delete","id":"copy"})).unwrap();
     assert_eq!(deleted["deleted"], "copy");
     assert!(!machine_states(&mut c, a).contains_key("copy"));

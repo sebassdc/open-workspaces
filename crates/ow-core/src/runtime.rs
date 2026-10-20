@@ -1033,7 +1033,9 @@ impl Runtime {
     }
 
     fn delete(&mut self, id: &str) -> Result<Value> {
-        self.workspace(id)?;
+        if self.workspace(id).is_err() {
+            return self.delete_unregistered(id);
+        }
         ensure!(
             !self.machines.contains_key(id),
             "workspace is running; stop or hibernate it first"
@@ -1065,6 +1067,23 @@ impl Runtime {
         self.state.workspaces.remove(id);
         self.save()?;
         Ok(json!({"deleted":id,"snapshots":snapshots}))
+    }
+
+    /// A create or fork interrupted (a worker crash) between making the directory and
+    /// registering the box left only files: remove them, so they stop holding disk.
+    fn delete_unregistered(&mut self, id: &str) -> Result<Value> {
+        identifier(id)?;
+        let directory = self.machine_dir(id);
+        ensure!(
+            directory.exists() && !self.state.placements.contains_key(id),
+            "workspace not found"
+        );
+        fs::remove_dir_all(&directory)?;
+        match fs::remove_file(self.root.join("recovery").join(format!("{id}.json"))) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
+        }
+        Ok(json!({"deleted":id,"snapshots":[],"registered":false}))
     }
 
     /// Deletes one named snapshot of `id`. Repeating a finished delete succeeds
@@ -2202,6 +2221,30 @@ mod disk_tests {
         assert!(!runtime.machine_dir("copy").exists());
         assert!(runtime.workspace("copy").is_err());
         runtime.machines.clear();
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn delete_removes_what_an_interrupted_create_left_unregistered() {
+        let mut runtime = fixture();
+        // A worker crash after the directory and disk, before the box was registered.
+        fs::create_dir(runtime.machine_dir("ghost")).unwrap();
+        File::create(runtime.machine_dir("ghost").join("disk.ext4"))
+            .unwrap()
+            .set_len(8 * GIB)
+            .unwrap();
+        assert_eq!(runtime.disk_reserved().unwrap(), 16 * GIB);
+        let deleted = runtime
+            .request(&json!({"op":"delete","id":"ghost"}))
+            .unwrap();
+        assert_eq!(deleted["registered"], false);
+        assert!(!runtime.machine_dir("ghost").exists());
+        assert_eq!(runtime.disk_reserved().unwrap(), 8 * GIB);
+        // Nothing there at all is still not found.
+        let error = runtime
+            .request(&json!({"op":"delete","id":"ghost"}))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "workspace not found");
         fs::remove_dir_all(&runtime.root).unwrap();
     }
 

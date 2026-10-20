@@ -191,8 +191,11 @@ A running box cannot be deleted: run `ow stop NAME`, then retry deletion with a
 new operation key. Deleting a box deletes its snapshots too: `ow delete` names
 them and asks first; without a terminal it refuses unless `--yes` is given. A
 machine whose create or fork never made it (state `pending` or `failed` with
-`unmade: true`) that its runner does not list is deleted from the catalog only;
-while that create or fork may still be running, delete says so instead.
+`unmade: true`) that its runner does not list is removed: the runner first deletes
+any files an interrupted create or fork left under its ID (an older worker that
+answers `workspace not found` has none to remove), then the catalog row goes. If
+the runner cannot remove them, the row stays and delete says to retry. While that
+create or fork may still be running, delete says so instead.
 
 A live fork (`ow fork BOX CHILD` without `--snapshot`) captures the running box.
 A stopped or hibernated box is refused before anything is reserved: run

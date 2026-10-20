@@ -38,6 +38,68 @@ pub fn reflink(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reflinks an open file (which may already be unlinked) to a new `destination`.
+fn reflink_from(src: &File, destination: &Path) -> Result<()> {
+    let dst = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let rc = unsafe { libc::ioctl(dst.as_raw_fd(), 0x40049409, src.as_raw_fd()) };
+    #[cfg(test)]
+    if rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EOPNOTSUPP) {
+        std::io::copy(&mut &*src, &mut &dst)?;
+        return Ok(());
+    }
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("memory reflink failed");
+    }
+    Ok(())
+}
+
+/// What the guest's memory pages that are clean (not dirtied since then) hold, so a
+/// `Diff` snapshot's dirty pages can be laid over it to make a full memory image.
+enum MemoryBase {
+    /// Unknown (dirty tracking off): the next capture is `Full`.
+    Unknown,
+    /// Booted with dirty tracking: clean pages are still zero.
+    Zero,
+    /// The memory image last loaded or captured; held open so it outlives a deleted capture.
+    Image(File),
+}
+
+/// Writes `diff`'s data ranges (the dirtied pages; the rest is holes) over `memory`.
+fn lay_over(diff: &Path, memory: &Path) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let source = File::open(diff)?;
+    let target = OpenOptions::new().write(true).open(memory)?;
+    let length = source.metadata()?.len();
+    ensure!(
+        length == target.metadata()?.len(),
+        "diff memory size differs from its base"
+    );
+    let mut buffer = vec![0; 1 << 20];
+    let mut offset = 0i64;
+    while (offset as u64) < length {
+        let start = unsafe { libc::lseek(source.as_raw_fd(), offset, libc::SEEK_DATA) };
+        if start < 0 {
+            // ENXIO: no data after `offset`.
+            break;
+        }
+        let end = unsafe { libc::lseek(source.as_raw_fd(), start, libc::SEEK_HOLE) };
+        ensure!(end > start, "diff memory extent map failed");
+        let mut at = start as u64;
+        while at < end as u64 {
+            let n = source.read_at(&mut buffer[..(end as u64 - at).min(1 << 20) as usize], at)?;
+            ensure!(n > 0, "diff memory ended early");
+            target.write_all_at(&buffer[..n], at)?;
+            at += n as u64;
+        }
+        offset = end;
+    }
+    target.sync_all()?;
+    Ok(())
+}
+
 pub fn host(command: &str, args: &[&str]) -> Result<()> {
     let result = Command::new(command).args(args).output()?;
     ensure!(
@@ -57,6 +119,7 @@ pub struct Vm {
     socket: PathBuf,
     pub tap: String,
     pub address: String,
+    memory_base: MemoryBase,
 }
 
 impl Vm {
@@ -170,6 +233,7 @@ impl Vm {
                 socket,
                 tap: tap.clone(),
                 address,
+                memory_base: MemoryBase::Unknown,
             };
             let started = Instant::now();
             while !vm.socket.exists() {
@@ -292,7 +356,8 @@ impl Vm {
         self.api(
             "PUT",
             "/machine-config",
-            json!({"vcpu_count":cpus,"mem_size_mib":memory}),
+            // Dirty tracking lets repeat captures write only the pages that changed.
+            json!({"vcpu_count":cpus,"mem_size_mib":memory,"track_dirty_pages":true}),
         )?;
         self.api("PUT", "/boot-source", json!({"kernel_image_path":kernel,"boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"}))?;
         self.api("PUT", "/drives/rootfs", json!({"drive_id":"rootfs","path_on_host":"disk.ext4","is_root_device":true,"is_read_only":false}))?;
@@ -304,17 +369,21 @@ impl Vm {
         self.api("PUT", "/actions", json!({"action_type":"InstanceStart"}))?;
         self.read_until(b"OW_GUEST_READY", Duration::from_secs(20))?;
         self.checked("true")?;
+        self.memory_base = MemoryBase::Zero;
         Ok(())
     }
 
     pub fn restore(&mut self, snapshot: &Path) -> Result<()> {
+        let image = File::open(snapshot.join("memory"))?;
         self.api(
             "PUT",
             "/snapshot/load",
             json!({"snapshot_path":snapshot.join("state"),
             "mem_backend":{"backend_path":snapshot.join("memory"),"backend_type":"File"},
-            "network_overrides":[{"iface_id":"net1","host_dev_name":self.tap}],"resume_vm":false,"clock_realtime":true}),
+            "network_overrides":[{"iface_id":"net1","host_dev_name":self.tap}],"resume_vm":false,"clock_realtime":true,"track_dirty_pages":true}),
         )?;
+        // Loaded pages are clean against this image until the guest writes them.
+        self.memory_base = MemoryBase::Image(image);
         self.resume()
     }
 
@@ -348,20 +417,61 @@ impl Vm {
     /// unless `resume` is false and the capture succeeded (hibernation drops the VM).
     /// Saves RAM and device state and reflinks the disk while the guest is paused; returns
     /// how long it was paused. The reflink stays inside the pause: it pairs disk with RAM.
+    ///
+    /// When the VMM tracks dirty pages, only pages written since its last load or capture
+    /// are saved (a `Diff` snapshot), and after the guest runs again they are laid over a
+    /// reflink of that earlier image, so `memory` is still a complete image.
     pub fn capture(&mut self, directory: &Path, disk: &Path, resume: bool) -> Result<Duration> {
         self.checked("sync")?;
+        let memory = directory.join("memory");
+        let diff = !matches!(self.memory_base, MemoryBase::Unknown);
+        let saved = if diff {
+            directory.join("memory.diff")
+        } else {
+            memory.clone()
+        };
         let paused = Instant::now();
         self.api("PATCH", "/vm", json!({"state":"Paused"}))?;
         let captured = (|| {
-            self.api_waiting("PUT", "/snapshot/create", json!({"snapshot_type":"Full","snapshot_path":directory.join("state"),"mem_file_path":directory.join("memory")}), 900)?;
+            self.api_waiting("PUT", "/snapshot/create", json!({"snapshot_type":if diff {"Diff"} else {"Full"},"snapshot_path":directory.join("state"),"mem_file_path":saved}), 900)?;
             reflink(disk, &directory.join("disk.ext4"))
         })();
-        if captured.is_ok() && !resume {
-            return Ok(paused.elapsed());
+        let paused_for = if captured.is_ok() && !resume {
+            paused.elapsed()
+        } else {
+            let resumed = self.resume();
+            let paused_for = paused.elapsed();
+            captured?;
+            resumed?;
+            paused_for
+        };
+        if !diff {
+            // No dirty tracking in this VMM: every capture stays `Full`.
+            return Ok(paused_for);
         }
-        let resumed = self.resume();
-        captured?;
-        resumed.map(|_| paused.elapsed())
+        // The dirty log restarted at this capture: the new image is the next base.
+        let merged = (|| {
+            match &self.memory_base {
+                MemoryBase::Image(base) => {
+                    reflink_from(base, &memory)?;
+                    lay_over(&saved, &memory)?;
+                    std::fs::remove_file(&saved)?;
+                }
+                // Since boot, clean pages are zero: the sparse diff is the whole image.
+                _ => std::fs::rename(&saved, &memory)?,
+            }
+            File::open(&memory).map_err(anyhow::Error::from)
+        })();
+        match merged {
+            Ok(image) => {
+                self.memory_base = MemoryBase::Image(image);
+                Ok(paused_for)
+            }
+            Err(error) => {
+                self.memory_base = MemoryBase::Unknown;
+                Err(error.context("merging changed memory pages"))
+            }
+        }
     }
 
     pub fn alive(&mut self) -> bool {
@@ -409,6 +519,8 @@ mod clock_tests {
     fn clock_after_resume(capture_failure: bool, date_exit: i32) {
         let root = std::env::temp_dir().join(format!("ow-clock-{}", nonce().unwrap()));
         std::fs::create_dir(&root).unwrap();
+        // The memory image a restore loads (and keeps as the base of later diffs).
+        std::fs::write(root.join("memory"), b"VM memory").unwrap();
         let socket = root.join("api.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let api = std::thread::spawn(move || {
@@ -503,6 +615,7 @@ mod clock_tests {
             buffer: Vec::new(),
             socket,
             tap: "clock-fixture-no-host-interface".into(),
+            memory_base: MemoryBase::Unknown,
             address: String::new(),
         };
         let before = SystemTime::now()
@@ -614,6 +727,12 @@ pub(crate) fn capture_fixture(directory: &Path, resume: bool) -> (Vm, std::threa
             reader.read_exact(&mut body).unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
             if endpoint == "/snapshot/create" {
+                // A diff goes to its own file and is merged after the guest resumes.
+                let diff = body["mem_file_path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("memory.diff");
+                assert_eq!(body["snapshot_type"], if diff { "Diff" } else { "Full" });
                 std::fs::write(body["snapshot_path"].as_str().unwrap(), b"VM state").unwrap();
                 std::fs::write(body["mem_file_path"].as_str().unwrap(), b"VM memory").unwrap();
             } else {
@@ -639,7 +758,62 @@ pub(crate) fn capture_fixture(directory: &Path, resume: bool) -> (Vm, std::threa
             socket,
             tap: "fixture-no-host-interface".into(),
             address: String::new(),
+            memory_base: MemoryBase::Unknown,
         },
         fixture,
     )
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+
+    fn scratch() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ow-memory-{}", nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn changed_pages_are_laid_over_a_copy_of_the_base_and_holes_keep_it() {
+        let root = scratch();
+        let base = root.join("base");
+        std::fs::write(&base, [b'A'; 3 * 4096]).unwrap();
+        let diff = root.join("memory.diff");
+        let file = File::create(&diff).unwrap();
+        file.set_len(3 * 4096).unwrap();
+        file.write_all_at(&[b'B'; 4096], 4096).unwrap();
+        let memory = root.join("memory");
+        reflink_from(&File::open(&base).unwrap(), &memory).unwrap();
+        lay_over(&diff, &memory).unwrap();
+        let merged = std::fs::read(&memory).unwrap();
+        assert!(merged[..4096].iter().all(|b| *b == b'A'));
+        assert!(merged[4096..8192].iter().all(|b| *b == b'B'));
+        assert!(merged[8192..].iter().all(|b| *b == b'A'));
+        // The base image is never written.
+        assert!(std::fs::read(&base).unwrap().iter().all(|b| *b == b'A'));
+        std::fs::write(&diff, b"short").unwrap();
+        assert!(lay_over(&diff, &memory).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_repeat_capture_saves_a_diff_and_publishes_a_complete_image() {
+        let root = scratch();
+        std::fs::write(root.join("disk.ext4"), b"disk").unwrap();
+        let (mut vm, server) = capture_fixture(&root, true);
+        // As after a load or an earlier capture: the base image the clean pages equal.
+        let base = root.join("base");
+        std::fs::write(&base, b"old pages").unwrap();
+        vm.memory_base = MemoryBase::Image(File::open(&base).unwrap());
+        let staging = root.join("capture");
+        std::fs::create_dir(&staging).unwrap();
+        vm.capture(&staging, &root.join("disk.ext4"), true).unwrap();
+        server.join().unwrap();
+        assert_eq!(std::fs::read(staging.join("memory")).unwrap(), b"VM memory");
+        assert!(!staging.join("memory.diff").exists());
+        assert!(matches!(vm.memory_base, MemoryBase::Image(_)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
