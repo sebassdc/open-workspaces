@@ -88,10 +88,17 @@ disk capacity; it is never inferred from physical host totals.
   `max_vcpus`: per-guest ceiling. CPU and RAM headroom must both fit; a free
   running slot alone is insufficient. Mac shape restrictions remain in force.
 - `disk.configured_gib`, `reserved_bytes`, and `host_reserve_gib` reflect the
-  worker's logical disk cap, all active disk reservations (including stopped and
-  hibernated boxes), and its host reserve. `available_bytes` is the lesser of
-  remaining logical cap and filesystem free space after host reserve and existing
-  full logical reservations, matching [worker disk admission](DISKS.md).
+  worker's logical disk cap, all active logical disk sizes (including stopped and
+  hibernated boxes), and its host reserve. `free_bytes` is the data volume's real
+  free space; `unwritten_bytes` is what box disks may still write (logical size
+  minus allocated blocks). `available_bytes` is the lesser of remaining logical
+  cap and `free_bytes` after host reserve, staging and `unwritten_bytes`, matching
+  [worker disk admission](DISKS.md). Workers before 0.9.22 report no
+  `free_bytes`/`unwritten_bytes` (null) and subtract full logical sizes.
+- `host_reserve`: CPU (`cpu_millis`, thousandths of a vCPU), RAM (`memory_mib`)
+  and disk (`disk_gib`) the runner keeps for its controller and node agent; the
+  effective budgets already exclude them ([host reserve](HOSTS.md#host-reserve-capacity-boxes-never-claim)).
+  CPU and RAM are null for workers before 0.9.24, which do not enforce them.
 - `workspaces` reports the worker box limit and observed count (including stopped
   boxes). Available box count is null without a fresh worker observation.
 - `last_seen_unix_s` is the controller heartbeat time. `disk.observed_unix_s` is
@@ -177,7 +184,7 @@ Recognizable failure codes are:
   discovery unsupported without claiming that list or exec are incompatible.
 - `unavailable_image`: run image list and choose a prepared online image.
 - `insufficient_capacity`: inspect nodes and image list; choose fitting resources
-  or wait. Full disk reservations count even when disks are sparse.
+  or wait. The unwritten part of every box disk stays reserved even when sparse.
 - `node_unavailable`: wait for the intended runner; existing placement stays fixed.
 - `not_found`: the named resource is absent or not accessible to your identity.
   Deleting an unknown machine reports `machine 'NAME' was not found.` (HTTP 404,
@@ -185,7 +192,24 @@ Recognizable failure codes are:
   with its original operation key still returns its saved success.
 
 A running box cannot be deleted: run `ow stop NAME`, then retry deletion with a
-new operation key. If `ssh-info` reports no registered key, run
+new operation key. Deleting a box deletes its snapshots too: `ow delete` names
+them and asks first; without a terminal it refuses unless `--yes` is given. A
+machine whose create or fork never made it (state `pending` or `failed` with
+`unmade: true`) that its runner does not list is removed: the runner first deletes
+any files an interrupted create or fork left under its ID (an older worker that
+answers `workspace not found` has none to remove), then the catalog row goes. If
+the runner cannot remove them, the row stays and delete says to retry. While that
+create or fork may still be running, delete says so instead.
+
+A live fork (`ow fork BOX CHILD` without `--snapshot`) captures the running box.
+A stopped or hibernated box is refused before anything is reserved: run
+`ow start BOX` first, or fork one of its snapshots with `--snapshot NAME`. A fork
+the runner rejects leaves its child `failed` with `unmade: true` and releases its
+reservation. A create or fork left uncertain (a lost reply or an interrupted
+controller) for 30 minutes whose machine the runner does not list fails with a
+timeout error.
+
+If `ssh-info` reports no registered key, run
 `ow ssh-authorize NAME --key PATH_TO_PUBLIC_KEY`, then retry.
 
 Admission codes are additive API `error_code` fields (or an operation's stored

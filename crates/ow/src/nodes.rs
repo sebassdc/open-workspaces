@@ -1064,6 +1064,106 @@ fn cache_extension(beat: &mut Value, status: &Value, root: &Path, negotiated: bo
     Ok(())
 }
 
+/// The heartbeat for this worker status, except the drain flag the channel adds when it
+/// sends. Hashes a newly cached image, so it runs on the status thread.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn build_beat(
+    hello: &Value,
+    status: &Value,
+    root: &Path,
+    guided: bool,
+    cache_negotiated: bool,
+) -> Result<Value> {
+    // Golden images built since the agent started are advertised too.
+    let mut beat = hello.clone();
+    if !guided && cfg!(target_os = "linux") {
+        beat["images"] = json!(base_images());
+        // A restarted worker may run with new limits.
+        beat["memory_mib"] = status["max_memory_mib"].clone();
+        beat["slots"] = status["max_running"].clone();
+        beat["vcpus"] = status["max_vcpus"].clone();
+    }
+    // Optional fields (older controllers ignore them), such as releases for upgrade
+    // health checks.
+    #[cfg(target_os = "linux")]
+    {
+        beat["park_wake_v1"] = json!(
+            common::placement_capable(status).is_ok()
+                && crate::image_store::configured_url(root).is_ok()
+        );
+        beat["managed_restore_v1"] = json!(
+            common::placement_capable(status).is_ok()
+                && crate::image_store::configured_url(root).is_ok()
+        );
+        beat["image_store_v1"] = json!(
+            status["image_store_v1"] == true && crate::image_store::configured_url(root).is_ok()
+        );
+    }
+    beat["image_digests"] = status["image_digests"].clone();
+    #[cfg(target_os = "linux")]
+    cache_extension(&mut beat, status, root, cache_negotiated)?;
+    beat["disk_resize_v1"] = json!(status["disk_resize_v1"] == true);
+    beat["snapshot_delete_v1"] = json!(status["snapshot_delete_v1"] == true);
+    #[cfg(target_os = "linux")]
+    {
+        beat["move_fork_v1"] = json!(
+            status["move_fork_v1"] == true
+                && status["worker_protocol"].as_u64().is_some_and(|p| p >= 3)
+                && crate::image_store::configured_url(root).is_ok()
+        );
+    }
+    beat["placement_fencing_v1"] = json!(common::placement_capable(status).is_ok());
+    for field in [
+        "compat",
+        "max_disk_gib",
+        "reserved_disk_bytes",
+        "unwritten_disk_bytes",
+        "free_disk_bytes",
+        "min_free_gib",
+        "host_reserve",
+        "available_disk_bytes",
+        "disk_observed_unix_s",
+        "workspace_count",
+        "max_workspaces",
+    ] {
+        beat[field] = status[field].clone();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        beat["drain_inventory_v1"] = json!(true);
+    }
+    beat["version"] = json!(env!("CARGO_PKG_VERSION"));
+    beat["worker"] = json!({"version":status["version"],"protocol":status["worker_protocol"]});
+    if let Some(golden) = status["images"].as_array() {
+        beat["images"]
+            .as_array_mut()
+            .unwrap()
+            .extend(golden.iter().cloned());
+    }
+    Ok(beat)
+}
+
+/// Legacy unmanaged nodes retain their separately configured asset contract. Checked on
+/// every heartbeat, so a developer image built later shows without a restart.
+fn base_images() -> Vec<&'static str> {
+    ["alpine", "arch", "ubuntu"]
+        .into_iter()
+        .filter(|image| {
+            crate::assets()
+                .join(match *image {
+                    "alpine" => "guest/base.ext4",
+                    "arch" => "guest/arch.ext4",
+                    _ => "guest/ubuntu.ext4",
+                })
+                .exists()
+        })
+        .collect()
+}
+
+/// A beat this old means the status thread is stuck (worker requests already time out
+/// after 1200 s): the channel closes and the runner shows offline.
+const BEAT_STALE: Duration = Duration::from_secs(1500);
+
 pub fn agent(
     root: &Path,
     controller: &str,
@@ -1138,22 +1238,6 @@ pub fn agent(
     // A worker outside this agent's protocol window is never driven or advertised.
     common::worker_compatible(&status)?;
     let guided = root.join("host.json").exists();
-    // Legacy unmanaged nodes retain their separately configured asset contract. Checked
-    // on every heartbeat, so a developer image built later shows without a restart.
-    let base_images = || {
-        ["alpine", "arch", "ubuntu"]
-            .into_iter()
-            .filter(|image| {
-                crate::assets()
-                    .join(match *image {
-                        "alpine" => "guest/base.ext4",
-                        "arch" => "guest/arch.ext4",
-                        _ => "guest/ubuntu.ext4",
-                    })
-                    .exists()
-            })
-            .collect::<Vec<_>>()
-    };
     let images = if guided {
         crate::onboarding::verified_images(root)?
     } else {
@@ -1166,14 +1250,29 @@ pub fn agent(
     let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    // Worker status for the heartbeats, fetched on its own thread: the worker answers
-    // one request at a time, so a long capture must not stall or end the heartbeats.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let cache_negotiated = Arc::new(AtomicBool::new(false));
+    // Worker status, and the heartbeat built from it, refreshed on their own thread: the
+    // worker answers one request at a time and a beat may hash a newly cached image, so a
+    // long capture or a slow disk must not stall or end the heartbeats. The channel sends
+    // the latest beat built; its observation times say how old it is.
     // None while the worker does not answer: the agent then sends no heartbeats (the
     // runner shows offline) and waits for a worker to answer again, so the worker can
     // restart (a runner upgrade) without the agent.
     let latest = Arc::new(std::sync::Mutex::new(Some(status.clone())));
+    let first = build_beat(&hello, &status, root, guided, false)?;
+    let prepared = Arc::new(std::sync::Mutex::new(Some((
+        std::time::Instant::now(),
+        first,
+    ))));
     {
-        let (latest, root) = (latest.clone(), root.to_owned());
+        let (latest, prepared, negotiated, root, hello) = (
+            latest.clone(),
+            prepared.clone(),
+            cache_negotiated.clone(),
+            root.to_owned(),
+            hello.clone(),
+        );
         std::thread::spawn(move || {
             let mut refused = false;
             loop {
@@ -1183,6 +1282,7 @@ pub fn agent(
                     wire::reply_wait(&json!({"op":"hibernate"})),
                 )
                 .map(|(_, v)| v)
+                .map_err(|e| eprintln!("worker status unavailable: {e:#}"))
                 .ok();
                 let status = match status.map(|s| common::worker_compatible(&s).map(|()| s)) {
                     Some(Err(e)) => {
@@ -1199,110 +1299,82 @@ pub fn agent(
                         other.and_then(Result::ok)
                     }
                 };
-                *latest.lock().unwrap() = status;
+                *latest.lock().unwrap() = status.clone();
+                match status.map(|s| {
+                    build_beat(&hello, &s, &root, guided, negotiated.load(Ordering::SeqCst))
+                }) {
+                    Some(Ok(beat)) => {
+                        *prepared.lock().unwrap() = Some((std::time::Instant::now(), beat))
+                    }
+                    // The last beat stays until it is too old to send.
+                    Some(Err(e)) => eprintln!("heartbeat not refreshed: {e:#}"),
+                    None => *prepared.lock().unwrap() = None,
+                }
                 std::thread::sleep(Duration::from_secs(3));
             }
         });
     }
+    // The status files are fsynced: written on their own thread, in order, so a slow disk
+    // never delays a heartbeat.
+    let (record, records) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+    std::thread::spawn(move || records.into_iter().for_each(|write| write()));
+    let record = |write: Box<dyn FnOnce() + Send>| {
+        let _ = record.send(write);
+    };
     loop {
         let result = (|| -> Result<()> {
             if guided {
-                channel_status(root, "connecting", &instance, None)?;
+                let (root, instance) = (root.to_owned(), instance.clone());
+                record(Box::new(move || {
+                    let _ = channel_status(&root, "connecting", &instance, None);
+                }));
             }
+            cache_negotiated.store(false, Ordering::SeqCst);
             let mut ws = socket(&origin, &format!("/node/{node}"), &credential, ca)?;
             timeout_socket(&ws)?;
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
             let mut unconfirmed = None;
-            #[cfg(target_os = "linux")]
-            let mut cache_negotiated = false;
             loop {
                 // A refused heartbeat closes the channel at once; one still open a second
                 // later was accepted.
                 if heartbeat.elapsed() > Duration::from_secs(1)
                     && let Some(beat) = unconfirmed.take()
                 {
-                    let _ = agent_status(root, true, &beat);
+                    let root = root.to_owned();
+                    record(Box::new(move || {
+                        let _ = agent_status(&root, true, &beat);
+                    }));
                 }
-                // Without a compatible worker the channel closes at once: the controller then
-                // sees this runner offline and dispatches nothing to it.
-                let status = latest
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .context("no compatible worker answers")?;
                 if heartbeat.elapsed() > Duration::from_secs(3) {
-                    // Golden images built since the agent started are advertised too.
-                    let mut beat = hello.clone();
-                    if !guided && cfg!(target_os = "linux") {
-                        beat["images"] = json!(base_images());
-                        // A restarted worker may run with new limits.
-                        beat["memory_mib"] = status["max_memory_mib"].clone();
-                        beat["slots"] = status["max_running"].clone();
-                        beat["vcpus"] = status["max_vcpus"].clone();
+                    // Without a compatible worker the channel closes at once: the controller
+                    // then sees this runner offline and dispatches nothing to it.
+                    let (built, mut beat) = prepared
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .context("no compatible worker answers")?;
+                    ensure!(
+                        built.elapsed() < BEAT_STALE,
+                        "worker status not refreshed for {} s",
+                        built.elapsed().as_secs()
+                    );
+                    if !cache_negotiated.load(Ordering::SeqCst) {
+                        // Built for an earlier channel: this controller has not negotiated it.
+                        for key in [
+                            "cache_eviction_v1",
+                            "cache_inventory_v1",
+                            "cache_entries",
+                            "cache_observed_unix_s",
+                        ] {
+                            beat.as_object_mut().map(|b| b.remove(key));
+                        }
                     }
-                    // Optional fields (older controllers ignore them): releases for upgrade
-                    // health checks, and a drain the host upgrader declares.
-                    #[cfg(target_os = "linux")]
-                    {
-                        beat["park_wake_v1"] = json!(
-                            common::placement_capable(&status).is_ok()
-                                && crate::image_store::configured_url(root).is_ok()
-                        );
-                        beat["managed_restore_v1"] = json!(
-                            common::placement_capable(&status).is_ok()
-                                && crate::image_store::configured_url(root).is_ok()
-                        );
-                        beat["image_store_v1"] = json!(
-                            status["image_store_v1"] == true
-                                && crate::image_store::configured_url(root).is_ok()
-                        );
-                    }
-                    beat["image_digests"] = status["image_digests"].clone();
-                    #[cfg(target_os = "linux")]
-                    cache_extension(&mut beat, &status, root, cache_negotiated)?;
-                    beat["disk_resize_v1"] = json!(status["disk_resize_v1"] == true);
-                    beat["snapshot_delete_v1"] = json!(status["snapshot_delete_v1"] == true);
-                    #[cfg(target_os = "linux")]
-                    {
-                        beat["move_fork_v1"] = json!(
-                            status["move_fork_v1"] == true
-                                && status["worker_protocol"].as_u64().is_some_and(|p| p >= 3)
-                                && crate::image_store::configured_url(root).is_ok()
-                        );
-                    }
-                    beat["placement_fencing_v1"] =
-                        json!(common::placement_capable(&status).is_ok());
-                    for field in [
-                        "compat",
-                        "max_disk_gib",
-                        "reserved_disk_bytes",
-                        "min_free_gib",
-                        "available_disk_bytes",
-                        "disk_observed_unix_s",
-                        "workspace_count",
-                        "max_workspaces",
-                    ] {
-                        beat[field] = status[field].clone();
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        beat["drain_inventory_v1"] = json!(true);
-                    }
-                    beat["version"] = json!(env!("CARGO_PKG_VERSION"));
-                    beat["worker"] =
-                        json!({"version":status["version"],"protocol":status["worker_protocol"]});
                     // A stopping agent takes no new jobs, so placement must skip it.
                     beat["drain"] = json!(
                         root.join("drain").exists()
                             || root.join("drain-seal.json").exists()
-                            || STOPPING.load(std::sync::atomic::Ordering::SeqCst)
+                            || STOPPING.load(Ordering::SeqCst)
                     );
-                    if let Some(golden) = status["images"].as_array() {
-                        beat["images"]
-                            .as_array_mut()
-                            .unwrap()
-                            .extend(golden.iter().cloned());
-                    }
                     ws.send(tungstenite::Message::Text(beat.to_string().into()))?;
                     heartbeat = std::time::Instant::now();
                     unconfirmed = Some(beat);
@@ -1318,19 +1390,28 @@ pub fn agent(
                                 .as_str()
                                 .context("acknowledgement generation required")?;
                             common::identifier(generation)?;
-                            #[cfg(target_os = "linux")]
-                            {
-                                cache_negotiated = v["extensions"]
-                                    .as_array()
-                                    .is_some_and(|a| a.iter().any(|x| x == "cache-inventory-v1"));
-                            }
+                            cache_negotiated.store(
+                                cfg!(target_os = "linux")
+                                    && v["extensions"].as_array().is_some_and(|a| {
+                                        a.iter().any(|x| x == "cache-inventory-v1")
+                                    }),
+                                Ordering::SeqCst,
+                            );
                             if guided {
-                                channel_status(root, "dispatchable", &instance, Some(generation))?;
+                                let (root, instance, generation) =
+                                    (root.to_owned(), instance.clone(), generation.to_owned());
+                                record(Box::new(move || {
+                                    let _ = channel_status(
+                                        &root,
+                                        "dispatchable",
+                                        &instance,
+                                        Some(&generation),
+                                    );
+                                }));
                             }
                             continue;
                         }
                         common::identifier(&id)?;
-                        use std::sync::atomic::Ordering;
                         // Stopping: jobs in flight finish, new ones are left to time out
                         // unattached (nothing ran), which the controller reports.
                         if STOPPING.load(Ordering::SeqCst) {
@@ -1379,10 +1460,14 @@ pub fn agent(
             }
         })();
         if let Err(e) = result {
-            if guided {
-                let _ = channel_status(root, "disconnected", &instance, None);
-            }
-            let _ = agent_status(root, false, &json!({}));
+            // After any online record still queued.
+            let (root, instance) = (root.to_owned(), instance.clone());
+            record(Box::new(move || {
+                if guided {
+                    let _ = channel_status(&root, "disconnected", &instance, None);
+                }
+                let _ = agent_status(&root, false, &json!({}));
+            }));
             eprintln!("node channel disconnected ({e:#}); reconnecting");
         }
         std::thread::sleep(Duration::from_secs(2));

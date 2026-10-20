@@ -286,6 +286,9 @@ fn command(root: &Path, c: &Config, action: &str) -> Result<Command> {
         .env("OW_MAX_MEMORY_MIB", c.memory.to_string())
         .env("OW_MAX_RUNNING", c.slots.to_string())
         .env("OW_MAX_VCPUS", c.cpus.to_string())
+        // --cpus already includes the ratio; the worker caps it at the host's CPUs less
+        // the reserve, times this ratio.
+        .env("OW_VCPU_OVERCOMMIT", c.vcpu_overcommit.to_string())
         .env("OW_MIN_FREE_GIB", c.storage_gib.to_string());
     cmd.arg("--local").arg("--data-dir").arg(root);
     if action == "run" {

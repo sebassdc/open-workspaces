@@ -9,14 +9,15 @@ operator configuration. **Experimental** has bounded acceptance and platform
 limits. **Not yet live** means code is merged, but activation or deployment
 acceptance remains outstanding. Versions below are the first tagged release
 containing that feature, not a claim that your host has installed or enabled it.
-Production hardening remains ongoing.
+Production hardening remains ongoing. Each dashboard action, its status and the
+browser test that guards it are listed in the [UI feature matrix](docs/UI_FEATURES.md).
 
 ### Boxes and lifecycle
 
 | Feature | What it does | Status | Shipped in | Guide |
 | --- | --- | --- | --- | --- |
 | Persistent Linux boxes | Create Alpine, Ubuntu or Arch workspaces on a prepared KVM runner; execute commands and transfer files. | Core | v0.1.0 | [Local use](docs/LOCAL_PROTOTYPE.md) |
-| Start, stop and delete | Keep disks across cold restarts; explicitly delete a stopped box and its snapshots. | Core | v0.1.0 | [CLI](docs/AGENT_CLI.md) |
+| Start, stop and delete | Keep disks across cold restarts; explicitly delete a stopped box and its snapshots, named and confirmed first; a create or fork that never made its box fails visibly and deletes cleanly. | Core | v0.1.0; confirm and clean failed forks v0.9.22 | [CLI](docs/AGENT_CLI.md) |
 | Rename in place | Change a box's name without forking it; disk, snapshots, shares, previews and running state stay. Owner only. | Core | v0.9.21 | [CLI](docs/AGENT_CLI.md), [daily use](docs/DAILY_USE.md#rename-a-box) |
 | CPU, RAM and disk sizing | Select resource sizes, grow sparse root disks, and resize stopped boxes. | Core | v0.1.0; disk sizing v0.7.0 | [Disks](docs/DISKS.md) |
 
@@ -27,14 +28,14 @@ Production hardening remains ongoing.
 | Remote CLI | Install compiled macOS/Linux clients; discover images, identity, targets and capacity. | Core | v0.8.0; discovery v0.8.5 | [Install](docs/INSTALL.md), [agent CLI](docs/AGENT_CLI.md) |
 | SSH and SFTP | Connect editors and standard SSH tools to explicitly enrolled Linux guests. | Opt-in | v0.1.0 | [SSH](docs/SSH.md) |
 | Interactive terminals | Use a guest PTY from `ow shell` or the dashboard, with resize and job control. | Core | v0.1.0 | [Terminals](docs/TERMINALS.md) |
-| Dashboard and tailnet login | Manage boxes in the browser using Tailscale identity and an operator-configured access grant; Access JWT remains an alternative. | Opt-in | v0.1.0; tailnet v0.2.0; grants v0.8.3 | [Dashboard](docs/DASHBOARD.md) |
+| Dashboard and tailnet login | Manage boxes in the browser using Tailscale identity and an operator-configured access grant; Access JWT remains an alternative. | Opt-in | v0.1.0; tailnet v0.2.0; grants v0.8.3 | [Dashboard](docs/DASHBOARD.md), [UI feature matrix](docs/UI_FEATURES.md) |
 | Private previews | Publish a guest HTTP port as a separate authenticated tailnet HTTPS URL. | Opt-in | v0.8.0 | [Previews](docs/DAILY_USE.md#tailnet-https-previews-v080) |
 
 ### Snapshots, forks and recovery
 
 | Feature | What it does | Status | Shipped in | Guide |
 | --- | --- | --- | --- | --- |
-| Local snapshots and forks | Capture paired RAM/disk state, restore it, and fork independent Linux disks on the same runner. | Core | v0.1.0 | [Snapshots](docs/LOCAL_PROTOTYPE.md) |
+| Local snapshots and forks | Capture paired RAM/disk state, restore it, and fork independent Linux disks on the same runner; the runner keeps answering while a capture is hashed. | Core | v0.1.0; hashing off the worker thread v0.9.22 | [Snapshots](docs/LOCAL_PROTOTYPE.md) |
 | Hibernate and wake | Release guest CPU/RAM while preserving state; resume on connection, with optional idle hibernation. | Core | v0.2.0 | [Daily use](docs/DAILY_USE.md) |
 | Off-host backups | Copy catalogs and sealed snapshots to S3-compatible storage; verify captures before restoring. | Opt-in | v0.2.0 | [Backups](docs/CORE.md), [snapshot store](docs/DAILY_USE.md) |
 | Recovery points | Upload periodic running captures and hibernation state; report last durable capture and failures. | Opt-in | v0.9.2 | [Recovery](docs/RECOVERY.md) |
@@ -68,6 +69,7 @@ Production hardening remains ongoing.
 | --- | --- | --- | --- | --- |
 | Owner quotas and pool admission | Reserve CPU, RAM, logical disk, box count and configured pool cost estimates before admission. | Core | v0.8.1 | [Limits](docs/LIMITS.md) |
 | vCPU overcommit | Allow a Linux host operator to select 1× or 2× vCPU admission; RAM is not overcommitted. | Opt-in | v0.8.5 | [Overcommit](docs/HOSTS.md#linux-vcpu-overcommit) |
+| Host reserve | Keep CPU and RAM per host that boxes never claim; on AWS hosts, systemd protects the controller/agent and kills a VM first under memory pressure. | Core | v0.9.24 | [Host reserve](docs/HOSTS.md#host-reserve-capacity-boxes-never-claim) |
 | User ownership and sharing | Scope boxes, snapshots and access to authenticated owners with explicit use/admin grants. | Core | v0.2.0 | [Users](docs/USERS.md) |
 | Guest isolation and egress | Run Linux guests under Firecracker/KVM with private host control and filtered guest networking. | Core | v0.1.0 | [Networking](docs/NETWORKING.md) |
 | CredentialBroker | Library-only per-box authorization for temporary AWS roles and secret writes; no live provider adapter or guest endpoint. | Not yet live | v0.8.0 (library only) | [Broker boundaries](docs/CREDENTIAL_BROKER.md) |

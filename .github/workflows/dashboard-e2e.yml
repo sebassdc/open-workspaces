@@ -1,0 +1,60 @@
+# Browser tests of the dashboard against a real `ow dashboard` and a fake worker,
+# then docs/UI_FEATURES.md against their results: a feature marked "works"
+# whose test is gone, skipped or failing fails this workflow.
+name: dashboard-e2e
+on:
+  pull_request:
+    # Labeled/unlabeled reruns the matrix check when the downgrade label changes.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths: [crates/**, e2e/**, docs/UI_FEATURES.md, Cargo.toml, Cargo.lock, .github/workflows/dashboard-e2e.yml]
+  push:
+    branches: [main]
+    paths: [crates/**, e2e/**, docs/UI_FEATURES.md, Cargo.toml, Cargo.lock, .github/workflows/dashboard-e2e.yml]
+permissions:
+  contents: read
+jobs:
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build the dashboard binary
+        working-directory: .
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --no-self-update
+          cargo +1.97.0 build --locked -p ow
+      - run: npm ci --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - name: Check the matrix checker
+        run: node --test check-matrix.test.mjs
+      - name: Run browser tests
+        run: npx playwright test
+      - name: Check the UI feature matrix against this run
+        if: success() || failure()
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          # A deliberate downgrade of a working feature needs this label on the pull request.
+          ALLOW_DOWNGRADE: ${{ contains(github.event.pull_request.labels.*.name, 'ui-matrix-downgrade') }}
+        run: |
+          base=()
+          if [ -n "$BASE_REF" ] && [ "$ALLOW_DOWNGRADE" != true ]; then
+            git fetch --depth=1 origin "$BASE_REF"
+            if git show "origin/$BASE_REF:docs/UI_FEATURES.md" > "$RUNNER_TEMP/base-matrix.md" 2>/dev/null; then
+              base=(--base "$RUNNER_TEMP/base-matrix.md")
+            fi
+          fi
+          node check-matrix.mjs "${base[@]}"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: dashboard-e2e-results
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 7

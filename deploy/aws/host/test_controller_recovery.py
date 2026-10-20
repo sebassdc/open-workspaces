@@ -30,7 +30,8 @@ class RecoveryHost(unittest.TestCase):
             h.write_atomic(r.guard(unit), f'[Unit]\nConditionPathExists=!{r.FREEZE}\n')
         self.new = {**copy.deepcopy(CONFIG), 'role': 'runner', 'dashboard': {},
                     'runner': {'node': 'fixture', 'controller': 'replacement',
-                               'joinSecretArn': 'arn:aws:secretsmanager:us-east-1:111122223333:secret:fixture'}}
+                               'joinSecretArn': 'arn:aws:secretsmanager:us-east-1:111122223333:secret:fixture'},
+                    'hostReserve': h.RESERVE['host']}
         self.config = Path(self.tmp.name) / 'new.json'
         self.config.write_text(json.dumps(self.new))
         self.ca = Path(self.tmp.name) / 'ca.pem'
@@ -112,6 +113,11 @@ class RecoveryHost(unittest.TestCase):
 
     def test_role_transition_cannot_redirect_or_disable_existing_backups(self):
         r.durable(r.FREEZE, {'state': 'stopped'})
+        # A runner's default host reserve would change the worker's budget.
+        self.config.write_text(json.dumps({k: v for k, v in self.new.items() if k != 'hostReserve'}))
+        with mock.patch.object(r, 'writer_stopped', return_value=True), mock.patch.object(h, 'budgets', return_value=BUDGET), \
+             mock.patch.object(r.ssl, 'create_default_context'), self.assertRaisesRegex(h.Refused, 'preserve hostReserve'):
+            r.runner(self.config, 'https://replacement:8790', self.ca)
         self.new['backup'] = {'url': 's3://another-bucket/elsewhere', 'schedule': ''}
         self.config.write_text(json.dumps(self.new))
         with mock.patch.object(r, 'writer_stopped', return_value=True), mock.patch.object(h, 'budgets', return_value=BUDGET), \

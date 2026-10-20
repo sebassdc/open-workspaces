@@ -200,6 +200,10 @@ be used locally but is not the public dashboard.
 
 ## Observed verification
 
+- Every dashboard feature and the browser test that covers it are listed in the
+  [UI feature matrix](UI_FEATURES.md). That suite runs in CI against the real
+  `ow dashboard` with a fake worker; a feature marked working whose test fails
+  or disappears fails the build.
 - Native JWT tests deny unsigned static/API routes, cross-origin mutations and
   arbitrary worker commands; verify CSP on authenticated HTML responses.
 - Real browser test against a fresh dedicated worker passes create/exec, a paired

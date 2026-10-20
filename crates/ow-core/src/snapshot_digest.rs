@@ -134,8 +134,9 @@ pub fn write_sidecar(directory: &Path, sealed: &BTreeMap<String, Sealed>) -> Res
     Ok(())
 }
 
-/// Files a capture reflinks; RAM and device state are written whole every time.
-const REFLINKED: [&str; 1] = ["disk.ext4"];
+/// Files a capture reflinks: the disk, and RAM, whose changed pages are laid over a
+/// reflink of the previous image. Device state is written whole every time.
+const REFLINKED: [&str; 2] = ["disk.ext4", "memory"];
 
 /// Seals `directory`'s `files`, reusing unchanged disk chunks of the snapshot at
 /// `previous` (if it has a sidecar), and writes the sidecar. Returns the seals.

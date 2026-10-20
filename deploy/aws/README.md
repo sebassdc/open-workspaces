@@ -88,6 +88,8 @@ export const instanceId = host.instanceId;
 | `backupUrl` | none | `s3://bucket/prefix`: install `ow-backup`, and let the host role list, read and add objects under the prefix (never delete). See below. |
 | `backupSchedule` | none | When `ow-backup` runs, as a systemd calendar expression (`*-*-* 01:00:00 UTC`); the host installs a timer. Needs `backupUrl`. |
 | `idleMinutes` | `30` | A box idle this long hibernates and wakes on its next connection; `0` turns it off. |
+| `hostReserveCpuMillis` | `1000` (Runner `500`) | Thousandths of a vCPU boxes never claim, kept for the controller/agent; see [host reserve](#host-reserve). |
+| `hostReserveMemoryMib` | `2048` (Runner `1024`) | RAM (MiB) boxes never claim. |
 
 Outputs: `instanceId`, `privateIp`, `availabilityZone`, `dataVolumeId`,
 `roleName`, `securityGroupId`, `configParameter`.
@@ -478,3 +480,29 @@ errors, sample counts and host configuration. Guest-local preview timing does no
 include the gateway, tailnet or a user's WAN.
 
 For a controlled class-1 controller replacement, use the [recovery guide](../../docs/CONTROLLER_RECOVERY.md). The checklist is read-only with respect to services; explicit host freeze/conversion commands preserve worker pins. Live cutover, private trust transfer and capacity remain separate operator gates.
+
+### Host reserve
+
+Every host keeps CPU and RAM that box admission never claims: 1 vCPU and 2 GiB
+on a `Host` (either role), 0.5 vCPU and 1 GiB on a `Runner` or `RunnerPool`
+runner, set with `hostReserveCpuMillis` and `hostReserveMemoryMib`. The host
+subtracts it from logical CPUs before the `vcpuOvercommit` ratio and from RAM:
+`OW_MAX_VCPUS`, `OW_MAX_MEMORY_MIB`, the local controller's `host up` budget and a
+runner's invitation budget all use the result (`ow-host status` shows it). The
+controller/agent unit runs in `owcontrol.slice` (`CPUWeight=1000`,
+`MemoryMin`/`MemoryLow`, `OOMScoreAdjust=-900`); the worker and its VMs run in
+`owguests.slice` (`MemoryMax` = host RAM − reserve). There the worker itself is
+protected (`OOMScoreAdjust=-900`, a delegated `control` cgroup with CPU weight 1000
+and `memory.low`) and its VMs run in a `guests` cgroup with OOM score 500, so the
+kernel kills a VM first. A reserve that leaves no room for boxes is refused by
+`apply` before anything changes. See
+[HOSTS.md](../../docs/HOSTS.md#host-reserve-capacity-boxes-never-claim).
+
+Upgrading to 0.9.24 changes the worker and control units and the worker budget:
+`apply` stages them and the class-2 `ow-host upgrade` applies them in place (no
+instance replacement). A box running beyond the lowered CPU budget stays
+hibernated after the upgrade until capacity frees, as with any box that does not
+resume. A host-to-runner conversion must set the host's reserve explicitly
+(`hostReserveCpuMillis: 1000`, `hostReserveMemoryMib: 2048`): the conversion
+refuses to change the worker's budget.
+

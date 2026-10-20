@@ -123,8 +123,10 @@ extent map until then) a disk chunk is not read when:
   device, inode, size and modification time recorded in its `chunks.json`. Its
   hash is taken from that seal.
 
-Anything else is read and hashed in parallel: changed disk ranges, the RAM and
-device state files (written whole by every capture), and every range whose
+The memory file is matched the same way from 0.9.22: a capture lays its changed
+pages over a reflink of the previous image, so unchanged RAM shares extents with
+it. Anything else is read and hashed in parallel: changed disk and RAM ranges, the
+device state file (written whole by every capture), and every range whose
 mapping is unknown, delayed, compressed, encrypted or inline. Without an earlier
 seal (first point, a changed destination, or a durable point from an older
 worker) the disk is flushed and only its holes are skipped (zero chunks, unread);
