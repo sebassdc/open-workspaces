@@ -7,7 +7,7 @@ import net from 'node:net';
 const GIB = 1024 ** 3, MAX_MEMORY_MIB = 4096;
 
 export function fakeWorker(socketPath, log = () => {}) {
-  const machines = new Map(), snapshots = new Map();
+  const machines = new Map(), snapshots = new Map(), terminals = new Set();
   const handlers = {
     list: () => [...machines.values()],
     snapshots: () => [...snapshots.values()],
@@ -31,7 +31,11 @@ export function fakeWorker(socketPath, log = () => {}) {
       return Object.assign(get(r.id), {state: 'running'});
     },
     hibernate: r => Object.assign(get(r.id), {state: 'hibernated'}),
-    stop: r => ({workspace: Object.assign(get(r.id), {state: 'stopped'})}),
+    // Like the real worker killing the VM, stop drops its terminal streams without an exit frame.
+    stop: r => {
+      for (const t of terminals) if (t.id === r.id) t.socket.destroy();
+      return {workspace: Object.assign(get(r.id), {state: 'stopped'})};
+    },
     resize: r => {
       const m = get(r.id);
       for (const key of ['memory_mib', 'vcpu_count']) if (r[key] != null) m[key] = r[key];
@@ -91,6 +95,8 @@ export function fakeWorker(socketPath, log = () => {}) {
       if (request.op === 'terminal') {
         get(request.id);
         terminal = true;
+        const entry = {id: request.id, socket};
+        terminals.add(entry); socket.on('close', () => terminals.delete(entry));
         socket.write(JSON.stringify({ok: true, result: {}}) + '\n');
         send(0, Buffer.from('fake-shell$ '));
         return frames();

@@ -146,11 +146,13 @@ function endTerminal(message) {
   if (terminalView) { terminalView.options.cursorBlink = false; terminalView.options.disableStdin = true; }
   $('terminal-close').textContent = 'Close'; $('terminal-new').hidden = false;
 }
-// A machine hibernated or stopped elsewhere may leave the socket open with nobody reading it.
+// A machine hibernated or stopped elsewhere may leave the socket open with nobody reading it,
+// or close it first; either way the open dialog says why once the poll sees the new state.
 function checkTerminal() {
-  if (!terminalSocket) return;
+  if (!$('terminal-dialog').open) return;
   const item = [...data.workspaces, ...(data.shared || [])].find(entry => entry.id === terminalId);
-  if (!item || item.state !== 'running') endTerminal(`Machine ${item ? item.state : 'removed'}. Start it, then choose New session.`);
+  const message = `Machine ${item ? item.state : 'removed'}. Start it, then choose New session.`;
+  if ((!item || item.state !== 'running') && $('terminal-status').textContent !== message) endTerminal(message);
 }
 function closeTerminal() {
   if (terminalSocket) { terminalSocket.close(); terminalSocket = null; }

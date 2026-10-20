@@ -48,6 +48,23 @@ test('terminal notices a machine hibernated elsewhere and blocks input', async (
   await expect(terminal).toBeHidden();
 });
 
+test('terminal explains a machine stopped elsewhere after its connection drops', async ({dashboard: page}) => {
+  await machines(page, 'halted');
+  await detailAction(page, 'Open Terminal').click();
+  const terminal = page.locator('#terminal-dialog'), status = page.locator('#terminal-status');
+  await expect(status).toHaveText('Connected');
+  await expect(terminal.locator('.xterm-rows')).toContainText('fake-shell$');
+  // The fake worker drops the stream at once, so the dialog first sees the close, then the poll.
+  await api(page, {op: 'stop', id: 'halted'});
+  await expect(status).toHaveText('Machine stopped. Start it, then choose New session.', {timeout: 10_000});
+  await expect(terminal.getByRole('button', {name: 'New session'})).toBeVisible();
+  await terminal.locator('.xterm').click();
+  await page.keyboard.type('lost-input');
+  await expect(terminal.locator('.xterm-rows')).not.toContainText('lost-input');
+  await terminal.getByRole('button', {name: 'Close'}).click();
+  await expect(terminal).toBeHidden();
+});
+
 test('command console shows output and exit status as text', async ({dashboard: page}) => {
   await machines(page, 'shell');
   const output = page.locator('#console-output');
