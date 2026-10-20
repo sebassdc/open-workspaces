@@ -1904,10 +1904,29 @@ fn shared_admin_move_is_denied_before_runner_contact() {
         )
         .unwrap();
     }
-    let error=relocate(f.shared.clone(),&admin,&json!({"op":"move","id":"owner@example.test/box","node":"missing-runner","operation_key":"denied"})).unwrap_err();
-    assert!(
-        error.to_string().contains("move requires the owner"),
-        "{error:#}"
+    let request = json!({"op":"move","id":"owner@example.test/box","node":"missing-runner","operation_key":"denied"});
+    let first = relocate(f.shared.clone(), &admin, &request).unwrap_err();
+    let failure = first
+        .downcast_ref::<crate::catalog::OperationFailure>()
+        .unwrap_or_else(|| panic!("{first:#}"));
+    assert!(failure.message().contains("move requires the owner"));
+    let retried = relocate(f.shared.clone(), &admin, &request).unwrap_err();
+    assert_eq!(
+        retried
+            .downcast_ref::<crate::catalog::OperationFailure>()
+            .unwrap_or_else(|| panic!("{retried:#}"))
+            .0,
+        failure.0
+    );
+    let c = f.shared.lock().unwrap();
+    assert_eq!(
+        c.db.query_row(
+            "SELECT COUNT(*) FROM operations WHERE retry_key='denied'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
     );
 }
 
