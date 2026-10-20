@@ -20,6 +20,7 @@ use std::{
     },
 };
 
+/// Legacy whole-file and v1 seal chunk size; new recovery clients use [`CHUNK_V2`].
 pub const CHUNK: usize = 8 << 20;
 /// Manifest `digest` of files sealed by [`root`] over 8 MiB chunks; without a
 /// digest a file hash is its whole-file SHA-256.

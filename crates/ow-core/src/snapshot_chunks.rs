@@ -404,7 +404,7 @@ fn parallel(count: usize, threads: usize, job: impl Fn(usize) -> Result<()> + Sy
 
 /// Chunk hashes the store is known to hold. Entries are only ever added for
 /// chunks a request proved stored; nothing in this tool deletes chunks, and a
-/// listing replaces the set daily in case anything else did.
+/// listing replaces the set before every point in case anything else did.
 struct Index {
     known: Mutex<HashSet<String>>,
     log: Option<Mutex<File>>,
