@@ -22,8 +22,9 @@ use std::{future::Future, sync::OnceLock, time::Duration};
 
 const ATTEMPTS: u32 = 4;
 
-/// Parallel requests per transfer: `OW_S3_TRANSFERS` (1-128), default 16. Each
-/// holds at most about 16 MiB, so memory stays near transfers x 16 MiB.
+/// Parallel requests per transfer: `OW_S3_TRANSFERS` (1-128), default 16.
+/// Artifact parts share a transfers x 16 MiB budget (or one larger part); chunk
+/// callers reduce their worker count for larger chunks.
 pub(crate) fn transfers() -> usize {
     std::env::var("OW_S3_TRANSFERS")
         .ok()
@@ -569,7 +570,8 @@ fn part(source: &mut dyn Read, size: u64) -> Result<Vec<u8>> {
 impl Http {
     /// Uploads `source` as `key`; the store checks every part's SHA-256. Parts of
     /// `part_size` (doubling every 1000 parts, at most 8x) go out on [`transfers`]
-    /// threads with at most `transfers x 16 MiB` in flight. With `once` the object
+    /// threads with at most `transfers x 16 MiB` in flight, or one larger part.
+    /// With `once` the object
     /// is created only if absent, and an existing one is accepted only when it
     /// holds exactly these bytes (which also covers a lost completion response).
     pub fn put_stream(
