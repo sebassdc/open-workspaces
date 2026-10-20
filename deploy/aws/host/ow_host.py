@@ -65,6 +65,13 @@ UNITS = {
 # Releases' own pins: each unit runs from /srv/ow/run/<pin>; current is the CLI and ow-host.
 PINS = ("worker", "agent", "dashboard")
 SLOTS = 8
+# CPU and RAM box admission never claims, kept for the controller and node agent.
+RESERVE = {"host": {"cpuMillis": 1000, "memoryMib": 2048},
+           "controller": {"cpuMillis": 1000, "memoryMib": 2048},
+           "runner": {"cpuMillis": 500, "memoryMib": 1024}}
+# Slice names without a dash: a dash would nest them under another slice.
+CONTROL = "owcontrol.slice"
+GUESTS = "owguests.slice"
 
 LOGIN = re.compile(r"^[A-Za-z0-9._%+@-]+@[A-Za-z0-9.-]+$")
 BACKUP = re.compile(r"^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$")
@@ -240,6 +247,12 @@ def validate(config):
     ratio = config.get("vcpuOvercommit", 1)
     if type(ratio) is not int or ratio not in (1, 2):
         raise Refused("config: vcpuOvercommit must be 1 or 2")
+    reserve = config.get("hostReserve", {})
+    reserve = {**RESERVE[role], **reserve} if isinstance(reserve, dict) else {}
+    if (set(reserve) != {"cpuMillis", "memoryMib"} or type(reserve["cpuMillis"]) is not int
+            or type(reserve["memoryMib"]) is not int or not 0 <= reserve["cpuMillis"] <= 64000
+            or not 0 <= reserve["memoryMib"] <= 1048576):
+        raise Refused("config: hostReserve needs cpuMillis 0 to 64000 and memoryMib 0 to 1048576")
     if role == "controller" and (images or backup.get("recovery") or store["images"]):
         raise Refused("config: controller role has no local images or recovery worker; configure images/recovery on runners")
     extra = {}
@@ -274,17 +287,31 @@ def validate(config):
         **({"store": store} if store["url"] else {}),
         "idleMinutes": idle,
         "vcpuOvercommit": ratio,
+        "hostReserve": reserve,
         **extra,
     }
 
 
 def budgets(config=None):
-    """Local runner budget: three quarters of RAM (cap 64 GiB), every vCPU (cap 64), 8 slots."""
+    """Local runner budget: three quarters of RAM (cap 64 GiB), every vCPU (cap 64), 8 slots,
+    and the host's RAM (MiB) for the host reserve. Physical: effective() applies the reserve."""
     if config and config["role"] == "controller":
         return {"memory": 0, "cpus": 0, "slots": 0}
     meminfo = p("/proc/meminfo").read_text()
     kib = int(re.search(r"^MemTotal:\s+(\d+)", meminfo, re.M).group(1))
-    return {"memory": min(kib * 3 // 4 // 1024, 65536), "cpus": min(os.cpu_count() or 1, 64), "slots": SLOTS}
+    return {"memory": min(kib * 3 // 4 // 1024, 65536), "cpus": min(os.cpu_count() or 1, 64), "slots": SLOTS,
+            "hostMemory": kib // 1024}
+
+
+def effective(config, budget):
+    """What box admission may claim: the physical budget less the host reserve, which the
+    controller and node agent keep; the remaining CPUs times the overcommit ratio."""
+    reserve = config["hostReserve"]
+    memory = budget["memory"]
+    if "hostMemory" in budget:
+        memory = min(memory, budget["hostMemory"] - reserve["memoryMib"])
+    cpus = (budget["cpus"] * 1000 - reserve["cpuMillis"]) * config["vcpuOvercommit"] // 1000
+    return {**budget, "memory": max(memory, 0), "cpus": max(min(cpus, 64), 0)}
 
 
 # ---------------------------------------------------------------- rendering
@@ -293,8 +320,13 @@ def budgets(config=None):
 def render(config, budget):
     """Every file setup owns: host path -> (content, mode). Pure; also run from a
     target release's copy to see which units an upgrade changes."""
-    # The input is a physical budget; all rendered consumers use the same effective CPU cap.
-    budget = {**budget, "cpus": min(budget["cpus"] * config.get("vcpuOvercommit", 1), 64)}
+    # The input is a physical budget; all rendered consumers use the same effective budget.
+    reserve = config["hostReserve"]
+    budget = effective(config, budget)
+    if config["role"] != "controller" and (budget["memory"] < 256 or budget["cpus"] < 1):
+        # Refused before anything is written: the controller keeps running as it was.
+        raise Refused(f"hostReserve ({reserve['cpuMillis']} millicpus, {reserve['memoryMib']} MiB) leaves no "
+                      "room for boxes on this host: lower it, or use a larger instance or role controller")
     files = {}
     asset = f"{SRV}/run/worker/assets"
     worker_bin = f"{SRV}/run/worker/bin/ow"
@@ -304,6 +336,10 @@ def render(config, budget):
         f"OW_MAX_MEMORY_MIB={budget['memory']}\n"
         f"OW_MAX_RUNNING={budget['slots']}\n"
         f"OW_MAX_VCPUS={budget['cpus']}\n"
+        f"OW_HOST_RESERVE_CPU_MILLIS={reserve['cpuMillis']}\n"
+        f"OW_HOST_RESERVE_MEMORY_MIB={reserve['memoryMib']}\n"
+        f"OW_VCPU_OVERCOMMIT={config['vcpuOvercommit']}\n"
+        "OW_DELEGATED_CGROUP=1\n"
         f"OW_IDLE_HIBERNATE_SECS={config['idleMinutes'] * 60}\n",
         0o644,
     )
@@ -324,15 +360,46 @@ ExecStop={worker_bin} --data-dir {RUNNER} down --hibernate
 TimeoutStopSec=900
 Restart=on-failure
 RestartSec=5
+# The worker and its VMs stay below the host reserve. Within that, the worker runs in a
+# protected child cgroup (CPU weight 1000, memory.low) and each VM in a "guests" one with
+# OOM score 500, so the kernel kills a VM before the worker, controller or node agent.
+Slice={GUESTS}
+Delegate=cpu memory
+DelegateSubgroup=control
+MemoryLow=256M
+OOMScoreAdjust=-900
 
 [Install]
 WantedBy=multi-user.target
 """,
         0o644,
     )
+    if "hostMemory" in budget:
+        files[f"/etc/systemd/system/{GUESTS}"] = (
+            f"""[Unit]
+Description=Open Workspaces worker and VMs, kept out of the host reserve
+
+[Slice]
+MemoryMax={max(budget['hostMemory'] - reserve['memoryMib'], 0)}M
+# Lets the worker's own protection hold inside this slice.
+MemoryLow=256M
+""",
+            0o644,
+        )
+    # Top-level slices: a protection only holds if every ancestor (except the root) has it.
+    protection = f"CPUWeight=1000\nMemoryMin={reserve['memoryMib'] // 2}M\nMemoryLow={reserve['memoryMib']}M\n"
+    files[f"/etc/systemd/system/{CONTROL}"] = (
+        f"""[Unit]
+Description=Open Workspaces controller and node agent, holding the host reserve
+
+[Slice]
+{protection}""",
+        0o644,
+    )
     if config["role"] == "controller":
         files.pop("/etc/open-workspaces/worker.env")
         files.pop("/etc/systemd/system/open-workspaces-worker.service")
+        files.pop(f"/etc/systemd/system/{GUESTS}", None)
     # Wants=/After= only: restarting the control plane never restarts the worker, and
     # at shutdown the control plane stops first, so no wake arrives while boxes hibernate.
     if config["role"] == "runner":
@@ -384,6 +451,9 @@ ExecStart={SRV}/run/agent/bin/ow host up --external-worker --memory {budget['mem
 TimeoutStopSec=960
 Restart=on-failure
 RestartSec=5
+# Boxes never starve or OOM-kill the control path: see the host reserve in docs/HOSTS.md.
+Slice={CONTROL}
+{protection}OOMScoreAdjust=-900
 
 [Install]
 WantedBy=multi-user.target
@@ -582,6 +652,8 @@ OWNED = (
     "/etc/open-workspaces/store.json",
     "/etc/systemd/system/open-workspaces-worker.service",
     "/etc/systemd/system/open-workspaces.service",
+    f"/etc/systemd/system/{CONTROL}",
+    f"/etc/systemd/system/{GUESTS}",
     "/etc/systemd/system/open-workspaces-recover.service",
     "/etc/systemd/system/open-workspaces-dashboard.service",
     "/etc/systemd/system/open-workspaces-images.service",
@@ -1141,8 +1213,7 @@ def pool_node(pool):
 def await_pool_join(me, config, wait):
     """Asks the controller for a join through this runner's secret (the controller
     creates it, tagged with this instance's session) and waits for the answer."""
-    budget = budgets(config)
-    budget["cpus"] = min(budget["cpus"] * config["vcpuOvercommit"], 64)
+    budget = effective(config, budgets(config))
     request = {"ready": me["node"], "budget": {k: int(budget[k]) for k in ("memory", "slots", "cpus")}}
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
@@ -1274,8 +1345,7 @@ def enrol(wait=120):
 def status():
     v = versions()
     config = validate(read_json(CONFIG))
-    budget = budgets(config)
-    budget["cpus"] = min(budget["cpus"] * config["vcpuOvercommit"], 64)
+    budget = effective(config, budgets(config))
     out = {"role": role(), "pins": pins(), "versions": v, "budget": budget, "node": local_node(),
            "units": {name: run(["systemctl", "is-active", unit], check=False).strip() or "unknown"
                      for name, unit in UNITS.items() if unit_exists(unit)},

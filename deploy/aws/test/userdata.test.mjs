@@ -306,6 +306,18 @@ test("recovery points require a store and remain opt in", () => {
 });
 
 
+test("host reserve is passed only when set and validated", () => {
+    const base = { repository: "https://github.com/example/open-workspaces.git", ref: "v0.7.4",
+        tailscaleAuthKeySecretArn: "", tailscaleHostname: "ow-host", tailscaleSsh: false,
+        dashboardLogins: [], developerImages: [], backupUrl: "", backupSchedule: "", idleMinutes: 30 };
+    assert.equal(hostConfig(base).hostReserve, undefined, "unset: the host keeps its role default");
+    assert.deepEqual(hostConfig({...base, hostReserveMemoryMib: 4096}).hostReserve, { memoryMib: 4096 });
+    assert.deepEqual(hostConfig({...base, hostReserveCpuMillis: 0, hostReserveMemoryMib: 0}).hostReserve, { cpuMillis: 0, memoryMib: 0 });
+    for (const bad of [{ hostReserveCpuMillis: -1 }, { hostReserveCpuMillis: 64001 }, { hostReserveMemoryMib: 1.5 }]) {
+        assert.throws(() => hostConfig({...base, ...bad}), /hostReserve/);
+    }
+});
+
 test("recovery opt-in preserves dashboard, CPU and artifact store configuration", async () => {
     const result = await deploy({
         tailscaleAuthKeySecretArn: secretArn,
