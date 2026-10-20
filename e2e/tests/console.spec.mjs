@@ -21,11 +21,19 @@ test('terminal opens, echoes input and reports the shell exit', async ({dashboar
   await expect(page.locator('#terminal-status')).toHaveText('Shell exited · 3');
   await expect(terminal.getByRole('button', {name: 'Disconnect'})).toBeHidden();
   await expect(terminal.getByRole('button', {name: 'Close'})).toBeVisible();
+  expect(await page.evaluate(() => ({blink: terminalView.options.cursorBlink, blocked: terminalView.options.disableStdin}))).toEqual({blink: false, blocked: true});
+  await terminal.locator('.xterm').click();
+  await page.keyboard.type('lost-input');
+  await expect(terminal.locator('.xterm-rows')).not.toContainText('lost-input');
   // A new session reconnects in the same dialog.
   await terminal.getByRole('button', {name: 'New session'}).click();
   await expect(page.locator('#terminal-status')).toHaveText('Connected');
   await expect(terminal.locator('.xterm-rows')).toContainText('fake-shell$');
   await expect(terminal.locator('.xterm-rows')).not.toContainText('hello-from-e2e');
+  await terminal.locator('.xterm').click();
+  await page.keyboard.type('fresh-session');
+  await page.keyboard.press('Enter');
+  await expect(terminal.locator('.xterm-rows')).toContainText(/fresh-session[\s\S]*fresh-session/);
   await terminal.getByRole('button', {name: 'Disconnect'}).click();
   await expect(terminal).toBeHidden();
 });
@@ -44,7 +52,12 @@ test('terminal notices a machine hibernated elsewhere and blocks input', async (
   await terminal.locator('.xterm').click();
   await page.keyboard.type('lost-input');
   await expect(rows).not.toContainText('lost-input');
-  await terminal.getByRole('button', {name: 'Close'}).click();
+  expect(await page.evaluate(() => terminalView.options.cursorBlink)).toBe(false);
+  await api(page, {op: 'start', id: 'napper'});
+  await terminal.getByRole('button', {name: 'New session'}).click();
+  await expect(page.locator('#terminal-status')).toHaveText('Connected');
+  await expect(rows).toContainText('fake-shell$');
+  await terminal.getByRole('button', {name: 'Disconnect'}).click();
   await expect(terminal).toBeHidden();
 });
 
@@ -57,6 +70,7 @@ test('terminal explains a machine stopped elsewhere after its connection drops',
   // The fake worker drops the stream at once, so the dialog first sees the close, then the poll.
   await api(page, {op: 'stop', id: 'halted'});
   await expect(status).toHaveText('Machine stopped. Start it, then choose New session.', {timeout: 10_000});
+  await expect(terminal.getByRole('button', {name: 'Close'})).toBeVisible();
   await expect(terminal.getByRole('button', {name: 'New session'})).toBeVisible();
   await terminal.locator('.xterm').click();
   await page.keyboard.type('lost-input');

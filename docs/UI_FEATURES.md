@@ -49,6 +49,15 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Memory counter: your usage against your owner limits | works | v0.9.23 | `machines.spec.mjs › memory counter shows your usage against your owner limits` |
 | Create dialog: name, image, memory, vCPU, disk | works | v0.9.22 | `machines.spec.mjs › create dialog creates a machine with the chosen shape` |
 | Refused create shown in the dialog | works | v0.9.22 | `machines.spec.mjs › create dialog shows a refused create and stays open` |
+| Create dialog marks images the pool cannot run (disabled, "not available on this pool") | works | v0.9.29 | `machines.spec.mjs › create dialog marks images the pool cannot run` |
+| Create dialog shows each node's free vCPU and memory, disables a full node, and explains refusals in dashboard words | works | v0.9.29 | `machines.spec.mjs › create dialog shows free room per node, disables a full one and explains a refusal plainly` |
+| Create dialog offers only memory and vCPU sizes the chosen node (or any node, when automatic) can place | works | v0.9.29 | `machines.spec.mjs › create dialog offers only sizes the chosen node can place` |
+| Create dialog offers only images the chosen node has ready | works | v0.9.29 | `machines.spec.mjs › create dialog offers only images the chosen node has ready` |
+| Create dialog disables all sizes and blocks submission when the pool is full | works | v0.9.29 | `machines.spec.mjs › create dialog blocks a full pool without submitting a shape` |
+| Create dialog blocks a node with no eligible images, clears the unavailable selections, and recovers when a ready node is chosen | works | v0.9.29 | `machines.spec.mjs › create dialog blocks a node without images and recovers on a ready node` |
+| Create dialog on an ARM-only pool starts on a Mac runner shape (512 MiB or more, no disk size) | works | v0.9.29 | `machines.spec.mjs › create dialog starts an ARM-only pool on a shape its Mac runner accepts` |
+| Create with a name already in use says the name is taken and stays open | works | v0.9.29 | `machines.spec.mjs › create dialog says a name is taken and stays open` |
+| Create dialog starts with focus on the machine name | works | v0.9.29 | `machines.spec.mjs › create dialog starts on the machine name` |
 | Rename in place, selection and console history follow | works | v0.9.22 | `machines.spec.mjs › rename keeps the machine selected under its new name` |
 | Recovery status: neutral while the first point is pending, warning only past the one-hour target or on an upload error, relative time | works | v0.9.26 | `states.spec.mjs › a new machine shows a neutral first recovery point`; `states.spec.mjs › recovery status warns only past the one-hour target and shows relative time` |
 | Navigation and resource usage view | works | v0.9.22 | `machines.spec.mjs › navigation switches between machines, snapshots and usage` |
@@ -69,10 +78,10 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 
 | Feature | Status | Last passed | Test |
 | --- | --- | --- | --- |
-| Interactive terminal: open, echo, shell exit, disconnect | works | v0.9.29 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
-| Terminal after the shell exits: Close and New session | works | v0.9.29 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
-| Terminal dark scrollbar (dark color scheme) | works | v0.9.29 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
-| Terminal notices a machine hibernated or stopped elsewhere and blocks input | works | v0.9.29 | `console.spec.mjs › terminal notices a machine hibernated elsewhere and blocks input`; `console.spec.mjs › terminal explains a machine stopped elsewhere after its connection drops` |
+| Interactive terminal: open, echo, shell exit, disconnect | works | v0.9.30 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
+| Terminal after the shell exits: Close and New session | works | v0.9.30 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
+| Terminal dark scrollbar (dark color scheme) | works | v0.9.30 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
+| Terminal notices a machine hibernated or stopped elsewhere and blocks input | works | v0.9.30 | `console.spec.mjs › terminal notices a machine hibernated elsewhere and blocks input`; `console.spec.mjs › terminal explains a machine stopped elsewhere after its connection drops` |
 | Command console: output as text, exit status, clear | works | v0.9.22 | `console.spec.mjs › command console shows output and exit status as text` |
 
 ## Snapshots and forks
