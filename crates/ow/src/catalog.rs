@@ -702,8 +702,8 @@ impl Catalog {
                 let id = c.db.query_row("SELECT id FROM transfers WHERE operation=?1",[operation],|r|r.get(0))?;
                 return c.transfer(id);
             }
-            ensure!(!c.db.query_row("SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1)",[&source],|r|r.get::<_,bool>(0))?, "machine already has an unfinished transfer");
-            ensure!(!c.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE (owner=?1 AND resource=(SELECT name FROM resources WHERE kind='machine' AND physical=?2) OR json_extract(request,'$.request.id')=?2 OR json_extract(request,'$.request.child')=?2) AND state IN ('pending','uncertain'))",params![owner,source],|r|r.get::<_,bool>(0))?, "machine has unresolved legacy effects");
+            ensure!(!c.db.query_row("SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1)",[&source],|r|r.get::<_,bool>(0))?, limits::Rejection("Box has an unfinished move, fork or wake; wait for it or inspect ow status.".into()));
+            ensure!(!c.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE (owner=?1 AND resource=(SELECT name FROM resources WHERE kind='machine' AND physical=?2) OR json_extract(request,'$.request.id')=?2 OR json_extract(request,'$.request.child')=?2) AND state IN ('pending','uncertain'))",params![owner,source],|r|r.get::<_,bool>(0))?, limits::Rejection("Box has a pending or uncertain operation; resolve it (see ow status) before moving or forking.".into()));
             ensure!(intent.kind == Kind::Fork || c.db.query_row("SELECT ssh_policy IS NOT NULL FROM resources WHERE kind='machine' AND physical=?1",[&source],|r|r.get::<_,bool>(0))?,"reconcile public SSH policy before managing placement");
             ensure!(intent.kind != Kind::Move || intent.target.as_deref() != Some(&source_node),"move requires another node");
             if intent.kind == Kind::Wake {
@@ -1033,6 +1033,11 @@ impl Catalog {
             ));
             if let Some((code, _)) = first_use_error(response["error"].as_str().unwrap_or("")) {
                 info["error_code"] = json!(code);
+            }
+            // Refusals carry only controller-written public reasons.
+            if response["refused"] == true {
+                info["error"] = response["error"].clone();
+                info["error_code"] = json!("refused");
             }
         }
         if let Some((id, epoch, step)) = self

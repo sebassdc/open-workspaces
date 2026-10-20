@@ -9,12 +9,31 @@ fn capable_move(c: &Catalog, node: &str, disk: u64) -> Result<()> {
         })?;
     ensure!(
         serde_json::from_str::<Value>(&caps)?["move_fork_v1"] == true,
-        "runner worker lacks move/fork exclusion and child preparation"
+        refuse(
+            node,
+            "runs a worker without move/fork support or artifact store; upgrade its worker"
+        )
     );
     Ok(())
 }
 
+/// Admits a move or cross-runner fork. A refused admission is journaled as a failed
+/// operation carrying its public reason, so the requester can see why in ow status.
 pub(crate) fn relocate(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> {
+    admit(shared.clone(), identity, request).or_else(|error| {
+        let Some(refusal) = error.downcast_ref::<crate::limits::Rejection>() else {
+            return Err(error);
+        };
+        let mut c = shared.lock().unwrap();
+        let user = c.user(identity)?;
+        let resource = request["child"].as_str().or(request["id"].as_str());
+        c.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,response,finished_at) VALUES(?1,?2,?3,'failed',?4,?5,?6,?7,CURRENT_TIMESTAMP)",params![user,request["op"].as_str(),resource,request["node"].as_str(),request["operation_key"].as_str(),json!({"request":request}).to_string(),json!({"error":refusal.0,"refused":true}).to_string()])?;
+        let id = c.db.last_insert_rowid();
+        Err(crate::catalog::OperationFailure(c.operation_info(user, id)?).into())
+    })
+}
+
+fn admit(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> {
     let kind = if request["op"] == "move" {
         Kind::Move
     } else {
@@ -38,7 +57,7 @@ pub(crate) fn relocate(shared: Shared, identity: &Identity, request: &Value) -> 
                     params![physical, user],
                     |r| r.get::<_, bool>(0)
                 )?,
-                "move requires the owner"
+                crate::limits::Rejection("move requires the owner".into())
             );
         }
         if let Some(id) = c.db.query_row("SELECT t.id FROM operations o JOIN transfers t ON t.operation=o.id WHERE o.owner=?1 AND o.retry_key=?2",params![user,key],|r|r.get::<_,i64>(0)).optional()? {
@@ -51,10 +70,14 @@ pub(crate) fn relocate(shared: Shared, identity: &Identity, request: &Value) -> 
             launch(shared,t.id);
             return Ok(info);
         }
+        // A refused admission keeps its outcome under its key.
+        if let Some(id) = c.db.query_row("SELECT id FROM operations WHERE owner=?1 AND retry_key=?2 AND op=?3 AND state='failed' AND json_extract(response,'$.refused')=1",params![user,key,kind.operation()],|r|r.get::<_,i64>(0)).optional()? {
+            return Err(crate::catalog::OperationFailure(c.operation_info(user,id)?).into());
+        }
         let (node,epoch,generation):(String,i64,i64) = c.db.query_row("SELECT node,placement_epoch,ssh_policy_generation FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         ensure!(
             !node.is_empty(),
-            "wake a parked box before moving or forking it"
+            crate::limits::Rejection("Box is parked; wake it before moving or forking it.".into())
         );
         let mut input = parking::shape(&c, &physical, kind, address)?;
         input.target = Some(target.into());
@@ -62,13 +85,17 @@ pub(crate) fn relocate(shared: Shared, identity: &Identity, request: &Value) -> 
         if kind == Kind::Fork {
             let child = request["child"].as_str().context("child name required")?;
             common::identifier(child)?;
+            ensure!(
+                !c.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE owner=?1 AND kind='machine' AND name=?2)",params![user,child],|r|r.get::<_,bool>(0))?,
+                crate::limits::Rejection(format!("A box named {child} already exists; choose another child name."))
+            );
             input.child = Some(Child {
                 id: format!("m-{}", &common::nonce()?[..24]),
                 name: child.into(),
             });
             if let Some(snapshot) = request["snapshot"].as_str() {
                 common::identifier(snapshot)?;
-                let metadata: String = c.db.query_row("SELECT metadata FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4",params![user,snapshot,node,physical],|r|r.get(0)).context("snapshot must belong to source on its current runner")?;
+                let metadata: String = c.db.query_row("SELECT metadata FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4",params![user,snapshot,node,physical],|r|r.get(0)).optional()?.ok_or_else(|| crate::limits::Rejection(format!("Snapshot {snapshot} is not a snapshot of this box on its current runner.")))?;
                 let meta: Value = serde_json::from_str(&metadata)?;
                 input.memory_mib = meta["memory_mib"]
                     .as_u64()

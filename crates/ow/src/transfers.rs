@@ -237,19 +237,35 @@ fn authorized(c: &Catalog, t: &Transfer) -> Result<()> {
     ensure!(c.db.query_row("SELECT r.ssh_policy_generation=t.source_policy_generation FROM transfers t JOIN resources r ON r.kind='machine' AND r.physical=t.source WHERE t.id=?1",[t.id],|r|r.get::<_,bool>(0))?, "source authority or SSH policy changed");
     Ok(())
 }
+/// A public-safe admission refusal naming the runner (runner IDs are listed by ow nodes).
+fn refuse(node: &str, reason: &str) -> crate::limits::Rejection {
+    crate::limits::Rejection(format!("Runner {node} {reason}."))
+}
 fn capable(c: &Catalog, node: &str, disk: u64) -> Result<()> {
-    let text: String = c.db.query_row("SELECT capabilities FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND COALESCE(json_extract(capabilities,'$.drain'),0)=0",[node],|r|r.get(0)).context("target unavailable or draining")?;
+    let text: String = c.db.query_row("SELECT capabilities FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND COALESCE(json_extract(capabilities,'$.drain'),0)=0",[node],|r|r.get(0)).optional()?.ok_or_else(|| refuse(node, "is offline, revoked or draining"))?;
     let caps: Value = serde_json::from_str(&text)?;
-    common::placement_capable(&caps)?;
+    common::placement_capable(&caps).map_err(|_| {
+        refuse(
+            node,
+            "runs a worker without placement fencing; upgrade its worker",
+        )
+    })?;
+    // The agent advertises managed restore only with an artifact store (store.json) configured.
     ensure!(
         caps["managed_restore_v1"] == true,
-        "runner agent lacks managed restore jobs"
+        refuse(
+            node,
+            "has no artifact store configured, or its agent lacks managed restore; cross-runner transfers need one on both runners"
+        )
     );
     ensure!(
         caps["disk_observed_unix_s"]
             .as_i64()
             .is_some_and(|at| at <= now() && at > now() - 15),
-        "target disk headroom is stale or unknown"
+        refuse(
+            node,
+            "has not reported its disk headroom recently; retry when it reports"
+        )
     );
     let pending: i64 = c.db.query_row(
         "SELECT COALESCE(SUM(disk_bytes),0) FROM transfer_reservations WHERE node=?1",
@@ -260,7 +276,7 @@ fn capable(c: &Catalog, node: &str, disk: u64) -> Result<()> {
         caps["available_disk_bytes"]
             .as_u64()
             .is_some_and(|n| n >= disk.saturating_add((pending as u64).saturating_mul(2))),
-        "target disk headroom exhausted or unknown"
+        refuse(node, "lacks disk headroom for this transfer")
     );
     Ok(())
 }
