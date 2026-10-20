@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.22",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Fork/delete robustness and honest disk admission. Worker disk admission subtracts each box's unwritten bytes (logical size minus allocated blocks), not its full logical size, from real free space, plus the host reserve; status adds free_disk_bytes and unwritten_disk_bytes, shown by ow nodes as disk.free_bytes and disk.unwritten_bytes; cache staging and eviction use the same accounting. A plain snapshot or live fork resumes the guest after the RAM/state save and disk reflink and hashes on a separate worker thread, so other requests are served meanwhile; replies carry timings.paused_ms and timings.total_ms. A live fork of a stopped or hibernated box is refused upfront (controller and worker); a failed fork removes its capture and a failed create its partial directory. The controller marks a rejected fork's child failed (unmade: true) and releases it, fails a create or fork its runner still lacks after 30 minutes, and deletes a never-made machine the runner does not list from the catalog only. ow delete names the snapshots that go with a box and asks first (--yes without a terminal); the dashboard delete dialog lists them. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-2 upgrade: the worker restarts through the existing upgrade policy."
+    },
+    {
       "version": "0.9.21",
       "class": 1,
       "changes": [

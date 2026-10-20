@@ -16,7 +16,7 @@ Production hardening remains ongoing.
 | Feature | What it does | Status | Shipped in | Guide |
 | --- | --- | --- | --- | --- |
 | Persistent Linux boxes | Create Alpine, Ubuntu or Arch workspaces on a prepared KVM runner; execute commands and transfer files. | Core | v0.1.0 | [Local use](docs/LOCAL_PROTOTYPE.md) |
-| Start, stop and delete | Keep disks across cold restarts; explicitly delete a stopped box and its snapshots. | Core | v0.1.0 | [CLI](docs/AGENT_CLI.md) |
+| Start, stop and delete | Keep disks across cold restarts; explicitly delete a stopped box and its snapshots, named and confirmed first; a create or fork that never made its box fails visibly and deletes cleanly. | Core | v0.1.0; confirm and clean failed forks v0.9.22 | [CLI](docs/AGENT_CLI.md) |
 | Rename in place | Change a box's name without forking it; disk, snapshots, shares, previews and running state stay. Owner only. | Core | v0.9.21 | [CLI](docs/AGENT_CLI.md), [daily use](docs/DAILY_USE.md#rename-a-box) |
 | CPU, RAM and disk sizing | Select resource sizes, grow sparse root disks, and resize stopped boxes. | Core | v0.1.0; disk sizing v0.7.0 | [Disks](docs/DISKS.md) |
 
@@ -34,7 +34,7 @@ Production hardening remains ongoing.
 
 | Feature | What it does | Status | Shipped in | Guide |
 | --- | --- | --- | --- | --- |
-| Local snapshots and forks | Capture paired RAM/disk state, restore it, and fork independent Linux disks on the same runner. | Core | v0.1.0 | [Snapshots](docs/LOCAL_PROTOTYPE.md) |
+| Local snapshots and forks | Capture paired RAM/disk state, restore it, and fork independent Linux disks on the same runner; the runner keeps answering while a capture is hashed. | Core | v0.1.0; hashing off the worker thread v0.9.22 | [Snapshots](docs/LOCAL_PROTOTYPE.md) |
 | Hibernate and wake | Release guest CPU/RAM while preserving state; resume on connection, with optional idle hibernation. | Core | v0.2.0 | [Daily use](docs/DAILY_USE.md) |
 | Off-host backups | Copy catalogs and sealed snapshots to S3-compatible storage; verify captures before restoring. | Opt-in | v0.2.0 | [Backups](docs/CORE.md), [snapshot store](docs/DAILY_USE.md) |
 | Recovery points | Upload periodic running captures and hibernation state; report last durable capture and failures. | Opt-in | v0.9.2 | [Recovery](docs/RECOVERY.md) |

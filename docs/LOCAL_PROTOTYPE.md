@@ -62,8 +62,25 @@ parameters agree. A fork child ID cannot silently switch its source parent.
 
 Capture synchronizes the guest, pauses the VM, saves RAM and VM state, clones the
 matching disk before resuming, hashes the artifacts, and atomically publishes the
-manifest. It does not guarantee application-consistent transactions with external
-databases or services. Process state can duplicate external side effects.
+manifest. The disk clone (a reflink) stays inside the pause because it pairs the
+disk with the saved RAM. From 0.9.22 a plain snapshot or live fork resumes the
+guest first and then hashes on a separate worker thread, so the box and every
+other box on the runner answer requests while the files are hashed; the reply
+arrives once the manifest is published, and a live fork's child is created after
+that. Whole-file SHA-256 digests stay the snapshot format, so backups and
+cross-runner moves read them unchanged. Each snapshot reply carries
+`timings.paused_ms` (guest paused: RAM/state save and disk reflink) and
+`timings.total_ms` (until the manifest is published); the worker logs both. RAM
+is still written whole on every capture (no incremental memory snapshots), so the
+pause grows with guest memory and data-volume write speed; see
+[snapshot pause timings](experiments/snapshot-pause-timings.md). A capture does
+not guarantee application-consistent transactions with external databases or
+services. Process state can duplicate external side effects.
+
+A live fork needs a running parent: a stopped or hibernated box is refused before
+any capture (start it, or fork one of its snapshots). A fork whose child cannot be
+made removes the capture taken for it, and a create that fails before the box is
+registered removes its partial directory, so retries with the same ID work.
 
 Snapshots are made read-only. SHA-256 verification is cached inside a worker
 after capture/verification, with inode, size, modification/change timestamps and

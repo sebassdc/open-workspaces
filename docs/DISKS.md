@@ -63,14 +63,21 @@ The worker serializes disk admission with its normal operations. It checks both:
 
 - `OW_MAX_DISK_GIB`: sum of logical active box disk sizes, including stopped and
   hibernated boxes (default **1024 GiB**, range 1–1048576).
-- Free space on its data volume: enough for **all existing logical box disks
-  plus the requested growth/new disk**, and `OW_MIN_FREE_GIB` host reserve
+- Free space on its data volume: enough for **what existing box disks may still
+  write plus the requested growth/new disk**, and `OW_MIN_FREE_GIB` host reserve
   (default **5 GiB**). Invalid configuration fails worker startup.
 
-This deliberately conservative reservation counts full disk sizes, even when
-already allocated or shared by reflinks: `st_blocks` cannot establish exclusive
-ownership of shared extents. Creating, growing, forking and importing boxes
-cannot overcommit the worker's disk budget. A snapshot reflinks the existing
+A box's unwritten reservation is its logical disk size minus the blocks already
+allocated to its disk file (`st_blocks`). Allocated blocks are already gone from
+filesystem free space, so subtracting the full logical size again would count
+them twice (before 0.9.22 a runner with about 155 GB really free and about
+33 GB written by boxes reported 0 bytes available). Blocks shared by reflinks
+count as written: a box that rewrites shared extents (a fork diverging from its
+source, a box rewriting its image's blocks) can allocate beyond its unwritten
+reservation, and only the host reserve absorbs that. Creating, growing, forking
+and importing boxes stay within the logical cap and the free space left after
+every box's unwritten bytes and the reserve. Image cache staging and eviction
+use the same accounting. A snapshot reflinks the existing
 disk rather than creating another writable box, so its admission requires only
 its RAM capture plus the host reserve. Later copy-on-write disk growth still
 consumes free space; captures are not a guarantee of capacity for arbitrary
