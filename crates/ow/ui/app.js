@@ -23,12 +23,26 @@ async function refresh() { try { data = await api('/api/state'); $('host-control
 function loadFailed() { const retry = element('button', 'Retry', 'text-button'); retry.addEventListener('click', refresh); const empty = element('div', 'Could not reach your machines. ', 'empty load-error'); empty.append(retry); $('machine-grid').replaceChildren(empty); }
 function action(label, callback, disabled = false) { const button = element('button', label, 'button secondary'); button.disabled = disabled || busy; button.addEventListener('click', () => Promise.resolve(callback()).catch(() => {})); return button; }
 function select(id) { selected = id; render(); }
+const ago = at => { const s = Date.now() / 1000 - at; return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)} min ago` : s < 86400 ? `${Math.floor(s / 3600)} h ago` : `${Math.floor(s / 86400)} d ago`; };
+const fullTime = at => new Date(at * 1000).toLocaleString();
+// [text, warning, title]: warn only once the one-hour target is really missed or an upload failed.
 function durability(item) {
-  const d = item.durability;
-  if (!d) return 'Off-host recovery status unavailable';
-  const saved = d.last_durable_at ? `Last durable ${new Date(d.last_durable_at * 1000).toLocaleString()}` : 'No durable recovery point yet';
+  const d = item.durability, now = Date.now() / 1000, young = item.created_at != null && now - item.created_at < 3600;
+  if (!d) return [young ? 'First recovery point pending' : 'Off-host recovery status unavailable', false, ''];
+  const last = d.last_durable_at, exceeded = !d.current_state_durable && (last ? now - last > 3600 : !young);
+  const saved = last ? `Last durable ${ago(last)}` : young ? 'First recovery point pending' : 'No durable recovery point yet';
   const retry = d.retry_at ? ` · retry ${new Date(d.retry_at * 1000).toLocaleTimeString()}` : '';
-  return `${saved}${(!d.current_state_durable && d.last_durable_at && Date.now() / 1000 - d.last_durable_at > 3600) ? ' · one-hour disk recovery target exceeded' : ''}${d.pending ? ' · upload pending' : ''}${d.error ? ` · ${d.error}${retry}` : ''}${d.last_durable_at ? ' · off-host copies retained' : ''}`;
+  return [`${saved}${exceeded ? ' · one-hour disk recovery target exceeded' : ''}${d.pending && (last || !young) ? ' · upload pending' : ''}${d.error ? ` · ${d.error}${retry}` : ''}${last ? ' · off-host copies retained' : ''}`,
+    Boolean(d.error) || exceeded, [last ? `Last durable ${fullTime(last)}` : '', d.retention || ''].filter(Boolean).join('\n')];
+}
+function snapshotStatus(item) {
+  // A live fork's own capture: named by the worker, so say which fork it was for.
+  const fork = item.fork ? `Taken for fork ${item.fork} · ` : /^fork-[0-9a-f]{24}$/.test(item.name) ? 'Taken for a fork · ' : '';
+  if (item.state === 'ready') return element('p', `${fork}${item.workspace} · ${mib(item.memory_mib)} · memory + disk`);
+  if (item.state !== 'failed') return element('p', `Capture ${item.state || 'pending'}. Check operation status before retrying.`);
+  const when = item.failed_at ? ` ${ago(item.failed_at)}` : '', line = element('p', item.workspace ? `Capture of ${item.workspace} failed${when}. Retry from the running machine.` : `Capture failed${when} · machine deleted.`, 'recovery-warning');
+  if (item.failed_at) line.title = fullTime(item.failed_at);
+  return line;
 }
 function machine() { return [...data.workspaces, ...(data.shared || [])].find(item => item.id === selected); }
 function setView(next) { view = next; for (const id of ['machines', 'snapshots', 'usage']) $(id + '-view').hidden = id !== view; document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view)); const names = {machines: ['Your machines.', 'A place to build, experiment, and pick up where you left off.', 'Machines'], snapshots: ['Pick up from here.', 'Saved memory and disk state, ready to restore or fork.', 'Snapshots'], usage: ['Room to grow.', 'See what your machines use, and free capacity when you need it.', 'Resource usage']}; $('page-title').textContent = names[view][0]; $('page-description').textContent = names[view][1]; $('breadcrumb').textContent = 'Your sandbox / ' + names[view][2]; }
@@ -59,8 +73,8 @@ function renderState() {
     const meta = element('div', undefined, 'card-meta'); meta.append(element('span', `${item.vcpu_count || 1} vCPU`), element('span', mib(item.memory_mib)));
     card.append(top, element('h3', item.id), meta, element('span', diskUsage(item), 'card-lineage'), element('span', item.source ? `Forked from ${item.source}` : (imageNames[item.image || 'alpine'] || 'Linux machine'), 'card-lineage')); if (item.node) card.append(element('span', `${item.node}${item.node_online === false ? ' · offline' : ''}`, 'card-lineage'));
     if (item.owner) card.append(element('span', `Shared by ${item.owner} · ${item.role}`, 'card-lineage'));
-    const recovery = element('span', durability(item), 'card-lineage' + (item.durability && (!item.durability.last_durable_at || item.durability.error || (!item.durability.current_state_durable && Date.now() / 1000 - item.durability.last_durable_at > 3600)) ? ' recovery-warning' : ''));
-    if (item.durability) recovery.title = item.durability.retention || '';
+    const [status, warning, title] = durability(item), recovery = element('span', status, 'card-lineage' + (warning ? ' recovery-warning' : ''));
+    recovery.title = title;
     card.append(recovery);
     card.addEventListener('click', () => select(item.id)); $(item.owner ? 'shared-grid' : 'machine-grid').append(card);
   }
@@ -92,7 +106,7 @@ function renderState() {
   }
   $('snapshot-list').replaceChildren();
   for (const item of data.snapshots.slice().reverse()) {
-    const row = element('article', undefined, 'snapshot-row'), info = element('div'); row.dataset.key = `${item.workspace}/${item.name}`; info.append(element('h3', item.name), element('p', item.state === 'ready' ? `${item.workspace} · ${mib(item.memory_mib)} · memory + disk` : item.state === 'failed' ? 'Capture failed. Retry from the running machine.' : `Capture ${item.state || 'pending'}. Check operation status before retrying.`));
+    const row = element('article', undefined, 'snapshot-row'), info = element('div'); row.dataset.key = `${item.workspace}/${item.name}`; info.append(element('h3', item.name), snapshotStatus(item));
     const buttons = element('div', undefined, 'actions'); if (item.state === 'ready') buttons.append(action('Fork a machine', () => openDialog('fork', item.workspace, item.name)), action('Restore', () => openDialog('restore', item.workspace, item.name)));
     row.append(info, buttons); $('snapshot-list').append(row);
   }

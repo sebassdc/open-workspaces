@@ -1,4 +1,4 @@
-import {test, expect, machines, card, notice, signIn} from './fixtures.mjs';
+import {test, expect, api, machines, card, notice, signIn} from './fixtures.mjs';
 
 test('worker outage shows an error and recovers on refresh', async ({dashboard: page}) => {
   await machines(page, 'steady');
@@ -75,4 +75,31 @@ test.describe('narrow width', () => {
     await expect(page.locator('#account-email')).toHaveAttribute('title', email);
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0);
   });
+});
+
+test('a new machine shows a neutral first recovery point', async ({dashboard: page}) => {
+  await machines(page, 'fresh');
+  const status = card(page, 'fresh').locator('.card-lineage', {hasText: 'recovery'});
+  await expect(status).toHaveText('First recovery point pending');
+  await expect(status).not.toHaveClass(/recovery-warning/);
+});
+
+test('recovery status warns only past the one-hour target and shows relative time', async ({dashboard: page}) => {
+  await machines(page, 'late', 'saved');
+  const now = Math.floor(Date.now() / 1000);
+  // Machines three hours old with recovery reports the fake worker does not make.
+  const state = await api(page);
+  for (const m of state.workspaces) {
+    m.created_at = now - 3 * 3600;
+    m.durability = m.id === 'late' ? {last_durable_at: null, pending: 'r1', current_state_durable: false} : {last_durable_at: now - 12 * 60, current_state_durable: false, retention: 'kept'};
+  }
+  await page.route('**/api/state', route => route.fulfill({json: {ok: true, result: state}}));
+  await page.getByRole('button', {name: '↻ Refresh'}).click();
+  const late = card(page, 'late').locator('.card-lineage', {hasText: 'durable'});
+  await expect(late).toHaveText('No durable recovery point yet · one-hour disk recovery target exceeded · upload pending');
+  await expect(late).toHaveClass(/recovery-warning/);
+  const saved = card(page, 'saved').locator('.card-lineage', {hasText: 'durable'});
+  await expect(saved).toHaveText('Last durable 12 min ago · off-host copies retained');
+  await expect(saved).not.toHaveClass(/recovery-warning/);
+  await expect(saved).toHaveAttribute('title', /^Last durable .*\d.*\nkept$/);
 });

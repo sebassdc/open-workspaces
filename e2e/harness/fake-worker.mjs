@@ -2,9 +2,12 @@
 // Rust test fakes (crates/ow/src/catalog_tests.rs): newline-delimited JSON
 // requests, one reply line, and for "terminal" a framed byte stream after it
 // (kind u8, length u32 BE, bytes; kind 0 data, 1 resize, 2 exit code).
+import crypto from 'node:crypto';
 import net from 'node:net';
 
 const GIB = 1024 ** 3, MAX_MEMORY_MIB = 4096;
+// Every capture of a machine with exactly this many vCPUs fails, so tests can see a failed snapshot.
+export const FAILING_CAPTURE_VCPUS = 13;
 
 export function fakeWorker(socketPath, log = () => {}) {
   const machines = new Map(), snapshots = new Map();
@@ -39,7 +42,9 @@ export function fakeWorker(socketPath, log = () => {}) {
       return m;
     },
     snapshot: r => {
-      const m = get(r.id), s = {name: r.name, workspace: r.id, memory_mib: m.memory_mib, vcpu_count: m.vcpu_count, image: m.image, state: 'ready'};
+      const m = get(r.id);
+      if (m.vcpu_count === FAILING_CAPTURE_VCPUS) throw Error('capture failed');
+      const s = {name: r.name, workspace: r.id, memory_mib: m.memory_mib, vcpu_count: m.vcpu_count, image: m.image, state: 'ready'};
       snapshots.set(r.name, s);
       return s;
     },
@@ -52,6 +57,11 @@ export function fakeWorker(socketPath, log = () => {}) {
     fork: r => {
       const child = {...get(r.id), id: r.child, source: r.id, state: 'running'};
       machines.set(r.child, child);
+      // Like the real worker, a fork of the running machine keeps its own capture, named for no one.
+      if (!r.snapshot) {
+        const name = `fork-${crypto.randomBytes(12).toString('hex')}`;
+        snapshots.set(name, {name, workspace: r.id, fork: r.child, memory_mib: child.memory_mib, vcpu_count: child.vcpu_count, image: child.image, state: 'ready'});
+      }
       return child;
     },
     delete: r => {
