@@ -910,6 +910,7 @@ mod tests {
             "fork",
             "recovery-prepare",
             "recovery-result",
+            "recovery-seal",
         ] {
             let e = runtime.request(&request(op)).unwrap_err();
             assert!(e.to_string().contains("fenced"), "{op}: {e:#}");

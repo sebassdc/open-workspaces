@@ -3,7 +3,7 @@
 //! onto another runner. This operator-local path never grants catalog ownership;
 //! managed remote restore consumes authorized catalog artifacts in `transfers`.
 use crate::{BackupAction, common, selfhost, wire};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use ow_core::snapshot_store::{S3Store, SnapshotStore};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -12,7 +12,6 @@ use std::{
     fs,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
 
@@ -136,6 +135,9 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
         status["recovery_points_v1"] == true,
         "worker does not support recovery points; complete its normal class-2 upgrade first"
     );
+    // A worker that can take its uploader's seals leaves captures unsealed, so
+    // each byte is read once: hashed and sent in the same pass.
+    let client_seal = status["recovery_client_seal_v1"] == true && store.seals_while_uploading();
     let machines = wire::request(runner, json!({"op":"list"}))?;
     let mut machines = machines.as_array().context("invalid machine list")?.clone();
     // An interrupted long transfer must not always leave later boxes at the back.
@@ -159,11 +161,46 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
             if let Some(placement) = machine.get("placement") {
                 request["placement"] = placement.clone();
             }
+            if client_seal {
+                request["client_seal"] = json!(true);
+            }
             let point = wire::request(runner, request.clone())?;
             let Some(name) = point["snapshot"].as_str() else {
                 return Ok(());
             };
-            let uploaded = store.push(name, &runner.join("snapshots").join(name));
+            let mut capture = point["chunks"].clone();
+            let uploaded = (|| -> Result<Value> {
+                let snapshots = runner.join("snapshots");
+                if let Some(staging) = point["unsealed"].as_str() {
+                    ensure!(
+                        staging.starts_with(".pending-") && !staging.contains('/'),
+                        "invalid unsealed capture"
+                    );
+                    let previous = match point["previous"].as_str() {
+                        Some(previous) => {
+                            common::identifier(previous)?;
+                            Some(snapshots.join(previous))
+                        }
+                        None => None,
+                    };
+                    let (files, sent) = store
+                        .upload_unsealed(&snapshots.join(staging), previous.as_deref())
+                        .context("store cannot seal captures")??;
+                    let mut seal = request.clone();
+                    seal["op"] = json!("recovery-seal");
+                    seal["snapshot"] = json!(name);
+                    seal["files"] = json!(files);
+                    seal["capture"] = sent["capture"].clone();
+                    wire::request(runner, seal)?;
+                    capture = sent["capture"].clone();
+                    // Every chunk was sent while sealing; this commits the manifest.
+                    let mut transfer = store.push(name, &snapshots.join(name))?;
+                    transfer["sealed_while_sending"] = sent;
+                    Ok(transfer)
+                } else {
+                    store.push(name, &snapshots.join(name))
+                }
+            })();
             request["op"] = json!("recovery-result");
             request["snapshot"] = json!(name);
             request["uploaded"] = json!(uploaded.is_ok());
@@ -172,7 +209,7 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
             println!(
                 "{}",
                 json!({"workspace":id,"snapshot":name,"last_durable_at":point["captured_at"],
-                       "capture":point["chunks"],"transfer":transfer})
+                       "capture":capture,"transfer":transfer})
             );
             Ok(())
         })();

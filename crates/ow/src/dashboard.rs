@@ -759,6 +759,7 @@ mod tests {
             "quiesce",
             "recovery-prepare",
             "recovery-result",
+            "recovery-seal",
             "tunnel",
             "put",
             "get",

@@ -11,6 +11,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -31,6 +32,21 @@ pub trait SnapshotStore {
     /// Downloads `name` into `directory`, which must not exist yet. Every file is
     /// checked against the stored manifest; on any failure `directory` is removed.
     fn pull(&self, name: &str, directory: &Path) -> Result<()>;
+    /// Whether [`Self::upload_unsealed`] works for this store.
+    fn seals_while_uploading(&self) -> bool {
+        false
+    }
+    /// Seals a capture its worker left unsealed while sending the chunks the store
+    /// lacks (each byte read once), for the worker to commit before [`Self::push`].
+    /// None when this store cannot.
+    #[allow(clippy::type_complexity)]
+    fn upload_unsealed(
+        &self,
+        _directory: &Path,
+        _previous: Option<&Path>,
+    ) -> Option<Result<(BTreeMap<String, crate::snapshot_digest::Sealed>, Value)>> {
+        None
+    }
 }
 
 /// S3 or an S3-compatible store (MinIO, R2), through the AWS SDK for Rust and
@@ -111,6 +127,15 @@ impl S3Store {
         )
         .context("uploading manifest")?;
         Ok(Value::Null)
+    }
+
+    /// Once per process: a run checks the bucket's retention once, not once per box.
+    fn retention(&self) -> Result<()> {
+        if self.retention.get().is_none() {
+            self.check_recovery_retention()?;
+            let _ = self.retention.set(());
+        }
+        Ok(())
     }
 
     /// Opt-in chunk format for managed recovery. Existing manual backups keep
@@ -210,15 +235,24 @@ impl SnapshotStore for S3Store {
 
     fn push(&self, name: &str, directory: &Path) -> Result<Value> {
         if self.incremental {
-            // Once per process: a run checks the bucket once, not once per box.
-            if self.retention.get().is_none() {
-                self.check_recovery_retention()?;
-                let _ = self.retention.set(());
-            }
+            self.retention()?;
             self.push_chunks(name, directory)
         } else {
             self.push_full(name, directory)
         }
+    }
+
+    fn seals_while_uploading(&self) -> bool {
+        self.incremental
+    }
+
+    fn upload_unsealed(
+        &self,
+        directory: &Path,
+        previous: Option<&Path>,
+    ) -> Option<Result<(BTreeMap<String, crate::snapshot_digest::Sealed>, Value)>> {
+        self.incremental
+            .then(|| S3Store::upload_unsealed(self, directory, previous))
     }
 
     fn manifest(&self, name: &str) -> Result<Vec<u8>> {

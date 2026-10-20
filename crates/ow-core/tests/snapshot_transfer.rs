@@ -82,6 +82,15 @@ fn incremental_retry_integrity_and_legacy_restore() {
         return;
     }
     let root = std::path::PathBuf::from(std::env::var_os("OW_TEST_STORE").unwrap());
+    if std::env::var_os("OW_KILL_UPLOAD").is_some() {
+        let endpoint = std::env::var("OW_TEST_ENDPOINT").unwrap();
+        let store = S3Store::new("s3://bucket/snapshots", Some(&endpoint))
+            .unwrap()
+            .incremental()
+            .index(&root.join("kill-index"));
+        store.push("abrupt", &root.join("abrupt")).unwrap();
+        panic!("upload was meant to be killed while blocked");
+    }
     let endpoint = std::env::var("OW_TEST_ENDPOINT").unwrap();
     let store = S3Store::new("s3://bucket/snapshots", Some(&endpoint))
         .unwrap()
@@ -174,8 +183,9 @@ fn incremental_retry_integrity_and_legacy_restore() {
     let broken = root.join("broken");
     assert!(store.pull("two", &broken).is_err());
     assert!(!broken.exists());
-    killed_runs_resume_and_lost_indexes_reconcile(&root, &store);
+    failed_runs_resume_and_lost_indexes_reconcile(&root, &store);
     chunk_seals_transfer_without_rereading(&root, &store);
+    abruptly_killed_upload_resumes(&root);
     println!(
         "Observed: first capture 4 nonzero chunks; one changed disk chunk added 1; interrupted commit + replay added 0; no chunk HEAD requests; second-runner bytes and legacy reads verified."
     );
@@ -191,7 +201,7 @@ fn distinct(count: usize, salt: u8) -> Vec<u8> {
     disk
 }
 
-fn killed_runs_resume_and_lost_indexes_reconcile(root: &Path, store: &S3Store) {
+fn failed_runs_resume_and_lost_indexes_reconcile(root: &Path, store: &S3Store) {
     let disk = distinct(6, 7);
     capture(&root.join("big"), "big", &disk);
     fs::write(root.join("put-budget"), "2").unwrap();
@@ -199,7 +209,7 @@ fn killed_runs_resume_and_lost_indexes_reconcile(root: &Path, store: &S3Store) {
     fs::remove_file(root.join("put-budget")).unwrap();
     assert!(!store.list().unwrap().contains(&"big".to_owned()));
     let resumed = store.push("big", &root.join("big")).unwrap();
-    // Six new disk chunks (state and memory are stored already); the killed run sent two.
+    // Six new disk chunks (state and memory are stored already); the failed run sent two.
     assert_eq!(resumed["new"], 4, "{resumed}");
     assert_eq!(resumed["uploaded"], 4, "{resumed}");
     assert_eq!(resumed["index_dropped"], 0);
@@ -267,9 +277,13 @@ fn chunk_seals_transfer_without_rereading(root: &Path, store: &S3Store) {
     ] {
         fs::write(dir.join(file), data).unwrap();
     }
-    let (files, _) =
-        ow_core::snapshot_digest::seal_directory(&dir, &ow_core::snapshot_store::DATA_FILES, None)
-            .unwrap();
+    let (files, _) = ow_core::snapshot_digest::seal_directory(
+        &dir,
+        &ow_core::snapshot_store::DATA_FILES,
+        None,
+        ow_core::snapshot_digest::CHUNKS_V1,
+    )
+    .unwrap();
     let manifest = json!({"name":"sealed","workspace":"box","files":files,"digest":ow_core::snapshot_digest::CHUNKS_V1});
     fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
     // Bytes changed after sealing are never sent under the sealed hash.
@@ -302,4 +316,50 @@ fn chunk_seals_transfer_without_rereading(root: &Path, store: &S3Store) {
     assert_eq!(fs::read(back.join("disk.ext4")).unwrap(), original);
     let public: Value = serde_json::from_slice(&store.manifest("sealed").unwrap()).unwrap();
     assert_eq!(public, manifest);
+}
+
+/// Kill after the store has committed a chunk but before answering that PUT.
+fn abruptly_killed_upload_resumes(root: &Path) {
+    capture(&root.join("abrupt"), "abrupt", &distinct(6, 19));
+    fs::write(root.join("pause-after-put"), "").unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "incremental_retry_integrity_and_legacy_restore",
+            "--nocapture",
+        ])
+        .env("OW_KILL_UPLOAD", "1")
+        .env("OW_S3_TRANSFERS", "1")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !root.join("put-paused").exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "uploader exited before kill"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "uploader did not reach committed PUT"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    fs::remove_file(root.join("pause-after-put")).unwrap();
+    let endpoint = std::env::var("OW_TEST_ENDPOINT").unwrap();
+    let store = S3Store::new("s3://bucket/snapshots", Some(&endpoint))
+        .unwrap()
+        .incremental()
+        .index(&root.join("kill-index"));
+    assert!(!store.list().unwrap().contains(&"abrupt".into()));
+    store.push("abrupt", &root.join("abrupt")).unwrap();
+    let restored = root.join("abrupt-restored");
+    store.pull("abrupt", &restored).unwrap();
+    for file in ow_core::snapshot_store::DATA_FILES {
+        assert_eq!(
+            fs::read(restored.join(file)).unwrap(),
+            fs::read(root.join("abrupt").join(file)).unwrap()
+        );
+    }
 }

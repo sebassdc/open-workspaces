@@ -14,6 +14,7 @@ import hashlib
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -126,6 +127,11 @@ class Handler(BaseHTTPRequestHandler):
                 output.write(body)
         except FileExistsError:
             return self.error(412, 'PreconditionFailed')
+        # Process-death fixture: bytes are durable, but the uploader has no response yet.
+        if '/chunks/' in f'/{key}' and (root / 'pause-after-put').exists():
+            (root / 'put-paused').touch()
+            while (root / 'pause-after-put').exists():
+                time.sleep(0.01)
         self.reply(200, headers=[('ETag', etag(body))])
 
 

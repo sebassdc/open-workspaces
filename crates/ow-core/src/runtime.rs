@@ -374,10 +374,11 @@ impl Staged {
                 &self.staging,
                 &crate::snapshot_store::DATA_FILES,
                 self.previous.as_deref(),
+                crate::snapshot_digest::CHUNKS_V2,
             )?;
             return Ok((
                 files,
-                Some(crate::snapshot_digest::CHUNKS_V1.into()),
+                Some(crate::snapshot_digest::CHUNKS_V2.into()),
                 Some(stats),
             ));
         }
@@ -586,6 +587,10 @@ pub struct Runtime {
     /// Set by `begin`: a plain capture is staged in `staged` instead of hashed in place.
     defer_seal: bool,
     staged: Option<Staged>,
+    /// Recovery captures whose uploader seals them while sending them (one read),
+    /// by snapshot name; `recovery-seal` commits them. Lost on restart, when
+    /// startup removes their staging.
+    unsealed: BTreeMap<String, Staged>,
     #[cfg(test)]
     crash: Option<&'static str>,
 }
@@ -725,6 +730,7 @@ impl Runtime {
             capture_ready: BTreeMap::new(),
             defer_seal: false,
             staged: None,
+            unsealed: BTreeMap::new(),
             #[cfg(test)]
             crash: None,
         };
@@ -1673,10 +1679,13 @@ impl Runtime {
             let path = directory.join(file);
             let actual = match snapshot.digest.as_deref() {
                 None => hash(&path)?,
-                Some(crate::snapshot_digest::CHUNKS_V1) => crate::snapshot_digest::root(
-                    &crate::snapshot_digest::seal(&path, None, false)?.0.chunks,
-                ),
-                Some(other) => bail!("unsupported snapshot digest {other}"),
+                Some(digest) => {
+                    let size = crate::snapshot_digest::chunk_size(Some(digest))?;
+                    let how = crate::snapshot_digest::Sealing::full(size);
+                    crate::snapshot_digest::root(
+                        &crate::snapshot_digest::seal(&path, None, &how)?.0.chunks,
+                    )
+                }
             };
             ensure!(
                 snapshot.files.get(file) == Some(&actual),
@@ -1843,7 +1852,12 @@ impl Runtime {
                 "managed operation requires lifecycle coordination"
             );
         }
-        if !id.is_empty() && !matches!(op, "hibernate" | "recovery-prepare" | "recovery-result") {
+        if !id.is_empty()
+            && !matches!(
+                op,
+                "hibernate" | "recovery-prepare" | "recovery-result" | "recovery-seal"
+            )
+        {
             self.idle.touch(id, std::time::Instant::now());
         }
         if matches!(op, "exec" | "shell-exec" | "put" | "get" | "ssh-keys") {
@@ -1883,7 +1897,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"snapshot_delete_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"snapshot_delete_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
@@ -1940,7 +1954,9 @@ impl Runtime {
                 self.check_replay(request)?;
                 Ok(json!({}))
             }
-            "recovery-prepare" | "recovery-result" => self.recovery_operation(request),
+            "recovery-prepare" | "recovery-result" | "recovery-seal" => {
+                self.recovery_operation(request)
+            }
             "create" => self.create(
                 id,
                 u32::try_from(request["memory_mib"].as_u64().unwrap_or(256))?,
@@ -2227,6 +2243,7 @@ mod disk_tests {
             capture_ready: BTreeMap::new(),
             defer_seal: false,
             staged: None,
+            unsealed: BTreeMap::new(),
             crash: None,
         }
     }
@@ -2675,7 +2692,7 @@ mod disk_tests {
         .unwrap();
         assert_eq!(
             pinned.digest.as_deref(),
-            Some(crate::snapshot_digest::CHUNKS_V1)
+            Some(crate::snapshot_digest::CHUNKS_V2)
         );
         assert!(runtime.snapshot_dir(name).join("chunks.json").is_file());
         runtime.verified.clear();
