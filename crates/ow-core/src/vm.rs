@@ -401,15 +401,32 @@ impl Vm {
     fn command_within(&mut self, command: &str, timeout: Duration) -> Result<(String, i32)> {
         ensure!(command.len() < 512 * 1024, "command too large");
         let marker = format!("OW_DONE_{}", nonce()?);
+        let timed_out = format!("guest command timed out after {timeout:?}");
         // Output marker uses a private nonce; this transport supports trusted local workloads only.
         // The begin marker separates this command's output from any a timed-out command left
         // on the channel: read_until discards that, its own end marker included.
+        // The shell cannot read the host while it waits, so a guest-side watchdog ends a command
+        // that outlives the timeout: TERM, then KILL, to its own session (process group when the
+        // shell has job control), and the channel is free again once its end marker is read.
         let wire = format!(
-            "printf '{marker}:begin\\n'; {command}; ow_rc=$?; printf '\\n{marker}:%s:{marker}\\n' \"$ow_rc\"\n"
+            "printf '{marker}:begin\\n'; ow_s=; case $- in *m*) ;; *) command -v setsid >/dev/null 2>&1 && ow_s=setsid;; esac; \
+             $ow_s /bin/sh -c {} & ow_p=$!; \
+             (ow_i=0; while kill -0 $ow_p 2>/dev/null; do if [ $ow_i -ge {} ]; then printf '\\n{marker}:timeout\\n'; \
+             kill -TERM -$ow_p 2>/dev/null || kill -TERM $ow_p 2>/dev/null; sleep 2; kill -KILL -$ow_p 2>/dev/null || kill -KILL $ow_p 2>/dev/null; break; fi; \
+             sleep 1; ow_i=$((ow_i+1)); done) & \
+             wait $ow_p; ow_rc=$?; printf '\\n{marker}:%s:{marker}\\n' \"$ow_rc\"\n",
+            shell_quote(command),
+            timeout.as_secs().max(1),
         );
         self.master.write_all(wire.as_bytes())?;
         let end = format!(":{marker}");
-        let bytes = self.read_until(end.as_bytes(), timeout)?;
+        // The watchdog needs up to a second to notice, two for TERM to work, then KILL.
+        let bytes = match self.read_until(end.as_bytes(), timeout + Duration::from_secs(15)) {
+            Err(error) if error.to_string().starts_with("guest command timed out") => {
+                anyhow::bail!(timed_out)
+            }
+            other => other?,
+        };
         let text = String::from_utf8_lossy(&bytes).replace('\r', "");
         let start = format!("{marker}:begin\n");
         let begin = text.rfind(&start).context("missing begin marker")? + start.len();
@@ -417,6 +434,10 @@ impl Vm {
             .rfind(&format!("{marker}:"))
             .context("missing exit marker")?;
         ensure!(begin <= finish, "missing exit marker");
+        ensure!(
+            !text[begin..].contains(&format!("\n{marker}:timeout\n")),
+            timed_out
+        );
         let code = text[finish + marker.len() + 1..text.len() - end.len()]
             .trim()
             .parse()?;
@@ -591,46 +612,29 @@ impl Drop for Vm {
 #[cfg(test)]
 mod command_tests {
     use super::*;
-    use std::{
-        io::{BufRead, BufReader},
-        os::unix::net::UnixStream,
-    };
+    use std::os::unix::net::UnixStream;
 
-    fn marker(line: &str) -> String {
-        let suffix = line
-            .split_once("OW_DONE_")
-            .unwrap()
-            .1
-            .split(':')
-            .next()
-            .unwrap();
-        format!("OW_DONE_{suffix}")
-    }
-
+    // A real interactive shell on the other end of the serial channel, as in the guest.
     #[test]
-    fn timed_out_command_output_does_not_reach_the_next_command() {
-        let (master, guest) = UnixStream::pair().unwrap();
-        let guest = std::thread::spawn(move || {
-            let mut serial = BufReader::new(guest);
-            let mut slow = String::new();
-            serial.read_line(&mut slow).unwrap();
-            let slow = marker(&slow);
-            write!(serial.get_mut(), "{slow}:begin\npartial-from-slow\n").unwrap();
-            // The shell reads the next command only after the slow one ends.
-            let mut quick = String::new();
-            serial.read_line(&mut quick).unwrap();
-            assert!(quick.contains("echo next-command"), "{quick}");
-            let quick = marker(&quick);
-            write!(
-                serial.get_mut(),
-                "leftover-from-slow\n\n{slow}:0:{slow}\nOW> {quick}:begin\nnext-command\n\n{quick}:0:{quick}\nOW> "
-            )
+    fn a_timed_out_command_is_ended_and_the_next_command_gets_only_its_own_output() {
+        let (master, serial) = UnixStream::pair().unwrap();
+        let log = std::env::temp_dir().join(format!("ow-serial-{}", nonce().unwrap()));
+        let child = Command::new("/bin/sh")
+            .arg("-i")
+            .env("PS1", "OW> ")
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(
+                serial.try_clone().unwrap(),
+            )))
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(
+                serial.try_clone().unwrap(),
+            )))
+            .stderr(Stdio::from(std::os::fd::OwnedFd::from(serial)))
+            .spawn()
             .unwrap();
-        });
         let mut vm = Vm {
-            child: Command::new("sleep").arg("30").spawn().unwrap(),
+            child,
             master: std::os::fd::OwnedFd::from(master).into(),
-            log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
+            log: File::create(&log).unwrap(),
             diagnostics: None,
             buffer: Vec::new(),
             socket: PathBuf::new(),
@@ -638,16 +642,37 @@ mod command_tests {
             memory_base: MemoryBase::Unknown,
             address: String::new(),
         };
+        let started = Instant::now();
         let error = vm
             .command_within(
-                "sleep 34; echo leftover-from-slow",
-                Duration::from_millis(300),
+                "(sleep 4; echo leftover-from-child) & sleep 65; echo leftover-from-slow",
+                Duration::from_secs(1),
             )
             .unwrap_err();
-        assert_eq!(error.to_string(), "guest command timed out after 300ms");
+        assert_eq!(error.to_string(), "guest command timed out after 1s");
+        // Ended by the guest watchdog, not left running for 65 s.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let quick = Instant::now();
         let (output, code) = vm.command("echo next-command").unwrap();
         assert_eq!((output.as_str(), code), ("next-command\n", 0));
-        guest.join().unwrap();
+        assert!(
+            quick.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            quick.elapsed()
+        );
+        // The slow command's background child went with it.
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(vm.command("echo last").unwrap(), ("last\n".into(), 0));
+        let (output, code) = vm.command("printf 'no newline'; exit 3").unwrap();
+        assert_eq!((output.as_str(), code), ("no newline", 3));
+        drop(vm);
+        let seen = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_file(&log).unwrap();
+        assert!(!seen.contains("leftover"), "{seen}");
     }
 }
 
@@ -732,8 +757,8 @@ mod clock_tests {
             for _ in 0..if capture_failure { 2 } else { 1 } {
                 let mut line = String::new();
                 serial.read_line(&mut line).unwrap();
-                let command = line.split_once("\\n'; ").unwrap().1;
-                let command = command.split_once("; ow_rc=").unwrap().0;
+                let command = wire_command(&line);
+                let command = command.as_str();
                 let code = if let Some(time) = command.strip_prefix("date -u -s '@") {
                     let seconds = time.split_once('\'').unwrap().0.parse::<u64>().unwrap();
                     if date_exit == 0 {
@@ -822,6 +847,14 @@ mod clock_tests {
     }
 }
 
+/// The command a serial wire line runs, unquoted.
+#[cfg(test)]
+pub(crate) fn wire_command(line: &str) -> String {
+    let quoted = line.split_once("/bin/sh -c ").unwrap().1;
+    let quoted = quoted.split_once(" & ow_p=").unwrap().0;
+    quoted[1..quoted.len() - 1].replace("'\\''", "'")
+}
+
 /// A real child and the real capture API/serial protocol, without KVM or host networking.
 #[cfg(test)]
 pub(crate) fn capture_fixture(directory: &Path, resume: bool) -> (Vm, std::thread::JoinHandle<()>) {
@@ -856,9 +889,10 @@ fn capture_fixture_steps(
             if serial.read_line(&mut command).unwrap() == 0 {
                 return false;
             }
-            let command = command.split_once("\\n'; ").unwrap().1;
+            let line = command;
+            let command = wire_command(&line);
             assert!(command.starts_with(prefix), "{command}");
-            let suffix = command
+            let suffix = line
                 .split_once("OW_DONE_")
                 .unwrap()
                 .1
@@ -874,7 +908,7 @@ fn capture_fixture_steps(
             true
         };
         for (capture_index, capture) in steps.into_iter().enumerate() {
-            if !reply("sync;", 0) {
+            if !reply("sync", 0) {
                 return;
             }
             let endpoints = if resume {
