@@ -69,6 +69,7 @@ browser test that guards it are listed in the [UI feature matrix](docs/UI_FEATUR
 | --- | --- | --- | --- | --- |
 | Owner quotas and pool admission | Reserve CPU, RAM, logical disk, box count and configured pool cost estimates before admission. | Core | v0.8.1 | [Limits](docs/LIMITS.md) |
 | vCPU overcommit | Allow a Linux host operator to select 1× or 2× vCPU admission; RAM is not overcommitted. | Opt-in | v0.8.5 | [Overcommit](docs/HOSTS.md#linux-vcpu-overcommit) |
+| Host reserve | Keep CPU and RAM per host that boxes never claim; on AWS hosts, systemd protects the controller/agent and kills a VM first under memory pressure. | Core | v0.9.24 | [Host reserve](docs/HOSTS.md#host-reserve-capacity-boxes-never-claim) |
 | User ownership and sharing | Scope boxes, snapshots and access to authenticated owners with explicit use/admin grants. | Core | v0.2.0 | [Users](docs/USERS.md) |
 | Guest isolation and egress | Run Linux guests under Firecracker/KVM with private host control and filtered guest networking. | Core | v0.1.0 | [Networking](docs/NETWORKING.md) |
 | CredentialBroker | Library-only per-box authorization for temporary AWS roles and secret writes; no live provider adapter or guest endpoint. | Not yet live | v0.8.0 (library only) | [Broker boundaries](docs/CREDENTIAL_BROKER.md) |

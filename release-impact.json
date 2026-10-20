@@ -2,6 +2,114 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.25",
+      "class": 1,
+      "changes": [
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Dashboard keeps keyboard focus on the same machine card or action button when the 5 s refresh rebuilds the lists. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-1 upgrade: the dashboard restarts; workers and guests are untouched."
+    },
+    {
+      "version": "0.9.24",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Host reserve: each AWS host keeps CPU and RAM box admission never claims, 1 vCPU and 2 GiB on a Host, 0.5 vCPU and 1 GiB on a runner (hostReserveCpuMillis, hostReserveMemoryMib). The host subtracts it from logical CPUs before the vcpuOvercommit ratio and from RAM, for the worker budget, the local controller and runner invitations. The controller/agent unit moves into owcontrol.slice (CPUWeight 1000, MemoryMin/MemoryLow, OOMScoreAdjust -900); the worker and its VMs into owguests.slice (MemoryMax host RAM less the reserve). Every Linux worker also caps OW_MAX_MEMORY_MIB and OW_MAX_VCPUS at host capacity less OW_HOST_RESERVE_CPU_MILLIS/OW_HOST_RESERVE_MEMORY_MIB (default a runner's; ow host up starts its worker with a controller host's) times OW_VCPU_OVERCOMMIT, refuses to start when nothing is left, and starts each VMM with OOM score 500 in a guests cgroup under a delegated worker unit (worker -900, CPU weight 1000, memory.low). apply refuses a reserve that leaves no room for boxes. The worker reports the reserve and ow nodes shows host_reserve (cpu_millis, memory_mib, disk_gib). The node agent builds heartbeats on its status thread and writes its status files on another, so a long capture, a cache hash or a slow disk no longer makes a runner look offline; a beat not refreshed for 1500 s closes the channel. A signal interrupting a worker request (a child process exiting) no longer drops the channel. Class 2 in place: apply stages the units and budget, the normal quiesce/swap/resume upgrade applies them; a running box beyond the lowered CPU budget stays hibernated until capacity frees. A host-to-runner conversion must carry the host's reserve. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged; no stage 0 change."
+    },
+    {
+      "version": "0.9.23",
+      "class": 1,
+      "changes": [
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Dashboard copy and counters for a shared host pool. Footer and sidebar name the shared private host pool; the pool banner says who can see guest data and the invitation policy appears only in the invite dialog. The memory counter shows the owner's provisioned usage against their owner limits (machines, vCPU, memory, disk); the usage view labels pool memory as shared by all users. A failed first state load shows a retry in the machine grid and keeps New machine disabled. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-1 upgrade: the dashboard restarts alone."
+    },
+    {
       "version": "0.9.22",
       "class": 2,
       "changes": [

@@ -43,6 +43,7 @@ fn max_memory() -> u32 {
         MAX_MEMORY_MIB,
         crate::common::HOST_MEMORY_MIB,
     )
+    .min(capacity().0)
 }
 fn max_running() -> usize {
     limit(
@@ -52,7 +53,68 @@ fn max_running() -> usize {
     ) as usize
 }
 fn max_cpus() -> u32 {
-    limit("OW_MAX_VCPUS", 16, crate::common::HOST_CPUS)
+    limit("OW_MAX_VCPUS", 16, crate::common::HOST_CPUS).min(capacity().1)
+}
+/// CPU (thousandths of a vCPU) and RAM (MiB) the host keeps for its controller and node
+/// agent. Defaults are a runner's; `ow host up` sets a controller host's. Invalid values
+/// reserve everything, so they fail closed.
+fn host_reserve() -> (u32, u32) {
+    let read = |name, default, high| match std::env::var(name) {
+        Err(_) => default,
+        Ok(v) => v
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n <= high)
+            .unwrap_or(u32::MAX),
+    };
+    (
+        read("OW_HOST_RESERVE_CPU_MILLIS", 500, 64000),
+        read("OW_HOST_RESERVE_MEMORY_MIB", 1024, 1048576),
+    )
+}
+/// The vCPU admission ratio the operator chose (1 or 2); invalid values admit nothing.
+fn overcommit() -> u32 {
+    match std::env::var("OW_VCPU_OVERCOMMIT").as_deref() {
+        Err(_) | Ok("1") => 1,
+        Ok("2") => 2,
+        Ok(_) => 0,
+    }
+}
+/// What box admission may claim on this host, whatever the configured budgets: RAM less
+/// the reserve, and logical CPUs less the reserve times the ratio.
+fn capacity() -> (u32, u32) {
+    #[cfg(not(test))]
+    static HOST: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    // Unit fixtures must not depend on the machine running them; the math is tested apart.
+    #[cfg(test)]
+    let (memory, cpus) = (1u64 << 20, 64);
+    #[cfg(not(test))]
+    let (memory, cpus) = *HOST.get_or_init(|| {
+        let memory = fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|m| {
+                m.lines()
+                    .find_map(|l| l.strip_prefix("MemTotal:"))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            })
+            .map_or(0, |kib| kib / 1024);
+        let cpus = std::thread::available_parallelism().map_or(0, |n| n.get() as u64);
+        (memory, cpus)
+    });
+    reserved_capacity(memory, cpus, host_reserve(), overcommit())
+}
+fn reserved_capacity(
+    memory: u64,
+    cpus: u64,
+    (cpu_millis, memory_mib): (u32, u32),
+    ratio: u32,
+) -> (u32, u32) {
+    let memory = memory.saturating_sub(u64::from(memory_mib));
+    let cpus = (cpus * 1000).saturating_sub(u64::from(cpu_millis)) * u64::from(ratio) / 1000;
+    (
+        memory.min(u64::from(u32::MAX)) as u32,
+        cpus.min(u64::from(u32::MAX)) as u32,
+    )
 }
 fn minimum_free_gib() -> Result<u32> {
     match std::env::var("OW_MIN_FREE_GIB") {
@@ -108,6 +170,16 @@ pub fn image_profile(image: &str) -> Result<()> {
 #[cfg(test)]
 mod image_tests {
     use super::*;
+    #[test]
+    fn budgets_never_claim_the_host_reserve() {
+        // 8 GiB, 2 CPUs: a runner keeps 0.5 vCPU and 1 GiB, a controller host 1 and 2 GiB.
+        assert_eq!(reserved_capacity(8192, 2, (500, 1024), 1), (7168, 1));
+        assert_eq!(reserved_capacity(8192, 2, (500, 1024), 2), (7168, 3));
+        assert_eq!(reserved_capacity(8192, 2, (1000, 2048), 1), (6144, 1));
+        // A reserve larger than the host leaves nothing, never an underflow.
+        assert_eq!(reserved_capacity(1024, 1, (1000, 2048), 2), (0, 0));
+        assert_eq!(reserved_capacity(8192, 2, (0, 0), 1), (8192, 2));
+    }
     #[test]
     fn worker_limits_fail_closed() {
         for value in ["", "garbage", "0", "4097", "-1"] {
@@ -595,6 +667,25 @@ impl Runtime {
         }
         minimum_free_gib()?;
         max_disk_gib()?;
+        let (reserve, ratio) = (host_reserve(), overcommit());
+        ensure!(
+            reserve.0 != u32::MAX && reserve.1 != u32::MAX && ratio != 0,
+            "invalid host reserve (OW_HOST_RESERVE_CPU_MILLIS 0-64000, OW_HOST_RESERVE_MEMORY_MIB 0-1048576) or OW_VCPU_OVERCOMMIT (1 or 2)"
+        );
+        ensure!(
+            max_memory() >= 256 && max_cpus() >= 1,
+            "the host reserve ({} vCPU, {} MiB) leaves no room for boxes on this host; lower OW_HOST_RESERVE_CPU_MILLIS/OW_HOST_RESERVE_MEMORY_MIB or run the controller without local compute",
+            f64::from(reserve.0) / 1000.0,
+            reserve.1
+        );
+        if std::env::var_os("OW_DELEGATED_CGROUP").is_some() {
+            // The VMMs' OOM score protects the worker regardless; this adds CPU and reclaim.
+            if let Err(e) =
+                crate::vm::delegated_cgroup().and_then(|c| crate::vm::isolate_guests(&c))
+            {
+                eprintln!("guests share the worker's cgroup: {e:#}");
+            }
+        }
         for directory in ["machines", "snapshots", "recovery"] {
             fs::create_dir_all(root.join(directory))?;
         }
@@ -1785,7 +1876,7 @@ impl Runtime {
                 "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"snapshot_delete_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
-                "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
+                "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
             "list" => Ok(json!(

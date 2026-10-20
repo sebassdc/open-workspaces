@@ -40,6 +40,9 @@ export interface RunnerPoolArgs {
     backupUrl?: pulumi.Input<string>;
     idleMinutes?: pulumi.Input<number>;
     vcpuOvercommit?: pulumi.Input<number>;
+    /** Host reserve per runner; see Host. Default: 500 (half a vCPU) and 1024 MiB. */
+    hostReserveCpuMillis?: pulumi.Input<number>;
+    hostReserveMemoryMib?: pulumi.Input<number>;
 }
 
 /** Stage 0 of bootstrap.sh, run unchanged: only the values ahead of it differ from a Host's. */
@@ -197,11 +200,12 @@ export class RunnerPool extends pulumi.ComponentResource {
                 pulumi.all([args.developerImages ?? [], backupUrl ?? "", args.idleMinutes ?? 30, args.vcpuOvercommit ?? 1]),
                 pulumi.all([args.storeUrl ?? "", args.imageArtifacts ?? {}]),
                 pulumi.all([partition, region, account, role.uniqueId]),
-            ]).apply(([[repository, ref, secretArn], [images, backup, idleMinutes, vcpuOvercommit], [storeUrl, imageArtifacts], [p, r, a, roleId]]) =>
+                pulumi.all([args.hostReserveCpuMillis, args.hostReserveMemoryMib]),
+            ]).apply(([[repository, ref, secretArn], [images, backup, idleMinutes, vcpuOvercommit], [storeUrl, imageArtifacts], [p, r, a, roleId], [hostReserveCpuMillis, hostReserveMemoryMib]]) =>
                 JSON.stringify(hostConfig({
                     repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: "", tailscaleSsh: false,
                     dashboardLogins: [], developerImages: images, backupUrl: backup, backupSchedule: "", idleMinutes, vcpuOvercommit,
-                    storeUrl, imageArtifacts,
+                    storeUrl, imageArtifacts, hostReserveCpuMillis, hostReserveMemoryMib,
                     pool: { name, controller: controller.hostName, group: groupName, roleId,
                         joinSecretPrefix: `arn:${p}:secretsmanager:${r}:${a}:secret:open-workspaces/pool/${name}/`,
                         hook: DRAIN_HOOK, instanceHourlyCents: args.instanceHourlyCents, diskMonthlyCentsPerGib: args.diskMonthlyCentsPerGib },

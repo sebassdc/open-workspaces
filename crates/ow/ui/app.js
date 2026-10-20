@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-let data = {workspaces: [], snapshots: [], stats: {}}, selected = null, busy = false, dialogOperation = null, view = 'machines';
+let data = {workspaces: [], snapshots: [], stats: {}}, loaded = false, selected = null, busy = false, dialogOperation = null, view = 'machines';
 const histories = new Map();
 const imageNames = {alpine:'Alpine Linux',arch:'Arch Linux',ubuntu:'Ubuntu 24.04', 'ubuntu-arm64':'Ubuntu 24.04 ARM64'};
 // Built-in images, then golden images that the runners advertise (`ow image build`).
@@ -18,7 +18,9 @@ async function api(path, body) {
   if (!response.ok || !value.ok) { const error = Error((value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : '')); error.operation = value.operation; throw error; }
   return value.result;
 }
-async function refresh() { try { data = await api('/api/state'); $('host-controls').hidden = !data.host_controls; $('pool-policy').textContent = data.pool_policy || ''; render(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; } }
+async function refresh() { try { data = await api('/api/state'); $('host-controls').hidden = !data.host_controls; loaded = true; render(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; if (!loaded) loadFailed(); } }
+// Without a first state the grid has nothing to show, so it offers a retry instead.
+function loadFailed() { const retry = element('button', 'Retry', 'text-button'); retry.addEventListener('click', refresh); const empty = element('div', 'Could not reach your machines. ', 'empty load-error'); empty.append(retry); $('machine-grid').replaceChildren(empty); }
 function action(label, callback, disabled = false) { const button = element('button', label, 'button secondary'); button.disabled = disabled || busy; button.addEventListener('click', () => Promise.resolve(callback()).catch(() => {})); return button; }
 function select(id) { selected = id; render(); }
 function durability(item) {
@@ -30,7 +32,12 @@ function durability(item) {
 }
 function machine() { return [...data.workspaces, ...(data.shared || [])].find(item => item.id === selected); }
 function setView(next) { view = next; for (const id of ['machines', 'snapshots', 'usage']) $(id + '-view').hidden = id !== view; document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view)); const names = {machines: ['Your machines.', 'A place to build, experiment, and pick up where you left off.', 'Machines'], snapshots: ['Pick up from here.', 'Saved memory and disk state, ready to restore or fork.', 'Snapshots'], usage: ['Room to grow.', 'See what your machines use, and free capacity when you need it.', 'Resource usage']}; $('page-title').textContent = names[view][0]; $('page-description').textContent = names[view][1]; $('breadcrumb').textContent = 'Your sandbox / ' + names[view][2]; }
-function render() {
+// Cards have changing status text; use their machine id alone, and row identity plus label for actions.
+const controlKey = node => node.dataset.machine ?? `${node.closest('[data-key]')?.dataset.key || ''}\n${node.textContent}`;
+function focusKey() { const node = document.activeElement, box = node?.parentElement?.closest('[id]'); return box && node.matches('button, a') ? [box.id, controlKey(node)] : null; }
+function restoreFocus(key) { if (!key || (document.activeElement && document.activeElement !== document.body)) return; const matches = [...($(key[0])?.querySelectorAll('button, a') || [])].filter(other => controlKey(other) === key[1]); if (matches.length === 1) matches[0].focus({preventScroll: true}); }
+function render() { const focused = focusKey(); renderState(); restoreFocus(focused); }
+function renderState() {
   if (data.user) { $('account-email').textContent = data.user.email; $('account-avatar').textContent = data.user.email.slice(0,1).toUpperCase(); }
   if (!selected && data.workspaces.length) selected = data.workspaces[0].id;
   if (selected && !machine()) selected = null;
@@ -38,8 +45,10 @@ function render() {
   const capacity = stats.limit_memory_mib ?? 0;
   $('metric-running').textContent = running; $('metric-total').textContent = `${data.workspaces.length} machines in your sandbox`;
   $('metric-memory').textContent = mib((stats.total_pss_kib || 0) / 1024);
-  $('metric-reserved').textContent = mib(stats.reserved_memory_mib || 0);
-  $('metric-limit').textContent = `of ${mib(capacity)} capacity`;
+  // Owner caps refuse a create; pool-wide totals are shared and change as hosts join.
+  const {caps = {}, usage = {}} = data.owner_limits || {};
+  $('metric-reserved').textContent = `${mib(usage.memory_mib || 0)} of ${mib(caps.memory_mib || 0)}`;
+  $('metric-limit').textContent = `${usage.boxes || 0} of ${caps.boxes || 0} machines · ${usage.cpus || 0} of ${caps.cpus || 0} vCPU · ${usage.disk_gib || 0} of ${caps.disk_gib || 0} GiB disk`;
   $('nav-count').textContent = data.workspaces.length; $('machine-total').textContent = data.workspaces.length;
   $('capacity').hidden = capacity === 0; $('capacity').max = capacity || 1; $('capacity').value = stats.reserved_memory_mib || 0; $('capacity-text').textContent = `${mib(stats.reserved_memory_mib || 0)} / ${mib(capacity)}`;
   $('machine-grid').replaceChildren(); $('shared-grid').replaceChildren(); $('shared-view').hidden = !(data.shared || []).length;
@@ -70,28 +79,28 @@ function render() {
     if (owned && !live) $('detail-actions').append(action('Delete', () => openDialog('delete', current.id), !supports('delete')));
     $('published-ports').replaceChildren();
     for (const port of current.published_ports || []) {
-      const row = element('span', `Port ${port.port}`, 'actions'), link = element('a', 'Open preview', 'button secondary');
+      const row = element('span', `Port ${port.port}`, 'actions'), link = element('a', 'Open preview', 'button secondary'); row.dataset.key = port.port;
       link.href = port.url; link.target = '_blank'; link.rel = 'noopener noreferrer'; row.append(link);
       if (owned) row.append(action('Unpublish', () => operate({op:'unpublish',id:current.id,port:port.port})));
       $('published-ports').append(row);
     }
     $('shared-with').replaceChildren(); $('shared-with').hidden = !(current.shared_with || []).length;
-    for (const grant of current.shared_with || []) { const row = element('span', `Shared with ${grant.email} · ${grant.role} `); row.append(action('Unshare', () => operate({op: 'unshare', id: current.id, with: grant.email}))); $('shared-with').append(row); }
+    for (const grant of current.shared_with || []) { const row = element('span', `Shared with ${grant.email} · ${grant.role} `); row.dataset.key = grant.email; row.append(action('Unshare', () => operate({op: 'unshare', id: current.id, with: grant.email}))); $('shared-with').append(row); }
     $('run-command').disabled = !live || busy; $('command').disabled = !live || busy;
     $('console-output').textContent = histories.get(current.id) || (live ? 'Ready. Run a command to get started.\n' : 'This machine is asleep or stopped. Start it to run commands.\n');
   }
   $('snapshot-list').replaceChildren();
   for (const item of data.snapshots.slice().reverse()) {
-    const row = element('article', undefined, 'snapshot-row'), info = element('div'); info.append(element('h3', item.name), element('p', item.state === 'ready' ? `${item.workspace} · ${mib(item.memory_mib)} · memory + disk` : item.state === 'failed' ? 'Capture failed. Retry from the running machine.' : `Capture ${item.state || 'pending'}. Check operation status before retrying.`));
+    const row = element('article', undefined, 'snapshot-row'), info = element('div'); row.dataset.key = `${item.workspace}/${item.name}`; info.append(element('h3', item.name), element('p', item.state === 'ready' ? `${item.workspace} · ${mib(item.memory_mib)} · memory + disk` : item.state === 'failed' ? 'Capture failed. Retry from the running machine.' : `Capture ${item.state || 'pending'}. Check operation status before retrying.`));
     const buttons = element('div', undefined, 'actions'); if (item.state === 'ready') buttons.append(action('Fork a machine', () => openDialog('fork', item.workspace, item.name)), action('Restore', () => openDialog('restore', item.workspace, item.name)));
     row.append(info, buttons); $('snapshot-list').append(row);
   }
   if (!data.snapshots.length) $('snapshot-list').append(element('div', 'No checkpoints yet. Select a running machine and capture a snapshot.', 'empty'));
   $('host-node-list').replaceChildren();
   if(data.host_controls) for(const node of (data.nodes||[]).filter(n=>!n.revoked)) {
-    const row=element('div'); row.append(element('span',`${node.id} · ${node.online?'online':'offline'} · ${mib(node.memory_mib)} `),action('Adjust budget',()=>hostDialog('budget',node.id))); $('host-node-list').append(row);
+    const row=element('div'); row.dataset.key=node.id; row.append(element('span',`${node.id} · ${node.online?'online':'offline'} · ${mib(node.memory_mib)} `),action('Adjust budget',()=>hostDialog('budget',node.id))); $('host-node-list').append(row);
   }
-  $('create').disabled = busy;
+  $('create').disabled = busy || !loaded;
 }
 function field(name, label, value, choices) { const wrapper = element('label', label, 'field'); let input; if (choices) { input = element('select'); for (const [v, title] of choices) { const option = element('option', title); option.value = v; input.append(option); } } else { input = element('input'); input.pattern = '[A-Za-z0-9_-]{1,32}'; input.maxLength = 32; input.required = true; input.autocomplete = 'off'; } input.name = name; if (value) input.value = value; wrapper.append(input); return wrapper; }
 function openDialog(op, id, snapshot) {
@@ -189,7 +198,7 @@ $('copy-install').addEventListener('click', async () => {
 });
 
 let hostMode='invite';
-function hostDialog(mode,node='') { hostMode=mode; $('host-description').textContent=mode==='budget'?'Set owner ceilings for this enrolled host. Its operator must separately consent to a stopped-host configuration. Lowering requires online idle inventory with no unresolved demand.':'Share this one-use invitation privately. Host participation grants no human dashboard login.'; $('host-title').textContent=mode==='budget'?'Adjust enrolled host budget':'Invite a trusted Linux host'; $('host-form').elements.ttl.parentElement.hidden=mode==='budget'; $('host-submit').textContent=mode==='budget'?'Save owner limits':'Create invitation'; $('host-form').reset(); $('host-envelope').value=''; $('host-envelope').hidden=true; $('host-instructions').hidden=true; $('host-submit').disabled=false; $('host-error').textContent=''; $('host-form').elements.node.value=node; const limits=(data.nodes||[]).find(n=>n.id===node)?.owner_limits; if(limits) for(const key of ['memory','slots','cpus']) $('host-form').elements[key].value=limits[key]; $('host-dialog').showModal(); }
+function hostDialog(mode,node='') { hostMode=mode; $('host-description').textContent=mode==='budget'?'Set owner ceilings for this enrolled host. Its operator must separately consent to a stopped-host configuration. Lowering requires online idle inventory with no unresolved demand.':`Share this one-use invitation privately. ${data.pool_policy || 'Host participation grants no human dashboard login.'}`; $('host-title').textContent=mode==='budget'?'Adjust enrolled host budget':'Invite a trusted Linux host'; $('host-form').elements.ttl.parentElement.hidden=mode==='budget'; $('host-submit').textContent=mode==='budget'?'Save owner limits':'Create invitation'; $('host-form').reset(); $('host-envelope').value=''; $('host-envelope').hidden=true; $('host-instructions').hidden=true; $('host-submit').disabled=false; $('host-error').textContent=''; $('host-form').elements.node.value=node; const limits=(data.nodes||[]).find(n=>n.id===node)?.owner_limits; if(limits) for(const key of ['memory','slots','cpus']) $('host-form').elements[key].value=limits[key]; $('host-dialog').showModal(); }
 $('host-invite').addEventListener('click',()=>hostDialog('invite'));
 $('host-budget').addEventListener('click',()=>hostDialog('budget'));
 function clearHostInvitation() { $('host-envelope').value=''; $('host-envelope').hidden=true; $('host-instructions').hidden=true; }

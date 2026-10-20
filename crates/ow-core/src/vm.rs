@@ -14,6 +14,72 @@ use std::{
 
 pub use crate::common::{nonce, shell_quote};
 
+/// `cgroup.procs` of the guests' cgroup, once the worker split its delegated cgroup.
+static GUEST_CGROUP: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+
+/// The worker's own cgroup when systemd delegated it (`Delegate=` in its unit).
+pub fn delegated_cgroup() -> Result<PathBuf> {
+    let own = std::fs::read_to_string("/proc/self/cgroup")?;
+    let path = own
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .context("cgroup v2 required")?;
+    Ok(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
+}
+
+/// Splits the worker's delegated cgroup: the worker moves into `control` (CPU weight
+/// 1000, protected memory) and every VMM starts in `guests` (weight 100), so contention
+/// and memory reclaim fall on the guests before the worker that controls them.
+pub fn isolate_guests(cgroup: &Path) -> Result<()> {
+    let procs = split_cgroup(cgroup)?;
+    let _ = GUEST_CGROUP.set(std::ffi::CString::new(
+        procs.into_os_string().into_encoded_bytes(),
+    )?);
+    Ok(())
+}
+fn split_cgroup(cgroup: &Path) -> Result<PathBuf> {
+    let (control, guests) = (cgroup.join("control"), cgroup.join("guests"));
+    for dir in [&control, &guests] {
+        match std::fs::create_dir(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            other => other?,
+        }
+    }
+    // A cgroup that enables controllers for its children may hold no process itself.
+    for pid in std::fs::read_to_string(cgroup.join("cgroup.procs"))?.lines() {
+        // One that exited meanwhile is gone; any other left behind fails the next write.
+        let _ = std::fs::write(control.join("cgroup.procs"), pid);
+    }
+    std::fs::write(cgroup.join("cgroup.subtree_control"), "+cpu +memory")?;
+    std::fs::write(control.join("cpu.weight"), "1000")?;
+    std::fs::write(control.join("memory.min"), (64u64 << 20).to_string())?;
+    std::fs::write(control.join("memory.low"), (256u64 << 20).to_string())?;
+    Ok(guests.join("cgroup.procs"))
+}
+
+/// Runs in a forked VMM before exec (async-signal-safe calls only): joins the guests'
+/// cgroup when there is one and raises its OOM score, so under memory pressure the kernel
+/// kills a VM before the worker (-900 in its unit) or the controller and agent.
+fn as_guest() -> std::io::Result<()> {
+    let write = |path: *const libc::c_char, value: &[u8]| unsafe {
+        let fd = libc::open(path, libc::O_WRONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let written = libc::write(fd, value.as_ptr().cast(), value.len());
+        let error = std::io::Error::last_os_error();
+        libc::close(fd);
+        if written != value.len() as isize {
+            return Err(error);
+        }
+        Ok(())
+    };
+    if let Some(procs) = GUEST_CGROUP.get() {
+        write(procs.as_ptr(), b"0")?;
+    }
+    write(c"/proc/self/oom_score_adj".as_ptr(), b"500")
+}
+
 pub fn reflink(source: &Path, destination: &Path) -> Result<()> {
     let src = File::open(source)?;
     let dst = OpenOptions::new()
@@ -191,7 +257,7 @@ impl Vm {
                     if libc::getppid() != parent_pid as i32 {
                         return Err(std::io::Error::other("worker exited during spawn"));
                     }
-                    Ok(())
+                    as_guest()
                 });
             }
             let mut child = command.spawn()?;
@@ -1025,5 +1091,36 @@ mod memory_tests {
         assert!(!staging.join("memory.diff").exists());
         assert!(matches!(vm.memory_base, MemoryBase::Image(_)));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod guest_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn a_vmm_starts_with_an_oom_score_above_the_worker() {
+        let mut command = Command::new("cat");
+        command.arg("/proc/self/oom_score_adj");
+        unsafe { command.pre_exec(as_guest) };
+        let out = command.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "500");
+    }
+
+    #[test]
+    fn the_worker_moves_into_control_and_protects_it() {
+        // A plain directory stands in for the delegated cgroup: the same writes land.
+        let cgroup = std::env::temp_dir().join(format!("ow-cg-{}", nonce().unwrap()));
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), "4242\n").unwrap();
+        let procs = split_cgroup(&cgroup).unwrap();
+        let read = |p: &str| std::fs::read_to_string(cgroup.join(p)).unwrap();
+        assert_eq!(read("control/cgroup.procs"), "4242");
+        assert_eq!(read("cgroup.subtree_control"), "+cpu +memory");
+        assert_eq!(read("control/cpu.weight"), "1000");
+        assert_eq!(read("control/memory.low"), (256u64 << 20).to_string());
+        assert!(cgroup.join("guests").is_dir());
+        assert_eq!(procs, cgroup.join("guests/cgroup.procs"));
+        std::fs::remove_dir_all(cgroup).unwrap();
     }
 }
