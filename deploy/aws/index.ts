@@ -99,12 +99,19 @@ export interface HostArgs {
     idleMinutes?: pulumi.Input<number>;
     /** CPU admission ratio: 1 (default) or 2 for dev workloads; RAM, slots and disk are unchanged. */
     vcpuOvercommit?: pulumi.Input<number>;
+    /** Thousandths of a vCPU box admission never claims, kept for the controller and node agent
+     * (before the ratio applies). Default: 1000 on a Host, 500 on a Runner. */
+    hostReserveCpuMillis?: pulumi.Input<number>;
+    /** RAM (MiB) box admission never claims. Default: 2048 on a Host, 1024 on a Runner. */
+    hostReserveMemoryMib?: pulumi.Input<number>;
 }
 
 /** A runner host: Host inputs except dashboard, role and GC rights, plus the controller it joins. */
 export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability" | "role" | "storeGc"> {
     // The package analyzer loses optional types inherited through Omit.
     vcpuOvercommit?: pulumi.Input<number>;
+    hostReserveCpuMillis?: pulumi.Input<number>;
+    hostReserveMemoryMib?: pulumi.Input<number>;
     dataVolumeSizeGib?: pulumi.Input<number>;
     dataVolumeIops?: pulumi.Input<number>;
     dataVolumeThroughput?: pulumi.Input<number>;
@@ -212,6 +219,8 @@ export interface HostConfigInputs {
     recoveryPoints?: boolean;
     idleMinutes: number;
     vcpuOvercommit?: number;
+    hostReserveCpuMillis?: number;
+    hostReserveMemoryMib?: number;
     directMac?: string;
 }
 
@@ -258,6 +267,15 @@ export function hostConfig(c: HostConfigInputs): object {
     if (vcpuOvercommit !== 1 && vcpuOvercommit !== 2) {
         throw new Error("vcpuOvercommit must be 1 or 2");
     }
+    // Unset keeps the role's default, chosen on the host (deploy/aws/host/ow_host.py RESERVE).
+    const hostReserve: { [key: string]: number } = {};
+    for (const [key, value, high] of [["cpuMillis", c.hostReserveCpuMillis, 64000], ["memoryMib", c.hostReserveMemoryMib, 1048576]] as const) {
+        if (value === undefined) continue;
+        if (!Number.isInteger(value) || value < 0 || value > high) {
+            throw new Error(`hostReserve ${key} must be a whole number from 0 to ${high}`);
+        }
+        hostReserve[key] = value;
+    }
     if (c.recoveryPoints && !backup) throw new Error("recoveryPoints needs backupUrl");
     if (!Number.isInteger(c.idleMinutes) || c.idleMinutes < 0 || c.idleMinutes > 10080) {
         throw new Error(`idleMinutes must be a whole number from 0 to 10080, not ${c.idleMinutes}`);
@@ -288,6 +306,7 @@ export function hostConfig(c: HostConfigInputs): object {
         backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule, ...(c.recoveryPoints ? { recovery: true } : {}) },
         idleMinutes: c.idleMinutes,
         vcpuOvercommit,
+        ...(Object.keys(hostReserve).length ? { hostReserve } : {}),
         ...(c.runner ? { runner: c.runner } : {}),
         ...(c.pool ? { pool: c.pool } : {}),
     };
@@ -514,12 +533,13 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                     runner,
                     directInterface ? directInterface.macAddress : pulumi.output(""),
                     pulumi.all([args.storeUrl ?? "", args.imageArtifacts ?? {}]),
-                    hostRole,
+                    pulumi.all([hostRole, args.hostReserveCpuMillis, args.hostReserveMemoryMib]),
                 ])
-                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints], runner, directMac, [storeUrl, imageArtifacts], role]) =>
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints], runner, directMac, [storeUrl, imageArtifacts], [role, hostReserveCpuMillis, hostReserveMemoryMib]]) =>
                     JSON.stringify(hostConfig({
                         role, repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
                         dashboardLogins: logins, dashboardCapability: capability, developerImages: images, backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints, runner, directMac, storeUrl, imageArtifacts,
+                        hostReserveCpuMillis, hostReserveMemoryMib,
                     })),
                 ),
             tags,
