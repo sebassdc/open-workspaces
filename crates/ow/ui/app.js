@@ -57,7 +57,7 @@ function snapshotStatus(item) {
   if (item.failed_at) line.title = fullTime(item.failed_at);
   return line;
 }
-function machine() { return [...data.workspaces, ...(data.shared || [])].find(item => item.id === selected); }
+function machine() { return [...data.workspaces, ...(data.shared || []), ...(data.pool || [])].find(item => item.id === selected); }
 function setView(next) { if (next !== view) notice(''); view = next; for (const id of ['machines', 'snapshots', 'usage']) $(id + '-view').hidden = id !== view; document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view)); const names = {machines: ['Your machines.', 'A place to build, experiment, and pick up where you left off.', 'Machines'], snapshots: ['Pick up from here.', 'Saved memory and disk state, ready to restore or fork.', 'Snapshots'], usage: ['Room to grow.', 'See what your machines use, and free capacity when you need it.', 'Resource usage']}; $('page-title').textContent = names[view][0]; $('page-description').textContent = names[view][1]; $('breadcrumb').textContent = 'Your sandbox / ' + names[view][2]; }
 // Cards have changing status text; use their machine id alone, and row identity plus label for actions.
 const controlKey = node => node.dataset.machine ?? `${node.closest('[data-key]')?.dataset.key || ''}\n${node.textContent}`;
@@ -79,17 +79,17 @@ function renderState() {
   $('metric-limit').textContent = `${usage.boxes || 0} of ${caps.boxes || 0} machines · ${usage.cpus || 0} of ${caps.cpus || 0} vCPU · ${usage.disk_gib || 0} of ${caps.disk_gib || 0} GiB disk`;
   $('nav-count').textContent = data.workspaces.length; $('machine-total').textContent = data.workspaces.length;
   $('capacity').hidden = capacity === 0; $('capacity').max = capacity || 1; $('capacity').value = stats.reserved_memory_mib || 0; $('capacity-text').textContent = `${mib(stats.reserved_memory_mib || 0)} / ${mib(capacity)}`;
-  $('machine-grid').replaceChildren(); $('shared-grid').replaceChildren(); $('shared-view').hidden = !(data.shared || []).length;
-  for (const item of [...data.workspaces, ...(data.shared || [])]) {
+  $('machine-grid').replaceChildren(); $('shared-grid').replaceChildren(); $('pool-grid').replaceChildren(); $('shared-view').hidden = !(data.shared || []).length; $('pool-view').hidden = !(data.pool || []).length;
+  for (const item of [...data.workspaces, ...(data.shared || []), ...(data.pool || [])]) {
     const card = element('button', undefined, 'machine-card' + (item.id === selected ? ' selected' : '')); card.dataset.machine = item.id; card.setAttribute('aria-pressed', String(item.id === selected));
     const top = element('div', undefined, 'card-top'); top.append(element('span', '▣', 'machine-icon'), element('span', item.state, `state ${['running','hibernated','stopped','failed'].includes(item.state) ? item.state : 'stopped'}`));
     const meta = element('div', undefined, 'card-meta'); meta.append(element('span', `${item.vcpu_count || 1} vCPU`), element('span', mib(item.memory_mib)));
     card.append(top, element('h3', item.id), meta, element('span', diskUsage(item), 'card-lineage'), element('span', item.source ? `Forked from ${item.source}` : (imageNames[item.image || 'alpine'] || 'Linux machine'), 'card-lineage')); if (item.node) card.append(element('span', `${item.node}${item.node_online === false ? ' · offline' : ''}`, 'card-lineage'));
-    if (item.owner) card.append(element('span', `Shared by ${item.owner} · ${item.role}`, 'card-lineage'));
+    if (item.owner) card.append(element('span', item.role === 'pool-admin' ? `Owned by ${item.owner}` : `Shared by ${item.owner} · ${item.role}`, 'card-lineage'));
     const [status, warning, title] = durability(item), recovery = element('span', status, 'card-lineage' + (warning ? ' recovery-warning' : ''));
     recovery.title = title;
     card.append(recovery);
-    card.addEventListener('click', () => select(item.id)); $(item.owner ? 'shared-grid' : 'machine-grid').append(card);
+    card.addEventListener('click', () => select(item.id)); $(item.role === 'pool-admin' ? 'pool-grid' : item.owner ? 'shared-grid' : 'machine-grid').append(card);
   }
   if (!data.workspaces.length) $('machine-grid').append(element('div', 'Your first machine is one click away. Choose “New machine” to get started.', 'empty'));
   const current = machine(); $('detail').hidden = !current;
@@ -98,8 +98,10 @@ function renderState() {
     const live = current.state === 'running';
     const operations=(data.nodes||[]).find(n=>n.id===current.node)?.capabilities?.operations;
     const supports=op=>!operations || operations.includes(op);
-    const owned = !current.role, admin = owned || current.role === 'admin';
-    if (live) { $('detail-actions').append(action('Open Terminal', () => openTerminal(current.id))); if (admin) $('detail-actions').append(action('Snapshot', () => openDialog('snapshot', current.id), !supports('snapshot'))); $('detail-actions').append(action('Fork', () => openDialog('fork', current.id), !supports('fork')), action('Hibernate', () => operate({op: 'hibernate', id: current.id}), !supports('hibernate'))); if (admin) $('detail-actions').append(action('Stop', () => openDialog('stop', current.id))); }
+    const owned = !current.role, admin = owned || current.role === 'admin', poolOnly = current.role === 'pool-admin';
+    // A pool admin reaches another owner's box only to fork or transfer it.
+    if (poolOnly) { if (live) $('detail-actions').append(action('Fork', () => openDialog('fork', current.id), !supports('fork'))); }
+    else if (live) { $('detail-actions').append(action('Open Terminal', () => openTerminal(current.id))); if (admin) $('detail-actions').append(action('Snapshot', () => openDialog('snapshot', current.id), !supports('snapshot'))); $('detail-actions').append(action('Fork', () => openDialog('fork', current.id), !supports('fork')), action('Hibernate', () => operate({op: 'hibernate', id: current.id}), !supports('hibernate'))); if (admin) $('detail-actions').append(action('Stop', () => openDialog('stop', current.id))); }
     else if (current.state !== 'missing' && !current.unmade) { $('detail-actions').append(action(current.state === 'hibernated' ? 'Resume machine' : 'Start machine', () => operate({op: 'start', id: current.id}))); }
     if (owned && current.state === 'stopped') $('detail-actions').append(action('Resize', () => openDialog('resize', current.id), !supports('resize')));
     if (owned && data.previews) $('detail-actions').append(action('Publish port', () => openDialog('publish', current.id), !supports('tunnel')));
@@ -115,7 +117,7 @@ function renderState() {
     }
     $('shared-with').replaceChildren(); $('shared-with').hidden = !(current.shared_with || []).length;
     for (const grant of current.shared_with || []) { const row = element('span', `Shared with ${grant.email} · ${grant.role} `); row.dataset.key = grant.email; row.append(action('Unshare', () => operate({op: 'unshare', id: current.id, with: grant.email}))); $('shared-with').append(row); }
-    $('run-command').disabled = !live || busy; $('command').disabled = !live || busy;
+    $('run-command').disabled = !live || busy || poolOnly; $('command').disabled = !live || busy || poolOnly;
     $('console-output').textContent = histories.get(current.id) || (live ? 'Ready. Run a command to get started.\n' : 'This machine is asleep or stopped. Start it to run commands.\n');
   }
   $('snapshot-list').replaceChildren();

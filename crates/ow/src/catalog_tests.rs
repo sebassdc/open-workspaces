@@ -2736,6 +2736,7 @@ fn transfer_fork_reserves_child_identity_and_releases_only_its_attempt() {
     intent.child = Some(Child {
         id: "m-child".into(),
         name: "child".into(),
+        owner: None,
     });
     let t = c.begin_transfer(user, "fork", &intent).unwrap();
     assert_eq!(c.physical(user, "machine", "child").unwrap(), "m-child");
@@ -2805,6 +2806,7 @@ fn transfer_permissions_capture_lineage_and_policy_generation_fail_closed() {
     shared.child = Some(Child {
         id: "m-shared-child".into(),
         name: "copy".into(),
+        owner: None,
     });
     let fork = c.begin_transfer(guest, "fork", &shared).unwrap();
     c.advance_transfer(
@@ -3050,6 +3052,7 @@ fn transfer_schema_four_keeps_store_roots_and_failed_preparation_rolls_back() {
     fork.child = Some(Child {
         id: "m-rejected".into(),
         name: "rejected".into(),
+        owner: None,
     });
     assert!(c.begin_transfer(user, "no-capacity", &fork).is_err());
     assert!(c.physical(user, "machine", "rejected").is_err());
@@ -3152,6 +3155,7 @@ fn transfer_import_pins_capture_and_commit_rechecks_authority_and_grants() {
     intent.child = Some(Child {
         id: "m-revoked-child".into(),
         name: "revoked-child".into(),
+        owner: None,
     });
     let fork = c.begin_transfer(guest, "shared-fork", &intent).unwrap();
     assert!(fork.epoch > t.epoch + 1);
@@ -3239,6 +3243,7 @@ fn aborted_fork_does_not_leak_grants_to_reused_id() {
         intent.child = Some(Child {
             id: "m-reused".into(),
             name: "first-child".into(),
+            owner: None,
         });
         let first = c.begin_transfer(user, "first-fork", &intent).unwrap();
         c.operation(
@@ -3268,6 +3273,7 @@ fn aborted_fork_does_not_leak_grants_to_reused_id() {
         intent.child = Some(Child {
             id: "m-reused".into(),
             name: "different-child".into(),
+            owner: None,
         });
         intent.machine = "owner@example.test/box".into();
         let second = c
@@ -3306,6 +3312,7 @@ fn aborted_fork_does_not_leak_grants_to_reused_id() {
                 child: Some(Child {
                     id: "m-unshared-copy".into(),
                     name: "unshared-copy".into(),
+                    owner: None,
                 }),
                 ..intent.clone()
             },
@@ -3333,6 +3340,7 @@ fn aborted_fork_name_is_reusable_by_legacy_create() {
         intent.child = Some(Child {
             id: "m-aborted".into(),
             name: "child".into(),
+            owner: None,
         });
         let t = c.begin_transfer(user, "fork-abort", &intent).unwrap();
         c.advance_transfer(
@@ -3367,6 +3375,7 @@ fn aborted_fork_cleanup_rolls_back_with_an_uncertain_target() {
     intent.child = Some(Child {
         id: "m-cleanup".into(),
         name: "child".into(),
+        owner: None,
     });
     let t = c.begin_transfer(user, "fork-cleanup", &intent).unwrap();
     c.operation(
@@ -3966,6 +3975,7 @@ fn named_fork_shape_is_rechecked_before_atomic_admission() {
     input.child = Some(Child {
         id: "child-id".into(),
         name: "child".into(),
+        owner: None,
     });
     input.memory_mib = 512;
     assert!(
@@ -4433,6 +4443,7 @@ fn pool_admins_create_and_fork_for_others_and_owners_fork_for_others() {
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();
     fake.worker("alpha");
     quota_node(&fake);
+    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET slots=16,capabilities=json_set(capabilities,'$.slots',16,'$.vcpus',16)",[]).unwrap();
     c.pool_admins = vec!["admin@example.test".into()];
     let a = c.user(&identity("alice")).unwrap();
     let s = c.user(&identity("sam")).unwrap();
@@ -4537,6 +4548,24 @@ fn pool_admins_create_and_fork_for_others_and_owners_fork_for_others() {
     )
     .unwrap();
     assert_eq!(c.state(a).unwrap()["audit"][0]["machine"], "peek-two");
+    // A pool admin forks the owner's named snapshot into someone else's account, and sees
+    // other owners' boxes listed; a non-admin does not.
+    c.operation(a, json!({"op":"snapshot","id":"gift","name":"saved"}))
+        .unwrap();
+    let mut from_snapshot = fork("alice@example.test/gift", "from-saved");
+    from_snapshot["snapshot"] = json!("saved");
+    c.operation(p, from_snapshot).unwrap();
+    assert!(c.physical(e, "machine", "from-saved").is_ok());
+    assert!(
+        c.state(p).unwrap()["pool"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "alice@example.test/keyed"
+                && m["role"] == "pool-admin"
+                && m["owner"] == "alice@example.test")
+    );
+    assert_eq!(c.state(a).unwrap()["pool"], json!([]));
     // A sharee's own fork is no admin action.
     c.operation(
         s,
@@ -4553,7 +4582,7 @@ fn pool_admins_create_and_fork_for_others_and_owners_fork_for_others() {
     assert!(c.operation(a, fork("gift", "own")).is_err());
     assert_eq!(
         c.state(e).unwrap()["workspaces"].as_array().unwrap().len(),
-        3
+        4
     );
     // Only create and fork take an owner.
     assert!(
@@ -4563,4 +4592,108 @@ fn pool_admins_create_and_fork_for_others_and_owners_fork_for_others() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn transfer_moves_stored_capture_and_snapshot_authority_to_the_new_owner() {
+    use crate::transfers::*;
+    let (_fake, mut c, user, physical, intent) = transfer_fixture();
+    let bob = c.user(&identity("bob")).unwrap();
+    let snapshot = c.reserve(user, "snapshot", "saved").unwrap();
+    c.db.execute(
+        "UPDATE resources SET node='alpha',metadata=?1 WHERE physical=?2",
+        params![
+            json!({"name":snapshot,"workspace":physical,"state":"ready"}).to_string(),
+            snapshot
+        ],
+    )
+    .unwrap();
+    c.db.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,digest,store_url) VALUES('stored-snapshot','snapshot',?1,?2,?3,'stored',?4,'fixture://store')",params![user,physical,snapshot,"b".repeat(64)]).unwrap();
+    // The roots store GC keeps: named snapshots joined to their artifacts by owner.
+    let roots = |c: &Catalog| -> i64 {
+        c.db.query_row("SELECT COUNT(*) FROM resources r JOIN artifacts a ON a.kind='snapshot' AND a.owner=r.owner AND a.local_name=r.physical WHERE r.kind='snapshot'",[],|r|r.get(0)).unwrap()
+    };
+    assert_eq!(roots(&c), 1);
+    c.operation(
+        user,
+        json!({"op":"transfer","id":"box","to":"bob@example.test"}),
+    )
+    .unwrap();
+    assert_eq!(roots(&c), 1);
+    assert_eq!(c.physical(bob, "snapshot", "saved").unwrap(), snapshot);
+    c.transfer_capture("capture", bob, &physical).unwrap();
+    assert!(c.transfer_capture("capture", user, &physical).is_err());
+    // The new owner moves the box with its stored capture; the old owner cannot.
+    assert!(c.begin_transfer(user, "old-move", &intent).is_err());
+    c.begin_transfer(bob, "move", &intent).unwrap();
+}
+
+#[test]
+fn managed_fork_for_another_owner_charges_and_audits_them() {
+    use crate::transfers::*;
+    let (_fake, mut c, user, physical, _) = completed_restore_fixture();
+    let bob = c.user(&identity("bob")).unwrap();
+    let intent = |id: &str, name: &str| Intent {
+        kind: Kind::Fork,
+        machine: "box".into(),
+        target: Some("beta".into()),
+        capture: Some("capture".into()),
+        child: Some(Child {
+            id: id.into(),
+            name: name.into(),
+            owner: Some(bob),
+        }),
+        snapshot: None,
+        memory_mib: 256,
+        cpus: 1,
+        disk_bytes: 8 * common::GIB,
+        accept_cold: false,
+        explicit_start: false,
+    };
+    // An aborted attempt removes the reserved child from the recipient again.
+    let t = c
+        .begin_transfer(user, "gift-1", &intent("m-gift-1", "gift"))
+        .unwrap();
+    assert_eq!(c.physical(bob, "machine", "gift").unwrap(), "m-gift-1");
+    assert!(c.physical(user, "machine", "gift").is_err());
+    assert_eq!(c.state(bob).unwrap()["owner_limits"]["usage"]["boxes"], 1);
+    c.advance_transfer(
+        t.id,
+        t.epoch,
+        Step::Preparing,
+        Step::Failed,
+        &Evidence::default(),
+    )
+    .unwrap();
+    assert!(c.physical(bob, "machine", "gift").is_err());
+    let t = c
+        .begin_transfer(user, "gift-2", &intent("m-gift-2", "gift"))
+        .unwrap();
+    prepare_transfer(&c, &t);
+    c.commit_transfer(t.id, t.epoch).unwrap();
+    for (from, to) in [
+        (Step::Committed, Step::Started),
+        (Step::Started, Step::Succeeded),
+    ] {
+        c.advance_transfer(t.id, t.epoch, from, to, &Evidence::default())
+            .unwrap();
+    }
+    assert_eq!(c.physical(bob, "machine", "gift").unwrap(), "m-gift-2");
+    assert!(c.managed_placement(&physical).unwrap().is_some());
+    let audit = c.state(bob).unwrap()["audit"][0].clone();
+    assert_eq!(
+        (
+            audit["action"].as_str(),
+            audit["machine"].as_str(),
+            audit["by"].as_str(),
+            audit["source"].as_str()
+        ),
+        (
+            Some("fork"),
+            Some("gift"),
+            Some("owner@example.test"),
+            Some("box")
+        )
+    );
+    assert_eq!(c.state(user).unwrap()["audit"][0]["to"], "bob@example.test");
 }

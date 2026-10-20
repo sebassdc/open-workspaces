@@ -104,8 +104,8 @@ fn validated(bytes: &[u8]) -> Result<Value> {
     }
     if let Some(owner) = operation.owner {
         ensure!(
-            operation.op == "create" || operation.op == "fork" && request.get("node").is_none(),
-            "only create and same-runner fork take an owner"
+            matches!(operation.op.as_str(), "create" | "fork"),
+            "only create and fork take an owner"
         );
         crate::common::email(&owner.to_ascii_lowercase())?;
         request["owner"] = json!(owner);
@@ -501,7 +501,7 @@ pub async fn handle(
         }
     };
     // A moved child's ordinary fork keeps its existing use-role permission and defaults to its runner.
-    if operation["op"] == "fork" && !operation["node"].is_string() && operation["owner"].is_null() {
+    if operation["op"] == "fork" && !operation["node"].is_string() {
         let target = catalog.as_ref().and_then(|shared| {
             let mut c=shared.lock().ok()?;
             let user=c.user(&identity).ok()?;
@@ -724,7 +724,6 @@ mod tests {
             json!({"op":"transfer","id":"box"}),
             json!({"op":"transfer","id":"box","to":"bob"}),
             json!({"op":"create","id":"box","owner":"bob"}),
-            json!({"op":"fork","id":"box","child":"copy","owner":"bob@example.test","node":"n","operation_key":"k"}),
             json!({"op":"start","id":"box","owner":"bob@example.test"}),
         ] {
             assert!(validated(bad.to_string().as_bytes()).is_err(), "{bad}");

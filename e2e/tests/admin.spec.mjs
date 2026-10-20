@@ -62,3 +62,28 @@ test('pool admin creates a machine for someone, who forks it for a teammate', as
   await deleteMachines(mate.context);
   await mate.context.close();
 });
+
+test('pool admin sees and transfers another owner\'s unshared machine', async ({dashboard: page, browser, user}) => {
+  await machines(page, 'team-box');
+  const next = `${user}-heir`;
+  const {context, page: admin} = await as(browser, 'pooladmin');
+  const box = card(admin, `${user}@example.test/team-box`);
+  await expect(box).toContainText(`Owned by ${user}@example.test`);
+  await box.click();
+  // Pool admin reaches it only to fork or transfer it.
+  for (const name of ['Open Terminal', 'Stop', 'Share', 'Rename', 'Delete', 'Hibernate']) await expect(detailAction(admin, name)).toHaveCount(0);
+  await detailAction(admin, 'Transfer').click();
+  await admin.getByLabel('New owner email').fill(`${next}@example.test`);
+  await admin.getByRole('button', {name: 'Transfer machine'}).click();
+  await expect(notice(admin)).toHaveText(`Machine transferred to ${next}@example.test.`);
+  await expect(card(admin, `${next}@example.test/team-box`)).toBeVisible();
+  await context.close();
+
+  await page.reload();
+  await expect(card(page, 'team-box')).toHaveCount(0);
+  await expect(page.locator('#audit-list')).toContainText(`pooladmin@example.test transferred team-box from ${user}@example.test to ${next}@example.test`);
+  const heir = await as(browser, next);
+  await expect(card(heir.page, 'team-box')).toBeVisible();
+  await deleteMachines(heir.context);
+  await heir.context.close();
+});

@@ -615,7 +615,7 @@ impl Catalog {
         Ok(self.access(user, address, op)?.0)
     }
     /// `machine`, with the role it was reached by: owner, a grant's role, or pool-admin.
-    fn access(&self, user: i64, address: &str, op: &str) -> Result<(String, String)> {
+    pub(crate) fn access(&self, user: i64, address: &str, op: &str) -> Result<(String, String)> {
         let Some((owner, name)) = address.split_once('/') else {
             return Ok((self.physical(user, "machine", address)?, "owner".into()));
         };
@@ -656,7 +656,7 @@ impl Catalog {
     }
     /// The user a login email names, in the caller's identity namespace. An email nobody has
     /// used yet is reserved, as for sharing: its first verified login binds it.
-    fn user_by_email(&self, user: i64, email: &str) -> Result<i64> {
+    pub(crate) fn user_by_email(&self, user: i64, email: &str) -> Result<i64> {
         let email = email.to_ascii_lowercase();
         common::email(&email)?;
         let issuer: String =
@@ -692,6 +692,63 @@ impl Catalog {
     ) -> Result<()> {
         self.db.execute("INSERT INTO audit(operation,actor,action,machine,source,from_owner,to_owner,keep_access) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(operation) DO NOTHING",params![operation,actor,action,machine,source,from,to,keep_access])?;
         Ok(())
+    }
+    /// Only a machine's owner or a pool admin forks it into someone else's name space.
+    pub(crate) fn fork_for_others(&self, user: i64, address: &str) -> Result<()> {
+        let (_, role) = self.access(user, address, "fork")?;
+        if !matches!(role.as_str(), "owner" | "pool-admin") && !self.pool_admin(user)? {
+            return Err(limits::Rejection(
+                "only the machine's owner or a pool admin can fork it for someone else".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+    /// Whose named snapshots of a machine a fork may start from: a pool admin uses the box
+    /// owner's, everyone else their own.
+    pub(crate) fn snapshot_owner(&self, user: i64, address: &str) -> Result<i64> {
+        let (physical, role) = self.access(user, address, "fork")?;
+        if role == "owner" || !self.pool_admin(user)? {
+            return Ok(user);
+        }
+        Ok(self.db.query_row(
+            "SELECT owner FROM resources WHERE kind='machine' AND physical=?1",
+            [physical],
+            |r| r.get(0),
+        )?)
+    }
+    /// Audit a fork when it made a box for someone else, or a pool admin forked another
+    /// owner's box (even one shared with them). `operation` is the requester's.
+    fn audit_fork(&self, operation: i64, source: &str, child: &str) -> Result<bool> {
+        let actor: i64 = self.db.query_row(
+            "SELECT owner FROM operations WHERE id=?1",
+            [operation],
+            |r| r.get(0),
+        )?;
+        let (from, source): (i64, String) = self.db.query_row(
+            "SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1",
+            [source],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let (to, child): (i64, String) = self.db.query_row(
+            "SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1",
+            [child],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let audited = to != actor || from != actor && self.pool_admin(actor)?;
+        if audited {
+            self.audit(
+                operation,
+                actor,
+                "fork",
+                &child,
+                Some(&source),
+                Some(from),
+                to,
+                false,
+            )?;
+        }
+        Ok(audited)
     }
     fn audit_log(&self, user: i64) -> Result<Value> {
         let mut stmt = self.db.prepare("SELECT CAST(strftime('%s',a.at) AS INTEGER),a.action,a.machine,a.source,ua.email,uf.email,ut.email,a.keep_access FROM audit a JOIN users ua ON ua.id=a.actor LEFT JOIN users uf ON uf.id=a.from_owner JOIN users ut ON ut.id=a.to_owner WHERE ?1 IN (a.actor,a.from_owner,a.to_owner) ORDER BY a.id DESC LIMIT 100")?;
@@ -867,7 +924,9 @@ impl Catalog {
             ensure!(intent.kind.needs_fence() || intent.kind == Kind::Fork || intent.capture.is_some(), "stored capture required");
             let fork_snapshot = if let Some(snapshot) = &intent.snapshot {
                 common::identifier(snapshot)?;
-                Some(c.db.query_row("SELECT physical FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4 AND json_extract(metadata,'$.memory_mib')=?5 AND json_extract(metadata,'$.vcpu_count')=?6 AND json_extract(metadata,'$.disk_bytes')=?7",params![user,snapshot,source_node,source,intent.memory_mib,intent.cpus,intent.disk_bytes as i64],|r|r.get::<_,String>(0)).context("snapshot identity or shape changed during admission")?)
+                // A pool admin forks the box owner's named snapshots; others their own.
+                let snapshots = c.snapshot_owner(user, &intent.machine)?;
+                Some(c.db.query_row("SELECT physical FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4 AND json_extract(metadata,'$.memory_mib')=?5 AND json_extract(metadata,'$.vcpu_count')=?6 AND json_extract(metadata,'$.disk_bytes')=?7",params![snapshots,snapshot,source_node,source,intent.memory_mib,intent.cpus,intent.disk_bytes as i64],|r|r.get::<_,String>(0)).context("snapshot identity or shape changed during admission")?)
             } else { None };
             // Global high-watermark survives aborts, deleted children and controller restarts.
             c.db.execute("INSERT INTO settings(key,value) VALUES('transfer_epoch','0') ON CONFLICT(key) DO NOTHING",[])?;
@@ -879,7 +938,7 @@ impl Catalog {
                 common::identifier(&child.id)?;
                 common::identifier(&child.name)?;
                 // INSERT, never reserve/reuse: an existing ID or logical name is a conflict.
-                c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'machine',?2,?3,'{\"state\":\"pending\"}','')",params![user,child.name,child.id])?;
+                c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'machine',?2,?3,'{\"state\":\"pending\"}','')",params![child.owner.unwrap_or(user),child.name,child.id])?;
                 c.db.execute("UPDATE resources SET ssh_policy='\"disabled\"' WHERE kind='machine' AND physical=?1",[&child.id])?;
                 limits::admit(&c.root,&c.db,&child.id,"fork",&json!({}),&json!({"memory_mib":intent.memory_mib,"vcpu_count":intent.cpus,"disk_bytes":intent.disk_bytes}))?;
                 child.id.clone()
@@ -1045,11 +1104,16 @@ impl Catalog {
                     c.db.execute("UPDATE publications SET active=0 WHERE physical=?1",[&t.machine])?;
                     c.db.execute("DELETE FROM grants WHERE physical=?1",[&t.machine])?;
                     c.db.execute("DELETE FROM owner_allocations WHERE physical=?1",[&t.machine])?;
-                    ensure!(c.db.execute("DELETE FROM resources WHERE kind='machine' AND physical=?1 AND placement_epoch=0 AND node='' AND owner=(SELECT owner FROM operations WHERE id=?2) AND EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1 AND transfer=?3)",params![t.machine,t.operation,id])? == 1,"fork child authority changed");
+                    // A child made for someone else leaves its name in the requester's history.
+                    c.db.execute("UPDATE operations SET resource='deleted:'||resource WHERE id=?1 AND resource NOT LIKE 'deleted:%'",[t.operation])?;
+                    ensure!(c.db.execute("DELETE FROM resources WHERE kind='machine' AND physical=?1 AND placement_epoch=0 AND node='' AND owner=(SELECT COALESCE(json_extract(request,'$.transfer.child.owner'),owner) FROM operations WHERE id=?2) AND EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1 AND transfer=?3)",params![t.machine,t.operation,id])? == 1,"fork child authority changed");
                 }
             }
             let step = serde_json::to_value(next)?.as_str().unwrap().to_owned();
             c.db.execute("UPDATE transfers SET step=?1 WHERE id=?2 AND epoch=?3",params![step,id,epoch])?;
+            if next == Step::Succeeded && t.kind == Kind::Fork {
+                c.audit_fork(t.operation, &t.source, &t.machine)?;
+            }
             if next.terminal() {
                 c.db.execute("DELETE FROM transfer_locks WHERE transfer=?1",[id])?;
                 c.db.execute("UPDATE operations SET state=?1,finished_at=CURRENT_TIMESTAMP WHERE id=?2",params![if next == Step::Succeeded {"succeeded"}else{"failed"},t.operation])?;
@@ -1419,6 +1483,29 @@ impl Catalog {
             value["role"] = json!(role);
             shared.push(value);
         }
+        // Pool admins also see every other box, to transfer or fork it; not its details.
+        let mut others = Vec::new();
+        if self.pool_admin(user)? {
+            let mut stmt = self.db.prepare("SELECT r.metadata,r.node,u.email,r.name,CAST(strftime('%s',r.created_at) AS INTEGER) FROM resources r JOIN users u ON u.id=r.owner WHERE r.kind='machine' AND r.owner<>?1 AND NOT EXISTS(SELECT 1 FROM grants g WHERE g.physical=r.physical AND g.grantee=?1) ORDER BY u.email,r.name")?;
+            let rows = stmt.query_map([user], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (metadata, node, owner, name, created_at) = row?;
+                let metadata: Value = serde_json::from_str(&metadata)?;
+                let mut value = json!({"id":format!("{owner}/{name}"),"owner":owner,"role":"pool-admin","node":node,"created_at":created_at});
+                for key in ["state", "image", "memory_mib", "vcpu_count", "disk_bytes"] {
+                    value[key] = metadata[key].clone();
+                }
+                others.push(value);
+            }
+        }
         let mut running = BTreeMap::new();
         let mut pss = 0;
         let mut limit = 0;
@@ -1468,7 +1555,7 @@ impl Catalog {
         }
         let discovery = self.discovery(user, &nodes)?;
         Ok(
-            json!({"discovery":discovery,"owner_limits":limits::state(&self.root,&self.db,user)?,"pool_admin":self.pool_admin(user)?,"audit":self.audit_log(user)?,"operations":operations,"workspaces":machines,"shared":shared,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
+            json!({"discovery":discovery,"owner_limits":limits::state(&self.root,&self.db,user)?,"pool_admin":self.pool_admin(user)?,"audit":self.audit_log(user)?,"operations":operations,"workspaces":machines,"shared":shared,"pool":others,"snapshots":snapshots,"nodes":nodes,"stats":{"running":running,"total_pss_kib":pss,"reserved_memory_mib":reserved,"limit_memory_mib":limit,"note":"Offline usage is stale; reservations remain fixed"}}),
         )
     }
     fn discovery(&self, user: i64, inventory: &Value) -> Result<Value> {
@@ -1783,6 +1870,9 @@ impl Catalog {
             // The old owner's history stays but stops claiming the names, which are free again.
             self.db.execute("UPDATE operations SET resource='transferred:'||resource WHERE owner=?1 AND resource=?2 AND op<>'snapshot'",params![old,name])?;
             self.db.execute(&format!("UPDATE operations SET resource='transferred:'||resource WHERE owner=?1 AND op='snapshot' AND resource IN (SELECT name FROM resources WHERE {SNAPSHOTS})"),params![old,physical])?;
+            // Stored captures and snapshot artifacts carry their owner: store GC roots and
+            // managed restores match it, so they move with the rows that name them.
+            self.db.execute(&format!("UPDATE artifacts SET owner=?3 WHERE owner=?1 AND (machine=?2 OR (kind='snapshot' AND local_name IN (SELECT physical FROM resources WHERE {SNAPSHOTS})))"),params![old,physical,new])?;
             self.db.execute(
                 &format!(
                     "UPDATE resources SET owner=?3,updated_at=CURRENT_TIMESTAMP WHERE {SNAPSHOTS}"
@@ -2304,20 +2394,7 @@ impl Catalog {
                     .into());
                 }
                 if op == "fork" {
-                    let (physical, role) = self.access(user, &name, "fork")?;
-                    if !matches!(role.as_str(), "owner" | "pool-admin") && !self.pool_admin(user)? {
-                        return Err(limits::Rejection(
-                            "only the machine's owner or a pool admin can fork it for someone else"
-                                .into(),
-                        )
-                        .into());
-                    }
-                    if self.managed_placement(&physical)?.is_some() {
-                        return Err(limits::Rejection(
-                            "this machine was moved, parked or woken; forking it for someone else works only on its original runner for now".into(),
-                        )
-                        .into());
-                    }
+                    self.fork_for_others(user, &name)?;
                 }
                 self.user_by_email(user, email)?
             }
@@ -2409,12 +2486,17 @@ impl Catalog {
             for key in ["name", "snapshot"] {
                 if matches!(op.as_str(), "restore" | "fork") {
                     if let Some(snapshot) = request[key].as_str() {
-                        let snapshot = self.physical(user, "snapshot", snapshot)?;
+                        let owner = if op == "fork" {
+                            self.snapshot_owner(user, &name)?
+                        } else {
+                            user
+                        };
+                        let snapshot = self.physical(owner, "snapshot", snapshot)?;
                         ensure!(
                             self.placement("snapshot", &snapshot)? == node,
                             "cross-node snapshot denied"
                         );
-                        self.snapshot_source(user, &snapshot, &physical)?;
+                        self.snapshot_source(owner, &snapshot, &physical)?;
                     }
                 }
             }
@@ -2611,12 +2693,13 @@ impl Catalog {
                 }
                 "fork" => {
                     if let Some(snapshot) = request["snapshot"].as_str() {
-                        let snapshot = self.physical(user, "snapshot", snapshot)?;
+                        let snapshots = self.snapshot_owner(user, &name)?;
+                        let snapshot = self.physical(snapshots, "snapshot", snapshot)?;
                         ensure!(
                             self.placement("snapshot", &snapshot)? == node,
                             "cross-node fork denied"
                         );
-                        self.snapshot_source(user, &snapshot, &physical)?;
+                        self.snapshot_source(snapshots, &snapshot, &physical)?;
                         request["snapshot"] = json!(snapshot);
                     }
                     let child = request["child"].as_str().context("child")?;

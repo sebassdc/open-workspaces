@@ -358,8 +358,8 @@ enum Action {
         accept_cold: bool,
         #[arg(long)]
         snapshot: Option<String>,
-        /// Make the child for this login email (the machine's owner or a pool admin; same runner).
-        #[arg(long, conflicts_with = "node")]
+        /// Make the child for this login email (the machine's owner or a pool admin).
+        #[arg(long)]
         owner: Option<String>,
     },
     /// Save RAM and disk, then stop compute; start resumes the saved state.
@@ -1091,7 +1091,7 @@ mod capability_tests {
                 "--node",
                 "n"
             ])
-            .is_err()
+            .is_ok()
         );
         assert!(matches!(
             Cli::try_parse_from(["ow", "audit"]).unwrap().command,

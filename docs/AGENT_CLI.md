@@ -162,7 +162,7 @@ print one JSON value on stdout, without an interactive prompt or progress banner
   has a machine (or snapshot) of that name, or when it would exceed the new
   owner's limits. Idempotent with `--operation-key`.
 - `create NAME --owner EMAIL` (pool admins) and `fork NAME CHILD --owner EMAIL`
-  (the machine's owner or a pool admin; not with `--node`): the new box is made in
+  (the machine's owner or a pool admin; works with `--node` too): the new box is made in
   that owner's name space and counts against their limits. A fork inherits no
   shares or SSH keys.
 - `audit`: ownership changes that involve you (as actor, old or new owner), newest

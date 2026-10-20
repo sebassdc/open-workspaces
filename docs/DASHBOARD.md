@@ -44,7 +44,9 @@ shares, previews and running state stay. **Transfer** (owner, or a pool admin on
 a machine shared with them) gives the machine to another login email with its
 disk, snapshots and running state; its shares end and the old owner keeps an
 admin share only if chosen. Pool admins get an owner email field in the create
-dialog, and owners and pool admins one in the fork dialog. **Ownership changes**
+dialog, and owners and pool admins one in the fork dialog; pool admins also see
+other owners' machines under **Pool machines**, where they can only fork or
+transfer them. **Ownership changes**
 lists every transfer, and every machine made for you or from yours, with who did
 it. **Delete** (owner only, on a
 stopped or hibernated machine) removes it with its disk and every snapshot taken

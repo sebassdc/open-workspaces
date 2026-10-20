@@ -166,14 +166,18 @@ different from a machine's `admin` share role.
 | `ow create NAME --owner EMAIL` | no | yes | no | no |
 
 A pool admin reaches another owner's box (`alice@example.com/BOX`) only to transfer
-or fork it: exec, shells, SSH, lifecycle and sharing still need ownership or a
+or fork it; the dashboard lists such boxes for them under Pool machines with
+those two actions only: exec, shells, SSH, lifecycle and sharing still need ownership or a
 share. A pool admin's fork of another owner's box copies everything on it into a
 box the admin chooses the owner of, so the list should hold only people trusted
 with every box in the pool.
 
 **Transfer** changes only catalog rows, in one SQLite transaction, with no worker
 contact: the box keeps its physical ID, disk, placement, published ports, SSH keys
-and running state, and the snapshots its owner took of it move with it. The new
+and running state, and the snapshots its owner took of it move with it, as do
+the stored recovery captures and snapshot artifacts in the artifact store that
+carry the owner, so store GC keeps them and the new owner can restore or move
+from them. The new
 owner gets full owner rights and addresses it as `NAME`; others use
 `new@example.com/NAME`. Every share ends (a teammate's or the new owner's), and
 the open terminals, SSH streams and preview connections of everyone who lost
@@ -190,9 +194,10 @@ email nobody has used yet is reserved, as for sharing.
 **Create and fork for someone else** reserve the new box, its operation and its
 quota in that owner's name space; the result names the `owner`. The actor's
 `--operation-key` is scoped to the actor, so it never replays the owner's own
-operations; a retry without a key is a new request. A fork for another
-owner works on boxes still on their original runner (not after a move, park or
-wake) and not with `--node`. Like every fork, it inherits no shares or SSH keys.
+operations; a retry without a key is a new request. A fork for another owner
+works like any fork, also for a moved, parked-and-woken box or with `--node`
+(the cross-runner path); `--snapshot` names the forker's own snapshot, or for a
+pool admin the box owner's. Like every fork, it inherits no shares or SSH keys.
 
 **Audit.** Every transfer, create for someone else, fork into someone else's name
 space and pool admin fork is a row in the catalog's `audit` table (actor, action,

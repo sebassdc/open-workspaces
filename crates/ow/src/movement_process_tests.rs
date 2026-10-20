@@ -60,6 +60,7 @@ fn moving_process_fixture(kind: Kind) -> (Processes, i64, Transfer) {
         input.child = Some(crate::transfers::Child {
             id: "child-id".into(),
             name: "child".into(),
+            owner: None,
         });
     }
     let t = c.begin_transfer(user, "process-move-fork", &input).unwrap();
