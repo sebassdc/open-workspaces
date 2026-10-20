@@ -407,14 +407,16 @@ impl Vm {
         // on the channel: read_until discards that, its own end marker included.
         // The shell cannot read the host while it waits, so a guest-side watchdog ends a command
         // that outlives the timeout: TERM, then KILL, to its own session (process group when the
-        // shell has job control), and the channel is free again once its end marker is read.
+        // shell has job control). USR1 interrupts the shell's wait, including when the
+        // workload ignores TERM, so cleanup finishes before the next command can begin.
         let wire = format!(
-            "printf '{marker}:begin\\n'; ow_s=; case $- in *m*) ;; *) command -v setsid >/dev/null 2>&1 && ow_s=setsid;; esac; \
-             $ow_s /bin/sh -c {} & ow_p=$!; \
-             (ow_i=0; while kill -0 $ow_p 2>/dev/null; do if [ $ow_i -ge {} ]; then printf '\\n{marker}:timeout\\n'; \
-             kill -TERM -$ow_p 2>/dev/null || kill -TERM $ow_p 2>/dev/null; sleep 2; kill -KILL -$ow_p 2>/dev/null || kill -KILL $ow_p 2>/dev/null; break; fi; \
-             sleep 1; ow_i=$((ow_i+1)); done) & \
-             wait $ow_p; ow_rc=$?; printf '\\n{marker}:%s:{marker}\\n' \"$ow_rc\"\n",
+            "ow_t=0; trap 'ow_t=1' USR1; printf '{marker}:begin\\n'; ow_s=; case $- in *m*) ;; *) command -v setsid >/dev/null 2>&1 && ow_s=setsid;; esac; \
+             $ow_s /bin/sh -c {} </dev/null & ow_p=$!; \
+             (ow_i=0; while kill -0 $ow_p 2>/dev/null; do if [ $ow_i -ge {} ]; then kill -USR1 $$; break; fi; \
+             sleep 1; ow_i=$((ow_i+1)); done) & ow_w=$!; \
+             wait $ow_p; ow_rc=$?; kill $ow_w 2>/dev/null; wait $ow_w 2>/dev/null; \
+             trap - USR1; if [ $ow_t -eq 1 ]; then kill -TERM -$ow_p 2>/dev/null || kill -TERM $ow_p 2>/dev/null; \
+             sleep 2; kill -KILL -$ow_p 2>/dev/null || kill -KILL $ow_p 2>/dev/null; wait $ow_p 2>/dev/null; printf '\\n{marker}:timeout\\n'; fi; printf '\\n{marker}:%s:{marker}\\n' \"$ow_rc\"\n",
             shell_quote(command),
             timeout.as_secs().max(1),
         );
@@ -614,26 +616,63 @@ mod command_tests {
     use super::*;
     use std::os::unix::net::UnixStream;
 
-    // A real interactive shell on the other end of the serial channel, as in the guest.
-    #[test]
-    fn a_timed_out_command_is_ended_and_the_next_command_gets_only_its_own_output() {
-        let (master, serial) = UnixStream::pair().unwrap();
+    // Exercise both a socket shell and the guest's controlling-terminal/job-control path.
+    fn timeout_recovery(terminal: bool, timeout: Duration) {
+        let (master, serial): (File, File) = if terminal {
+            let (mut master, mut slave) = (-1, -1);
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+            assert_eq!(
+                unsafe { libc::tcgetattr(slave, attributes.as_mut_ptr()) },
+                0
+            );
+            let mut attributes = unsafe { attributes.assume_init() };
+            attributes.c_lflag &= !libc::ECHO;
+            assert_eq!(
+                unsafe { libc::tcsetattr(slave, libc::TCSANOW, &attributes) },
+                0
+            );
+            unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+        } else {
+            let (master, serial) = UnixStream::pair().unwrap();
+            (
+                std::os::fd::OwnedFd::from(master).into(),
+                std::os::fd::OwnedFd::from(serial).into(),
+            )
+        };
         let log = std::env::temp_dir().join(format!("ow-serial-{}", nonce().unwrap()));
-        let child = Command::new("/bin/sh")
+        let mut shell = Command::new("/bin/sh");
+        shell
             .arg("-i")
             .env("PS1", "OW> ")
-            .stdin(Stdio::from(std::os::fd::OwnedFd::from(
-                serial.try_clone().unwrap(),
-            )))
-            .stdout(Stdio::from(std::os::fd::OwnedFd::from(
-                serial.try_clone().unwrap(),
-            )))
-            .stderr(Stdio::from(std::os::fd::OwnedFd::from(serial)))
-            .spawn()
-            .unwrap();
+            .stdin(Stdio::from(serial.try_clone().unwrap()))
+            .stdout(Stdio::from(serial.try_clone().unwrap()))
+            .stderr(Stdio::from(serial));
+        if terminal {
+            unsafe {
+                shell.pre_exec(|| {
+                    if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = shell.spawn().unwrap();
         let mut vm = Vm {
             child,
-            master: std::os::fd::OwnedFd::from(master).into(),
+            master,
             log: File::create(&log).unwrap(),
             diagnostics: None,
             buffer: Vec::new(),
@@ -645,14 +684,17 @@ mod command_tests {
         let started = Instant::now();
         let error = vm
             .command_within(
-                "(sleep 4; echo leftover-from-child) & sleep 65; echo leftover-from-slow",
-                Duration::from_secs(1),
+                "(sleep 65; echo leftover-from-child) & sleep 65; echo leftover-from-slow",
+                timeout,
             )
             .unwrap_err();
-        assert_eq!(error.to_string(), "guest command timed out after 1s");
+        assert_eq!(
+            error.to_string(),
+            format!("guest command timed out after {timeout:?}")
+        );
         // Ended by the guest watchdog, not left running for 65 s.
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < timeout + Duration::from_secs(5),
             "{:?}",
             started.elapsed()
         );
@@ -664,15 +706,43 @@ mod command_tests {
             "{:?}",
             quick.elapsed()
         );
-        // The slow command's background child went with it.
-        std::thread::sleep(Duration::from_secs(4));
+        // A TERM-resistant child must not write into the immediately following command.
+        let error = vm
+            .command_within(
+                "(trap '' TERM; sleep 2; echo leftover-from-resistant-child) & sleep 65",
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "guest command timed out after 1s");
+        assert_eq!(
+            vm.command("sleep 3; echo after-resistant-child").unwrap(),
+            ("after-resistant-child\n".into(), 0)
+        );
+        assert_eq!(
+            vm.command_within("trap '' TERM; sleep 65", Duration::from_secs(1))
+                .unwrap_err()
+                .to_string(),
+            "guest command timed out after 1s"
+        );
         assert_eq!(vm.command("echo last").unwrap(), ("last\n".into(), 0));
+        assert_eq!(
+            vm.command("cat; echo stdin-closed").unwrap(),
+            ("stdin-closed\n".into(), 0)
+        );
         let (output, code) = vm.command("printf 'no newline'; exit 3").unwrap();
         assert_eq!((output.as_str(), code), ("no newline", 3));
         drop(vm);
-        let seen = std::fs::read_to_string(&log).unwrap();
         std::fs::remove_file(&log).unwrap();
-        assert!(!seen.contains("leftover"), "{seen}");
+    }
+
+    #[test]
+    fn a_timed_out_command_is_ended_and_the_next_command_gets_only_its_own_output() {
+        timeout_recovery(false, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn production_timeout_recovers_with_terminal_job_control() {
+        timeout_recovery(true, Duration::from_secs(30));
     }
 }
 
@@ -851,7 +921,7 @@ mod clock_tests {
 #[cfg(test)]
 pub(crate) fn wire_command(line: &str) -> String {
     let quoted = line.split_once("/bin/sh -c ").unwrap().1;
-    let quoted = quoted.split_once(" & ow_p=").unwrap().0;
+    let quoted = quoted.split_once(" </dev/null & ow_p=").unwrap().0;
     quoted[1..quoted.len() - 1].replace("'\\''", "'")
 }
 

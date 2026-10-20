@@ -43,10 +43,13 @@ test('a command past the 30 s limit shows a plain message, not the operation jou
   const output = page.locator('#console-output');
   await page.locator('#command').fill('sleep 34; echo leftover-from-slow');
   await page.locator('#command').press('Enter');
-  await expect(output).toContainText('Stopped waiting after 30 s: commands in the console are limited to 30 s');
+  await expect(output).toContainText('Stopped after 30 s: commands in the console are limited to 30 s');
   await expect(output).toContainText('Use Open Terminal');
   await expect(output).not.toContainText('journal');
   await page.locator('#command').fill('echo next-command');
   await page.locator('#command').press('Enter');
   await expect(output).toContainText('$ echo next-command\nnext-command\n[exit 0]');
+  await expect(output).not.toContainText('OW_DONE_');
+  await expect(output).not.toContainText('OW>');
+  await expect(output).not.toContainText(/\nleftover-from-slow(?:\n|$)/);
 });

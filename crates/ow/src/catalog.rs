@@ -64,8 +64,8 @@ const UNMADE: &str = "metadata=json_set(metadata,'$.state','failed','$.unmade',j
 const CREATION_TIMEOUT_MINUTES: u32 = 30;
 const CREATION_TIMEOUT: &str = "Creation did not complete within 30 minutes and the runner has no such machine; it failed. Delete it, or retry with a new operation key.";
 
-/// The serial channel stops waiting; the guest has no way to interrupt the command.
-pub(crate) const COMMAND_TIMEOUT: &str = "Stopped waiting after 30 s: commands in the console are limited to 30 s, and this one may still be running in the machine. Use Open Terminal (ow shell) for long-running work.";
+/// The guest ends the command (TERM, then KILL) once it outlives the serial timeout.
+pub(crate) const COMMAND_TIMEOUT: &str = "Stopped after 30 s: commands in the console are limited to 30 s. Use Open Terminal (ow shell) for long-running work.";
 
 fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
     match (op, diagnostic) {
