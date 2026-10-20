@@ -36,7 +36,11 @@ for prepare and acknowledgment, so a transfer during upload rejects a stale resu
 
 `ow list` and `ow inspect BOX` expose `durability` in their existing JSON. The
 dashboard shows its last durable capture time, pending upload, failures and retry
-time. Timestamps are Unix seconds in the API/CLI and local time in the dashboard:
+time. Timestamps are Unix seconds in the API/CLI; the dashboard shows the last
+durable time as relative ("12 min ago", full local time on hover). A machine
+less than an hour old without a point reads "First recovery point pending" in
+neutral text; the warning colour appears only once the one-hour target is
+missed or an upload error is reported:
 
 - `last_durable_at`: capture **start**, only set after the remote manifest commits.
 - `uploaded_at`: completion time; it never makes an older capture appear newer.
@@ -130,7 +134,7 @@ device state file (written whole by every capture), and every range whose
 mapping is unknown, delayed, compressed, encrypted or inline. Without an earlier
 seal (first point, a changed destination, or a durable point from an older
 worker) the disk and RAM files are flushed and only their holes are skipped (zero
-chunks, unread, from 0.9.25); every mapped chunk is read, and zero chunks are still
+chunks, unread, from 0.9.27); every mapped chunk is read, and zero chunks are still
 recognized without hashing. This trusts the
 filesystem's extent sharing, as changed-block tracking does; a worker that
 verifies such a snapshot again (after a restart, or for import) reads every byte
