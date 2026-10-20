@@ -354,7 +354,7 @@ grants and the pinned SSH host key. Children have independent writes, belong to 
 requester and require separate SSH enrollment. Worker interface 3 and a configured
 artifact store are required; installation alone does not move existing boxes.
 When a check refuses the request (a runner offline or draining, without an artifact
-store or disk headroom, a taken child name, a box with an unfinished transfer), the
+store, disk headroom or free memory, vCPUs and box slots, a taken child name, a box with an unfinished transfer), the
 command fails with that reason and `status` lists a failed operation carrying it.
 Retrying the same operation key returns the same refusal; use a new key once fixed.
 See [move/fork recovery and cold-consent rules](LIFECYCLE.md#explicit-move-and-cross-runner-fork).
