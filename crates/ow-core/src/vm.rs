@@ -376,7 +376,11 @@ impl Vm {
             };
             let ready = unsafe { libc::poll(&mut descriptor, 1, 100) };
             if ready < 0 {
-                return Err(std::io::Error::last_os_error()).context("poll");
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error).context("poll");
             }
             if ready > 0 {
                 let mut bytes = [0u8; 65536];
