@@ -2,11 +2,10 @@
   "schema": 1,
   "releases": [
     {
-      "version": "0.9.29",
+      "version": "0.9.30",
       "class": 1,
       "changes": [
-        "controller",
-        "agent"
+        "controller"
       ],
       "protocol": {
         "speaks": 1,
@@ -36,6 +35,42 @@
       "host_layout": 2,
       "in_place_from": "0.5.0",
       "notes": "Cross-runner fork and move refusals say why: the controller names the runner and the reason (offline or draining, no artifact store, stale or exhausted disk headroom, worker without move/fork support, taken child name, unfinished transfer or pending operation, snapshot not of this box) instead of a generic error, and records the refusal as a failed operation with error_code refused that ow status lists; the same operation key returns the same refusal. Class 1: controller only; protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged."
+    },
+    {
+      "version": "0.9.29",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "The New machine dialog offers only images and resource sizes eligible for the selected node or automatic placement, shows free node capacity, and blocks creation when no image and size fit. Known refusals use dashboard language, duplicate machine names are refused explicitly while retries retain their original result, and focus starts on Machine name. Class-1 upgrade: restart the controller and dashboard; workers and running machines are untouched. Protocols, catalog schema, runtime, guest kernel and host layout are unchanged."
     },
     {
       "version": "0.9.28",
