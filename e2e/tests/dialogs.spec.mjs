@@ -2,8 +2,8 @@ import {test, expect, machines, detailAction, dialog, notice} from './fixtures.m
 
 test('no console errors on page load and dialog open', async ({page}) => {
   const errors = [];
-  // Network failures are logged too; the tailnet dashboard answers the CLI installer probe with 404 on purpose.
-  page.on('console', message => { if (['error', 'warning'].includes(message.type()) && !(message.text().includes('404') && message.location().url.endsWith('/cli/install.sh'))) errors.push(message.text()); });
+  // Network failures are logged too; tailnet sign-in answers the CLI installer and binary probes with 404 on purpose.
+  page.on('console', message => { if (['error', 'warning'].includes(message.type()) && !(message.text().includes('404') && ['/cli/install.sh', '/cli/ow-linux-amd64'].some(path => message.location().url.endsWith(path)))) errors.push(message.text()); });
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
   await expect(page.locator('#updated')).toHaveText(/^Updated/);

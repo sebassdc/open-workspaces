@@ -1,4 +1,4 @@
-import {test, expect, api, machines, card, notice} from './fixtures.mjs';
+import {test, expect, api, machines, card, notice, signIn} from './fixtures.mjs';
 
 test('worker outage shows an error and recovers on refresh', async ({dashboard: page}) => {
   await machines(page, 'steady');
@@ -41,6 +41,12 @@ test('the tailnet dashboard offers no CLI installer', async ({dashboard: page}) 
   await expect(page.locator('#cli-install')).toBeHidden();
 });
 
+test('the tailnet dashboard hides the sidebar CLI download', async ({dashboard: page}) => {
+  // Tailnet sign-in serves no CLI binary, so the link would download a 404 page.
+  expect(await page.evaluate(async () => (await fetch('/cli/ow-linux-amd64', {method: 'HEAD'})).ok)).toBe(false);
+  await expect(page.getByRole('link', {name: /Download CLI/})).toBeHidden();
+});
+
 test.describe('narrow width', () => {
   test.use({viewport: {width: 390, height: 844}, isMobile: true, hasTouch: true});
 
@@ -58,6 +64,17 @@ test.describe('narrow width', () => {
     expect(box.x).toBeGreaterThanOrEqual(0);
     expect(box.x + box.width).toBeLessThanOrEqual(390);
     await expect(page.getByRole('button', {name: 'Create machine'})).toBeInViewport();
+  });
+
+  test('a long signed-in email does not widen the phone layout', async ({page, user}) => {
+    // 64 characters is the longest local part an address may have.
+    const name = user.padEnd(64, 'a');
+    const email = `${name}@example.test`;
+    await signIn(page.context(), name);
+    await page.goto('/');
+    await expect(page.locator('#account-email')).toHaveText(email);
+    await expect(page.locator('#account-email')).toHaveAttribute('title', email);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0);
   });
 });
 
