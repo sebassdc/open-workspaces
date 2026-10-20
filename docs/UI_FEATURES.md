@@ -43,9 +43,10 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Feature | Status | Last passed | Test |
 | --- | --- | --- | --- |
 | Machine list: cards, counts, selection | works | v0.9.22 | `machines.spec.mjs › machine list shows cards, counts and the selected machine` |
-| Card content top-aligned; page notice spaced from the card below | works | v0.9.23 | `machines.spec.mjs › cards keep their content at the top, whatever their height` |
-| Phone width: tapping a card scrolls its actions into view | works | v0.9.23 | `machines.spec.mjs › on a phone, tapping a card brings its actions into view` |
+| Card content top-aligned; page notice spaced from the card below | works | v0.9.24 | `machines.spec.mjs › cards keep their content at the top, whatever their height` |
+| Phone width: tapping a card scrolls its actions into view | works | v0.9.24 | `machines.spec.mjs › on a phone, tapping a card brings its actions into view` |
 | Empty sandbox and empty snapshot list | works | v0.9.22 | `machines.spec.mjs › empty sandbox invites a first machine` |
+| Memory counter: your usage against your owner limits | works | v0.9.23 | `machines.spec.mjs › memory counter shows your usage against your owner limits` |
 | Create dialog: name, image, memory, vCPU, disk | works | v0.9.22 | `machines.spec.mjs › create dialog creates a machine with the chosen shape` |
 | Refused create shown in the dialog | works | v0.9.22 | `machines.spec.mjs › create dialog shows a refused create and stays open` |
 | Rename in place, selection and console history follow | works | v0.9.22 | `machines.spec.mjs › rename keeps the machine selected under its new name` |
@@ -60,8 +61,8 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Stop with its warning, then start | works | v0.9.22 | `lifecycle.spec.mjs › stop explains what is lost, then start brings it back` |
 | Resize a stopped machine's disk | works | v0.9.22 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
 | Delete with snapshot warnings | works | v0.9.22 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `lifecycle.spec.mjs › delete of a machine without snapshots says so` |
-| Resize dialog prefilled with the current size; the same size answers "Already N GiB" | works | v0.9.23 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
-| Destructive confirms (delete, restore) lead with a warning and use a danger button | works | v0.9.23 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `snapshots.spec.mjs › fork and restore from the snapshot list` |
+| Resize dialog prefilled with the current size; the same size answers "Already N GiB" | works | v0.9.24 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
+| Destructive confirms (delete, restore) lead with a warning and use a danger button | works | v0.9.24 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `snapshots.spec.mjs › fork and restore from the snapshot list` |
 
 ## Terminal and console
 
@@ -98,6 +99,7 @@ dashboard.
 | Invite a Linux host (one-use invitation, cleared on close) | works | v0.9.22 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` |
 | Adjust an enrolled host's budget | partial | v0.9.22 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` (refusal for a host that never enrolled; the success path needs an enrolled runner) |
 | Revoke a host | partial | v0.9.22 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` (revokes an invited host that never enrolled) |
+| Pool banner says who can see guest data; invitation policy only in the invite dialog | works | v0.9.23 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` |
 | Host controls only for the pool owner | works | v0.9.22 | `hosts.spec.mjs › host controls are hidden from other users` |
 
 ## Errors, sign-in and layout
@@ -105,6 +107,7 @@ dashboard.
 | Feature | Status | Last passed | Test |
 | --- | --- | --- | --- |
 | Worker outage error, recovery on refresh | works | v0.9.22 | `states.spec.mjs › worker outage shows an error and recovers on refresh` |
+| Failed first load: retry in the grid, New machine disabled | works | v0.9.23 | `states.spec.mjs › failed first load offers a retry and keeps New machine disabled` |
 | Expired login message | works | v0.9.22 | `states.spec.mjs › expired login asks the user to reload and sign in` |
 | CLI installer panel (hidden on tailnet sign-in) | partial | v0.9.22 | `states.spec.mjs › the tailnet dashboard offers no CLI installer` (the Access sign-in panel and its copy button are not covered) |
 | Phone width: no horizontal overflow, dialogs fit | works | v0.9.22 | `states.spec.mjs › narrow width › phone layout has no horizontal overflow and dialogs fit` |
