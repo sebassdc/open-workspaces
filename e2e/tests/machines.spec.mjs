@@ -35,6 +35,8 @@ test('create dialog creates a machine with the chosen shape', async ({dashboard:
   await page.getByRole('button', {name: '＋ New machine'}).click();
   await expect(dialog(page)).toBeVisible();
   await expect(page.locator('#dialog-title')).toHaveText('A fresh place to build.');
+  await expect(page.locator('#dialog-eyebrow')).toHaveText('YOUR SANDBOX');
+  await expect(page.locator('#dialog-submit')).toHaveClass('button primary');
   await page.getByLabel('Machine name').fill('made-in-ui');
   await page.getByLabel('Operating system').selectOption('ubuntu');
   await page.getByLabel('Memory').selectOption('512');
@@ -104,4 +106,34 @@ test('top bar shows the signed-in account', async ({page, user}) => {
   await page.goto('/');
   await expect(page.locator('#account-email')).toHaveText(`${name}@example.test`);
   await expect(page.locator('#account-avatar')).toHaveText('Z');
+});
+
+test('cards keep their content at the top, whatever their height', async ({dashboard: page}) => {
+  await machines(page, 'short', 'tall');
+  // A taller neighbour in the same row stretches every card; content must not drift down.
+  await card(page, 'tall').evaluate(node => node.append(Object.assign(document.createElement('span'), {className: 'card-lineage', textContent: 'extra line'})));
+  const offsets = await page.locator('.machine-card').evaluateAll(cards => cards.map(c => c.querySelector('.machine-icon').getBoundingClientRect().top - c.getBoundingClientRect().top));
+  expect(offsets).toHaveLength(2);
+  // 1 px border + 21 px padding: the icon sits at the top, not centred.
+  for (const offset of offsets) expect(offset).toBeCloseTo(22, 0);
+  // The notice keeps a gap from the card below it.
+  await card(page, 'short').click();
+  await detailAction(page, 'Hibernate').click();
+  await expect(notice(page)).toBeVisible();
+  const gap = await notice(page).evaluate(node => {
+    let next = node.nextElementSibling; while (next.hidden) next = next.nextElementSibling;
+    return next.getBoundingClientRect().top - node.getBoundingClientRect().bottom;
+  });
+  expect(gap).toBeGreaterThanOrEqual(16);
+});
+
+test('on a phone, tapping a card brings its actions into view', async ({dashboard: page}) => {
+  await page.setViewportSize({width: 390, height: 844});
+  await machines(page, 'm1', 'm2', 'm3', 'm4', 'm5');
+  await card(page, 'm1').evaluate(node => node.scrollIntoView({block: 'start'}));
+  await expect(page.locator('.detail-heading')).not.toBeInViewport();
+  await card(page, 'm1').click();
+  await expect(page.locator('#selected-name')).toHaveText('m1');
+  await expect(page.locator('.detail-heading')).toBeInViewport();
+  await expect(detailAction(page, 'Hibernate')).toBeInViewport();
 });
