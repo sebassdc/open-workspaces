@@ -21,57 +21,27 @@ const INDEX_HEADER: &str = "ow-chunk-index-v1";
 
 impl S3Store {
     pub(super) fn check_recovery_retention(&self) -> Result<()> {
-        let path = self.url.strip_prefix("s3://").unwrap();
-        let (bucket, prefix) = path.split_once('/').unwrap_or((path, ""));
-        let version = self
-            .aws()
-            .args([
-                "s3api",
-                "get-bucket-versioning",
-                "--bucket",
-                bucket,
-                "--output",
-                "json",
-            ])
-            .output()?;
+        let http = self.http()?;
+        let http = &*http;
+        let prefix = http.prefix.trim_end_matches('/').to_owned();
         ensure!(
-            version.status.success(),
-            "cannot verify snapshot bucket versioning: {}",
-            String::from_utf8_lossy(&version.stderr)
-        );
-        let version: Value = serde_json::from_slice(&version.stdout)?;
-        ensure!(
-            version["Status"] == "Enabled",
+            http.versioning()
+                .context("cannot verify snapshot bucket versioning")?
+                .as_deref()
+                == Some("Enabled"),
             "recovery needs bucket versioning for seven-day undo"
         );
-        let lifecycle = self
-            .aws()
-            .args([
-                "s3api",
-                "get-bucket-lifecycle-configuration",
-                "--bucket",
-                bucket,
-                "--output",
-                "json",
-            ])
-            .output()?;
-        let rules = if lifecycle.status.success() {
-            serde_json::from_slice::<Value>(&lifecycle.stdout)?
-        } else {
-            ensure!(
-                String::from_utf8_lossy(&lifecycle.stderr)
-                    .contains("(NoSuchLifecycleConfiguration)"),
-                "cannot verify snapshot lifecycle: {}",
-                String::from_utf8_lossy(&lifecycle.stderr)
-            );
-            serde_json::json!({"Rules":[]})
-        };
-        retention_rules(&rules, prefix)
+        let rules = http
+            .lifecycle()
+            .context("cannot verify snapshot lifecycle")?
+            .unwrap_or_else(|| serde_json::json!({"Rules":[]}));
+        retention_rules(&rules, &prefix)
     }
 
     pub(super) fn stored_manifest(&self, name: &str) -> Result<Value> {
         crate::common::identifier(name)?;
         let http = self.http()?;
+        let http = &*http;
         let key = format!("{}{name}/manifest.json", http.prefix);
         Ok(serde_json::from_slice(&http.get(&key, MAX_MANIFEST)?)?)
     }
@@ -86,6 +56,7 @@ impl S3Store {
             "local manifest contains reserved transfer metadata"
         );
         let http = self.http()?;
+        let http = &*http;
         let manifest_key = format!("{}{name}/manifest.json", http.prefix);
         let stored = http.exists(&manifest_key)?;
         if stored {
@@ -186,6 +157,7 @@ impl S3Store {
             Some(other) => bail!("unsupported snapshot digest {other}"),
         };
         let http = self.http()?;
+        let http = &*http;
         for file in DATA_FILES {
             let chunks = &files[file];
             let length = check(chunks)?;
@@ -444,7 +416,7 @@ fn listed(http: &Http) -> Result<HashSet<String>> {
         let mut known = known.lock().unwrap();
         known.extend(
             keys.iter()
-                .filter_map(|k| k.strip_prefix(&base)?.strip_suffix(".zst"))
+                .filter_map(|k| k.key.strip_prefix(&base)?.strip_suffix(".zst"))
                 .filter(|h| valid_hash(h))
                 .map(str::to_owned),
         );
@@ -524,9 +496,11 @@ mod tests {
             .unwrap()
             .incremental()
             .index(&root.join("index"));
-        let _ = store
-            .http
-            .set(Http::fixed(&fake.endpoint, "bucket", "points/"));
+        let _ = store.http.set(std::sync::Arc::new(Http::fixed(
+            &fake.endpoint,
+            "bucket",
+            "points/",
+        )));
         let mut disk: Vec<u8> = (0..6 * CHUNK + 77)
             .map(|i| (i / 4096 % 251) as u8 + 1)
             .collect();

@@ -62,38 +62,10 @@ fn default_controller_build_uses_sibling_runner_and_commits_image() {
     fs::write(assets.join("downloads/vmlinux-6.1.186"), b"fixture kernel").unwrap();
     let recipe = root.0.join("tools.sh");
     fs::write(&recipe, "# ow-image: base=ubuntu\ntrue\n").unwrap();
-    let aws = root.0.join("aws");
-    fs::write(&aws, r#"#!/usr/bin/env python3
-import sys,json,pathlib,hashlib,base64
-root=pathlib.Path(__file__).parent/'objects'
-a=sys.argv[1:]
-if a[:1]==['--endpoint-url']:a=a[2:]
-def arg(k): return a[a.index(k)+1]
-def digest(b): return base64.b64encode(hashlib.sha256(b).digest()).decode()
-if a[:2]==['configure','export-credentials']:
-    print('{"Version":1,"AccessKeyId":"fixture","SecretAccessKey":"fixture"}');sys.exit(0)
-assert a[0]=='s3api'
-op=a[1]
-assert arg('--bucket')=='bucket'
-if op=='get-bucket-versioning':out={'Status':'Enabled'}
-elif op=='get-bucket-lifecycle-configuration':out={'Rules':[{'Status':'Enabled','Filter':{'Prefix':'root/store/'},'NoncurrentVersionExpiration':{'NoncurrentDays':7}}]}
-elif op=='get-bucket-policy':out={'Policy':json.dumps({'Statement':[{'Effect':'Deny','Principal':'*','Action':'s3:PutObject','Resource':'arn:aws:s3:::bucket/root/store/v1/*','Condition':{'Null':{'s3:if-none-match':'true'},'Bool':{'s3:ObjectCreationOperation':'true'}}}]})}
-else:
-    path=root/'bucket'/arg('--key')
-    if op=='put-object':
-        assert arg('--if-none-match')=='*'
-        data=pathlib.Path(arg('--body')).read_bytes();assert digest(data)==arg('--checksum-sha256')
-        path.parent.mkdir(parents=True,exist_ok=True)
-        with path.open('xb') as f:f.write(data)
-        out={}
-    elif op=='head-object':
-        data=path.read_bytes();out={'ChecksumSHA256':digest(data),'ContentLength':len(data)}
-    else:raise AssertionError(op)
-print(json.dumps(out))
-"#).unwrap();
-    fs::set_permissions(&aws, fs::Permissions::from_mode(0o700)).unwrap();
     // Objects move through the loopback S3 fixture over root/objects.
     fs::create_dir_all(root.0.join("objects")).unwrap();
+    // The bucket answers as a safe write-once store.
+    fs::write(root.0.join("objects/write-once-policy"), b"").unwrap();
     fs::write(
         root.0.join("s3"),
         include_bytes!("../../ow-core/tests/fake_s3.py"),
@@ -169,6 +141,13 @@ print(json.dumps(out))
             .env("XDG_CONFIG_HOME", root.0.join("client-config"))
             .env("OW_SERVER", "http://fixture.invalid")
             .env("OW_TEST_S3_ENDPOINT", &endpoint)
+            // The SDK's credential chain finds fixture keys first; no profile, no instance role.
+            .env("AWS_ACCESS_KEY_ID", "AKIDFIXTURE")
+            .env("AWS_SECRET_ACCESS_KEY", "fixture")
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_CONFIG_FILE", root.0.join("no-config"))
+            .env("AWS_SHARED_CREDENTIALS_FILE", root.0.join("no-credentials"))
+            .env("AWS_EC2_METADATA_DISABLED", "true")
             .env(
                 "PATH",
                 std::env::join_paths(

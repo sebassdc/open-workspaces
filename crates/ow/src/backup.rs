@@ -221,27 +221,34 @@ fn listing(
     Ok(rows)
 }
 
-/// `(date time, key)` of every object under `url`, through `aws s3 ls --recursive`.
+/// `(UTC date time, key)` of every object under `url`.
 fn ls(store: &S3Store, url: &str) -> Result<Vec<(String, String)>> {
-    let output = store
-        .aws()
-        .args(["s3", "ls", "--recursive", &format!("{url}/")])
-        .stderr(Stdio::inherit())
-        .output()
-        .context("the AWS CLI (aws) is required for snapshot stores")?;
-    // As S3Store::list: exit 1 with no output is an empty prefix, anything else fails.
-    if !output.status.success() && !(output.status.code() == Some(1) && output.stdout.is_empty()) {
-        bail!("listing {url} failed ({})", output.status);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let at = format!("{} {}", parts.next()?, parts.next()?);
-            parts.next()?;
-            Some((at, parts.next()?.to_owned()))
-        })
+    Ok(store
+        .objects(url)?
+        .into_iter()
+        .map(|(at, key)| (utc(at), key))
         .collect())
+}
+
+/// `YYYY-MM-DD HH:MM:SS` of a Unix time, in UTC.
+fn utc(at: i64) -> String {
+    let (days, secs) = (at.div_euclid(86400), at.rem_euclid(86400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
 }
 
 /// Where the catalog copies for a `…/snapshots` store live: beside it, or for a
@@ -284,13 +291,9 @@ fn owners_from_s3(store: &S3Store, key: &str) -> Result<HashMap<String, (String,
     fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let result = (|| {
         let path = dir.join("catalog.sqlite3");
-        let status = store
-            .aws()
-            .args(["s3", "cp", "--only-show-errors", key])
-            .arg(&path)
-            .status()
-            .context("the AWS CLI (aws) is required for snapshot stores")?;
-        ensure!(status.success(), "downloading {key} failed ({status})");
+        store
+            .download(key, &path)
+            .with_context(|| format!("downloading {key}"))?;
         owners(&path)
     })();
     fs::remove_dir_all(&dir)?;

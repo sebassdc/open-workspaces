@@ -309,6 +309,16 @@ impl Processes {
             .env("OW_TRANSFER_ROOT", root)
             .env("OW_TRANSFER_ORIGIN", &self.origin)
             .env("OW_TEST_S3_ENDPOINT", &self.s3_endpoint)
+            // The SDK's credential chain finds fixture keys first; no profile, no instance role.
+            .env("AWS_ACCESS_KEY_ID", "AKIDFIXTURE")
+            .env("AWS_SECRET_ACCESS_KEY", "fixture")
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_CONFIG_FILE", self.root.join("no-config"))
+            .env(
+                "AWS_SHARED_CREDENTIALS_FILE",
+                self.root.join("no-credentials"),
+            )
+            .env("AWS_EC2_METADATA_DISABLED", "true")
             .env(
                 "PATH",
                 format!(
@@ -470,11 +480,7 @@ fn fixture() -> Processes {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    // Local stand-in for the AWS CLI hands out fixture credentials only; objects
-    // move through the loopback S3 fixture over root/objects.
-    let aws = root.join("bin/aws");
-    fs::write(&aws,"#!/bin/sh\nset -eu\n[ \"$1\" != --endpoint-url ] || shift 2\ntest \"$1 $2\" = 'configure export-credentials'\necho '{\"Version\":1,\"AccessKeyId\":\"fixture\",\"SecretAccessKey\":\"fixture\"}'\n").unwrap();
-    fs::set_permissions(aws, fs::Permissions::from_mode(0o700)).unwrap();
+    // Objects move through the loopback S3 fixture over root/objects.
     fs::create_dir_all(root.join("objects")).unwrap();
     fs::write(
         root.join("bin/s3"),

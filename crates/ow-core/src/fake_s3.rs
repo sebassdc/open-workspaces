@@ -17,7 +17,11 @@ pub struct Stored {
     pub bytes: Vec<u8>,
     pub checksum: String,
     pub etag: String,
+    pub version: String,
 }
+
+/// Every object's Last-Modified: 2026-10-19T12:34:56Z.
+pub const MODIFIED: i64 = 1792413296;
 
 /// Uploaded parts of one multipart upload: bytes and checksum by part number.
 type Parts = BTreeMap<u16, (Vec<u8>, String)>;
@@ -35,7 +39,15 @@ pub struct State {
     pub refuse_puts: AtomicUsize,
     /// The next this many completions take effect, then answer 500.
     pub lose_completions: AtomicUsize,
+    /// The next this many ranged GETs send half their body, then close.
+    pub cut_ranges: AtomicUsize,
     uploads_made: AtomicUsize,
+    versions_made: AtomicUsize,
+    /// Bucket versioning status; None until set.
+    pub versioning: Mutex<Option<String>>,
+    /// Lifecycle rules as `<Rule>` XML; None is no configuration.
+    pub lifecycle: Mutex<Option<String>>,
+    pub policy: Mutex<Option<String>>,
 }
 
 pub struct FakeS3 {
@@ -147,6 +159,12 @@ fn serve(stream: TcpStream, state: &State) -> std::io::Result<()> {
             .get("content-length")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        if headers
+            .get("expect")
+            .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+        {
+            writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        }
         let mut body = vec![0; length];
         reader.read_exact(&mut body)?;
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
@@ -169,8 +187,12 @@ fn serve(stream: TcpStream, state: &State) -> std::io::Result<()> {
             ("PUT", false) => "put",
             ("POST", true) => "complete",
             ("POST", false) => "create",
-            ("DELETE", _) => "abort",
+            ("DELETE", true) => "abort",
+            ("DELETE", false) => "delete",
             ("HEAD", _) => "head",
+            ("GET", _) if query.contains_key("versioning") => "versioning",
+            ("GET", _) if query.contains_key("lifecycle") => "lifecycle",
+            ("GET", _) if query.contains_key("policy") => "policy",
             ("GET", _) if query.contains_key("list-type") => "list",
             ("GET", _) if headers.contains_key("range") => "range",
             _ => "get",
@@ -208,6 +230,17 @@ fn serve(stream: TcpStream, state: &State) -> std::io::Result<()> {
         }
         head.push_str("\r\n");
         writer.write_all(head.as_bytes())?;
+        if kind == "range"
+            && response.status == 206
+            && state
+                .cut_ranges
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            // A connection lost mid-body: the length promised, half the bytes sent.
+            writer.write_all(&response.body[..response.body.len() / 2])?;
+            return Ok(());
+        }
         if method != "HEAD" {
             writer.write_all(&response.body)?;
         }
@@ -249,6 +282,7 @@ fn handle(
                     etag: format!("\"{}\"", &checksum[..8]),
                     checksum,
                     bytes: body,
+                    version: format!("v{}", state.versions_made.fetch_add(1, Ordering::SeqCst)),
                 },
             );
             reply(200, "")
@@ -260,6 +294,11 @@ fn handle(
                 r.headers = vec![
                     ("content-length".into(), object.bytes.len().to_string()),
                     ("etag".into(), object.etag.clone()),
+                    (
+                        "last-modified".into(),
+                        "Mon, 19 Oct 2026 12:34:56 GMT".into(),
+                    ),
+                    ("x-amz-version-id".into(), object.version.clone()),
                 ];
                 if headers.get("x-amz-checksum-mode").map(String::as_str) == Some("ENABLED") {
                     r.headers
@@ -299,7 +338,7 @@ fn handle(
                     break;
                 }
                 xml.push_str(&format!(
-                    "<Contents><Key>{name}</Key><LastModified>2026-10-19T00:00:00.000Z</LastModified><ETag>{}</ETag><Size>{}</Size></Contents>",
+                    "<Contents><Key>{name}</Key><LastModified>2026-10-19T12:34:56.000Z</LastModified><ETag>{}</ETag><Size>{}</Size></Contents>",
                     object.etag.replace('"', "&quot;"),
                     object.bytes.len()
                 ));
@@ -362,7 +401,8 @@ fn handle(
                         .nth(1)
                         .and_then(|r| r.split(&format!("</{name}>")).next())
                         .unwrap_or("")
-                        .to_owned()
+                        .replace("&quot;", "\"")
+                        .replace("&amp;", "&")
                 };
                 let number: u16 = field("PartNumber").parse().unwrap();
                 let Some((data, checksum)) = upload.get(&number) else {
@@ -387,6 +427,7 @@ fn handle(
                     bytes,
                     checksum: format!("{}-{count}", digest(&composite)),
                     etag: format!("\"multi-{count}\""),
+                    version: format!("v{}", state.versions_made.fetch_add(1, Ordering::SeqCst)),
                 },
             );
             if state.lose_completions.load(Ordering::SeqCst) > 0 {
@@ -398,6 +439,49 @@ fn handle(
                 r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></CompleteMultipartUploadResult>"#,
             )
         }
+        "delete" => {
+            objects.remove(key);
+            let mut r = reply(204, "");
+            r.headers = vec![
+                ("x-amz-delete-marker".into(), "true".into()),
+                (
+                    "x-amz-version-id".into(),
+                    format!(
+                        "marker-{}",
+                        state.versions_made.fetch_add(1, Ordering::SeqCst)
+                    ),
+                ),
+            ];
+            r
+        }
+        "versioning" => {
+            let status = state.versioning.lock().unwrap().clone();
+            reply(
+                200,
+                format!(
+                    r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{}</VersioningConfiguration>"#,
+                    status
+                        .map(|s| format!("<Status>{s}</Status>"))
+                        .unwrap_or_default()
+                ),
+            )
+        }
+        "lifecycle" => match state.lifecycle.lock().unwrap().clone() {
+            None => reply(
+                404,
+                "<Error><Code>NoSuchLifecycleConfiguration</Code></Error>",
+            ),
+            Some(rules) => reply(
+                200,
+                format!(
+                    r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{rules}</LifecycleConfiguration>"#
+                ),
+            ),
+        },
+        "policy" => match state.policy.lock().unwrap().clone() {
+            None => reply(404, "<Error><Code>NoSuchBucketPolicy</Code></Error>"),
+            Some(policy) => reply(200, policy),
+        },
         "abort" => {
             state.uploads.lock().unwrap().remove(&query["uploadId"]);
             reply(204, "")

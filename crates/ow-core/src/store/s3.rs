@@ -1,33 +1,19 @@
 use super::*;
 use crate::snapshot_store::{
     S3Store,
-    http::{Http, checksum, transfers},
+    http::{Http, RANGE},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::json;
-use std::{
-    collections::VecDeque,
-    io::Cursor,
-    sync::{
-        Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::JoinHandle,
-};
+use std::sync::{Arc, OnceLock};
 
-/// Bytes per ranged download request and the first upload parts.
-const RANGE: u64 = 16 << 20;
-
-/// The deployment backup root, not `store/v1` itself. Uses the normal AWS CLI
-/// role chain; objects move in process, in parallel parts and ranges.
+/// The deployment backup root, not `store/v1` itself. Requests go through the
+/// AWS SDK and its credential chain; objects move in parallel parts and ranges.
 pub struct S3Objects {
     transport: S3Store,
     http: OnceLock<Arc<Http>>,
     bucket: String,
     prefix: String,
     part_size: u64,
-    #[cfg(test)]
-    program: Option<PathBuf>,
 }
 impl S3Objects {
     pub fn new(url: &str, endpoint: Option<&str>) -> Result<Self> {
@@ -69,48 +55,36 @@ impl S3Objects {
                 format!("{prefix}/store/v1/")
             },
             part_size: RANGE,
-            #[cfg(test)]
-            program: None,
         })
     }
-    fn aws(&self) -> std::process::Command {
-        let command = self.transport.aws();
-        #[cfg(test)]
-        if let Some(program) = &self.program {
-            let mut fake = std::process::Command::new(program);
-            for (name, value) in command.get_envs() {
-                if let Some(value) = value {
-                    fake.env(name, value);
-                } else {
-                    fake.env_remove(name);
-                }
-            }
-            return fake;
+    fn http(&self) -> Result<Arc<Http>> {
+        if let Some(http) = self.http.get() {
+            return Ok(http.clone());
         }
-        command
+        let _ = self.http.set(Arc::new(Http::new(&self.transport)?));
+        Ok(self.http.get().unwrap().clone())
+    }
+    /// Full key of a store-relative `key`, checked.
+    fn key(&self, key: &str) -> Result<String> {
+        key_path(key)?;
+        Ok(format!("{}{key}", self.prefix))
     }
     /// Fail closed before publishing into a bucket that could expire live artifacts.
     pub fn configuration_snapshot(&self) -> Result<Value> {
-        let read = |operation: &str| -> Result<Value> {
-            let output = self
-                .aws()
-                .args([
-                    "s3api",
-                    operation,
-                    "--bucket",
-                    &self.bucket,
-                    "--output",
-                    "json",
-                ])
-                .output()?;
-            ensure!(
-                output.status.success(),
-                "cannot verify artifact bucket safety ({operation})"
-            );
-            Ok(serde_json::from_slice(&output.stdout)?)
-        };
+        let http = self.http()?;
+        let unverifiable = |what: &str| format!("cannot verify artifact bucket safety ({what})");
+        let versioning = http
+            .versioning()
+            .with_context(|| unverifiable("get-bucket-versioning"))?;
+        let lifecycle = http
+            .lifecycle()
+            .with_context(|| unverifiable("get-bucket-lifecycle-configuration"))?
+            .with_context(|| unverifiable("get-bucket-lifecycle-configuration"))?;
+        let policy = http
+            .policy()
+            .with_context(|| unverifiable("get-bucket-policy"))?;
         Ok(
-            json!({"versioning":read("get-bucket-versioning")?,"lifecycle":read("get-bucket-lifecycle-configuration")?,"policy":read("get-bucket-policy")?}),
+            json!({"versioning":{"Status":versioning},"lifecycle":lifecycle,"policy":{"Policy":policy}}),
         )
     }
     pub fn verify_configuration(&self) -> Result<()> {
@@ -138,165 +112,6 @@ impl S3Objects {
         );
         Ok(())
     }
-    fn command(&self, operation: &str, key: &str) -> Result<std::process::Command> {
-        key_path(key)?;
-        let mut command = self.aws();
-        command
-            .env("AWS_PAGER", "")
-            .env("AWS_CLI_AUTO_PROMPT", "off");
-        command.args([
-            "s3api",
-            operation,
-            "--bucket",
-            &self.bucket,
-            "--key",
-            &format!("{}{key}", self.prefix),
-            "--output",
-            "json",
-        ]);
-        Ok(command)
-    }
-    fn call(&self, operation: &str, key: &str, args: &[&str]) -> Result<Value> {
-        let output = self
-            .command(operation, key)?
-            .args(args)
-            .output()
-            .context("AWS CLI required for artifact store")?;
-        // CLI stderr can contain deployment details; keep it out of public responses.
-        ensure!(
-            output.status.success(),
-            "S3 {operation} failed ({})",
-            output.status
-        );
-        let value = if output.stdout.is_empty() {
-            json!({})
-        } else {
-            serde_json::from_slice(&output.stdout)?
-        };
-        ensure!(
-            value.get("Error").is_none(),
-            "S3 {operation} returned an error"
-        );
-        Ok(value)
-    }
-    fn http(&self) -> Result<Arc<Http>> {
-        if let Some(http) = self.http.get() {
-            return Ok(http.clone());
-        }
-        let _ = self.http.set(Arc::new(Http::new(&self.transport)?));
-        Ok(self.http.get().unwrap().clone())
-    }
-    /// The existing object at full key `key` must hold exactly these bytes.
-    fn same(http: &Http, key: &str, checksum: &str, length: u64) -> Result<()> {
-        let head = http
-            .head(key, true)?
-            .context("write-once object mismatch")?;
-        let header = |name: &str| head.get(name).and_then(|v| v.to_str().ok());
-        ensure!(
-            header("x-amz-checksum-sha256") == Some(checksum)
-                && header("content-length") == Some(&length.to_string()),
-            "write-once object mismatch"
-        );
-        Ok(())
-    }
-    /// Uploads the parts of `source` after `first` on [`transfers`] threads, with
-    /// at most `transfers x 16 MiB` of parts in flight, then commits them unless
-    /// `key` exists.
-    fn multipart(
-        &self,
-        http: &Http,
-        key: &str,
-        upload: &str,
-        first: Vec<u8>,
-        source: &mut dyn Read,
-    ) -> Result<()> {
-        let done = Mutex::new(Vec::new());
-        let failed = AtomicBool::new(false);
-        let budget = transfers() as u64 * RANGE;
-        let (in_flight, freed) = (Mutex::new(0u64), Condvar::new());
-        // A rendezvous channel: a part is read only when a sender is free.
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<(u16, bytes::Bytes)>(0);
-        let receiver = Mutex::new(receiver);
-        let mut total = 0u64;
-        let mut count = 0u16;
-        std::thread::scope(|scope| -> Result<()> {
-            let workers: Vec<_> = (0..transfers())
-                .map(|_| {
-                    scope.spawn(|| -> Result<()> {
-                        let mut result = Ok(());
-                        // After a failure keep draining so the reader never blocks.
-                        loop {
-                            // Not in the loop condition: the lock must drop before the upload.
-                            let next = receiver.lock().unwrap().recv();
-                            let Ok((number, body)) = next else { break };
-                            let length = body.len() as u64;
-                            if result.is_ok() && !failed.load(Ordering::Relaxed) {
-                                match http.upload_part(key, upload, number, body) {
-                                    Ok((etag, checksum)) => {
-                                        done.lock().unwrap().push((number, etag, checksum))
-                                    }
-                                    Err(error) => {
-                                        failed.store(true, Ordering::Relaxed);
-                                        result = Err(error);
-                                    }
-                                }
-                            }
-                            *in_flight.lock().unwrap() -= length;
-                            freed.notify_one();
-                        }
-                        result
-                    })
-                })
-                .collect();
-            let read = (|| -> Result<()> {
-                let mut body = first;
-                while !body.is_empty() && !failed.load(Ordering::Relaxed) {
-                    // shortcut: parts of 16, 32, 64, then 128 MiB cap compressed objects at about 987 GiB; grow them further before supporting larger ones.
-                    ensure!(count < 10000, "multipart limit exceeded");
-                    count += 1;
-                    let length = body.len() as u64;
-                    total += length;
-                    {
-                        let mut held = in_flight.lock().unwrap();
-                        while *held > 0
-                            && *held + length > budget
-                            && !failed.load(Ordering::Relaxed)
-                        {
-                            held = freed.wait(held).unwrap();
-                        }
-                        *held += length;
-                    }
-                    sender
-                        .send((count, body.into()))
-                        .map_err(|_| anyhow::anyhow!("part upload stopped"))?;
-                    body = part(source, self.part_size << (count / 1000).min(3))?;
-                }
-                Ok(())
-            })();
-            drop(sender);
-            for worker in workers {
-                worker.join().expect("part upload thread panicked")?;
-            }
-            read
-        })?;
-        let mut parts = done.into_inner().unwrap();
-        parts.sort();
-        ensure!(
-            parts.len() == count as usize
-                && parts.iter().enumerate().all(|(i, p)| p.0 as usize == i + 1),
-            "multipart upload lost a part"
-        );
-        let mut composite = Sha256::new();
-        for (_, _, checksum) in &parts {
-            composite.update(STANDARD.decode(checksum)?);
-        }
-        let checksum = format!("{}-{}", STANDARD.encode(composite.finalize()), parts.len());
-        let parts: Vec<_> = parts.into_iter().map(|(_, e, c)| (e, c)).collect();
-        if let Err(error) = http.complete_multipart(key, upload, &parts) {
-            Self::same(http, key, &checksum, total).map_err(|_| error)?;
-        }
-        Ok(())
-    }
 }
 impl gc::ControllerObjects for S3Objects {
     fn configuration(&self) -> Result<()> {
@@ -304,236 +119,77 @@ impl gc::ControllerObjects for S3Objects {
     }
     fn marker(&self, run: &str) -> Result<i64> {
         attempt_prefix(run)?;
-        let key = format!("gc/runs/{run}.json");
-        let scratch = Scratch::new()?;
-        let body = scratch.0.join("marker");
-        private_file(&body)?.write_all(b"{\"format\":1}")?;
-        let call = |op: &str, args: &[&str]| -> Result<Value> {
-            let output = self
-                .aws()
-                .args([
-                    "s3api",
-                    op,
-                    "--bucket",
-                    &self.bucket,
-                    "--key",
-                    &format!("{}{key}", self.prefix),
-                    "--output",
-                    "json",
-                ])
-                .args(args)
-                .output()?;
-            ensure!(output.status.success(), "S3 run marker failed");
-            Ok(serde_json::from_slice(&output.stdout)?)
-        };
-        call(
-            "put-object",
-            &[
-                "--body",
-                body.to_str().context("marker path")?,
-                "--if-none-match",
-                "*",
-            ],
-        )?;
-        let head = call("head-object", &[])?;
-        gc::timestamp(
-            head["LastModified"]
-                .as_str()
-                .context("run marker has no server timestamp")?,
-        )
+        let key = format!("{}gc/runs/{run}.json", self.prefix);
+        let http = self.http()?;
+        ensure!(
+            http.put_new(&key, &b"{\"format\":1}"[..])
+                .context("S3 run marker failed")?,
+            "S3 run marker already exists"
+        );
+        http.head(&key, false)
+            .context("S3 run marker failed")?
+            .and_then(|head| head.modified)
+            .context("run marker has no server timestamp")
     }
     fn list(&self) -> Result<Vec<gc::ListedObject>> {
-        let prefix = format!("{}u/", self.prefix);
-        let mut continuation: Option<String> = None;
         let mut objects = Vec::new();
-        loop {
-            let mut command = self.aws();
-            command.args([
-                "s3api",
-                "list-objects-v2",
-                "--bucket",
-                &self.bucket,
-                "--prefix",
-                &prefix,
-                "--no-paginate",
-                "--output",
-                "json",
-            ]);
-            if let Some(token) = &continuation {
-                command.args(["--continuation-token", token]);
-            }
-            let output = command.output()?;
-            ensure!(output.status.success(), "S3 candidate enumeration failed");
-            let value: Value = serde_json::from_slice(&output.stdout)?;
-            if let Some(contents) = value.get("Contents") {
-                for object in contents.as_array().context("invalid listing")? {
-                    let key = object["Key"]
-                        .as_str()
-                        .context("listing key missing")?
-                        .strip_prefix(&self.prefix)
-                        .context("listing escaped store")?;
-                    key_path(key)?;
-                    objects.push(gc::ListedObject {
-                        key: key.into(),
-                        bytes: object["Size"].as_u64().context("listing size missing")?,
-                        modified: gc::timestamp(
-                            object["LastModified"]
-                                .as_str()
-                                .context("listing timestamp missing")?,
-                        )?,
-                    });
-                }
-            }
-            if value["IsTruncated"] == false {
-                break;
-            }
-            let next = value["NextContinuationToken"]
-                .as_str()
-                .context("incomplete listing")?
-                .to_owned();
-            ensure!(
-                continuation.as_ref() != Some(&next),
-                "listing did not advance"
-            );
-            continuation = Some(next);
+        for object in self
+            .http()?
+            .list(&format!("{}u/", self.prefix))
+            .context("S3 candidate enumeration failed")?
+        {
+            let key = object
+                .key
+                .strip_prefix(&self.prefix)
+                .context("listing escaped store")?;
+            key_path(key)?;
+            objects.push(gc::ListedObject {
+                key: key.into(),
+                bytes: object.size,
+                modified: object.modified,
+            });
         }
         Ok(objects)
     }
     fn head(&self, key: &str) -> Result<Option<gc::ObjectVersion>> {
-        let output = self.command("head-object", key)?.output()?;
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            if error.contains("(404)") || error.contains("(NoSuchKey)") {
-                return Ok(None);
-            }
-            anyhow::bail!("S3 verification HEAD failed");
-        }
-        let head: Value = serde_json::from_slice(&output.stdout)?;
-        let version = head["VersionId"]
-            .as_str()
-            .context("versioning proof missing")?;
+        let key = self.key(key)?;
+        let Some(head) = self
+            .http()?
+            .head(&key, false)
+            .context("S3 verification HEAD failed")?
+        else {
+            return Ok(None);
+        };
+        let version = head.version.context("versioning proof missing")?;
         ensure!(
             !version.is_empty() && version != "null",
             "unversioned artifact"
         );
         Ok(Some(gc::ObjectVersion {
-            bytes: head["ContentLength"]
-                .as_u64()
-                .context("HEAD size missing")?,
-            version: version.into(),
+            bytes: head.length,
+            version,
         }))
     }
     fn delete(&self, key: &str) -> Result<String> {
-        let value = self.call("delete-object", key, &[])?;
-        ensure!(
-            value["DeleteMarker"] == true,
-            "delete did not return a versioned marker"
-        );
-        let version = value["VersionId"]
-            .as_str()
-            .context("delete marker version missing")?;
+        let key = self.key(key)?;
+        let (marker, version) = self.http()?.delete(&key)?;
+        ensure!(marker, "delete did not return a versioned marker");
+        let version = version.context("delete marker version missing")?;
         ensure!(
             !version.is_empty() && version != "null",
             "unversioned deletion"
         );
-        Ok(version.into())
+        Ok(version)
     }
-}
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new() -> Result<Self> {
-        let path = std::env::temp_dir().join(format!("ow-upload-{}", token()?));
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(Self(path))
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-/// Up to `size` bytes of `source`; fewer only at its end.
-fn part(source: &mut dyn Read, size: u64) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(size as usize);
-    source.take(size).read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 impl Objects for S3Objects {
     fn put_once(&self, key: &str, source: &mut dyn Read) -> Result<()> {
-        key_path(key)?;
-        let http = self.http()?;
-        let key = format!("{}{key}", self.prefix);
-        let first = part(source, self.part_size)?;
-        if (first.len() as u64) < self.part_size {
-            let (checksum, length) = (checksum(&first), first.len() as u64);
-            match http.put_new(&key, first) {
-                Ok(true) => {}
-                Ok(false) => Self::same(&http, &key, &checksum, length)?,
-                Err(error) => Self::same(&http, &key, &checksum, length).map_err(|_| error)?,
-            }
-            return Ok(());
-        }
-        let upload = http.create_multipart(&key)?;
-        let result = self.multipart(&http, &key, &upload, first, source);
-        // Also harmless after a lost completion response or successful completion.
-        let _ = http.abort_multipart(&key, &upload);
-        result
+        let key = self.key(key)?;
+        self.http()?.put_stream(&key, source, self.part_size, true)
     }
     fn get(&self, key: &str) -> Result<Box<dyn Read>> {
-        key_path(key)?;
-        let http = self.http()?;
-        let key = format!("{}{key}", self.prefix);
-        let head = http.head(&key, false)?.context("stored object missing")?;
-        let header = |name: &str| head.get(name).and_then(|v| v.to_str().ok());
-        let size = header("content-length")
-            .and_then(|v| v.parse().ok())
-            .context("stored object size missing")?;
-        // Every range must come from this one version of the object.
-        let etag = header("etag").context("stored object ETag missing")?.into();
-        Ok(Box::new(Download {
-            http,
-            key,
-            etag,
-            size,
-            next: 0,
-            pending: VecDeque::new(),
-            current: Cursor::new(Vec::new()),
-        }))
-    }
-}
-/// An object read in order from parallel ranged requests, a bounded number ahead.
-struct Download {
-    http: Arc<Http>,
-    key: String,
-    etag: String,
-    size: u64,
-    next: u64,
-    pending: VecDeque<JoinHandle<Result<Vec<u8>>>>,
-    current: Cursor<Vec<u8>>,
-}
-impl Read for Download {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            let n = self.current.read(bytes)?;
-            if n > 0 || bytes.is_empty() {
-                return Ok(n);
-            }
-            while self.pending.len() < transfers() && self.next < self.size {
-                let (start, end) = (self.next, (self.next + RANGE).min(self.size));
-                let (http, key, etag) = (self.http.clone(), self.key.clone(), self.etag.clone());
-                self.pending.push_back(std::thread::spawn(move || {
-                    http.get_range(&key, start, end, &etag)
-                }));
-                self.next = end;
-            }
-            let Some(range) = self.pending.pop_front() else {
-                return Ok(0);
-            };
-            let range = range
-                .join()
-                .map_err(|_| std::io::Error::other("download thread panicked"))?;
-            self.current = Cursor::new(range.map_err(std::io::Error::other)?);
-        }
+        let key = self.key(key)?;
+        Ok(Box::new(self.http()?.reader(&key)?))
     }
 }
 
@@ -541,7 +197,9 @@ impl Read for Download {
 mod tests {
     use super::*;
     use crate::fake_s3::FakeS3;
-    fn objects(fake: &FakeS3, part_size: u64) -> S3Objects {
+    use crate::snapshot_store::http::transfers;
+    use std::sync::atomic::Ordering;
+    pub(super) fn objects(fake: &FakeS3, part_size: u64) -> S3Objects {
         let mut objects = S3Objects::new("s3://bucket/root", None).unwrap();
         let _ = objects
             .http
@@ -651,6 +309,50 @@ mod tests {
             .etag = "\"other\"".into();
         assert!(download.read_to_end(&mut Vec::new()).is_err());
     }
+    #[test]
+    fn s3_a_range_cut_short_is_fetched_again() {
+        let fake = FakeS3::start();
+        let store = objects(&fake, 64 << 10);
+        let data: Vec<u8> = (0..(RANGE as usize + 4321))
+            .map(|i| (i % 241) as u8)
+            .collect();
+        let key = key();
+        store.put_once(&key, &mut &data[..]).unwrap();
+        // Each range's first response sends half its body and drops the connection.
+        fake.state.cut_ranges.store(2, Ordering::SeqCst);
+        let mut read = Vec::new();
+        store.get(&key).unwrap().read_to_end(&mut read).unwrap();
+        assert!(read == data);
+        assert_eq!(
+            fake.calls("range"),
+            4,
+            "two cut ranges, each asked again once"
+        );
+    }
+    #[test]
+    fn s3_bucket_safety_is_read_through_the_sdk_and_fails_closed() {
+        let fake = FakeS3::start();
+        let store = objects(&fake, RANGE);
+        // Nothing configured: unverifiable, so refused.
+        assert!(store.verify_configuration().is_err());
+        *fake.state.versioning.lock().unwrap() = Some("Enabled".into());
+        *fake.state.lifecycle.lock().unwrap() = Some("<Rule><ID>undo</ID><Filter><Prefix>root/store/</Prefix></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration></Rule>".into());
+        *fake.state.policy.lock().unwrap() = Some(json!({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/root/store/v1/*","Condition":{"Null":{"s3:if-none-match":"true"},"Bool":{"s3:ObjectCreationOperation":"true"}}}]}).to_string());
+        store.verify_configuration().unwrap();
+        let evidence = store.configuration_snapshot().unwrap();
+        assert_eq!(evidence["versioning"]["Status"], "Enabled");
+        assert_eq!(
+            evidence["lifecycle"]["Rules"][0]["Filter"]["Prefix"],
+            "root/store/"
+        );
+        // An expiring rule, a tag-scoped undo rule or suspended versioning are refused.
+        *fake.state.lifecycle.lock().unwrap() = Some("<Rule><ID>undo</ID><Filter><Prefix>root/store/</Prefix></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration></Rule><Rule><ID>age</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule>".into());
+        assert!(store.verify_configuration().is_err());
+        *fake.state.lifecycle.lock().unwrap() = Some("<Rule><ID>undo</ID><Filter><And><Prefix>root/store/</Prefix><Tag><Key>k</Key><Value>v</Value></Tag></And></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration></Rule>".into());
+        assert!(store.verify_configuration().is_err());
+        *fake.state.versioning.lock().unwrap() = Some("Suspended".into());
+        assert!(store.verify_configuration().is_err());
+    }
 }
 
 fn check_configuration(versioning: &Value, lifecycle: &Value, prefix: &str) -> Result<()> {
@@ -752,54 +454,35 @@ fn s3_store_requires_write_once_policy_for_every_principal() {
 
 #[cfg(test)]
 #[test]
-fn controller_gc_uses_server_marker_paged_listing_and_only_current_deletes() {
+fn controller_gc_uses_server_marker_listing_and_only_current_deletes() {
     use gc::ControllerObjects;
-    let scratch = Scratch::new().unwrap();
-    let script = scratch.0.join("aws");
-    fs::write(&script,r#"#!/usr/bin/env python3
-import sys,json,pathlib
-root=pathlib.Path(__file__).parent
-a=sys.argv[1:]
-def arg(k):return a[a.index(k)+1]
-op=a[1]
-with (root/'gc-calls').open('a') as f:f.write(json.dumps(a)+'\n')
-assert '--version-id' not in a
-assert arg('--bucket')=='bucket'
-if op=='put-object':
- assert arg('--if-none-match')=='*'
- assert arg('--key').startswith('root/store/v1/gc/runs/')
- assert pathlib.Path(arg('--body')).read_text()=='{"format":1}'
- print('{}')
-elif op=='head-object':
- key=arg('--key')
- if key.endswith('memory.zst'):
-  print('An error occurred (404) when calling the HeadObject operation',file=sys.stderr);sys.exit(1)
- if key.endswith('state.zst'):
-  print('An error occurred (403) when calling the HeadObject operation',file=sys.stderr);sys.exit(1)
- print(json.dumps({'LastModified':'2026-10-19T12:34:56+00:00','ContentLength':9,'VersionId':'original'}))
-elif op=='list-objects-v2':
- assert arg('--prefix')=='root/store/v1/u/' and '--no-paginate' in a
- page=1 if '--continuation-token' not in a else 2
- if page==2:assert arg('--continuation-token')=='page2'
- print(json.dumps({'Contents':[{'Key':'root/store/v1/u/aa/'+'a'*32+('/manifest.json' if page==1 else '/disk.ext4.zst'),'Size':page*10,'LastModified':'2026-10-19T10:00:00Z'}], 'IsTruncated':page==1,**({'NextContinuationToken':'page2'} if page==1 else {})}))
-elif op=='delete-object':print(json.dumps({'DeleteMarker':True,'VersionId':'marker'}))
-else:raise Exception(op)
-"#).unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-    let mut s3 = S3Objects::new("s3://bucket/root", None).unwrap();
-    s3.program = Some(script);
-    assert_eq!(s3.marker(&token().unwrap()).unwrap(), 1792413296);
-    let listed = s3.list().unwrap();
-    assert_eq!(listed.len(), 2);
-    assert_eq!(listed.iter().map(|o| o.bytes).sum::<u64>(), 30);
+    let fake = crate::fake_s3::FakeS3::start();
+    let s3 = tests::objects(&fake, RANGE);
     assert_eq!(
-        s3.head(&listed[0].key).unwrap().unwrap().version,
-        "original"
+        s3.marker(&token().unwrap()).unwrap(),
+        crate::fake_s3::MODIFIED
     );
     let prefix = attempt_prefix(&"a".repeat(32)).unwrap();
+    for (file, bytes) in [
+        ("manifest.json", &b"0123456789"[..]),
+        ("disk.ext4.zst", &[7; 20][..]),
+    ] {
+        s3.put_once(&format!("{prefix}{file}"), &mut &bytes[..])
+            .unwrap();
+    }
+    let listed = s3.list().unwrap();
+    assert_eq!(listed.len(), 2, "run markers are not candidates");
+    assert_eq!(listed.iter().map(|o| o.bytes).sum::<u64>(), 30);
+    assert!(
+        listed
+            .iter()
+            .all(|o| o.modified == crate::fake_s3::MODIFIED)
+    );
+    let head = s3.head(&listed[0].key).unwrap().unwrap();
+    assert!(head.version.starts_with('v') && head.bytes == listed[0].bytes);
     assert!(s3.head(&format!("{prefix}memory.zst")).unwrap().is_none());
-    assert!(s3.head(&format!("{prefix}state.zst")).is_err());
-    assert_eq!(s3.delete(&listed[0].key).unwrap(), "marker");
+    assert!(s3.delete(&listed[0].key).unwrap().starts_with("marker-"));
+    assert!(s3.head(&listed[0].key).unwrap().is_none());
     for bad in [
         "../catalog/saved.json",
         "u/aa/wrong/disk.ext4.zst",
@@ -807,6 +490,9 @@ else:raise Exception(op)
     ] {
         assert!(s3.delete(bad).is_err());
     }
-    let calls = fs::read_to_string(scratch.0.join("gc-calls")).unwrap();
-    assert!(!calls.contains("--version-id") && !calls.contains("delete-object-version"));
+    assert_eq!(
+        fake.calls("delete"),
+        1,
+        "only the checked current object was deleted"
+    );
 }

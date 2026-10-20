@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Credential-free S3 HTTP fixture for the in-process chunk transfer.
+"""Credential-free S3 HTTP fixture for the AWS SDK transfers.
 
-Serves path-style requests from ROOT/<bucket>/<key>, the layout fake_aws.py
-uses, and logs each request to ROOT/calls.jsonl. Prints its port on stdout.
-Fault files in ROOT: deny-head, fail-manifest, and put-budget (how many more
-chunk uploads succeed before the rest are refused). HEAD reports length, ETag and
-(when asked) SHA-256; ranged GETs must match that ETag.
+Serves signed path-style requests from ROOT/<bucket>/<key> and logs each to
+ROOT/calls.jsonl. Prints its port on stdout. Fault files in ROOT: deny-head,
+fail-manifest, put-budget (how many more chunk uploads succeed before the rest
+are refused), no-versioning and unsafe-lifecycle. HEAD reports length, ETag and
+(when asked) SHA-256; ranged GETs must match that ETag. Bucket versioning,
+lifecycle (seven-day undo) and, when ROOT/write-once-policy exists, the
+write-once policy for root/store/v1/ are answered as a safe deployment would.
 """
 import base64
 import hashlib
@@ -34,8 +36,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def target(self):
         url = urlparse(self.path)
-        query = parse_qs(url.query)
-        assert 'X-Amz-Signature' in query, 'unsigned request'
+        query = parse_qs(url.query, keep_blank_values=True)
+        assert (self.headers['Authorization'] or '').startswith('AWS4-HMAC-SHA256'), 'unsigned request'
         bucket, _, key = unquote(url.path).lstrip('/').partition('/')
         with (root / 'calls.jsonl').open('a') as log:
             log.write(json.dumps(['http', self.command, key, bucket]) + '\n')
@@ -68,6 +70,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         bucket, key, query = self.target()
+        if 'versioning' in query:
+            status = 'Suspended' if (root / 'no-versioning').exists() else 'Enabled'
+            return self.reply(200, f'<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>{status}</Status></VersioningConfiguration>'.encode())
+        if 'lifecycle' in query:
+            expire = '<Expiration><Days>30</Days></Expiration>' if (root / 'unsafe-lifecycle').exists() else ''
+            return self.reply(200, f'<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>undo</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>{expire}<NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>'.encode())
+        if 'policy' in query:
+            if not (root / 'write-once-policy').exists():
+                return self.error(404, 'NoSuchBucketPolicy')
+            return self.reply(200, json.dumps({'Statement': [{'Effect': 'Deny', 'Principal': '*', 'Action': 's3:PutObject', 'Resource': f'arn:aws:s3:::{bucket}/root/store/v1/*', 'Condition': {'Null': {'s3:if-none-match': 'true'}, 'Bool': {'s3:ObjectCreationOperation': 'true'}}}]}).encode())
         if query.get('list-type') == ['2']:
             prefix = query.get('prefix', [''])[0]
             base = root / bucket
@@ -94,7 +106,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         bucket, key, _ = self.target()
         body = self.rfile.read(int(self.headers['Content-Length']))
-        assert self.headers['If-None-Match'] == '*'
+        once = self.headers['If-None-Match'] == '*'
         checksum = base64.b64encode(hashlib.sha256(body).digest()).decode()
         if self.headers['x-amz-checksum-sha256'] != checksum:
             return self.error(400, 'BadDigest')
@@ -110,11 +122,11 @@ class Handler(BaseHTTPRequestHandler):
         dest = root / bucket / key
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with dest.open('xb') as output:
+            with dest.open('xb' if once else 'wb') as output:
                 output.write(body)
         except FileExistsError:
             return self.error(412, 'PreconditionFailed')
-        self.reply(200)
+        self.reply(200, headers=[('ETag', etag(body))])
 
 
 server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)

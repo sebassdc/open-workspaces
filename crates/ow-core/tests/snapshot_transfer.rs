@@ -36,15 +36,13 @@ fn capture(dir: &Path, name: &str, disk: &[u8]) {
 
 #[test]
 fn incremental_retry_integrity_and_legacy_restore() {
-    // Each child has its own PATH; parallel tests never mutate process environment.
+    // Each child has its own environment; parallel tests never mutate this process's.
     if std::env::var_os("OW_STORE_CHILD").is_none() {
         let root =
             std::env::temp_dir().join(format!("ow-transfer-{}", ow_core::common::nonce().unwrap()));
         fs::create_dir(&root).unwrap();
         let bin = root.join("bin");
         fs::create_dir(&bin).unwrap();
-        fs::write(bin.join("aws"), include_bytes!("fake_aws.py")).unwrap();
-        fs::set_permissions(bin.join("aws"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(bin.join("s3"), include_bytes!("fake_s3.py")).unwrap();
         let mut server = Command::new("python3")
             .arg(bin.join("s3"))
@@ -62,10 +60,13 @@ fn incremental_retry_integrity_and_legacy_restore() {
                 "incremental_retry_integrity_and_legacy_restore",
                 "--nocapture",
             ])
-            .env(
-                "PATH",
-                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
-            )
+            // The SDK's credential chain finds fixture keys first; no profile, no instance role.
+            .env("AWS_ACCESS_KEY_ID", "AKIDFIXTURE")
+            .env("AWS_SECRET_ACCESS_KEY", "fixture")
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_CONFIG_FILE", root.join("no-config"))
+            .env("AWS_SHARED_CREDENTIALS_FILE", root.join("no-credentials"))
+            .env("AWS_EC2_METADATA_DISABLED", "true")
             .env("OW_STORE_CHILD", "1")
             .env("OW_TEST_STORE", &root)
             .env(
@@ -124,13 +125,6 @@ fn incremental_retry_integrity_and_legacy_restore() {
     store.push("two", &root.join("two")).unwrap();
     assert_eq!(count_puts(), 5, "retry reuploaded chunks");
     assert_eq!(calls("HEAD"), 0, "checked chunks one request at a time");
-    assert!(
-        fs::read_to_string(root.join("calls.jsonl"))
-            .unwrap()
-            .lines()
-            .all(|l| !l.contains("put-object") && !l.contains("head-object")),
-        "spawned a CLI process per object"
-    );
     let remote = root.join("bucket/snapshots");
     let descriptor: Value =
         serde_json::from_slice(&fs::read(remote.join("two/manifest.json")).unwrap()).unwrap();
