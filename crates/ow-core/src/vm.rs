@@ -297,7 +297,7 @@ impl Vm {
             }
             ensure!(
                 started.elapsed() < timeout,
-                "guest command timed out; stop/start to recover the serial channel"
+                "guest command timed out after {timeout:?}"
             );
             ensure!(
                 self.buffer.len() < 2 * 1024 * 1024,
@@ -325,23 +325,35 @@ impl Vm {
     }
 
     pub fn command(&mut self, command: &str) -> Result<(String, i32)> {
+        self.command_within(command, Duration::from_secs(30))
+    }
+
+    fn command_within(&mut self, command: &str, timeout: Duration) -> Result<(String, i32)> {
         ensure!(command.len() < 512 * 1024, "command too large");
         let marker = format!("OW_DONE_{}", nonce()?);
         // Output marker uses a private nonce; this transport supports trusted local workloads only.
-        let wire = format!("{command}; ow_rc=$?; printf '\\n{marker}:%s:{marker}\\n' \"$ow_rc\"\n");
+        // The begin marker separates this command's output from any a timed-out command left
+        // on the channel: read_until discards that, its own end marker included.
+        let wire = format!(
+            "printf '{marker}:begin\\n'; {command}; ow_rc=$?; printf '\\n{marker}:%s:{marker}\\n' \"$ow_rc\"\n"
+        );
         self.master.write_all(wire.as_bytes())?;
         let end = format!(":{marker}");
-        let bytes = self.read_until(end.as_bytes(), Duration::from_secs(30))?;
+        let bytes = self.read_until(end.as_bytes(), timeout)?;
         let text = String::from_utf8_lossy(&bytes).replace('\r', "");
-        let begin = text
+        let start = format!("{marker}:begin\n");
+        let begin = text.rfind(&start).context("missing begin marker")? + start.len();
+        let finish = text
             .rfind(&format!("{marker}:"))
             .context("missing exit marker")?;
-        let code = text[begin + marker.len() + 1..text.len() - end.len()]
+        ensure!(begin <= finish, "missing exit marker");
+        let code = text[finish + marker.len() + 1..text.len() - end.len()]
             .trim()
             .parse()?;
-        let output = text[..begin]
-            .trim_start_matches("\n")
-            .trim_start_matches("OW> ")
+        // Drop the newline the exit marker printf adds.
+        let output = text[begin..finish]
+            .strip_suffix('\n')
+            .unwrap_or(&text[begin..finish])
             .to_string();
         Ok((output, code))
     }
@@ -507,6 +519,69 @@ impl Drop for Vm {
 }
 
 #[cfg(test)]
+mod command_tests {
+    use super::*;
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::net::UnixStream,
+    };
+
+    fn marker(line: &str) -> String {
+        let suffix = line
+            .split_once("OW_DONE_")
+            .unwrap()
+            .1
+            .split(':')
+            .next()
+            .unwrap();
+        format!("OW_DONE_{suffix}")
+    }
+
+    #[test]
+    fn timed_out_command_output_does_not_reach_the_next_command() {
+        let (master, guest) = UnixStream::pair().unwrap();
+        let guest = std::thread::spawn(move || {
+            let mut serial = BufReader::new(guest);
+            let mut slow = String::new();
+            serial.read_line(&mut slow).unwrap();
+            let slow = marker(&slow);
+            write!(serial.get_mut(), "{slow}:begin\npartial-from-slow\n").unwrap();
+            // The shell reads the next command only after the slow one ends.
+            let mut quick = String::new();
+            serial.read_line(&mut quick).unwrap();
+            assert!(quick.contains("echo next-command"), "{quick}");
+            let quick = marker(&quick);
+            write!(
+                serial.get_mut(),
+                "leftover-from-slow\n\n{slow}:0:{slow}\nOW> {quick}:begin\nnext-command\n\n{quick}:0:{quick}\nOW> "
+            )
+            .unwrap();
+        });
+        let mut vm = Vm {
+            child: Command::new("sleep").arg("30").spawn().unwrap(),
+            master: std::os::fd::OwnedFd::from(master).into(),
+            log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
+            diagnostics: None,
+            buffer: Vec::new(),
+            socket: PathBuf::new(),
+            tap: "command-fixture-no-host-interface".into(),
+            memory_base: MemoryBase::Unknown,
+            address: String::new(),
+        };
+        let error = vm
+            .command_within(
+                "sleep 34; echo leftover-from-slow",
+                Duration::from_millis(300),
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "guest command timed out after 300ms");
+        let (output, code) = vm.command("echo next-command").unwrap();
+        assert_eq!((output.as_str(), code), ("next-command\n", 0));
+        guest.join().unwrap();
+    }
+}
+
+#[cfg(test)]
 mod clock_tests {
     use super::*;
     use std::{
@@ -587,7 +662,8 @@ mod clock_tests {
             for _ in 0..if capture_failure { 2 } else { 1 } {
                 let mut line = String::new();
                 serial.read_line(&mut line).unwrap();
-                let command = line.split_once("; ow_rc=").unwrap().0;
+                let command = line.split_once("\\n'; ").unwrap().1;
+                let command = command.split_once("; ow_rc=").unwrap().0;
                 let code = if let Some(time) = command.strip_prefix("date -u -s '@") {
                     let seconds = time.split_once('\'').unwrap().0.parse::<u64>().unwrap();
                     if date_exit == 0 {
@@ -606,7 +682,11 @@ mod clock_tests {
                     .next()
                     .unwrap();
                 let marker = format!("OW_DONE_{suffix}");
-                write!(serial.get_mut(), "\n{marker}:{code}:{marker}\n").unwrap();
+                write!(
+                    serial.get_mut(),
+                    "{marker}:begin\n\n{marker}:{code}:{marker}\n"
+                )
+                .unwrap();
             }
         });
         let child = Command::new("sleep").arg("30").spawn().unwrap();
@@ -706,6 +786,7 @@ fn capture_fixture_steps(
             if serial.read_line(&mut command).unwrap() == 0 {
                 return false;
             }
+            let command = command.split_once("\\n'; ").unwrap().1;
             assert!(command.starts_with(prefix), "{command}");
             let suffix = command
                 .split_once("OW_DONE_")
@@ -715,7 +796,11 @@ fn capture_fixture_steps(
                 .next()
                 .unwrap();
             let marker = format!("OW_DONE_{suffix}");
-            write!(serial.get_mut(), "\n{marker}:{exit}:{marker}\n").unwrap();
+            write!(
+                serial.get_mut(),
+                "{marker}:begin\n\n{marker}:{exit}:{marker}\n"
+            )
+            .unwrap();
             true
         };
         for (capture_index, capture) in steps.into_iter().enumerate() {

@@ -64,6 +64,9 @@ const UNMADE: &str = "metadata=json_set(metadata,'$.state','failed','$.unmade',j
 const CREATION_TIMEOUT_MINUTES: u32 = 30;
 const CREATION_TIMEOUT: &str = "Creation did not complete within 30 minutes and the runner has no such machine; it failed. Delete it, or retry with a new operation key.";
 
+/// The serial channel stops waiting; the guest has no way to interrupt the command.
+pub(crate) const COMMAND_TIMEOUT: &str = "Stopped waiting after 30 s: commands in the console are limited to 30 s, and this one may still be running in the machine. Use Open Terminal (ow shell) for long-running work.";
+
 fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
     match (op, diagnostic) {
         (_, CREATION_TIMEOUT) => CREATION_TIMEOUT,
@@ -94,6 +97,7 @@ fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
             "Named snapshot limit (24) reached. Remove unneeded snapshots on the host before retrying with a new operation key."
         }
         (_, "incomplete snapshot exists; preserve and inspect it") => diagnostic,
+        (_, "guest command timed out after 30s") => COMMAND_TIMEOUT,
         (_, "node route unavailable before dispatch") => {
             "Node is unavailable; no operation was dispatched. Retry with the same operation key when it reconnects."
         }
@@ -2728,6 +2732,10 @@ mod tests {
             assert!(message.contains("ow "));
             assert_eq!(public_operation_error("create", diagnostic), message);
         }
+        assert_eq!(
+            public_operation_error("exec", "guest command timed out after 30s"),
+            COMMAND_TIMEOUT
+        );
         assert!(first_use_error("node capacity exhausted: /private/tenant-secret").is_none());
         assert!(
             !public_operation_error("create", "/private/tenant-secret").contains("tenant-secret")

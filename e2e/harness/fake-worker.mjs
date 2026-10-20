@@ -64,7 +64,12 @@ export function fakeWorker(socketPath, log = () => {}) {
       return {deleted: r.id, snapshots: gone};
     },
     // Guest output is whatever the command says, so tests can check it is shown as text.
-    exec: r => ({output: r.command.replace(/^echo /, ''), exit_code: r.command.startsWith('false') ? 1 : 0}),
+    // A real guest command past 30 s ends with this worker diagnostic.
+    exec: r => {
+      // What the real worker says when a guest command runs past 30 s.
+      if (r.command.startsWith('sleep ')) throw Error('guest command timed out after 30s');
+      return {output: r.command.replace(/^echo /, ''), exit_code: r.command.startsWith('false') ? 1 : 0};
+    },
   };
   // Like the real worker, refuse to run more guest memory than the host has.
   function admit(memory) {
