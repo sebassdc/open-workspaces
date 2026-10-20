@@ -3,10 +3,11 @@
   "releases": [
     {
       "version": "0.9.38",
-      "class": 0,
+      "class": 1,
       "changes": [
         "component",
         "config",
+        "dashboard",
         "host-layout"
       ],
       "protocol": {
@@ -36,7 +37,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "AWS component input poolAdmins (Host only; login emails) sets the gateway config's pool_admins on the controller's dashboard, so pool admins are managed in place; it needs a dashboard and admits nobody by itself. The config parameter carries dashboard.poolAdmins and ow-host writes OW_POOL_ADMINS to dashboard.env only when set, so hosts without it render the same files; setting or changing it restarts only the dashboard. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel, host layout 2 and stage 0 are unchanged."
+      "notes": "AWS component input poolAdmins (Host only; login emails) sets the gateway config's pool_admins on the controller's dashboard, so pool admins are managed in place; it needs a dashboard and admits nobody by itself. The config parameter carries dashboard.poolAdmins and ow-host writes OW_POOL_ADMINS to dashboard.env only when set, so hosts without it render the same env file; the changed dashboard-prepare restarts each dashboard once on upgrade, and setting or changing poolAdmins later restarts only the dashboard. Dashboard and controller logins are now matched in full, so a trailing newline is refused. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel, host layout 2 and stage 0 are unchanged."
     },
     {
       "version": "0.9.37",

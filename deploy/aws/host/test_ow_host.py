@@ -129,7 +129,7 @@ class Render(unittest.TestCase):
                          "OW_DASHBOARD_LOGINS=you@example.com\nOW_DASHBOARD_CAPABILITY=\nOW_POOL_ADMINS=admin@example.com\n")
         changed = {path for path in files if files[path] != self.files[path]}
         self.assertEqual(h.units_changed(changed), {"dashboard"})
-        for bad in (["not an email"], ["a@example.com\nX=1"]):
+        for bad in (["not an email"], ["a@example.com\nX=1"], ["a@example.com\n"]):
             with self.assertRaises(h.Refused):
                 config(dashboard={"logins": ["you@example.com"], "poolAdmins": bad})
         with self.assertRaises(h.Refused):

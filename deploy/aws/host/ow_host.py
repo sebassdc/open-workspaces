@@ -212,13 +212,13 @@ def validate(config):
                 or not re.fullmatch(r"[A-Za-z0-9._/-]+", path)):
             raise Refused("config: dashboard.capability must be domain/path (at most 512 characters)")
     for login in logins:
-        if not isinstance(login, str) or not LOGIN.match(login) or len(login) > 254:
+        if not isinstance(login, str) or not LOGIN.fullmatch(login) or len(login) > 254:
             raise Refused(f"config: invalid dashboard login {login!r}")
     if (logins or capability) and not tailscale["secretArn"]:
         raise Refused("config: dashboard logins/capability need tailscale.secretArn (the dashboard is served over the tailnet only)")
     pool_admins = (config.get("dashboard") or {}).get("poolAdmins") or []
     for admin in pool_admins:
-        if not isinstance(admin, str) or not LOGIN.match(admin) or len(admin) > 254:
+        if not isinstance(admin, str) or not LOGIN.fullmatch(admin) or len(admin) > 254:
             raise Refused(f"config: invalid pool admin {admin!r}")
     if pool_admins and not (logins or capability):
         raise Refused("config: dashboard.poolAdmins needs a dashboard (logins or capability)")
