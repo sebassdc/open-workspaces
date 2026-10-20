@@ -2141,6 +2141,9 @@ mod disk_tests {
         runtime
             .request(&json!({"op":"delete","id":"legacy"}))
             .unwrap();
+        // A new box under the same ID is not the one captured.
+        let again: Workspace = serde_json::from_value(json!({"id":"legacy","index":2,"state":"stopped","memory_mib":1024,"vcpu_count":2,"source":null,"hibernation":null})).unwrap();
+        runtime.state.workspaces.insert("legacy".into(), again);
         let sealed = staged.seal();
         let error = runtime.finish(staged, sealed).unwrap_err();
         assert!(error.to_string().contains("deleted during"), "{error:#}");
