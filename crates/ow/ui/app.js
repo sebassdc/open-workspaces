@@ -4,8 +4,16 @@ let data = {workspaces: [], snapshots: [], stats: {}}, selected = null, busy = f
 const histories = new Map();
 const imageNames = {alpine:'Alpine Linux',arch:'Arch Linux',ubuntu:'Ubuntu 24.04', 'ubuntu-arm64':'Ubuntu 24.04 ARM64'};
 // Built-in images, then golden images that the runners advertise (`ow image build`).
-const imageChoices = () => [...Object.entries(imageNames).map(([value,label]) => [value,value === 'alpine' ? label : `${label} · developer tools`]),
-  ...[...new Set((data.nodes || []).flatMap(n => n.capabilities?.images || []))].filter(i => !Object.hasOwn(imageNames, i)).sort().map(i => [i, `${i} · golden image`])];
+// Discovery decides availability once the pool has nodes; a lone local host has none and decides itself.
+const imageChoices = () => { const pool = data.discovery?.nodes?.length ? data.discovery.images || [] : null;
+  return [...Object.entries(imageNames).map(([value,label]) => [value,value === 'alpine' ? label : `${label} · developer tools`]),
+  ...[...new Set((data.nodes || []).flatMap(n => n.capabilities?.images || []))].filter(i => !Object.hasOwn(imageNames, i)).sort().map(i => [i, `${i} · golden image`])]
+  .map(([value,label]) => pool && !pool.some(i => i.name === value && i.available) ? [value, `${imageNames[value] || value} · not available on this pool`, true] : [value,label]); };
+// Online pool nodes with their free room; a full or draining node stays listed but cannot be picked.
+const nodeChoices = () => (data.discovery?.nodes || []).filter(n => n.online).map(n => { const free = n.available, full = free && (!free.slots || !free.vcpus || free.memory_mib < 256 || n.workspaces?.available === 0);
+  return n.draining ? [n.id, `${n.id} · draining`, true] : full ? [n.id, `${n.id} · full`, true] : [n.id, free ? `${n.id} · ${free.vcpus} vCPU · ${mib(free.memory_mib)} free` : n.id]; });
+// Refusals the dashboard can explain in its own words; other errors keep the server's text.
+const refusals = {name_taken: 'You already have a machine with that name. Choose another name.', unavailable_image: 'That operating system is not available on this pool right now. Choose another one.', insufficient_capacity: 'The pool has no room for a machine this size right now. Choose less memory or fewer vCPUs, another node, or try again later.', unsupported_capability: 'This pool cannot run a machine of that shape. Choose another operating system or size.', node_unavailable: 'No pool node is online right now. Try again in a moment.'};
 const diskUsage = item => item.disk_bytes ? `${mib(item.disk_bytes / 1048576)} disk · ${item.disk_used_bytes == null ? 'use unknown' : mib(item.disk_used_bytes / 1048576) + ' used'}` : 'Disk size unavailable';
 const mib = value => value >= 1024 ? `${(value / 1024).toFixed(1)} GiB` : `${Math.round(value)} MiB`;
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
@@ -15,7 +23,7 @@ async function api(path, body) {
   const kind = response.headers.get('content-type') || '';
   if (!kind.includes('application/json')) throw Error('Your login may have expired. Reload the page to sign in again.');
   const value = await response.json();
-  if (!response.ok || !value.ok) { const error = Error((value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : '')); error.operation = value.operation; throw error; }
+  if (!response.ok || !value.ok) { const plain = refusals[value.error_code || value.operation?.error_code]; const error = Error(plain || (value.error || 'The request could not complete. Refresh before retrying.') + (value.operation ? ` Operation ${value.operation.id}: ${value.operation.state}; retry key ${value.operation.retry_key}.` : '')); error.operation = value.operation; throw error; }
   return value.result;
 }
 async function refresh() { try { data = await api('/api/state'); $('host-controls').hidden = !data.host_controls; $('pool-policy').textContent = data.pool_policy || ''; render(); $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; } catch (error) { notice(error.message, true); $('updated').textContent = 'Connection interrupted'; } }
@@ -93,12 +101,13 @@ function render() {
   }
   $('create').disabled = busy;
 }
-function field(name, label, value, choices) { const wrapper = element('label', label, 'field'); let input; if (choices) { input = element('select'); for (const [v, title] of choices) { const option = element('option', title); option.value = v; input.append(option); } } else { input = element('input'); input.pattern = '[A-Za-z0-9_-]{1,32}'; input.maxLength = 32; input.required = true; input.autocomplete = 'off'; } input.name = name; if (value) input.value = value; wrapper.append(input); return wrapper; }
+function field(name, label, value, choices) { const wrapper = element('label', label, 'field'); let input; if (choices) { input = element('select'); for (const [v, title, disabled] of choices) { const option = element('option', title); option.value = v; option.disabled = !!disabled; input.append(option); } } else { input = element('input'); input.pattern = '[A-Za-z0-9_-]{1,32}'; input.maxLength = 32; input.required = true; input.autocomplete = 'off'; } input.name = name; if (value) input.value = value; wrapper.append(input); return wrapper; }
 function openDialog(op, id, snapshot) {
   if (busy) return; dialogOperation = {op, id, snapshot}; $('dialog-fields').replaceChildren(); $('dialog-error').hidden = true;
   const defaults = {publish: ['Publish a port.', 'Open a guest HTTP server over tailnet HTTPS. Only you and teammates with a share can access it. The server must listen on 0.0.0.0; preview cookies are disabled.', 'Publish port'], resize: ['Grow this machine.', 'The machine must be stopped. Disk growth is permanent; its filesystem expands on the next start.', 'Resize machine'], create: ['A fresh place to build.', 'Start a persistent Linux machine. Your disk stays with it when you stop.', 'Create machine'], snapshot: ['Save this moment.', 'Capture this machine’s memory and disk together. You can return to this checkpoint later.', 'Capture snapshot'], fork: ['Try another direction.', 'Create an independent machine from this checkpoint. Changes stay separate from the parent.', 'Create fork'], restore: ['Return to this checkpoint?', 'This replaces the machine’s current memory and disk with the saved snapshot. Changes made since that snapshot will be lost.', 'Restore snapshot'], stop: ['Stop this machine?', 'Disk changes are saved. Running processes and memory state are lost. Choose Hibernate instead to keep them.', 'Stop machine'], share: ['Share this machine.', 'Your teammate gets in with their own login. A fork they make copies everything on this machine, including your credentials, and stays theirs after you unshare.', 'Share machine'], rename: ['Rename this machine.', 'Only the name changes: disk, snapshots, shares, previews and running state stay. SSH config and teammates use the new name from now on.', 'Rename machine'], delete: ['Delete this machine?', 'Its disk and every snapshot taken from it are removed for good, and anyone it is shared with loses it. Forks made earlier stay.', 'Delete machine']};
   $('dialog-title').textContent = defaults[op][0]; $('dialog-description').textContent = defaults[op][1]; $('dialog-submit').textContent = defaults[op][2];
-  if (op === 'create') $('dialog-fields').append(field('id', 'Machine name', '', null), field('image', 'Operating system', 'alpine', imageChoices()), field('memory_mib', 'Memory', '256', [['256','256 MiB'],['512','512 MiB'],['1024','1 GiB'],['2048','2 GiB'],['4096','4 GiB'],['8192','8 GiB'],['16384','16 GiB']]), field('vcpu_count', 'vCPU', '1', Array.from({length:16},(_,i)=>[String(i+1),String(i+1)])), field('node', 'Pool node', '', [['','Automatic placement'], ...(data.nodes || []).filter(n => n.online).map(n => [n.id, n.id])]));
+  const images = imageChoices();
+  if (op === 'create') $('dialog-fields').append(field('id', 'Machine name', '', null), field('image', 'Operating system', images.find(choice => !choice[2])?.[0] || 'alpine', images), field('memory_mib', 'Memory', '256', [['256','256 MiB'],['512','512 MiB'],['1024','1 GiB'],['2048','2 GiB'],['4096','4 GiB'],['8192','8 GiB'],['16384','16 GiB']]), field('vcpu_count', 'vCPU', '1', Array.from({length:16},(_,i)=>[String(i+1),String(i+1)])), field('node', 'Pool node', '', [['','Automatic placement'], ...nodeChoices()]));
   if (op === 'create' || op === 'resize') {
     const size = op === 'resize' ? Math.ceil((machine()?.disk_bytes || 0) / 1073741824) : 32;
     const disk = field('disk_gib', 'Root disk (GiB)', String(size || 32));
@@ -119,6 +128,8 @@ function openDialog(op, id, snapshot) {
   if (op === 'fork') { $('dialog-fields').append(field('child', 'New machine name', '', null)); if (!snapshot) { const choices = [['','Capture a new snapshot now'], ...data.snapshots.filter(item => item.workspace === id).map(item => [item.name,item.name])]; $('dialog-fields').append(field('snapshot', 'Start from', '', choices)); } }
   if (id) $('dialog-fields').append(element('p', `Machine: ${id}${snapshot ? ` · Snapshot: ${snapshot}` : ''}`, 'muted'));
   $('operation-dialog').showModal();
+  // Start on the first field (the machine name when creating), not the close button.
+  $('dialog-fields').querySelector('input, select')?.focus();
 }
 async function operate(operation) {
   const {operation_key: suppliedKey, ...parameters} = operation; const intent = JSON.stringify(parameters); const storageKey = 'ow-operation:' + intent; operation.operation_key ||= sessionStorage.getItem(storageKey) || crypto.randomUUID().replaceAll('-',''); sessionStorage.setItem(storageKey, operation.operation_key);

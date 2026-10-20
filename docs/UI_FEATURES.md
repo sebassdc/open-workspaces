@@ -46,6 +46,10 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Empty sandbox and empty snapshot list | works | v0.9.22 | `machines.spec.mjs › empty sandbox invites a first machine` |
 | Create dialog: name, image, memory, vCPU, disk | works | v0.9.22 | `machines.spec.mjs › create dialog creates a machine with the chosen shape` |
 | Refused create shown in the dialog | works | v0.9.22 | `machines.spec.mjs › create dialog shows a refused create and stays open` |
+| Create dialog marks images the pool cannot run (disabled, "not available on this pool") | works | v0.9.22 | `machines.spec.mjs › create dialog marks images the pool cannot run` |
+| Create dialog shows each node's free vCPU and memory, disables a full node, and explains refusals in dashboard words | works | v0.9.22 | `machines.spec.mjs › create dialog shows free room per node, disables a full one and explains a refusal plainly` |
+| Create with a name already in use says the name is taken and stays open | works | v0.9.22 | `machines.spec.mjs › create dialog says a name is taken and stays open` |
+| Create dialog starts with focus on the machine name | works | v0.9.22 | `machines.spec.mjs › create dialog starts on the machine name` |
 | Rename in place, selection and console history follow | works | v0.9.22 | `machines.spec.mjs › rename keeps the machine selected under its new name` |
 | Navigation and resource usage view | works | v0.9.22 | `machines.spec.mjs › navigation switches between machines, snapshots and usage` |
 | Signed-in account shown in the top bar | missing | — | The page reads `user` from `/api/state`, which the API does not return, so it always shows "Your account"; the login is available at `discovery.identity.email`. |

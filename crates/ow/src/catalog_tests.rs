@@ -541,6 +541,11 @@ fn placement_ownership_snapshots_duplicate_and_offline_state() {
     changed["memory_mib"] = json!(512);
     changed["operation_key"] = json!("new-key");
     assert!(c.operation(a, changed).is_err());
+    // A new create intent for a name already in use is refused as a taken name, even with the same shape.
+    let mut again = create.clone();
+    again["operation_key"] = json!("another-create");
+    let taken = c.operation(a, again).unwrap_err();
+    assert!(taken.downcast_ref::<crate::catalog::NameTaken>().is_some());
     assert_eq!(
         c.db.query_row(
             "SELECT reserved_mib FROM resources WHERE physical=?1",

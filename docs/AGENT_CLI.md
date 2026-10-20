@@ -182,6 +182,9 @@ Recognizable failure codes are:
 - `insufficient_capacity`: inspect nodes and image list; choose fitting resources
   or wait. The unwritten part of every box disk stays reserved even when sparse.
 - `node_unavailable`: wait for the intended runner; existing placement stays fixed.
+- `name_taken`: you already have a machine with that name; choose another
+  (HTTP 409). Retrying the original create with its operation key is not a new
+  intent and still returns that create's result.
 - `not_found`: the named resource is absent or not accessible to your identity.
   Deleting an unknown machine reports `machine 'NAME' was not found.` (HTTP 404,
   CLI exit 1). No worker operation is dispatched. Replaying a successful delete

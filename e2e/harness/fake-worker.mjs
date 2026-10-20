@@ -21,6 +21,12 @@ export function fakeWorker(socketPath, log = () => {}) {
     }),
     stats: () => ({running: Object.fromEntries([...machines.values()].filter(m => m.state === 'running').map(m => [m.id, {pss_kib: m.memory_mib * 256}])), reserved_memory_mib: 0}),
     create: r => {
+      // Like the real runner: a repeated create with the same shape returns the machine, any other is refused.
+      const existing = machines.get(r.id);
+      if (existing) {
+        if (existing.memory_mib !== (r.memory_mib ?? 256) || existing.vcpu_count !== (r.vcpu_count ?? 1) || existing.image !== (r.image ?? 'alpine') || (r.disk_gib != null && existing.disk_bytes !== r.disk_gib * GIB)) throw Error('ID already exists with different parameters');
+        return existing;
+      }
       admit(r.memory_mib ?? 256);
       const m = {id: r.id, memory_mib: r.memory_mib ?? 256, vcpu_count: r.vcpu_count ?? 1, image: r.image ?? 'alpine', image_digest: r.image_digest ?? null, state: 'running', source: null, disk_bytes: (r.disk_gib ?? 32) * GIB, disk_used_bytes: 64 * 1024 * 1024};
       machines.set(r.id, m);
