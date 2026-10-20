@@ -93,7 +93,13 @@ made removes the capture taken for it, and a create that fails before the box is
 registered removes its partial directory, so retries with the same ID work. When
 the worker itself stops between making a box's directory and registering the box,
 `delete` of that ID removes the leftover directory; the controller sends that
-delete before it drops a never-made machine's catalog row.
+delete before it drops a never-made machine's catalog row. Before taking a live
+fork capture, the worker saves its generated capture name against the child ID
+in the runtime registry. Deleting an interrupted child removes that capture too,
+even if interruption preceded the child directory. Deletion during capture also
+cancels publication and queued child creation. Capture cleanup errors are returned
+and retain the association for retry; named snapshots are not treated as generated
+fork captures.
 
 Snapshots are made read-only. SHA-256 verification is cached inside a worker
 after capture/verification, with inode, size, modification/change timestamps and

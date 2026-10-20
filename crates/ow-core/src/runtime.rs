@@ -173,6 +173,9 @@ struct State {
     workspaces: BTreeMap<String, Workspace>,
     #[serde(default)]
     placements: BTreeMap<String, Managed>,
+    /// Generated live-fork captures, keyed by child, until child creation finishes.
+    #[serde(default)]
+    pending_forks: BTreeMap<String, String>,
 }
 
 impl State {
@@ -1064,6 +1067,9 @@ impl Runtime {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             result => result?,
         }
+        if let Some(name) = self.cleanup_fork_capture(id)? {
+            snapshots.push(name);
+        }
         self.state.workspaces.remove(id);
         self.save()?;
         Ok(json!({"deleted":id,"snapshots":snapshots}))
@@ -1075,15 +1081,39 @@ impl Runtime {
         identifier(id)?;
         let directory = self.machine_dir(id);
         ensure!(
-            directory.exists() && !self.state.placements.contains_key(id),
+            (directory.exists() || self.state.pending_forks.contains_key(id))
+                && !self.state.placements.contains_key(id),
             "workspace not found"
         );
-        fs::remove_dir_all(&directory)?;
+        match fs::remove_dir_all(&directory) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
+        }
         match fs::remove_file(self.root.join("recovery").join(format!("{id}.json"))) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             result => result?,
         }
-        Ok(json!({"deleted":id,"snapshots":[],"registered":false}))
+        let snapshots: Vec<_> = self.cleanup_fork_capture(id)?.into_iter().collect();
+        Ok(json!({"deleted":id,"snapshots":snapshots,"registered":false}))
+    }
+
+    fn cleanup_fork_capture(&mut self, child: &str) -> Result<Option<String>> {
+        let Some(name) = self.state.pending_forks.get(child).cloned() else {
+            return Ok(None);
+        };
+        identifier(&name)?;
+        match fs::remove_dir_all(self.snapshot_dir(&name)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
+        }
+        File::open(self.root.join("snapshots"))?.sync_all()?;
+        self.verified.remove(&name);
+        self.state.pending_forks.remove(child);
+        if let Err(error) = self.save() {
+            self.state.pending_forks.insert(child.into(), name);
+            return Err(error);
+        }
+        Ok(Some(name))
     }
 
     /// Deletes one named snapshot of `id`. Repeating a finished delete succeeds
@@ -1312,6 +1342,12 @@ impl Runtime {
                 self.workspace(&id).is_ok_and(|w| w.index == staged.index),
                 "workspace was deleted during the capture"
             );
+            if let Some((_, child)) = &staged.fork {
+                ensure!(
+                    self.state.pending_forks.get(child) == Some(&name),
+                    "fork was deleted during the capture"
+                );
+            }
             let destination = self.snapshot_dir(&name);
             if destination.join("manifest.json").exists() {
                 let existing: Snapshot =
@@ -1351,6 +1387,11 @@ impl Runtime {
         })();
         if result.is_err() {
             staged.discard();
+            if let Some((_, child)) = &staged.fork
+                && self.state.pending_forks.get(child) == Some(&staged.snapshot.name)
+            {
+                self.cleanup_fork_capture(child)?;
+            }
         }
         result
     }
@@ -1366,6 +1407,12 @@ impl Runtime {
     ) -> Result<Value> {
         let mut created = false;
         let result = (|| {
+            if generated {
+                ensure!(
+                    self.state.pending_forks.get(child).map(String::as_str) == Some(name),
+                    "fork was deleted or superseded before child creation"
+                );
+            }
             if let Some(existing) = self.state.workspaces.get(child) {
                 // A retried fork whose first attempt made the child meanwhile.
                 ensure!(
@@ -1400,14 +1447,17 @@ impl Runtime {
                 .workspaces
                 .get(child)
                 .is_some_and(|w| w.state != "failed");
-        if generated && !used {
-            let directory = self.snapshot_dir(name);
-            if directory.exists()
-                && let Err(error) = fs::remove_dir_all(&directory)
-            {
-                eprintln!("removing unused fork capture {name}: {error:#}");
+        // A queued completion of an older fork must not remove a newer fork's capture.
+        if generated && self.state.pending_forks.get(child).map(String::as_str) == Some(name) {
+            if used {
+                self.state.pending_forks.remove(child);
+                if let Err(error) = self.save() {
+                    self.state.pending_forks.insert(child.into(), name.into());
+                    return Err(error);
+                }
+            } else {
+                self.cleanup_fork_capture(child)?;
             }
-            self.verified.remove(name);
         }
         result
     }
@@ -1980,8 +2030,18 @@ impl Runtime {
                         "fork source is {}; start the box first (ow start), or fork from one of its snapshots",
                         parent.state
                     );
+                    ensure!(
+                        !self.state.pending_forks.contains_key(child),
+                        "fork for this child is already pending; delete the child before retrying"
+                    );
                     let name = format!("fork-{}", vm::nonce()?);
-                    self.capture(id, &name, false)?;
+                    // Persist before capture publication: deletion must work after a worker crash.
+                    self.state.pending_forks.insert(child.into(), name.clone());
+                    self.save()?;
+                    if let Err(error) = self.capture(id, &name, false) {
+                        self.cleanup_fork_capture(child)?;
+                        return Err(error);
+                    }
                     if let Some(staged) = self.staged.as_mut() {
                         staged.fork = Some((id.into(), child.into()));
                         return Ok(Value::Null);
@@ -2221,6 +2281,161 @@ mod disk_tests {
         assert!(!runtime.machine_dir("copy").exists());
         assert!(runtime.workspace("copy").is_err());
         runtime.machines.clear();
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn delete_interrupted_fork_cleans_its_published_capture_after_restart() {
+        for (partial_disk, registered) in [(true, false), (false, false), (true, true)] {
+            let (mut runtime, server) = small_running();
+            runtime.save().unwrap();
+            let Step::Seal(staged) =
+                runtime.begin(&json!({"op":"fork","id":"legacy","child":"ghost"}))
+            else {
+                panic!("live fork must stage a capture");
+            };
+            server.join().unwrap();
+            let name = staged.snapshot.name.clone();
+            let sealed = staged.seal();
+            runtime.finish(staged, sealed).unwrap();
+            assert!(runtime.snapshot_dir(&name).exists());
+            // Interrupt after publication, before or during creation of the child disk.
+            if partial_disk {
+                fs::create_dir(runtime.machine_dir("ghost")).unwrap();
+                fs::write(
+                    runtime.machine_dir("ghost").join("disk.ext4"),
+                    b"partial disk",
+                )
+                .unwrap();
+            }
+            runtime.machines.clear();
+            if registered {
+                // The worker can also stop after registration but before fork completion.
+                let mut child = runtime.workspace("legacy").unwrap();
+                child.id = "ghost".into();
+                child.index = 2;
+                child.state = "failed".into();
+                child.source = Some("legacy".into());
+                runtime.state.workspaces.insert("ghost".into(), child);
+                runtime.save().unwrap();
+            }
+            runtime.state =
+                State::read(&fs::read(runtime.root.join("state.json")).unwrap()).unwrap();
+            let keep = runtime.snapshot_dir("keep");
+            fs::create_dir(&keep).unwrap();
+            for file in ["state", "memory", "disk.ext4"] {
+                fs::copy(runtime.snapshot_dir(&name).join(file), keep.join(file)).unwrap();
+            }
+            let mut snapshot: Snapshot = serde_json::from_slice(
+                &fs::read(runtime.snapshot_dir(&name).join("manifest.json")).unwrap(),
+            )
+            .unwrap();
+            snapshot.name = "keep".into();
+            atomic_json(&keep.join("manifest.json"), &snapshot).unwrap();
+            let deleted = runtime
+                .request(&json!({"op":"delete","id":"ghost"}))
+                .unwrap();
+            assert_eq!(deleted["snapshots"], json!([name]));
+            if !registered {
+                assert_eq!(deleted["registered"], false);
+            }
+            assert!(!runtime.machine_dir("ghost").exists());
+            assert!(
+                !runtime.snapshot_dir(&name).exists(),
+                "generated capture survived delete"
+            );
+            assert!(runtime.validate_snapshot("keep", false).is_ok());
+            let durable = State::read(&fs::read(runtime.root.join("state.json")).unwrap()).unwrap();
+            assert!(!durable.pending_forks.contains_key("ghost"));
+            assert!(runtime.machine_dir("legacy").join("disk.ext4").exists());
+            // A completion already queued on the worker must not recreate the deleted child.
+            assert!(runtime.fork_child("legacy", "ghost", &name, true).is_err());
+            assert!(!runtime.machine_dir("ghost").exists());
+            fs::remove_dir_all(&runtime.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn delete_during_fork_sealing_cancels_publication_and_old_completion() {
+        let (mut runtime, server) = small_running();
+        let Step::Seal(staged) = runtime.begin(&json!({"op":"fork","id":"legacy","child":"ghost"}))
+        else {
+            panic!("live fork must stage a capture");
+        };
+        server.join().unwrap();
+        let name = staged.snapshot.name.clone();
+        let sealed = staged.seal();
+        runtime
+            .request(&json!({"op":"delete","id":"ghost"}))
+            .unwrap();
+        // A newer fork's association must survive completion of the canceled request.
+        let next = "fork-new";
+        runtime
+            .state
+            .pending_forks
+            .insert("ghost".into(), next.into());
+        fs::create_dir(runtime.snapshot_dir(next)).unwrap();
+        runtime.save().unwrap();
+        assert!(runtime.finish(staged, sealed).is_err());
+        assert!(!runtime.snapshot_dir(&name).exists());
+        assert_eq!(pending(&runtime), 0);
+        assert!(runtime.fork_child("legacy", "ghost", &name, true).is_err());
+        assert!(runtime.snapshot_dir(next).exists());
+        assert_eq!(runtime.state.pending_forks["ghost"], next);
+        runtime.machines.clear();
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn failed_fork_seal_releases_capture_association() {
+        let (mut runtime, server) = small_running();
+        let Step::Seal(staged) = runtime.begin(&json!({"op":"fork","id":"legacy","child":"ghost"}))
+        else {
+            panic!("live fork must stage a capture");
+        };
+        server.join().unwrap();
+        let name = staged.snapshot.name.clone();
+        assert!(
+            runtime
+                .finish(staged, Err(anyhow::anyhow!("hash failed")))
+                .is_err()
+        );
+        let durable = State::read(&fs::read(runtime.root.join("state.json")).unwrap()).unwrap();
+        assert!(!durable.pending_forks.contains_key("ghost"));
+        assert!(!runtime.snapshot_dir(&name).exists());
+        assert_eq!(pending(&runtime), 0);
+        runtime.machines.clear();
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn failed_fork_capture_cleanup_remains_retryable() {
+        let mut runtime = fixture();
+        let name = "fork-leftover";
+        runtime
+            .state
+            .pending_forks
+            .insert("ghost".into(), name.into());
+        runtime.save().unwrap();
+        // An unexpected file prevents directory removal: never claim successful deletion.
+        fs::write(runtime.snapshot_dir(name), b"unexpected file").unwrap();
+        assert!(
+            runtime
+                .request(&json!({"op":"delete","id":"ghost"}))
+                .is_err()
+        );
+        assert_eq!(runtime.state.pending_forks["ghost"], name);
+        assert_eq!(
+            State::read(&fs::read(runtime.root.join("state.json")).unwrap())
+                .unwrap()
+                .pending_forks["ghost"],
+            name
+        );
+        fs::remove_file(runtime.snapshot_dir(name)).unwrap();
+        runtime
+            .request(&json!({"op":"delete","id":"ghost"}))
+            .unwrap();
+        assert!(!runtime.state.pending_forks.contains_key("ghost"));
         fs::remove_dir_all(&runtime.root).unwrap();
     }
 
