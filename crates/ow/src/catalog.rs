@@ -57,8 +57,19 @@ impl std::error::Error for OperationFailure {}
 
 /// Only known diagnostics cross the human API boundary. Raw errors stay in the private
 /// operation response and host journal, where the operation ID makes them discoverable.
+/// Metadata of a fork child that was never made: failed, flagged so quotas skip it. A
+/// worker inventory that lists the machine after all replaces this metadata.
+const UNMADE: &str = "metadata=json_set(metadata,'$.state','failed','$.unmade',json('true')),reserved_mib=0,reserved_cpus=0";
+/// A create or fork its runner still lacks after this long is failed, not left pending.
+const CREATION_TIMEOUT_MINUTES: u32 = 30;
+const CREATION_TIMEOUT: &str = "Creation did not complete within 30 minutes and the runner has no such machine; it failed. Delete it, or retry with a new operation key.";
+
 fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
     match (op, diagnostic) {
+        (_, CREATION_TIMEOUT) => CREATION_TIMEOUT,
+        ("fork", d) if d.starts_with("fork source is ") && d.ends_with("; start the box first (ow start), or fork from one of its snapshots") => {
+            "Box is not running. Start it first with ow start, or fork from one of its snapshots, then retry with a new operation key."
+        }
         (_, d) if d.starts_with("incompatible stored RAM;") => "Saved RAM is incompatible. Retry wake with a new operation key and explicit --accept-cold; the old RAM artifact is retained.",
         ("delete", "workspace is running; stop or hibernate it first") => {
             "Box is running. Stop the box first with ow stop, then retry ow delete with a new operation key."
@@ -1123,6 +1134,9 @@ impl Catalog {
                 .iter()
                 .filter_map(|m| m["id"].as_str())
                 .collect::<std::collections::BTreeSet<_>>();
+            // A create or fork the runner still lacks after the timeout never completed (an
+            // interrupted controller or lost reply): it fails visibly instead of staying pending.
+            self.db.execute(&format!("UPDATE operations SET state='failed',response=?3,finished_at=CURRENT_TIMESTAMP WHERE node=?1 AND op IN ('create','fork') AND state IN ('pending','uncertain') AND created_at<datetime('now','-{CREATION_TIMEOUT_MINUTES} minutes') AND NOT EXISTS(SELECT 1 FROM transfers WHERE operation=operations.id) AND COALESCE(json_extract(request,'$.request.child'),json_extract(request,'$.request.id')) NOT IN (SELECT value FROM json_each(?2)) AND COALESCE(json_extract(request,'$.request.child'),json_extract(request,'$.request.id')) IN (SELECT physical FROM resources WHERE kind='machine' AND node=?1 AND placement_managed=0 AND placement_epoch=0 AND json_extract(metadata,'$.state')='pending' AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical))"),params![node,json!(observed).to_string(),json!({"error":CREATION_TIMEOUT}).to_string()])?;
             let mut stmt=self.db.prepare("SELECT physical FROM resources WHERE kind='machine' AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical) AND node=?1 AND json_extract(metadata,'$.state')='pending' AND EXISTS(SELECT 1 FROM operations WHERE resource=resources.name AND owner=resources.owner AND state='failed') AND NOT EXISTS(SELECT 1 FROM operations WHERE resource=resources.name AND owner=resources.owner AND state IN ('pending','uncertain'))")?;
             let absent = stmt
                 .query_map([&node], |r| r.get::<_, String>(0))?
@@ -1131,6 +1145,9 @@ impl Catalog {
             for physical in absent {
                 if !observed.contains(physical.as_str()) {
                     self.db.execute("UPDATE resources SET reserved_mib=0,reserved_cpus=0 WHERE kind='machine' AND physical=?1 AND node=?2",params![physical,node])?;
+                    // A fork child (it names its source) ends failed; a create stays pending
+                    // so a retry with a new key reuses its placement.
+                    self.db.execute(&format!("UPDATE resources SET {UNMADE} WHERE kind='machine' AND physical=?1 AND json_extract(metadata,'$.state')='pending' AND json_extract(metadata,'$.source') IS NOT NULL"),[&physical])?;
                 }
             }
             // Missing inventory releases owner demand only after all effects are resolved.
@@ -1149,7 +1166,7 @@ impl Catalog {
             // A machine this runner no longer lists is gone from it (deleted there, or the runner
             // lost its data): flag it so its owner can delete it here. Never-observed creates
             // stay pending; a machine listed again gets its metadata back on the next pass.
-            self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','missing'),reserved_mib=0,reserved_cpus=0,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical) AND node=?1 AND json_extract(metadata,'$.state') NOT IN ('pending','missing') AND physical NOT IN (SELECT value FROM json_each(?2))",params![node,json!(observed).to_string()])?;
+            self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','missing'),reserved_mib=0,reserved_cpus=0,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical) AND node=?1 AND json_extract(metadata,'$.state') NOT IN ('pending','missing') AND json_extract(metadata,'$.unmade') IS NULL AND physical NOT IN (SELECT value FROM json_each(?2))",params![node,json!(observed).to_string()])?;
             self.db.execute("INSERT INTO node_usage(node,extra_mib,extra_cpus,extra_slots) VALUES(?1,?2,?3,?4) ON CONFLICT(node) DO UPDATE SET extra_mib=?2,extra_cpus=?3,extra_slots=?4",params![node,extra_mib,extra_cpus,extra_slots])?;
             for snapshot in snapshots.as_array().context("invalid snapshots")? {
                 let physical = snapshot["name"].as_str().context("snapshot ID")?;
@@ -1364,6 +1381,14 @@ impl Catalog {
             .context("invalid machines")?
             .iter()
             .any(|m| m["id"] == physical))
+    }
+    /// Whether the machine was never made: its create or fork is pending or failed.
+    fn unmade(&self, physical: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT json_extract(metadata,'$.state')='pending' OR json_extract(metadata,'$.unmade') IS NOT NULL FROM resources WHERE kind='machine' AND physical=?1",
+            [physical],
+            |r| r.get::<_, Option<bool>>(0),
+        )? == Some(true))
     }
     /// Whether reconcile found the machine gone from its runner.
     fn missing(&self, physical: &str) -> Result<bool> {
@@ -1990,6 +2015,16 @@ impl Catalog {
             if self.missing(&physical)? && !self.listed(&node, &physical)? {
                 return self.delete_missing(user, &name, &physical, &input);
             }
+            // A create or fork that never made the machine: only the catalog row is left.
+            if self.unmade(&physical)? && !self.listed(&node, &physical)? {
+                if limits::unresolved(&self.db, &physical)? {
+                    return Err(limits::Rejection(format!(
+                        "machine '{name}' is still being created or forked; delete it when that finishes, or after it fails ({CREATION_TIMEOUT_MINUTES} minutes at most)"
+                    ))
+                    .into());
+                }
+                return self.delete_missing(user, &name, &physical, &input);
+            }
         }
         if op == "create" {
             let selector = request["image"].as_str().unwrap_or("alpine").to_owned();
@@ -2143,6 +2178,16 @@ impl Catalog {
                     let new_child = self.physical(user, "machine", child).is_err();
                     target = self.reserve(user, "machine", child)?;
                     let existing:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE owner=?1 AND resource=?2 AND op='fork')",params![user,child],|r|r.get(0))?;
+                    // A live fork captures the running box; say so before anything is reserved.
+                    if !existing
+                        && request["snapshot"].is_null()
+                        && let Some(state @ ("stopped" | "hibernated")) = metadata["state"].as_str()
+                    {
+                        return Err(limits::Rejection(format!(
+                            "machine '{name}' is {state}; start the box first (ow start {name}), or fork from one of its snapshots (--snapshot)"
+                        ))
+                        .into());
+                    }
                     if !existing && new_child {
                         self.db.execute(
                             "UPDATE resources SET node=?1 WHERE kind='machine' AND physical=?2",
@@ -2319,6 +2364,10 @@ impl Catalog {
                 "UPDATE operations SET state=?1,response=?3,finished_at=CASE WHEN ?1='failed' THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id=?2",
                 params![if uncertain { "uncertain" } else { "failed" }, operation, envelope.to_string()],
             )?;
+            if !uncertain && op == "fork" {
+                // No child was made: its reserved row ends failed, never pending forever.
+                self.db.execute(&format!("UPDATE resources SET {UNMADE},updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND physical=?1 AND json_extract(metadata,'$.state')='pending'"),[&target])?;
+            }
             // Keep raw worker diagnostics private, but never discard the cause.
             eprintln!(
                 "operation {operation} ({op}) on node {node}: {}",

@@ -1695,8 +1695,11 @@ fn owner_quota_each_boundary_override_and_stopped_accounting() {
         .unwrap();
         // Overrides are trusted config keyed by durable owner ID, not request fields.
         std::fs::write(fake.root.join("limits.json"),json!({"owner_defaults":caps,"owners":{a.to_string():{"cpus":16,"memory_mib":32768,"disk_gib":256,"boxes":8}}}).to_string()).unwrap();
+        // A live fork captures a running box.
+        c.operation(a, json!({"op":"start","id":"one"})).unwrap();
         c.operation(a, json!({"op":"fork","id":"one","child":"copy"}))
             .unwrap();
+        c.operation(a, json!({"op":"stop","id":"one"})).unwrap();
         assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 2);
         c.operation(a, json!({"op":"delete","id":"one"})).unwrap();
         assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 1);
@@ -1821,6 +1824,8 @@ fn owner_quota_shared_fork_charges_recipient_and_snapshot_shape() {
         json!({"op":"share","id":"one","with":"bob@example.test"}),
     )
     .unwrap();
+    // A live fork captures a running box.
+    c.operation(a, json!({"op":"start","id":"one"})).unwrap();
     c.operation(
         b,
         json!({"op":"fork","id":"alice@example.test/one","child":"mine"}),
@@ -3983,4 +3988,138 @@ fn named_fork_shape_is_rechecked_before_atomic_admission() {
     );
     input.snapshot = None;
     assert!(c.begin_transfer(user, "named-fork", &input).is_err());
+}
+
+fn machine_states(c: &mut Catalog, user: i64) -> BTreeMap<String, String> {
+    c.state(user).unwrap()["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| {
+            (
+                w["id"].as_str().unwrap().to_owned(),
+                w["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_rejected_fork_ends_failed_releases_its_reservation_and_deletes_without_the_runner() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    c.operation(a, json!({"op":"create","id":"one","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    *fake.reject.lock().unwrap() = Some("fork".into());
+    let error = c
+        .operation(a, json!({"op":"fork","id":"one","child":"copy"}))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<OperationFailure>().unwrap().0["state"],
+        "failed"
+    );
+    let states = machine_states(&mut c, a);
+    assert_eq!(states["copy"], "failed");
+    assert_eq!(c.state(a).unwrap()["stats"]["reserved_memory_mib"], 256);
+    // The runner never had it: a dispatched delete would be rejected.
+    *fake.reject.lock().unwrap() = Some("delete".into());
+    let deleted = c.operation(a, json!({"op":"delete","id":"copy"})).unwrap();
+    assert_eq!(deleted["deleted"], "copy");
+    assert!(!machine_states(&mut c, a).contains_key("copy"));
+    // The name is free for a new fork.
+    *fake.reject.lock().unwrap() = None;
+    let fork = c
+        .operation(a, json!({"op":"fork","id":"one","child":"copy"}))
+        .unwrap();
+    assert_eq!(fork["state"], "running");
+}
+
+#[test]
+fn an_interrupted_fork_times_out_visibly_and_its_ghost_can_be_deleted() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    c.operation(a, json!({"op":"create","id":"one","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    // The reply is lost: the controller cannot know whether the runner made the child.
+    *fake.reject.lock().unwrap() = Some("fork".into());
+    fake.uncertain.store(true, Ordering::SeqCst);
+    c.operation(a, json!({"op":"fork","id":"one","child":"copy"}))
+        .unwrap_err();
+    fake.uncertain.store(false, Ordering::SeqCst);
+    *fake.reject.lock().unwrap() = Some("delete".into());
+    assert_eq!(machine_states(&mut c, a)["copy"], "pending");
+    let early = c
+        .operation(a, json!({"op":"delete","id":"copy"}))
+        .unwrap_err();
+    assert!(early.is::<limits::Rejection>(), "{early:#}");
+    assert!(early.to_string().contains("still being created or forked"));
+    // Past the timeout, a runner that still lacks the child fails it.
+    c.db.execute(
+        "UPDATE operations SET created_at=datetime('now','-31 minutes') WHERE op='fork'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(machine_states(&mut c, a)["copy"], "failed");
+    let operations = c.state(a).unwrap()["operations"].clone();
+    let fork = operations
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["op"] == "fork")
+        .unwrap();
+    assert_eq!(fork["state"], "failed");
+    assert_eq!(fork["error"], CREATION_TIMEOUT);
+    assert_eq!(c.state(a).unwrap()["stats"]["reserved_memory_mib"], 256);
+    let deleted = c.operation(a, json!({"op":"delete","id":"copy"})).unwrap();
+    assert_eq!(deleted["deleted"], "copy");
+    assert!(!machine_states(&mut c, a).contains_key("copy"));
+}
+
+#[test]
+fn a_young_fork_the_runner_already_has_is_never_timed_out() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    c.operation(a, json!({"op":"create","id":"one","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    c.operation(a, json!({"op":"fork","id":"one","child":"copy"}))
+        .unwrap();
+    // An old uncertain fork whose child the runner lists is resolved by inventory, not failed.
+    c.db.execute("UPDATE operations SET state='uncertain',created_at=datetime('now','-31 minutes') WHERE op='fork'", []).unwrap();
+    assert_eq!(machine_states(&mut c, a)["copy"], "running");
+    let state: String =
+        c.db.query_row("SELECT state FROM operations WHERE op='fork'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "uncertain");
+}
+
+#[test]
+fn a_live_fork_of_a_stopped_or_hibernated_box_asks_to_start_it_first() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    c.operation(a, json!({"op":"create","id":"one","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    for op in ["stop", "hibernate"] {
+        if op == "hibernate" {
+            c.operation(a, json!({"op":"start","id":"one"})).unwrap();
+        }
+        c.operation(a, json!({"op":op,"id":"one"})).unwrap();
+        let error = c
+            .operation(a, json!({"op":"fork","id":"one","child":"copy"}))
+            .unwrap_err();
+        assert!(error.is::<limits::Rejection>(), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("start the box first (ow start one)"),
+            "{error:#}"
+        );
+        // Nothing was reserved for the child.
+        assert!(!machine_states(&mut c, a).contains_key("copy"));
+    }
 }
