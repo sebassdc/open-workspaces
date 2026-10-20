@@ -434,3 +434,19 @@ closed, and a pending chunk-sealed point keeps failing until the worker is
 upgraded again. Restoring a chunk-sealed point needs a 0.9.20 or newer CLI. Protocol windows, worker
 interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are
 unchanged.
+
+### Host reserve
+
+Version 0.9.24 is class 2 on runners and controller hosts with a local worker, and
+class 1 on a controller-only host. The worker reports the
+[host reserve](HOSTS.md#host-reserve-capacity-boxes-never-claim) and AWS hosts
+lower its CPU (and, on small hosts, RAM) budget by it; every Linux worker also
+caps its configured budgets at host capacity less the reserve (a runner's by
+default). The worker and control units move into the `owguests`/`owcontrol` slices
+with their protections, and VMMs start with OOM score 500. Use the
+normal quiesce/swap/resume procedure; a running box beyond the lowered budget
+stays hibernated until capacity frees. The node agent's heartbeats no longer wait
+on worker status, cache inventory or status-file writes. Protocol windows, worker
+interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are
+unchanged.
+
