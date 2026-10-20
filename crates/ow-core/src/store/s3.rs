@@ -9,13 +9,13 @@ use std::{
     collections::VecDeque,
     io::Cursor,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
 };
 
-/// Bytes per ranged download request.
+/// Bytes per ranged download request and the first upload parts.
 const RANGE: u64 = 16 << 20;
 
 /// The deployment backup root, not `store/v1` itself. Uses the normal AWS CLI
@@ -64,7 +64,7 @@ impl S3Objects {
             } else {
                 format!("{prefix}/store/v1/")
             },
-            part_size: 64 * 1024 * 1024,
+            part_size: RANGE,
             #[cfg(test)]
             program: None,
         })
@@ -195,8 +195,9 @@ impl S3Objects {
         );
         Ok(())
     }
-    /// Uploads the parts of `source` after `first`, at most [`parts_in_flight`]
-    /// at a time, then commits them unless `key` exists.
+    /// Uploads the parts of `source` after `first` on [`transfers`] threads, with
+    /// at most `transfers x 16 MiB` of parts in flight, then commits them unless
+    /// `key` exists.
     fn multipart(
         &self,
         http: &Http,
@@ -207,13 +208,15 @@ impl S3Objects {
     ) -> Result<()> {
         let done = Mutex::new(Vec::new());
         let failed = AtomicBool::new(false);
+        let budget = transfers() as u64 * RANGE;
+        let (in_flight, freed) = (Mutex::new(0u64), Condvar::new());
         // A rendezvous channel: a part is read only when a sender is free.
         let (sender, receiver) = std::sync::mpsc::sync_channel::<(u16, bytes::Bytes)>(0);
         let receiver = Mutex::new(receiver);
         let mut total = 0u64;
         let mut count = 0u16;
         std::thread::scope(|scope| -> Result<()> {
-            let workers: Vec<_> = (0..parts_in_flight())
+            let workers: Vec<_> = (0..transfers())
                 .map(|_| {
                     scope.spawn(|| -> Result<()> {
                         let mut result = Ok(());
@@ -222,18 +225,20 @@ impl S3Objects {
                             // Not in the loop condition: the lock must drop before the upload.
                             let next = receiver.lock().unwrap().recv();
                             let Ok((number, body)) = next else { break };
-                            if result.is_err() || failed.load(Ordering::Relaxed) {
-                                continue;
-                            }
-                            match http.upload_part(key, upload, number, body) {
-                                Ok((etag, checksum)) => {
-                                    done.lock().unwrap().push((number, etag, checksum))
+                            let length = body.len() as u64;
+                            if result.is_ok() && !failed.load(Ordering::Relaxed) {
+                                match http.upload_part(key, upload, number, body) {
+                                    Ok((etag, checksum)) => {
+                                        done.lock().unwrap().push((number, etag, checksum))
+                                    }
+                                    Err(error) => {
+                                        failed.store(true, Ordering::Relaxed);
+                                        result = Err(error);
+                                    }
                                 }
-                                Err(error) => {
-                                    failed.store(true, Ordering::Relaxed);
-                                    result = Err(error);
-                                }
                             }
+                            *in_flight.lock().unwrap() -= length;
+                            freed.notify_one();
                         }
                         result
                     })
@@ -242,14 +247,25 @@ impl S3Objects {
             let read = (|| -> Result<()> {
                 let mut body = first;
                 while !body.is_empty() && !failed.load(Ordering::Relaxed) {
-                    // shortcut: 64 MiB parts cap compressed objects at 625 GiB; raise part size before supporting larger ones.
+                    // shortcut: parts of 16, 32, 64, then 128 MiB cap compressed objects at about 987 GiB; grow them further before supporting larger ones.
                     ensure!(count < 10000, "multipart limit exceeded");
                     count += 1;
-                    total += body.len() as u64;
+                    let length = body.len() as u64;
+                    total += length;
+                    {
+                        let mut held = in_flight.lock().unwrap();
+                        while *held > 0
+                            && *held + length > budget
+                            && !failed.load(Ordering::Relaxed)
+                        {
+                            held = freed.wait(held).unwrap();
+                        }
+                        *held += length;
+                    }
                     sender
                         .send((count, body.into()))
                         .map_err(|_| anyhow::anyhow!("part upload stopped"))?;
-                    body = part(source, self.part_size)?;
+                    body = part(source, self.part_size << (count / 1000).min(3))?;
                 }
                 Ok(())
             })();
@@ -277,10 +293,6 @@ impl S3Objects {
         }
         Ok(())
     }
-}
-/// Parts uploaded at once: each holds one part, so memory is about this x 64 MiB.
-fn parts_in_flight() -> usize {
-    (transfers() / 4).max(1)
 }
 impl gc::ControllerObjects for S3Objects {
     fn configuration(&self) -> Result<()> {
@@ -502,7 +514,7 @@ impl Read for Download {
             if n > 0 || bytes.is_empty() {
                 return Ok(n);
             }
-            while self.pending.len() < (transfers() / 2).max(1) && self.next < self.size {
+            while self.pending.len() < transfers() && self.next < self.size {
                 let (start, end) = (self.next, (self.next + RANGE).min(self.size));
                 let (http, key, etag) = (self.http.clone(), self.key.clone(), self.etag.clone());
                 self.pending.push_back(std::thread::spawn(move || {
@@ -594,6 +606,19 @@ mod tests {
         );
     }
     #[test]
+    fn s3_parts_grow_every_thousand_to_raise_the_object_limit() {
+        let fake = FakeS3::start();
+        let store = objects(&fake, 8);
+        let data: Vec<u8> = (0..1000 * 8 + 3 * 16).map(|i| (i % 249) as u8).collect();
+        let key = key();
+        store.put_once(&key, &mut &data[..]).unwrap();
+        assert_eq!(fake.calls("part"), 1003);
+        assert_eq!(
+            fake.state.objects.lock().unwrap()[&format!("root/store/v1/{key}")].bytes,
+            data
+        );
+    }
+    #[test]
     fn s3_parts_and_ranges_run_in_parallel_within_their_limits() {
         let fake = FakeS3::start();
         let store = objects(&fake, 64 << 10);
@@ -605,12 +630,12 @@ mod tests {
         let parts = fake.calls("part");
         assert_eq!(parts, data.len().div_ceil(64 << 10));
         assert!(fake.peak("part") > 1, "parts were sent one at a time");
-        assert!(fake.peak("part") <= parts_in_flight());
+        assert!(fake.peak("part") <= transfers());
         let mut read = Vec::new();
         store.get(&key).unwrap().read_to_end(&mut read).unwrap();
         assert!(read == data, "ranged download reassembled wrong bytes");
         assert_eq!(fake.calls("range"), 4);
-        assert!(fake.peak("range") > 1 && fake.peak("range") <= (transfers() / 2).max(1));
+        assert!(fake.peak("range") > 1 && fake.peak("range") <= transfers());
         // A replaced object is never stitched from two versions.
         let mut download = store.get(&key).unwrap();
         fake.state

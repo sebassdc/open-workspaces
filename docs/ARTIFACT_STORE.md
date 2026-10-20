@@ -26,15 +26,17 @@ Object transfers run in process: one `aws configure export-credentials` call
 takes the AWS CLI's usual credential chain (refreshed every five minutes), and
 each request is signed in process on a shared connection pool, with retries and
 backoff for throttling, server errors and lost connections. zstd compresses on
-several threads (the same zstd stream format). Uploads send compressed 64 MiB
-parts with SHA-256 checksums, several at once (`OW_S3_TRANSFERS / 4`, default 4;
-each in-flight part holds 64 MiB of memory), and commit them with a conditional
-`CompleteMultipartUpload`; a short object is one conditional `PutObject`. The
-10,000 part limit caps a compressed object at 625 GiB in this implementation. A
-lost completion response is checked with HEAD, including composite SHA-256 and
-length. Downloads read 16 MiB ranges in parallel (`OW_S3_TRANSFERS / 2`, default
-8), all pinned with `If-Match` to the ETag first seen, and reassemble them in
-order; the uncompressed SHA-256 is still checked against the manifest.
+several threads (the same zstd stream format) while the file is read ahead on
+its own thread. Uploads send compressed parts with SHA-256 checksums on
+`OW_S3_TRANSFERS` threads (1-128, default 16), with at most that many times
+16 MiB of parts in flight, and commit them with a conditional
+`CompleteMultipartUpload`; a short object is one conditional `PutObject`. Parts
+are 16 MiB, doubling every 1000 parts up to 128 MiB, so the 10,000 part limit
+caps a compressed object at about 987 GiB in this implementation. A lost
+completion response is checked with HEAD, including composite SHA-256 and
+length. Downloads read 16 MiB ranges on as many threads, all pinned with
+`If-Match` to the ETag first seen, and reassemble them in order while a second
+thread writes the sparse file; the uncompressed SHA-256 is still checked against the manifest.
 
 Before image publication/build, the application checks bucket versioning,
 lifecycle, and the write-once policy. Missing read permissions or an unsafe bucket
