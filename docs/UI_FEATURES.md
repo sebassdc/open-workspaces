@@ -64,10 +64,10 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 
 | Feature | Status | Last passed | Test |
 | --- | --- | --- | --- |
-| Interactive terminal: open, echo, shell exit, disconnect | works | v0.9.22 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
-| Terminal after the shell exits: Close and New session | works | v0.9.22 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
-| Terminal dark scrollbar (dark color scheme) | works | v0.9.22 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
-| Terminal notices a machine hibernated or stopped elsewhere and blocks input | works | v0.9.22 | `console.spec.mjs › terminal notices a machine hibernated elsewhere and blocks input`; `console.spec.mjs › terminal explains a machine stopped elsewhere after its connection drops` |
+| Interactive terminal: open, echo, shell exit, disconnect | works | v0.9.26 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
+| Terminal after the shell exits: Close and New session | works | v0.9.26 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
+| Terminal dark scrollbar (dark color scheme) | works | v0.9.26 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
+| Terminal notices a machine hibernated or stopped elsewhere and blocks input | works | v0.9.26 | `console.spec.mjs › terminal notices a machine hibernated elsewhere and blocks input`; `console.spec.mjs › terminal explains a machine stopped elsewhere after its connection drops` |
 | Command console: output as text, exit status, clear | works | v0.9.22 | `console.spec.mjs › command console shows output and exit status as text` |
 
 ## Snapshots and forks
