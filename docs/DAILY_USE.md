@@ -331,6 +331,20 @@ is not cancellation: reconnect to join the same wake. An incompatible RAM failur
 requires a fresh key and explicit cold consent; its stored RAM is retained.
 See [park/wake lifecycle, compatibility and verification limits](LIFECYCLE.md#explicit-park-and-shared-wake).
 
+### Rename a box
+
+```sh
+ow --server URL --operation-key rename-1 rename demo web
+```
+
+Only the name changes, without a restart: disk, snapshots (they now show
+`workspace: web`), shares, published ports and SSH keys stay. Owner only; the new
+name must be free among your machines. Preview URLs (`https://HOST:PORT/`) carry
+no name and keep working. Generated SSH configs name the box in `Host ow-demo` and
+its `ProxyCommand`; run `ow ssh-config web` again. Teammates switch to
+`alice@example.com/web`; their open sessions stay up. The old name is free for a
+new box. In the dashboard, select the box and choose Rename.
+
 ### Move or fork to an explicit runner
 
 Owners can use `ow --server URL move BOX --node RUNNER`; existing fork permissions

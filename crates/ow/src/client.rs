@@ -357,6 +357,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Resize { .. }
                 | Action::Start { .. }
                 | Action::Move { .. }
+                | Action::Rename { .. }
                 | Action::Park { .. }
                 | Action::Wake { .. }
                 | Action::Stop { .. }
@@ -517,6 +518,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             }
             None => json!({"op":"move","id":id,"node":node,"accept_cold":accept_cold}),
         },
+        Action::Rename { id, new_name } => json!({"op":"rename","id":id,"name":new_name}),
         Action::Park { id } => json!({"op":"park","id":id}),
         Action::Wake { id, accept_cold } => json!({"op":"wake","id":id,"accept_cold":accept_cold}),
         Action::Start { id } => json!({"op":"start","id":id}),

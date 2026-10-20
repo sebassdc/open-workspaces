@@ -270,12 +270,12 @@ pub fn share_unlocked(root: &Path, identity: &Identity, request: &Value) -> Resu
     share_on(&mut db, user, op, request)
 }
 
-/// What a grantee may do on a machine shared with them. Resize, delete and sharing stay with
-/// the owner.
+/// What a grantee may do on a machine shared with them. Resize, delete, rename and sharing
+/// stay with the owner.
 fn permitted(role: &str, op: &str) -> bool {
     match role {
         "owner" => true,
-        "admin" => !matches!(op, "resize" | "delete"),
+        "admin" => !matches!(op, "resize" | "delete" | "rename"),
         "use" => matches!(
             op,
             "exec"
@@ -1405,6 +1405,79 @@ impl Catalog {
         }
         Ok(None)
     }
+    /// Change only a machine's logical name: its physical ID, disk, snapshots, placement,
+    /// grants, previews and running state stay. No worker contact.
+    fn rename(&mut self, user: i64, request: &Value) -> Result<Value> {
+        let address = request["id"].as_str().context("id")?;
+        let new = request["name"].as_str().context("new name required")?;
+        common::address(address)?;
+        common::identifier(new)?;
+        let fingerprint = json!({"request":{"op":"rename","id":address,"name":new}}).to_string();
+        let key = request["operation_key"].as_str();
+        if let Some(key) = key {
+            common::identifier(key)?;
+        }
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let renamed = (|| -> Result<Value> {
+            // The old name is gone after the first success: answer a retry by its key alone.
+            if let Some(key) = key {
+                let previous: Option<(String, String, Option<String>)> = self.db.query_row("SELECT op,request,response FROM operations WHERE owner=?1 AND retry_key=?2",params![user,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                if let Some((op, previous, response)) = previous {
+                    ensure!(
+                        op == "rename" && previous == fingerprint,
+                        "operation key conflicts with original parameters"
+                    );
+                    return Ok(serde_json::from_str(&response.context("missing result")?)?);
+                }
+            }
+            let physical = self.machine(user, address, "rename")?;
+            let (old, email): (String, String) = self.db.query_row("SELECT r.name,u.email FROM resources r JOIN users u ON u.id=r.owner WHERE r.kind='machine' AND r.physical=?1",[&physical],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            if old == new {
+                return Ok(json!({"id":new,"renamed_from":old}));
+            }
+            if self.physical(user, "machine", new).is_ok() {
+                return Err(limits::Rejection(format!(
+                    "you already have a machine named '{new}'; choose another name"
+                ))
+                .into());
+            }
+            // A transfer resolves its machine by name between steps.
+            let moving: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1)",
+                [&physical],
+                |r| r.get(0),
+            )?;
+            if moving {
+                return Err(limits::Rejection(format!(
+                    "machine '{old}' is being moved, parked or woken; retry the rename when it finishes"
+                ))
+                .into());
+            }
+            self.db.execute("UPDATE resources SET name=?1,updated_at=CURRENT_TIMESTAMP WHERE kind='machine' AND physical=?2",params![new,physical])?;
+            // Machine history follows the name; snapshot operations are keyed by snapshot name.
+            self.db.execute("UPDATE operations SET resource=?1 WHERE owner=?2 AND resource=?3 AND op NOT IN ('snapshot','snapshot-delete')",params![new,user,old])?;
+            self.db.execute("UPDATE operations SET resource=?1||'/'||?2 WHERE resource=?1||'/'||?3 AND op NOT IN ('snapshot','snapshot-delete')",params![email,new,old])?;
+            let node = self.placement("machine", &physical)?;
+            self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,finished_at) VALUES(?1,'rename',?2,'succeeded',?3,?4,?5,CURRENT_TIMESTAMP)",params![user,new,node,key,fingerprint])?;
+            let operation = self.db.last_insert_rowid();
+            let value = json!({"id":new,"renamed_from":old,"operation_id":operation});
+            self.db.execute(
+                "UPDATE operations SET response=?1 WHERE id=?2",
+                params![value.to_string(), operation],
+            )?;
+            Ok(value)
+        })();
+        match renamed {
+            Ok(value) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.db.execute_batch("ROLLBACK")?;
+                Err(error)
+            }
+        }
+    }
     /// Delete a machine its runner no longer lists: record the operation under its key, with
     /// the fingerprint a dispatched delete would have, then drop the entry.
     fn delete_missing(
@@ -1805,13 +1878,17 @@ impl Catalog {
                 "share",
                 "unshare",
                 "delete",
-                "snapshot-delete"
+                "snapshot-delete",
+                "rename"
             ]
             .contains(&op.as_str()),
             "unsupported user operation"
         );
         if matches!(op.as_str(), "share" | "unshare") {
             return self.share(user, &op, &request);
+        }
+        if op == "rename" {
+            return self.rename(user, &request);
         }
         if matches!(op.as_str(), "create" | "resize") {
             common::requested_resources(&request)?;

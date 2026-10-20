@@ -106,7 +106,9 @@ each machine, and the dashboard has Share and Unshare buttons.
 | `use` (default) | exec, shell, SSH stream, `put`/`get`, `ssh-info`, start, hibernate, fork into their own namespace |
 | `admin` | `use`, plus stop, snapshot, restore, deleting their own snapshots and `ssh-keys` |
 
-Resize, delete and sharing stay with the owner. Delete removes the machine, its
+Resize, rename, delete and sharing stay with the owner. After `ow rename demo
+web`, Bob uses `alice@example.com/web`; his grant, open shells and SSH sessions
+carry over. Delete removes the machine, its
 disk, every snapshot taken from it (a grantee's too) and its grants; past
 operations stay in the history as `deleted:NAME`, and the name can be used again.
 The catalog keeps grants in `grants(physical, grantee, role)` (an additive table:

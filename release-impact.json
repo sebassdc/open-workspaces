@@ -2,6 +2,45 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.21",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "New `ow rename BOX NEW_NAME` (remote API op `rename`, dashboard Rename action) changes only the logical name of a machine its owner holds: physical ID, disk, snapshots, placement, sharing grants, published ports, SSH keys and running state stay, with no worker contact. Owner only; the new name follows the create rules and must be free for that owner; a machine in a move, park, wake or fork transfer refuses it until the transfer ends. Idempotent with --operation-key; renaming to the same name is a no-op. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-1 controller and dashboard upgrade; no worker restart.",
+      "waivers": {
+        "worker": "crates/ow/src/host.rs adds only the local CLI refusal arm for rename; no worker code, operation, runtime or service changes."
+      }
+    },
+    {
       "version": "0.9.20",
       "class": 2,
       "changes": [
