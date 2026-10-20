@@ -207,7 +207,7 @@ fn store_image_selectors_are_bounded_paths_and_canonical_versions() {
 }
 
 #[test]
-fn read_ahead_returns_every_byte_in_order_at_any_length() {
+fn read_ahead_returns_every_byte_in_order_and_hashes_only_complete_reads() {
     let f = Fixture::new();
     let block = 4 << 20;
     for length in [0, 1, block, 5 * block, 5 * block + 123] {
@@ -219,5 +219,11 @@ fn read_ahead_returns_every_byte_in_order_at_any_length() {
         ahead.read_to_end(&mut read).unwrap();
         assert!(read == bytes, "length {length}");
         assert_eq!(ahead.read(&mut [0; 8]).unwrap(), 0, "read past the end");
+        assert_eq!(ahead.finish().unwrap(), (length as u64, sha256(&bytes)));
     }
+    // A reader that stops early never yields a digest.
+    let path = f.0.join(format!("file-{}", 5 * block));
+    let mut ahead = ReadAhead::new(File::open(&path).unwrap());
+    ahead.read_exact(&mut vec![0; block]).unwrap();
+    assert!(ahead.finish().is_err());
 }
