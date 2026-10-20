@@ -1007,6 +1007,135 @@ fn delete_is_owner_only_drops_snapshots_grants_and_frees_the_name() {
 }
 
 #[test]
+fn rename_is_owner_only_keeps_identity_and_frees_the_old_name() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    let b = c.user(&identity("bob")).unwrap();
+    let e = c.user(&identity("eve")).unwrap();
+    c.operation(a, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    c.operation(a, json!({"op":"create","id":"taken","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    let physical = c.physical(a, "machine", "demo").unwrap();
+    nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET capabilities=json_set(capabilities,'$.guest_ssh_v1',json('true')) WHERE id='alpha'",[]).unwrap();
+    c.operation(a, json!({"op":"snapshot","id":"demo","name":"saved"}))
+        .unwrap();
+    c.operation(
+        a,
+        json!({"op":"share","id":"demo","with":"bob@example.test","role":"admin"}),
+    )
+    .unwrap();
+    let https = c
+        .publication(
+            a,
+            &json!({"op":"publish","id":"demo","port":3000}),
+            |_, _| Ok(()),
+        )
+        .unwrap()["https_port"]
+        .as_u64()
+        .unwrap() as u16;
+    let (_, _, grantee_stream) = c.terminal_target(b, "alice@example.test/demo").unwrap();
+    let rename = |id: &str, name: &str| json!({"op":"rename","id":id,"name":name});
+    let before = fake.calls.load(Ordering::SeqCst);
+    // Owner only: a shared admin, a stranger and bad or taken names are refused.
+    for (user, request) in [
+        (b, rename("alice@example.test/demo", "mine")),
+        (b, rename("demo", "mine")),
+        (e, rename("alice@example.test/demo", "mine")),
+        (a, rename("demo", "bad name")),
+        (a, rename("demo", "")),
+        (a, rename("demo", &"x".repeat(33))),
+        (a, rename("missing", "other")),
+    ] {
+        assert!(c.operation(user, request.clone()).is_err(), "{request}");
+    }
+    let taken = c.operation(a, rename("demo", "taken")).unwrap_err();
+    assert!(
+        taken
+            .downcast_ref::<limits::Rejection>()
+            .is_some_and(|r| r.0.contains("already have a machine named 'taken'")),
+        "{taken:#}"
+    );
+    // A machine in a transfer keeps its name until the transfer finishes.
+    c.db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    c.db.execute(
+        "INSERT INTO transfer_locks(machine,transfer) VALUES(?1,999)",
+        [&physical],
+    )
+    .unwrap();
+    assert!(
+        c.operation(a, rename("demo", "renamed"))
+            .unwrap_err()
+            .downcast_ref::<limits::Rejection>()
+            .is_some()
+    );
+    c.db.execute("DELETE FROM transfer_locks", []).unwrap();
+    c.db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    // Same name: a no-op.
+    assert_eq!(
+        c.operation(a, rename("demo", "demo")).unwrap()["id"],
+        "demo"
+    );
+    let mut keyed = rename("demo", "renamed");
+    keyed["operation_key"] = json!("rename-one");
+    let renamed = c.operation(a, keyed.clone()).unwrap();
+    assert_eq!(
+        (renamed["id"].as_str(), renamed["renamed_from"].as_str()),
+        (Some("renamed"), Some("demo"))
+    );
+    // No worker contact: the running machine is untouched.
+    assert_eq!(fake.calls.load(Ordering::SeqCst), before);
+    // The retry key replays the result although the old name no longer resolves.
+    assert_eq!(c.operation(a, keyed.clone()).unwrap(), renamed);
+    keyed["name"] = json!("elsewhere");
+    assert!(c.operation(a, keyed).is_err());
+    assert_eq!(c.physical(a, "machine", "renamed").unwrap(), physical);
+    assert!(c.physical(a, "machine", "demo").is_err());
+    let state = c.state(a).unwrap();
+    let machine = state["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "renamed")
+        .unwrap()
+        .clone();
+    assert_eq!(machine["state"], "running");
+    assert_eq!(machine["shared_with"][0]["email"], "bob@example.test");
+    assert_eq!(machine["published_ports"][0]["https_port"], https);
+    assert_eq!(state["snapshots"][0]["workspace"], "renamed");
+    assert_eq!(state["operations"][0]["op"], "rename");
+    // The shared user keeps access under the new address and open streams stay open.
+    let shared = "alice@example.test/renamed";
+    assert_eq!(c.state(b).unwrap()["shared"][0]["id"], shared);
+    assert_eq!(
+        c.operation(b, json!({"op":"exec","id":shared,"command":"id"}))
+            .unwrap()["output"],
+        "ok"
+    );
+    assert!(c.terminal_target(b, "alice@example.test/demo").is_err());
+    assert_eq!(c.ssh_target(b, shared).unwrap().1, physical);
+    assert_eq!(c.preview_name(b, https).unwrap(), shared);
+    assert_eq!(c.preview_name(a, https).unwrap(), "renamed");
+    assert!(
+        !tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_millis(50), grantee_stream.notified()).await
+            })
+            .is_ok()
+    );
+    // The old name is free for a new machine; the rename survives a restart.
+    c.operation(a, json!({"op":"stop","id":"taken"})).unwrap();
+    c.operation(a, json!({"op":"create","id":"demo","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    assert_ne!(c.physical(a, "machine", "demo").unwrap(), physical);
+    drop(c);
+    let c = Catalog::open(&fake.root, "test", None).unwrap();
+    assert_eq!(c.physical(a, "machine", "renamed").unwrap(), physical);
+}
+
+#[test]
 fn machines_the_runner_lost_are_flagged_and_deleted_without_it() {
     let mut fake = Fake::new();
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();
@@ -1910,6 +2039,64 @@ async fn owner_quota_dashboard_error_names_the_resource_and_cap() {
     assert!(error.contains("owner CPU limit exceeded"));
     assert!(error.contains("limit 0"));
     assert!(!error.contains("/tmp/"));
+}
+
+#[tokio::test]
+async fn dashboard_rename_answers_the_new_name_and_explains_a_taken_one() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let alice = c.user(&identity("alice")).unwrap();
+    for (name, physical) in [("demo", "physical-a"), ("taken", "physical-b")] {
+        c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata) VALUES(?1,'machine',?2,?3,'{}')",params![alice,name,physical]).unwrap();
+    }
+    let shared = Arc::new(Mutex::new(c));
+    let call = |body: Value| {
+        let shared = shared.clone();
+        let root = fake.root.clone();
+        async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/operation")
+                .header("content-type", "application/json")
+                .header("x-ow-request", "dashboard")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = crate::dashboard::handle(
+                Some(shared),
+                Some(root),
+                identity("alice"),
+                request,
+                false,
+                None,
+            )
+            .await;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        }
+    };
+    let (status, v) = call(json!({"op":"rename","id":"demo","name":"taken"})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("already have a machine named 'taken'")
+    );
+    let (status, _) = call(json!({"op":"rename","id":"demo"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(json!({"op":"rename","id":"demo","name":"no/slash"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, v) =
+        call(json!({"op":"rename","id":"demo","name":"fresh","operation_key":"k1"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["result"]["id"], "fresh");
+    let c = shared.lock().unwrap();
+    assert_eq!(c.physical(alice, "machine", "fresh").unwrap(), "physical-a");
 }
 
 #[test]

@@ -132,6 +132,19 @@ print one JSON value on stdout, without an interactive prompt or progress banner
 - `start`, `stop`, `hibernate`, `snapshot`, `fork`, `restore`, `delete`: lifecycle.
   Stop preserves disk but ends processes; hibernate preserves paired state;
   restore replaces later changes. Delete is deliberate and owner-scoped.
+- `rename NAME NEW_NAME`: owner-only, in place. Only the name changes: the
+  physical ID, disk, snapshots, placement, shares, published ports, SSH keys and
+  host identity stay, and a running or hibernated box keeps running or stays
+  hibernated (no worker contact). NEW_NAME follows the create rules (1–32 ASCII
+  letters, digits, `-`, `_`) and must not name another of your machines; a taken
+  name is refused with a message saying so. Renaming to the current name is a
+  no-op. A box in a move, park, wake or fork transfer refuses it until the
+  transfer ends. A retry with the original `--operation-key` returns the first
+  result even though the old name no longer resolves. Afterwards every command,
+  including `ssh-proxy` and the `ProxyCommand` of a config printed earlier, uses
+  the new name: rerun `ssh-config NEW_NAME`. Teammates use
+  `owner@example.com/NEW_NAME`. Preview URLs do not contain the name and do not
+  change.
 - `delete-snapshot NAME SNAPSHOT`: delete one of your named snapshots of that
   workspace (the machine it captured). Workspaces forked or restored from it keep
   their own disks, and the snapshot name can be used again. It needs the

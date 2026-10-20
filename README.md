@@ -17,6 +17,7 @@ Production hardening remains ongoing.
 | --- | --- | --- | --- | --- |
 | Persistent Linux boxes | Create Alpine, Ubuntu or Arch workspaces on a prepared KVM runner; execute commands and transfer files. | Core | v0.1.0 | [Local use](docs/LOCAL_PROTOTYPE.md) |
 | Start, stop and delete | Keep disks across cold restarts; explicitly delete a stopped box and its snapshots. | Core | v0.1.0 | [CLI](docs/AGENT_CLI.md) |
+| Rename in place | Change a box's name without forking it; disk, snapshots, shares, previews and running state stay. Owner only. | Core | v0.9.21 | [CLI](docs/AGENT_CLI.md), [daily use](docs/DAILY_USE.md#rename-a-box) |
 | CPU, RAM and disk sizing | Select resource sizes, grow sparse root disks, and resize stopped boxes. | Core | v0.1.0; disk sizing v0.7.0 | [Disks](docs/DISKS.md) |
 
 ### Access

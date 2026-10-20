@@ -206,6 +206,11 @@ fn validated(bytes: &[u8]) -> Result<Value> {
             request["artifact"] = json!(artifact);
             request["accept_cold"] = json!(operation.accept_cold.unwrap_or(false));
         }
+        "rename" => {
+            let name = operation.name.context("new name required")?;
+            runtime::identifier(&name)?;
+            request["name"] = json!(name);
+        }
         "snapshot" | "snapshot-delete" | "restore" => {
             let name = operation
                 .name
@@ -655,6 +660,24 @@ mod tests {
         assert!(validated(br#"{"op":"restore","id":"box","name":"local-snapshot"}"#).is_ok());
         assert!(validated(br#"{"op":"snapshot-delete","id":"box","name":"old"}"#).is_ok());
         assert!(validated(br#"{"op":"snapshot-delete","id":"box"}"#).is_err());
+    }
+
+    #[test]
+    fn rename_requires_a_valid_new_name() {
+        assert_eq!(
+            validated(br#"{"op":"rename","id":"box","name":"new-name","operation_key":"k"}"#)
+                .unwrap(),
+            json!({"op":"rename","id":"box","name":"new-name","operation_key":"k"})
+        );
+        for bad in [
+            json!({"op":"rename","id":"box"}),
+            json!({"op":"rename","id":"box","name":""}),
+            json!({"op":"rename","id":"box","name":"a b"}),
+            json!({"op":"rename","id":"box","name":"x".repeat(33)}),
+            json!({"op":"rename","id":"box","name":"owner@example.com/box"}),
+        ] {
+            assert!(validated(bad.to_string().as_bytes()).is_err(), "{bad}");
+        }
     }
 
     #[test]

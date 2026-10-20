@@ -278,6 +278,8 @@ enum Action {
         #[arg(long)]
         accept_cold: bool,
     },
+    /// Rename a machine you own in place; ID, disk, snapshots, shares and state stay (remote only).
+    Rename { id: String, new_name: String },
     /// Stop a workspace (disk persists; running processes end).
     Stop { id: String },
     /// Run a noninteractive command; raw combined output and guest exit status.
@@ -1032,6 +1034,16 @@ mod capability_tests {
             }
         ));
         assert!(Cli::try_parse_from(["ow", "publish", "demo", "--port", "65536"]).is_err());
+    }
+    #[test]
+    fn rename_takes_the_machine_and_its_new_name() {
+        assert!(matches!(
+            Cli::try_parse_from(["ow", "--operation-key", "k", "rename", "box", "new-box"])
+                .unwrap()
+                .command,
+            Action::Rename { id, new_name } if id == "box" && new_name == "new-box"
+        ));
+        assert!(Cli::try_parse_from(["ow", "rename", "box"]).is_err());
     }
     #[test]
     fn move_recovery_requires_a_target_or_explicit_abort_and_current_epoch() {

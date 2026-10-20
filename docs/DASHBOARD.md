@@ -36,7 +36,9 @@ user emails, tokens and deployment logs remain in ignored private storage.
 The command console invokes `/bin/sh -c` for each command, with output after
 completion. **Open Terminal** creates a separate interactive PTY inside the
 selected running VM. See [terminal transport and limits](TERMINALS.md).
-Guest networking now supports filtered IPv4 Internet egress. The page includes a copyable curl installer for the remote Linux x86-64 CLI; see [networking and CLI](NETWORKING.md). **Delete** (owner only, on a
+Guest networking now supports filtered IPv4 Internet egress. The page includes a copyable curl installer for the remote Linux x86-64 CLI; see [networking and CLI](NETWORKING.md). **Rename** (owner only, any state)
+changes only the machine's name and keeps it selected; its disk, snapshots,
+shares, previews and running state stay. **Delete** (owner only, on a
 stopped or hibernated machine) removes it with its disk and every snapshot taken
 from it, and closes the sessions of anyone it was shared with. A machine its
 runner no longer lists shows as `missing` and holds no capacity; deleting it

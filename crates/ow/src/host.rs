@@ -879,8 +879,8 @@ pub fn run(cli: Cli) -> Result<i32> {
                 .retain(|_, value| !value.is_null());
             request
         }
-        Action::Move { .. } | Action::Park { .. } | Action::Wake { .. } => {
-            anyhow::bail!("move/park/wake requires a remote controller")
+        Action::Move { .. } | Action::Park { .. } | Action::Wake { .. } | Action::Rename { .. } => {
+            anyhow::bail!("move/park/wake/rename requires a remote controller")
         }
         Action::Start { id } => json!({"op":"start","id":id}),
         Action::Stop { id } => json!({"op":"stop","id":id}),
