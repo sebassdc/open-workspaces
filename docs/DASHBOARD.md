@@ -47,7 +47,10 @@ runner no longer lists shows as `missing` and holds no capacity; deleting it
 only drops the entry. **AWS role** (owner or admin, when the operator configured
 [per-box AWS access](AWS_ACCESS.md)) attaches one role from the operator's
 allow-list; the machine details then show it with its token expiry and a
-**Detach** button. The API does not delete snapshots on their own, change host configuration, grant Cloudflare permissions, or serve
+**Detach** button. The configured pool administrator also sees other owners' box
+names and AWS settings in the host controls, with attach/detach actions that need
+no share grant; their role choices still follow each box owner's allow-list.
+These settings grant no terminal or disk access. The API does not delete snapshots on their own, change host configuration, grant Cloudflare permissions, or serve
 arbitrary guest HTML on the dashboard origin. Public guest-app publishing remains
 a subsequent slice.
 

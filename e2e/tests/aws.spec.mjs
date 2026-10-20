@@ -43,3 +43,35 @@ test('aws role is refused off the allow-list, not inherited by a fork, and not o
   await expect(api(theirs, {op: 'aws-role', id: `${user}@example.test/parent`})).rejects.toThrow();
   await other.close();
 });
+
+test('pool administrator manages AWS roles without a share and ordinary users cannot', async ({dashboard: page, browser, user}) => {
+  await machines(page, 'managed');
+  const address = `${user}@example.test/managed`;
+  expect((await api(page)).aws_boxes).toBeUndefined();
+  expect((await api(page)).workspaces.find(m => m.id === 'managed').shared_with).toEqual([]);
+  const admin = await browser.newContext({baseURL: 'https://dashboard.e2e.ts.net', ignoreHTTPSErrors: true});
+  await signIn(admin, 'owner');
+  const pool = await admin.newPage();
+  await pool.goto('/');
+  await expect(pool.locator('#host-controls')).toBeVisible();
+  const row = pool.locator('#pool-aws-roles > div').filter({hasText: address});
+  await row.getByRole('button', {name: 'AWS role', exact: true}).click();
+  await expect(pool.getByLabel('IAM role').locator('option')).toHaveText([ROLE]);
+  await pool.getByRole('button', {name: 'Attach role', exact: true}).click();
+  await expect(notice(pool)).toHaveText('AWS role attached.');
+  expect((await api(page)).workspaces.find(m => m.id === 'managed').aws_role.role_arn).toBe(ROLE);
+  await expect(api(pool, {op: 'aws-role', id: address, role_arn: 'arn:aws:iam::111122223333:role/admin'})).rejects.toThrow(/not on this server's allow-list/);
+  await row.getByRole('button', {name: 'Detach', exact: true}).click();
+  await expect(notice(pool)).toHaveText('AWS role detached; its token was removed.');
+  expect((await api(page)).workspaces.find(m => m.id === 'managed').aws_role).toBeNull();
+  const outsider = await browser.newContext({baseURL: 'https://dashboard.e2e.ts.net', ignoreHTTPSErrors: true});
+  await signIn(outsider, `${user}-outsider`);
+  const denied = await outsider.newPage();
+  await denied.goto('/');
+  await expect(denied.locator('#host-controls')).toBeHidden();
+  expect((await api(denied)).aws_boxes).toBeUndefined();
+  await expect(api(denied, {op: 'aws-role', id: address, role_arn: ROLE})).rejects.toThrow(/404/);
+  await expect(api(denied, {op: 'aws-role', id: address, role_arn: ROLE, pool_admin: true})).rejects.toThrow(/400/);
+  await outsider.close();
+  await admin.close();
+});

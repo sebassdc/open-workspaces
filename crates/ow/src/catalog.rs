@@ -25,7 +25,7 @@ pub struct Catalog {
 }
 
 #[derive(Debug)]
-pub struct ResourceNotFound(String);
+pub struct ResourceNotFound(pub(crate) String);
 impl std::fmt::Display for ResourceNotFound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} was not found.", self.0)
@@ -2052,7 +2052,7 @@ impl Catalog {
             "unsupported user operation"
         );
         if op == "aws-role" {
-            return self.aws_role(user, &request);
+            return self.aws_role(user, &request, false);
         }
         if matches!(op.as_str(), "share" | "unshare") {
             return self.share(user, &op, &request);

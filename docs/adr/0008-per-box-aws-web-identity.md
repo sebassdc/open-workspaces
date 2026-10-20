@@ -56,14 +56,20 @@ The controller is an OpenID Connect identity provider for its boxes:
    trust policies need no update on a move. The role session name is the hashed
    `SourceIdentity` (`ow-<32 hex>`), so CloudTrail separates generations.
 5. **Authority.** Off unless the operator writes `aws-identity.json` (issuer and
-   role allow-list, optionally per owner email). The owner or an `admin` grantee
-   attaches one allowed role; `use` grantees cannot. An attachment is pinned to the
-   owner who made it: a box whose owner changes has no role until its new owner
+   role allow-list, optionally per owner email). The box owner, an `admin` grantee
+   or the configured pool administrator attaches one allowed role; `use` grantees
+   cannot. Pool authority requires the verified issuer/subject and bound catalog
+   user ID from host administration. It applies only to AWS settings and always
+   checks the box owner's allow-list. The dashboard lists only box names and AWS
+   settings for this purpose, without granting guest or disk access. An attachment
+   is pinned to the box owner at attachment: a box whose owner changes has no role until its new owner
    attaches one. Forks get a new box ID and no row, and the refresher removes the
    token files a full-state fork copied from its parent. Cleanup is repeated after
    restore or start operations, including those dispatched by an admin grantee,
    using the journal's physical box ID. Removing a role from the
-   allow-list stops issuance, withdraws the key and clears the guest.
+   allow-list stops issuance, withdraws the key and clears the guest. Revoked
+   attachments retry cleanup on every refresh, including after a failed attempt
+   on a stopped guest and after a restore copies token files back.
 6. **Refresh.** A controller thread checks attached boxes every minute and
    re-issues when less than 10 minutes remain or the incarnation changed. Each box
    is handled under the catalog lock on its own, serialized with lifecycle and API

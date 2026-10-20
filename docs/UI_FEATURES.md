@@ -116,6 +116,7 @@ dashboard.
 | --- | --- | --- | --- |
 | AWS role dialog: attach a role from the operator allow-list, show it with its token expiry, detach | works | v0.9.37 | `aws.spec.mjs › aws role dialog attaches an allowed role, shows its token and detaches it` |
 | AWS role refused off the allow-list, not inherited by a fork, not offered to a use grantee | works | v0.9.37 | `aws.spec.mjs › aws role is refused off the allow-list, not inherited by a fork, and not offered to a use grantee` |
+| Pool administrator attaches/detaches allowed AWS roles without a share; ordinary users cannot | works | v0.9.37 | `aws.spec.mjs › pool administrator manages AWS roles without a share and ordinary users cannot` |
 
 The fake worker accepts the token delivery call; that a guest's AWS SDK turns
 the token into credentials is checked by `crates/ow-core/tests/web_identity_chain.rs`

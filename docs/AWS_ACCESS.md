@@ -78,7 +78,14 @@ In the dashboard, select the machine and choose **AWS role**; only the roles the
 operator allows for you are offered. The machine details show the role and until
 when its current token is valid, with **Detach**.
 
-- Only the owner or a teammate with the `admin` share role can set or unset it.
+- The box owner, a teammate with the `admin` share role, or the configured pool
+  administrator can set or unset it. Pool authority uses the verified login
+  subject and bound catalog user ID (`node_owner_subject` / `node_owner_user_id`),
+  never an email header or a request parameter. A pool administrator needs no
+  share: use `ow aws-role set owner@example.com/box --role-arn ARN` or `unset`.
+  The dashboard's host controls list other owners' boxes with their AWS role,
+  allowed roles and attach/detach actions; this grants no terminal or disk access.
+  The chosen role must still be allowed for the **box owner**.
 - `state` is `active` (token delivered, `token_expires_at` in Unix seconds),
   `pending` (the box is not running; it gets one when it runs), `error` (not
   delivered: an old runner, or the role was removed from the allow-list) or
@@ -91,9 +98,11 @@ when its current token is valid, with **Detach**.
   Parked or transferring boxes have their keys withdrawn at the next refresh;
   re-attaching withdraws the old key immediately even while parked. Cleanup of
   role-less boxes runs again after a restore or start by the owner or an admin.
-- **A new owner starts without a role.** An attachment belongs to the owner who
-  made it. If a box changes owner, it gets no new tokens and its files are removed
-  at the next pass; the new owner, or an admin, attaches a role again.
+- **A new owner starts without a role.** An attachment belongs to the box owner
+  at attachment. If a box changes owner, it gets no new tokens and its files are removed
+  at the next pass; the new owner, or an admin, attaches a role again. Revoked
+  attachments retry file cleanup every refresh pass, including after a stopped
+  box starts or a snapshot restores copied token files.
 - Unset, owner change, allow-list removal and deleting the box withdraw the box's
   signing key from the JWKS and remove the files: its tokens, copies included, stop
   verifying once AWS re-reads the JWKS (served with `max-age=60`; AWS's own cache

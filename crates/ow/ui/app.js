@@ -132,6 +132,12 @@ function renderState() {
   if(data.host_controls) for(const node of (data.nodes||[]).filter(n=>!n.revoked)) {
     const row=element('div'); row.dataset.key=node.id; row.append(element('span',`${node.id} · ${node.online?'online':'offline'} · ${mib(node.memory_mib)} `),action('Adjust budget',()=>hostDialog('budget',node.id))); $('host-node-list').append(row);
   }
+  $('pool-aws-roles').replaceChildren();
+  if (data.host_controls) for (const box of data.aws_boxes || []) {
+    const row = element('div'); row.append(element('span', `${box.id} · ${box.aws_role?.role_arn || 'No AWS role'} `), action('AWS role', () => openDialog('aws-role', box.id)));
+    if (box.aws_role) row.append(action('Detach', () => operate({op: 'aws-role', id: box.id})));
+    $('pool-aws-roles').append(row);
+  }
   $('create').disabled = busy || !loaded;
 }
 function field(name, label, value, choices) { const wrapper = element('label', label, 'field'); let input; if (choices) { input = element('select'); for (const [v, title, disabled] of choices) { const option = element('option', title); option.value = v; option.disabled = !!disabled; input.append(option); } } else { input = element('input'); input.pattern = '[A-Za-z0-9_\\-]{1,32}'; input.title = 'Letters, digits, - and _, up to 32 characters.'; input.maxLength = 32; input.required = true; input.autocomplete = 'off'; } input.name = name; if (value) input.value = value; wrapper.append(input); return wrapper; }
@@ -178,7 +184,7 @@ function openDialog(op, id, snapshot) {
   }
   if (op === 'publish') { const port = field('port', 'Guest HTTP port', '3000'), input = port.querySelector('input'); input.type = 'number'; input.removeAttribute('pattern'); input.removeAttribute('title'); input.removeAttribute('maxlength'); input.min = '1'; input.max = '65535'; input.step = '1'; $('dialog-fields').append(port); }
   if (op === 'share') { const email = field('with', 'Teammate email', '', null), input = email.querySelector('input'); input.type = 'email'; input.removeAttribute('pattern'); input.removeAttribute('title'); input.maxLength = 254; $('dialog-fields').append(email, field('role', 'Role', 'use', [['use','Use · terminal, SSH, commands, fork'],['admin','Admin · also stop, snapshot, restore, SSH keys']])); }
-  if (op === 'aws-role') { const roles = machine()?.aws_roles || data.aws_identity?.roles || []; $('dialog-fields').append(roles.length ? field('role_arn', 'IAM role', machine()?.aws_role?.role_arn || roles[0], roles.map(r => [r, r])) : element('p', 'Your server operator allows no AWS roles for your machines yet.', 'field-error')); $('dialog-submit').disabled = !roles.length; }
+  if (op === 'aws-role') { const target = [...data.workspaces, ...(data.shared || []), ...(data.aws_boxes || [])].find(box => box.id === id), roles = target?.aws_roles || data.aws_identity?.roles || []; $('dialog-fields').append(roles.length ? field('role_arn', 'IAM role', target?.aws_role?.role_arn || roles[0], roles.map(r => [r, r])) : element('p', 'Your server operator allows no AWS roles for this machine yet.', 'field-error')); $('dialog-submit').disabled = !roles.length; }
   if (op === 'rename') $('dialog-fields').append(field('name', 'New machine name', id, null));
   if (op === 'delete') { const going = data.snapshots.filter(item => item.workspace === id).map(item => item.name); $('dialog-fields').append(element('p', going.length ? `Its ${going.length} snapshot${going.length === 1 ? '' : 's'} will be deleted too: ${going.join(', ')}` : 'It has no snapshots.', going.length ? 'field-error' : 'muted')); }
   if (op === 'snapshot') $('dialog-fields').append(field('name', 'Snapshot name', `snapshot-${Date.now().toString(36)}`));

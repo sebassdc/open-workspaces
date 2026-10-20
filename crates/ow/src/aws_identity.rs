@@ -326,9 +326,18 @@ pub(crate) enum Work {
 
 impl Catalog {
     /// `{"op":"aws-role","id":NAME,"role_arn":ARN}` attaches; without `role_arn` it detaches.
-    pub fn aws_role(&mut self, user: i64, request: &Value) -> Result<Value> {
+    pub fn aws_role(&mut self, user: i64, request: &Value, pool_admin: bool) -> Result<Value> {
         let name = request["id"].as_str().context("id")?;
-        let physical = self.machine(user, name, "aws-role")?;
+        let physical = if pool_admin && let Some((owner, logical)) = name.split_once('/') {
+            common::address(name)?;
+            self.db.query_row(
+                "SELECT r.physical FROM resources r JOIN users u ON u.id=r.owner WHERE r.kind='machine' AND u.issuer=(SELECT issuer FROM users WHERE id=?1) AND u.email=?2 AND r.name=?3",
+                params![user, owner.to_ascii_lowercase(), logical],
+                |r| r.get(0),
+            ).optional()?.ok_or_else(|| crate::catalog::ResourceNotFound(format!("machine '{name}'")))?
+        } else {
+            self.machine(user, name, "aws-role")?
+        };
         let role = request["role_arn"].as_str();
         if let Some(role) = role {
             let config = config(&self.root)?.ok_or_else(|| Refusal {
@@ -383,6 +392,19 @@ impl Catalog {
         Ok(json!({"id":name,"aws_role":view(&self.db, &physical)?}))
     }
 
+    /// Only the verified pool administrator receives this limited AWS settings list.
+    pub(crate) fn pool_aws_boxes(&self, user: i64) -> Result<Vec<Value>> {
+        let Some(config) = config(&self.root)? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = self.db.prepare("SELECT r.physical,u.email,r.name FROM resources r JOIN users u ON u.id=r.owner WHERE r.kind='machine' AND r.owner<>?1 AND u.issuer=(SELECT issuer FROM users WHERE id=?1) ORDER BY u.email,r.name")?;
+        statement.query_map([user], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+            .map(|row| {
+                let (physical, owner, name) = row?;
+                Ok(json!({"id":format!("{owner}/{name}"),"aws_role":view(&self.db, &physical)?,"aws_roles":config.roles_for(&owner)}))
+            }).collect()
+    }
+
     /// Changes whenever a fork of this box is started or made (here or on another runner):
     /// a fork's RAM holds the parent's token, so the parent then moves to a new generation.
     fn fork_mark(&self, physical: &str) -> Result<String> {
@@ -397,10 +419,10 @@ impl Catalog {
     /// Returns whether the worker wrote to a running guest.
     pub(crate) fn sync_aws(&mut self, physical: &str, force: bool) -> Result<bool> {
         #[allow(clippy::type_complexity)]
-        let row: Option<(String, i64, i64, Option<String>, Option<i64>, Option<i64>, i64, String, i64, String, Option<String>, Option<String>)> = self.db.query_row(
-            "SELECT a.role_arn,a.owner,a.generation,a.node,a.epoch,a.expires_at,r.owner,r.node,r.placement_epoch,u.email,a.fork_mark,a.error FROM aws_roles a JOIN resources r ON r.kind='machine' AND r.physical=a.physical JOIN users u ON u.id=r.owner WHERE a.physical=?1",
+        let row: Option<(String, i64, i64, Option<String>, Option<i64>, Option<i64>, i64, String, i64, String, Option<String>)> = self.db.query_row(
+            "SELECT a.role_arn,a.owner,a.generation,a.node,a.epoch,a.expires_at,r.owner,r.node,r.placement_epoch,u.email,a.fork_mark FROM aws_roles a JOIN resources r ON r.kind='machine' AND r.physical=a.physical JOIN users u ON u.id=r.owner WHERE a.physical=?1",
             [physical],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),
         ).optional()?;
         let moving: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1)",
@@ -436,7 +458,6 @@ impl Catalog {
             epoch,
             email,
             seen_forks,
-            seen_error,
         )) = row
         else {
             return self.deliver(&node, physical, None);
@@ -451,9 +472,6 @@ impl Catalog {
             };
             // Its tokens stop verifying once AWS re-reads the JWKS, whatever copies exist.
             revoke(&self.root, physical)?;
-            if seen_error.as_deref() == Some(error) {
-                return Ok(false);
-            }
             self.db.execute(
                 "UPDATE aws_roles SET expires_at=NULL,error=?2 WHERE physical=?1",
                 params![physical, error],

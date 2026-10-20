@@ -394,7 +394,7 @@ pub async fn handle(
     root: Option<std::path::PathBuf>,
     identity: Identity,
     request: Request,
-    host_controls: bool,
+    pool_owner: Option<i64>,
     preview_host: Option<String>,
 ) -> Response {
     let path = request.uri().path();
@@ -440,6 +440,10 @@ pub async fn handle(
                         item["published_ports"] = json!([]);
                     }
                 }
+            }
+            let host_controls = pool_owner == Some(user);
+            if host_controls {
+                state["aws_boxes"] = json!(catalog.pool_aws_boxes(user)?);
             }
             state["host_controls"] = json!(host_controls);
             state["pool_policy"] = json!(crate::nodes::POOL_POLICY);
@@ -557,7 +561,7 @@ pub async fn handle(
         }
     } else if operation["op"] == "aws-role" {
         with_catalog(catalog, identity, move |catalog, user| {
-            catalog.aws_role(user, &operation)
+            catalog.aws_role(user, &operation, pool_owner == Some(user))
         })
         .await
     } else if matches!(operation["op"].as_str(), Some("publish" | "unpublish")) {

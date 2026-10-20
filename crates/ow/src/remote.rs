@@ -701,15 +701,16 @@ async fn handle(app: &App, mut request: Request) -> Response {
         return host_admin(app, identity, request).await;
     }
     if app.dashboard.is_some() {
-        // Owner controls only shape /api/state. Checking them takes the catalog lock, which a
-        // slow worker call can hold, so other paths (unshare above all) must not wait for it.
-        let controls = request.uri().path() == "/api/state" && owner_controls(app, &identity).await;
+        // The verified subject selects a candidate ID; with_catalog must bind it to
+        // the authenticated user before granting pool authority for an operation.
+        let pool_owner =
+            designated_owner(app, &identity).then(|| app.config.node_owner_user_id.unwrap());
         return crate::dashboard::handle(
             app.catalog.clone(),
             app.dashboard.clone(),
             identity,
             request,
-            controls,
+            pool_owner,
             (app.config.previews && app.config.auth == Auth::Tailscale)
                 .then(|| app.config.hostname.clone()),
         )
@@ -2904,6 +2905,91 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("pool spend cap exceeded")
+        );
+        // Pool authority applies to AWS role changes without a box share. The role
+        // allow-list still belongs to the box owner, not the pool administrator.
+        let role = "arn:aws:iam::111122223333:role/box-reader";
+        fs::write(root.join(crate::aws_identity::CONFIG), json!({"issuer":"https://app.example.test","allowed_roles":[{"role_arn":role,"owners":["box-owner@example.test"]}]}).to_string()).unwrap();
+        {
+            let mut c = app.catalog.as_ref().unwrap().lock().unwrap();
+            let user = c
+                .user(&Identity {
+                    issuer: app.config.issuer(),
+                    subject: "box-owner".into(),
+                    email: "box-owner@example.test".into(),
+                })
+                .unwrap();
+            c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'machine','box','m-box','{}','')", [user]).unwrap();
+        }
+        let aws_request = |claims: &Value, role: Option<&str>| {
+            let mut request = make(Some(token(&key, claims)), "unused");
+            *request.uri_mut() = "/api/operation".parse().unwrap();
+            let mut operation = json!({"op":"aws-role","id":"box-owner@example.test/box"});
+            if let Some(role) = role {
+                operation["role_arn"] = json!(role);
+            }
+            *request.body_mut() = Body::from(operation.to_string());
+            request
+        };
+        let mut state_request = aws_request(&claims(), None);
+        *state_request.uri_mut() = "/api/state".parse().unwrap();
+        *state_request.method_mut() = Method::GET;
+        *state_request.body_mut() = Body::empty();
+        let response = handle(&app, state_request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let state: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            state["result"]["aws_boxes"],
+            json!([{
+                "id":"box-owner@example.test/box", "aws_role":null, "aws_roles":[role]
+            }])
+        );
+        assert_eq!(
+            handle(&app, aws_request(&claims(), Some(role)))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            handle(
+                &app,
+                aws_request(&claims(), Some("arn:aws:iam::111122223333:role/unlisted"))
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            handle(&app, aws_request(&claims(), None)).await.status(),
+            StatusCode::OK
+        );
+        app.config.node_owner_user_id = Some(owner + 1000);
+        assert!(
+            !handle(&app, aws_request(&claims(), Some(role)))
+                .await
+                .status()
+                .is_success()
+        );
+        app.config.node_owner_user_id = Some(owner);
+        let mut forged = claims();
+        forged["sub"] = json!("other-subject");
+        assert!(
+            !handle(&app, aws_request(&forged, Some(role)))
+                .await
+                .status()
+                .is_success()
+        );
+        assert!(
+            app.catalog
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .db
+                .query_row("SELECT COUNT(*) FROM aws_roles", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+                == 0
         );
         drop(app);
         fs::remove_dir_all(root).unwrap();

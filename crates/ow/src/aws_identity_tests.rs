@@ -382,9 +382,11 @@ fn tokens_are_short_lived_rotate_and_follow_the_incarnation() {
     assert_eq!(revoked.len(), 1);
     assert!(revoked[0].get("token").is_none());
     assert!(rejected(&f.root, &latest));
-    // Cleared once, not on every pass.
+    // Revoked attachments keep retrying cleanup: a later restore can copy files back.
     pass(&mut c, &mut cleared);
-    assert!(f.requests().is_empty());
+    let retried = f.requests();
+    assert_eq!(retried.len(), 1);
+    assert!(retried[0].get("token").is_none());
     assert_eq!(
         c.state(a).unwrap()["workspaces"][0]["aws_role"]["state"],
         "error"
@@ -528,5 +530,42 @@ fn admin_restore_invalidates_roleless_cleanup_cache() {
         assert!(!f.present.load(Ordering::SeqCst));
         pass(&mut c, &mut cleared);
         assert!(f.requests().is_empty());
+    }
+}
+
+#[test]
+fn revoked_roles_retry_cleanup_after_stop_and_restored_credentials() {
+    let f = Fixture::new();
+    f.configure(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":ROLE}]}));
+    let mut c = Catalog::open(&f.root, "test", None).unwrap();
+    let owner = c.user(&identity("a", "a@example.test")).unwrap();
+    running(&c, owner, "box", "m-box");
+    c.operation(owner, json!({"op":"aws-role","id":"box","role_arn":ROLE}))
+        .unwrap();
+    let old = f.requests().pop().unwrap();
+    let mut cleared = HashSet::new();
+    let pass = |c: &mut Catalog, cleared: &mut HashSet<_>| {
+        for work in c.aws_work().unwrap() {
+            c.aws_step(work, cleared);
+        }
+    };
+    f.written.store(false, Ordering::SeqCst);
+    f.configure(json!({"issuer":ISSUER,"allowed_roles":[]}));
+    pass(&mut c, &mut cleared);
+    assert_eq!(f.requests().len(), 1);
+    assert!(rejected(&f.root, &old));
+    f.written.store(true, Ordering::SeqCst);
+    for op in ["start", "restore"] {
+        f.present.store(true, Ordering::SeqCst);
+        c.db.execute(
+            "INSERT INTO operations(owner,op,resource,state) VALUES(?1,?2,'box','succeeded')",
+            params![owner, op],
+        )
+        .unwrap();
+        pass(&mut c, &mut cleared);
+        let requests = f.requests();
+        assert_eq!(requests.len(), 1, "{op}: cleanup must be retried");
+        assert!(requests[0].get("token").is_none());
+        assert!(!f.present.load(Ordering::SeqCst));
     }
 }
