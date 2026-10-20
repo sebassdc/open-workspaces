@@ -2,7 +2,6 @@ use crate::runtime::Runtime;
 use crate::{Action, Cli, assets, common, network, remote, runtime, terminal, vm, wire};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use ow_core::ComputeProvider;
 use serde_json::{Value, json};
 use std::{
     fs::{self, OpenOptions},
@@ -160,7 +159,19 @@ fn worker(root: PathBuf) -> Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     let terminals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut idle_check = Instant::now();
+    // Live forks whose capture a sealing thread finished: (reply, parent, child, capture).
+    let (sealed_forks, forks) = std::sync::mpsc::channel::<(UnixStream, String, String, String)>();
     while !stopping.load(Ordering::SeqCst) {
+        // The child VMM must be spawned here, by the worker thread (see below).
+        while let Ok((mut stream, parent, child, capture)) = forks.try_recv() {
+            let response = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
+                .fork_child(&parent, &child, &capture, true);
+            if let Err(error) = wire::send(&mut stream, &wire::response(response)) {
+                eprintln!("fork reply: {error:#}");
+            }
+        }
         // On this thread: hibernation must not race the VMMs this thread spawns.
         if idle_check.elapsed() >= Duration::from_secs(5) {
             idle_check = Instant::now();
@@ -300,11 +311,48 @@ fn worker(root: PathBuf) -> Result<()> {
                     } else {
                         // VMMs must be spawned by this long-lived worker thread: Linux
                         // parent-death signals are tied to the spawning thread's lifetime.
-                        let response = runtime
+                        let step = runtime
                             .lock()
                             .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
-                            .operation(&request);
-                        wire::send(&mut stream, &wire::response(response))?;
+                            .begin(&request);
+                        match step {
+                            runtime::Step::Done(response) => {
+                                wire::send(&mut stream, &wire::response(response))?
+                            }
+                            // The guest already runs again; hashing its capture here would hold
+                            // every machine's requests, so a thread seals it.
+                            runtime::Step::Seal(staged) => {
+                                let runtime = runtime.clone();
+                                let sealed_forks = sealed_forks.clone();
+                                std::thread::spawn(move || {
+                                    let sealed = staged.seal();
+                                    let fork = staged.fork.clone();
+                                    let result = match runtime.lock() {
+                                        Ok(mut runtime) => runtime.finish(staged, sealed),
+                                        Err(_) => Err(anyhow::anyhow!("runtime lock poisoned")),
+                                    };
+                                    match (result, fork) {
+                                        (Ok(capture), Some((parent, child))) => {
+                                            let capture =
+                                                capture["name"].as_str().unwrap_or_default();
+                                            let _ = sealed_forks.send((
+                                                stream,
+                                                parent,
+                                                child,
+                                                capture.into(),
+                                            ));
+                                        }
+                                        (result, _) => {
+                                            if let Err(error) =
+                                                wire::send(&mut stream, &wire::response(result))
+                                            {
+                                                eprintln!("snapshot reply: {error:#}");
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
                     }
                     Ok(())
                 })();
@@ -948,7 +996,9 @@ pub fn run(cli: Cli) -> Result<i32> {
             json!({"op":"fork","id":id,"child":child,"snapshot":snapshot})
         }
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),
-        Action::Delete { id } => {
+        Action::Delete { id, yes } => {
+            let snapshots = wire::request(&root, json!({"op":"snapshots"}))?;
+            crate::client::confirm_delete(&id, &snapshots, yes, crate::client::interactive())?;
             // Publications close only once the worker has accepted the delete.
             let result = wire::request(&root, json!({"op":"delete","id":id}))?;
             unpublish_all(&root, Some(&id))?;

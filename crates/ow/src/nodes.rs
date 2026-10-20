@@ -1117,6 +1117,8 @@ fn build_beat(
         "compat",
         "max_disk_gib",
         "reserved_disk_bytes",
+        "unwritten_disk_bytes",
+        "free_disk_bytes",
         "min_free_gib",
         "host_reserve",
         "available_disk_bytes",
