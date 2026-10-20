@@ -176,17 +176,21 @@ contact: the box keeps its physical ID, disk, placement, published ports, SSH ke
 and running state, and the snapshots its owner took of it move with it. The new
 owner gets full owner rights and addresses it as `NAME`; others use
 `new@example.com/NAME`. Every share ends (a teammate's or the new owner's), and
-the open terminals and SSH streams of everyone who lost access close; with
+the open terminals, SSH streams and preview connections of everyone who lost
+access close; with
 `--keep-access` the old owner gets an `admin` share. The old owner's name is free
 again; their operation history stays, renamed `transferred:NAME`. Snapshots a
 grantee took stay theirs. It is refused when the new owner already has a machine
 or snapshot of the same name, when the box is still being created, or has an
-unfinished move, park, wake, fork, capture, start, resize or restore, and when the
-box would push the new owner past any of their CPU, RAM, disk or box limits. An
+unfinished move, park, wake, fork, capture, start, resize, restore or delete, and
+when the box would push the new owner past any of their CPU, RAM, disk or box
+limits (the refusal names the limit, not their usage). An
 email nobody has used yet is reserved, as for sharing.
 
 **Create and fork for someone else** reserve the new box, its operation and its
-quota in that owner's name space; the result names the `owner`. A fork for another
+quota in that owner's name space; the result names the `owner`. The actor's
+`--operation-key` is scoped to the actor, so it never replays the owner's own
+operations; a retry without a key is a new request. A fork for another
 owner works on boxes still on their original runner (not after a move, park or
 wake) and not with `--node`. Like every fork, it inherits no shares or SSH keys.
 

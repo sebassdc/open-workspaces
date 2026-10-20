@@ -350,7 +350,8 @@ pub(crate) fn admit_owner(
         .zip(used.values().into_iter().zip(caps.values()))
     {
         if !used.checked_add(next).is_some_and(|sum| sum <= cap) {
-            return Err(Rejection(format!("{email} would exceed their {name} limit: total {}, limit {cap}; free room in their account or ask the administrator to change limits", used.saturating_add(next))).into());
+            // Their usage and caps are theirs to see, not the sender's.
+            return Err(Rejection(format!("{email} has no room for it under their {name} limit; they can free room, or ask the administrator to change limits")).into());
         }
     }
     Ok(())

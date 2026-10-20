@@ -1715,7 +1715,7 @@ impl Catalog {
             common::identifier(key)?;
         }
         self.db.execute_batch("BEGIN IMMEDIATE")?;
-        let moved = (|| -> Result<(Value, String, Vec<i64>)> {
+        let moved = (|| -> Result<(Value, Vec<String>, Vec<i64>)> {
             // The address may not resolve after the first success: answer a retry by its key.
             if let Some(key) = key {
                 let previous: Option<(String, String, Option<String>)> = self.db.query_row("SELECT op,request,response FROM operations WHERE owner=?1 AND retry_key=?2",params![user,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
@@ -1725,7 +1725,7 @@ impl Catalog {
                         "operation key conflicts with original parameters"
                     );
                     let value = serde_json::from_str(&response.context("missing result")?)?;
-                    return Ok((value, String::new(), Vec::new()));
+                    return Ok((value, Vec::new(), Vec::new()));
                 }
             }
             let (physical, _) = self.access(user, address, "transfer")?;
@@ -1742,7 +1742,7 @@ impl Catalog {
                 }
                 .into());
             }
-            let refuse = |why: String| -> Result<(Value, String, Vec<i64>)> {
+            let refuse = |why: String| -> Result<(Value, Vec<String>, Vec<i64>)> {
                 Err(limits::Rejection(why).into())
             };
             if self.unmade(&physical)? {
@@ -1750,12 +1750,13 @@ impl Catalog {
                     "machine '{name}' was never made or is still being created; transfer it once it exists"
                 ));
             }
-            // A transfer step re-authorizes by owner and name; an unresolved capture would leave
-            // its snapshot with the old owner.
-            let busy: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1) OR EXISTS(SELECT 1 FROM operations WHERE state IN ('pending','uncertain') AND op IN ('create','fork','resize','restore','start','snapshot') AND (json_extract(request,'$.request.id')=?1 OR json_extract(request,'$.request.child')=?1))",[&physical],|r|r.get(0))?;
+            // A move, park or wake holds a transfer lock and re-authorizes by owner and name. An
+            // unresolved effect (its fingerprint names the physical ID) may still land under the
+            // old owner, such as a capture's snapshot.
+            let busy: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1) OR EXISTS(SELECT 1 FROM operations WHERE state IN ('pending','uncertain') AND op IN ('create','fork','resize','restore','start','snapshot','snapshot-delete','delete') AND (json_extract(request,'$.request.id')=?1 OR json_extract(request,'$.request.child')=?1))",[&physical],|r|r.get(0))?;
             if busy {
                 return refuse(format!(
-                    "machine '{name}' has an unfinished operation (a move, park, wake, fork or snapshot); transfer it when that finishes"
+                    "machine '{name}' has an unfinished operation (a move, park, wake, create, fork, snapshot, start, resize, restore or delete); transfer it when that finishes"
                 ));
             }
             if self.physical(new, "machine", &name).is_ok() {
@@ -1804,6 +1805,15 @@ impl Catalog {
             } else {
                 cut.push(old);
             }
+            // Preview streams are keyed by port, not machine.
+            let previews = self
+                .db
+                .prepare("SELECT https_port FROM publications WHERE physical=?1 AND active=1")?
+                .query_map([&physical], |r| r.get::<_, u16>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let streams = std::iter::once(physical.clone())
+                .chain(previews.iter().map(|https| format!("preview:{https}")))
+                .collect::<Vec<_>>();
             let node = self.placement("machine", &physical)?;
             self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,finished_at) VALUES(?1,'transfer',?2,'succeeded',?3,?4,?5,CURRENT_TIMESTAMP)",params![user,format!("transferred:{name}"),node,key,fingerprint])?;
             let operation = self.db.last_insert_rowid();
@@ -1827,13 +1837,15 @@ impl Catalog {
                 "UPDATE operations SET response=?1 WHERE id=?2",
                 params![value.to_string(), operation],
             )?;
-            Ok((value, physical, cut))
+            Ok((value, streams, cut))
         })();
         match moved {
-            Ok((value, physical, losers)) => {
+            Ok((value, streams, losers)) => {
                 self.db.execute_batch("COMMIT")?;
                 for loser in losers {
-                    cut(loser, &physical);
+                    for stream in &streams {
+                        cut(loser, stream);
+                    }
                 }
                 Ok(value)
             }
@@ -2281,6 +2293,10 @@ impl Catalog {
                     matches!(op.as_str(), "create" | "fork"),
                     "only create and fork take an owner"
                 );
+                ensure!(
+                    op == "create" || request.get("node").is_none(),
+                    "a fork for another owner stays on its machine's runner; omit the node"
+                );
                 if op == "create" && !self.pool_admin(user)? {
                     return Err(limits::Rejection(
                         "only a pool admin can create a machine for someone else".into(),
@@ -2306,6 +2322,20 @@ impl Catalog {
                 self.user_by_email(user, email)?
             }
         };
+        if owner != user {
+            // Keys live in the owner's operation history. Scope the actor's there, so no actor
+            // replays the owner's own operations; a retry without a key is a new intent.
+            use sha2::{Digest, Sha256};
+            let key = match request["operation_key"].as_str() {
+                Some(key) => {
+                    common::identifier(key)?;
+                    key.to_owned()
+                }
+                None => common::nonce()?,
+            };
+            request["operation_key"] =
+                json!(format!("{:x}", Sha256::digest(format!("{user}:{key}")))[..32]);
+        }
         let input = request.clone();
         // A finished delete has no row left to resolve: answer its key before looking.
         if op == "delete"
@@ -2925,32 +2955,35 @@ impl Catalog {
         value["operation"]["state"] = json!("succeeded");
         value["operation_id"] = json!(operation);
         value["node"] = json!(node);
-        // A box made for someone else, or a pool admin's fork of another owner's box.
-        let admin_fork =
-            op == "fork" && owner == user && self.access(user, &name, "fork")?.1 == "pool-admin";
-        if owner != user || admin_fork {
+        // A box made for someone else, or a pool admin's fork of another owner's box (even one
+        // shared with them).
+        if owner != user || op == "fork" {
             let (from, source): (i64, String) = self.db.query_row(
                 "SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1",
                 [&physical],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            let fork = op == "fork";
-            let child = if fork {
-                input["child"].as_str().unwrap_or(&name)
-            } else {
-                &name
-            };
-            self.audit(
-                operation,
-                user,
-                &op,
-                child,
-                fork.then_some(source.as_str()),
-                fork.then_some(from),
-                owner,
-                false,
-            )?;
-            value["owner"] = json!(self.email(owner)?);
+            if owner != user || from != user && self.pool_admin(user)? {
+                let fork = op == "fork";
+                let child = if fork {
+                    input["child"].as_str().unwrap_or(&name)
+                } else {
+                    &name
+                };
+                self.audit(
+                    operation,
+                    user,
+                    &op,
+                    child,
+                    fork.then_some(source.as_str()),
+                    fork.then_some(from),
+                    owner,
+                    false,
+                )?;
+            }
+            if owner != user {
+                value["owner"] = json!(self.email(owner)?);
+            }
         }
         self.db.execute("UPDATE operations SET state='succeeded',response=?1,finished_at=CURRENT_TIMESTAMP WHERE id=?2",params![value.to_string(),operation])?;
         if matches!(op.as_str(), "stop" | "hibernate") {

@@ -4242,6 +4242,16 @@ fn transfer_by_owner_or_pool_admin_keeps_the_box_and_moves_its_owner() {
     .unwrap();
     let (_, _, owner_stream) = c.terminal_target(a, "demo").unwrap();
     let (_, _, grantee_stream) = c.terminal_target(s, "alice@example.test/demo").unwrap();
+    let https = c
+        .publication(
+            a,
+            &json!({"op":"publish","id":"demo","port":3000}),
+            |_, _| Ok(()),
+        )
+        .unwrap()["https_port"]
+        .as_u64()
+        .unwrap() as u16;
+    let grantee_preview = c.preview_target(s, https).unwrap().unpublished;
     let transfer = |id: &str, to: &str| json!({"op":"transfer","id":id,"to":to});
     // A shared admin, a stranger, a missing box or a bad email cannot.
     for (user, request) in [
@@ -4286,10 +4296,33 @@ fn transfer_by_owner_or_pool_admin_keeps_the_box_and_moves_its_owner() {
     assert!(
         full.downcast_ref::<limits::Rejection>().is_some_and(|r| r
             .0
-            .contains("bob@example.test would exceed their boxes limit")),
+            .contains("bob@example.test has no room for it under their boxes limit")
+            && !r.0.contains('1')),
         "{full:#}"
     );
     std::fs::remove_file(fake.root.join("limits.json")).unwrap();
+    // An unresolved effect on the box, or a move in progress, holds it with its owner.
+    c.db.execute("INSERT INTO operations(owner,op,resource,state,request) VALUES(?1,'snapshot','late','uncertain',?2)",params![a,json!({"request":{"op":"snapshot","id":physical,"name":"s-late"},"node":"alpha"}).to_string()]).unwrap();
+    c.db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    c.db.execute(
+        "INSERT INTO transfer_locks(machine,transfer) VALUES(?1,999)",
+        [&physical],
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let busy = c
+            .operation(a, transfer("demo", "bob@example.test"))
+            .unwrap_err();
+        assert!(
+            busy.downcast_ref::<limits::Rejection>()
+                .is_some_and(|r| r.0.contains("unfinished operation")),
+            "{busy:#}"
+        );
+        c.db.execute("DELETE FROM transfer_locks", []).unwrap();
+    }
+    c.db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    c.db.execute("DELETE FROM operations WHERE resource='late'", [])
+        .unwrap();
     assert_eq!(c.physical(a, "machine", "demo").unwrap(), physical);
     // The owner hands it over: no worker contact, so the running box keeps running.
     let before = fake.calls.load(Ordering::SeqCst);
@@ -4338,7 +4371,9 @@ fn transfer_by_owner_or_pool_admin_keeps_the_box_and_moves_its_owner() {
         )
         .is_err()
     );
-    assert!(closed(&owner_stream) && closed(&grantee_stream));
+    assert!(closed(&owner_stream) && closed(&grantee_stream) && closed(&grantee_preview));
+    // The preview stays published, now for its new owner.
+    assert!(c.preview_target(b, https).is_ok() && c.preview_target(s, https).is_err());
     assert_eq!(c.state(a).unwrap()["audit"][0]["to"], "bob@example.test");
     assert_eq!(c.state(a).unwrap()["snapshots"], json!([]));
     assert_eq!(c.state(e).unwrap()["audit"], json!([]));
@@ -4483,6 +4518,25 @@ fn pool_admins_create_and_fork_for_others_and_owners_fork_for_others() {
             "create - -->alice@example.test gift by admin@example.test",
         ]
     );
+    // An actor's key never replays the owner's own operation of the same name and shape.
+    c.operation(a, json!({"op":"create","id":"keyed","memory_mib":256,"vcpu_count":1,"operation_key":"alice-key"}))
+        .unwrap();
+    let replay = c
+        .operation(p, json!({"op":"create","id":"keyed","memory_mib":256,"vcpu_count":1,"operation_key":"alice-key","owner":"alice@example.test"}))
+        .unwrap_err();
+    assert!(replay.downcast_ref::<NameTaken>().is_some(), "{replay:#}");
+    // A pool admin the box is shared with is still audited when forking it.
+    c.operation(
+        a,
+        json!({"op":"share","id":"gift","with":"admin@example.test"}),
+    )
+    .unwrap();
+    c.operation(
+        p,
+        json!({"op":"fork","id":"alice@example.test/gift","child":"peek-two"}),
+    )
+    .unwrap();
+    assert_eq!(c.state(a).unwrap()["audit"][0]["machine"], "peek-two");
     // A sharee's own fork is no admin action.
     c.operation(
         s,
