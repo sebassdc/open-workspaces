@@ -134,7 +134,7 @@ device state file (written whole by every capture), and every range whose
 mapping is unknown, delayed, compressed, encrypted or inline. Without an earlier
 seal (first point, a changed destination, or a durable point from an older
 worker) the disk and RAM files are flushed and only their holes are skipped (zero
-chunks, unread, from 0.9.27); every mapped chunk is read, and zero chunks are still
+chunks, unread, from 0.9.28); every mapped chunk is read, and zero chunks are still
 recognized without hashing. This trusts the
 filesystem's extent sharing, as changed-block tracking does; a worker that
 verifies such a snapshot again (after a restart, or for import) reads every byte

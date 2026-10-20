@@ -1,7 +1,7 @@
 # S3 transfer timings: in-process parallel transfers
 
 Observed on 2026-10-20 (UTC) in a dedicated sandbox AWS account, one host and one
-box, before and after the 0.9.27 transfer changes
+box, before and after the 0.9.28 transfer changes
 ([ARTIFACT_STORE.md](../ARTIFACT_STORE.md), [RECOVERY.md](../RECOVERY.md)).
 Unless a row says n=2 or n=3, every figure is a single sample (n=1), so there are
 no percentiles. All resources were destroyed afterwards.
@@ -38,7 +38,7 @@ Method:
 
 ## Results
 
-| | Before (v0.9.21) | After (0.9.27) |
+| | Before (v0.9.21) | After (0.9.28) |
 | --- | ---: | ---: |
 | Artifact push (64 GiB sparse disk with 39 GiB of data, 4 GiB RAM) | 698 s | **111 s** |
 | Artifact pull of the same | 136 s | **102 s** |

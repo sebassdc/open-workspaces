@@ -2,7 +2,7 @@
   "schema": 1,
   "releases": [
     {
-      "version": "0.9.27",
+      "version": "0.9.28",
       "class": 2,
       "changes": [
         "worker",
@@ -36,6 +36,41 @@
       "host_layout": 2,
       "in_place_from": "0.5.0",
       "notes": "Faster S3 transfers. The artifact store behind cross-runner fork, move, park and restore no longer runs an AWS CLI process per 64 MiB part: uploads and downloads are signed in process on one connection pool, with OW_S3_TRANSFERS (default 16) parallel parts or 16 MiB ranges, multithreaded zstd (same stream format), read-ahead with hashing on its own thread and a separate sparse-file writer. Parts start at 16 MiB and double every 1000 parts up to 128 MiB (object cap about 987 GiB, was 625 GiB). Recovery chunk transfers use the same OW_S3_TRANSFERS setting (default 16, was 8), the stored manifest is read in process, and a first recovery capture skips holes in reflinked files. Storage formats, manifests, retention and GC are unchanged. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout are unchanged. Class-2 worker and agent upgrade."
+    },
+    {
+      "version": "0.9.27",
+      "class": 1,
+      "changes": [
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Dashboard polish for machine cards and lifecycle dialogs. Card content is top-aligned; delete and restore confirms use a danger button under a \"CANNOT BE UNDONE\" eyebrow; resizing to the current disk size answers \"Already N GiB\" in the dialog without sending an operation; the page notice is spaced from the card below; on phone widths a card tap scrolls the selected-machine actions into view. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-1 dashboard upgrade; no worker restart."
     },
     {
       "version": "0.9.26",
