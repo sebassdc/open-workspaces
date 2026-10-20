@@ -129,8 +129,9 @@ it. Anything else is read and hashed in parallel: changed disk and RAM ranges, t
 device state file (written whole by every capture), and every range whose
 mapping is unknown, delayed, compressed, encrypted or inline. Without an earlier
 seal (first point, a changed destination, or a durable point from an older
-worker) the disk is flushed and only its holes are skipped (zero chunks, unread);
-every mapped chunk is read, and zero chunks are still recognized without hashing. This trusts the
+worker) the disk and RAM files are flushed and only their holes are skipped (zero
+chunks, unread, from 0.9.25); every mapped chunk is read, and zero chunks are still
+recognized without hashing. This trusts the
 filesystem's extent sharing, as changed-block tracking does; a worker that
 verifies such a snapshot again (after a restart, or for import) reads every byte
 and compares the result with the seal.
@@ -140,7 +141,8 @@ only those, checks each against its hash (a changed file fails the upload; nothi
 else is sent under a sealed hash), and runs up to `OW_S3_TRANSFERS` (1-128,
 default 16) compressed transfers at once (at most about 16 MiB of memory each).
 The stored manifest is also read in process; restore downloads chunks with the
-same parallelism. Points sealed by an older worker are still
+same parallelism. Measured timings are in
+[s3-transfer-timings.md](experiments/s3-transfer-timings.md). Points sealed by an older worker are still
 read whole and checked against their whole-file hashes.
 
 ### Chunk index and resumed runs
