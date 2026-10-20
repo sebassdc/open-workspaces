@@ -156,6 +156,7 @@ pub fn seal_directory(
         let (seal, counted) = seal(
             &directory.join(file),
             prior.as_ref().map(|(p, s)| (p.as_path(), *s)),
+            REFLINKED.contains(file),
         )?;
         roots.insert((*file).to_owned(), root(&seal.chunks));
         sealed.insert((*file).to_owned(), seal);
@@ -166,12 +167,17 @@ pub fn seal_directory(
 }
 
 /// Chunks `path`. With `previous` (an earlier seal and its file), chunks whose
-/// extents are identical in both files are taken from that seal unread.
-pub fn seal(path: &Path, previous: Option<(&Path, &Sealed)>) -> Result<(Sealed, Stats)> {
+/// extents are identical in both files are taken from that seal unread. With
+/// `holes`, chunks the filesystem maps to no extent are zero chunks, unread.
+pub fn seal(
+    path: &Path,
+    previous: Option<(&Path, &Sealed)>,
+    holes: bool,
+) -> Result<(Sealed, Stats)> {
     if File::open(path).is_ok_and(|f| reflink_filesystem(&f)) {
-        seal_with(path, previous, &extents)
+        seal_with(path, previous, holes, &extents)
     } else {
-        seal_with(path, previous, &|_, _, _| None)
+        seal_with(path, previous, holes, &|_, _, _| None)
     }
 }
 
@@ -195,6 +201,7 @@ type Map = dyn Fn(&File, u64, u64) -> Option<Vec<Extent>> + Sync;
 fn seal_with(
     path: &Path,
     previous: Option<(&Path, &Sealed)>,
+    holes: bool,
     map: &Map,
 ) -> Result<(Sealed, Stats)> {
     let file = File::open(path)?;
@@ -211,12 +218,17 @@ fn seal_with(
             && check(&sealed.chunks).ok() == Some(sealed.size))
         .then_some((file, sealed))
     });
-    // Extents are only compared with an earlier seal. Pending writes are not in the
-    // map yet (an overwritten range still shows its old shared extent): flush both.
+    // Extents are compared with an earlier seal, or read for holes. Pending writes
+    // are not in the map yet (an overwritten range still shows its old shared
+    // extent, a filled hole may still show none): flush first.
     let mapped = match &previous {
         Some((earlier, _)) => {
             file.sync_all()?;
             earlier.sync_all()?;
+            true
+        }
+        None if holes => {
+            file.sync_all()?;
             true
         }
         None => false,
@@ -456,7 +468,7 @@ mod tests {
         data[5 * CHUNK + 100] = 4;
         let old = dir.join("old");
         fs::write(&old, &data).unwrap();
-        let (sealed, stats) = seal(&old, None).unwrap();
+        let (sealed, stats) = seal(&old, None, false).unwrap();
         assert_eq!(sealed.chunks.len(), 6);
         assert_eq!(check(&sealed.chunks).unwrap(), data.len() as u64);
         assert_eq!((stats.chunks, stats.reused), (6, 0));
@@ -468,14 +480,27 @@ mod tests {
         data[2 * CHUNK + 7] = 9;
         let new = dir.join("new");
         fs::write(&new, &data).unwrap();
-        let (changed, stats) = seal_with(&new, Some((&old, &sealed)), &content_map).unwrap();
+        let (changed, stats) = seal_with(&new, Some((&old, &sealed)), false, &content_map).unwrap();
         assert_eq!(
             (stats.read, stats.reused, stats.holes),
             (1, 3, 2),
             "{stats:?}"
         );
         assert_eq!(stats.bytes_read, CHUNK as u64);
-        let (full, _) = seal(&new, None).unwrap();
+        let (full, _) = seal(&new, None, false).unwrap();
+        // A first capture reads only mapped chunks: holes are zero chunks, unread.
+        let (first, stats) = seal_with(&new, None, true, &content_map).unwrap();
+        assert_eq!((stats.read, stats.holes), (4, 2), "{stats:?}");
+        assert_eq!(
+            first.chunks, full.chunks,
+            "hole map diverged from a full read"
+        );
+        let (_, stats) = seal_with(&new, None, false, &content_map).unwrap();
+        assert_eq!(
+            (stats.read, stats.holes),
+            (6, 0),
+            "mapped holes without asking"
+        );
         assert_eq!(
             changed.chunks, full.chunks,
             "reuse diverged from a full read"
@@ -485,10 +510,10 @@ mod tests {
         // The earlier seal is refused once its file is not the one it hashed.
         fs::remove_file(&old).unwrap();
         fs::write(&old, &data).unwrap();
-        let (_, stats) = seal_with(&new, Some((&old, &sealed)), &content_map).unwrap();
+        let (_, stats) = seal_with(&new, Some((&old, &sealed)), false, &content_map).unwrap();
         assert_eq!(stats.reused, 0, "trusted a replaced previous file");
         // Unknown extents always read.
-        let (_, stats) = seal_with(&new, Some((&new, &full)), &|_, _, _| None).unwrap();
+        let (_, stats) = seal_with(&new, Some((&new, &full)), true, &|_, _, _| None).unwrap();
         assert_eq!((stats.read, stats.reused), (6, 0));
 
         // Sidecars round-trip and are checked.
@@ -521,7 +546,7 @@ mod tests {
         let old = dir.join("old");
         let mut data: Vec<u8> = (0..4 * CHUNK).map(|i| (i % 251) as u8 + 1).collect();
         fs::write(&old, &data).unwrap();
-        let (sealed, _) = seal(&old, None).unwrap();
+        let (sealed, _) = seal(&old, None, true).unwrap();
         let new = dir.join("new");
         let cloned = std::process::Command::new("cp")
             .args(["--reflink=always"])
@@ -542,9 +567,9 @@ mod tests {
             .unwrap()
             .write_all_at(&data[CHUNK..CHUNK + 4096], CHUNK as u64)
             .unwrap();
-        let (changed, stats) = seal(&new, Some((&old, &sealed))).unwrap();
+        let (changed, stats) = seal(&new, Some((&old, &sealed)), true).unwrap();
         assert_eq!((stats.read, stats.reused), (1, 3), "{stats:?}");
-        assert_eq!(changed.chunks, seal(&new, None).unwrap().0.chunks);
+        assert_eq!(changed.chunks, seal(&new, None, false).unwrap().0.chunks);
         fs::remove_dir_all(dir).unwrap();
     }
 }

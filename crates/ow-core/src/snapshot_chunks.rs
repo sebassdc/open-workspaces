@@ -17,7 +17,6 @@ use std::sync::{
 };
 
 const MAX_MANIFEST: u64 = 32 << 20;
-const TRANSFERS: usize = 8;
 const INDEX_HEADER: &str = "ow-chunk-index-v1";
 
 impl S3Store {
@@ -72,20 +71,9 @@ impl S3Store {
 
     pub(super) fn stored_manifest(&self, name: &str) -> Result<Value> {
         crate::common::identifier(name)?;
-        let mut child = self.get(&self.key(name, "manifest.json"))?;
-        let mut bytes = Vec::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .take(MAX_MANIFEST + 1)
-            .read_to_end(&mut bytes)?;
-        finished(child, "downloading manifest")?;
-        ensure!(
-            bytes.len() as u64 <= MAX_MANIFEST,
-            "stored manifest too large"
-        );
-        Ok(serde_json::from_slice(&bytes)?)
+        let http = self.http()?;
+        let key = format!("{}{name}/manifest.json", http.prefix);
+        Ok(serde_json::from_slice(&http.get(&key, MAX_MANIFEST)?)?)
     }
 
     /// Uploads one sealed snapshot as chunks, manifest last. Returns what it did.
@@ -313,7 +301,7 @@ struct Sent {
     read: u64,
 }
 
-/// Uploads `needed` chunks with bounded parallelism (about 16 MiB per transfer),
+/// Uploads `needed` chunks with bounded parallelism (at most about 16 MiB per transfer),
 /// recording each in the index as soon as the store holds it.
 fn upload(
     http: &Http,
@@ -338,6 +326,7 @@ fn upload(
             "{file} changed since it was sealed"
         );
         let body = zstd::stream::encode_all(&data[..], 3)?;
+        drop(data);
         let size = body.len() as u64;
         if http.put_new(&format!("{}chunks/{hash}.zst", http.prefix), body)? {
             created.fetch_add(1, Ordering::Relaxed);
@@ -352,12 +341,12 @@ fn upload(
     })
 }
 
-/// Runs `job(0..count)` on up to [`TRANSFERS`] threads; stops at the first error.
+/// Runs `job(0..count)` on up to [`super::http::transfers`] threads; stops at the first error.
 fn parallel(count: usize, job: impl Fn(usize) -> Result<()> + Sync) -> Result<()> {
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..TRANSFERS.min(count))
+        let workers: Vec<_> = (0..super::http::transfers().min(count))
             .map(|_| {
                 scope.spawn(|| -> Result<()> {
                     while !failed.load(Ordering::Relaxed) {
@@ -503,7 +492,116 @@ fn retention_rules(config: &Value, prefix: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake_s3::FakeS3;
     use serde_json::json;
+
+    /// A snapshot directory: a disk with distinct, repeated and zero chunks.
+    fn snapshot(root: &Path, name: &str, disk: &[u8]) -> PathBuf {
+        let directory = root.join(name);
+        fs::create_dir(&directory).unwrap();
+        let memory: Vec<u8> = (0..CHUNK + 5).map(|i| (i % 241) as u8).collect();
+        let mut files = serde_json::Map::new();
+        for (file, bytes) in [
+            ("state", &b"device state"[..]),
+            ("memory", &memory),
+            ("disk.ext4", disk),
+        ] {
+            fs::write(directory.join(file), bytes).unwrap();
+            files.insert(file.into(), json!(hex(&Sha256::digest(bytes))));
+        }
+        let manifest = json!({"name":name,"workspace":"box1","files":files});
+        fs::write(directory.join("manifest.json"), manifest.to_string()).unwrap();
+        directory
+    }
+
+    #[test]
+    fn chunk_upload_resumes_after_a_failure_and_sends_only_changed_chunks() {
+        let fake = FakeS3::start();
+        let root =
+            std::env::temp_dir().join(format!("ow-chunks-{}", crate::common::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let store = S3Store::new("s3://bucket/points", None)
+            .unwrap()
+            .incremental()
+            .index(&root.join("index"));
+        let _ = store
+            .http
+            .set(Http::fixed(&fake.endpoint, "bucket", "points/"));
+        let mut disk: Vec<u8> = (0..6 * CHUNK + 77)
+            .map(|i| (i / 4096 % 251) as u8 + 1)
+            .collect();
+        disk[2 * CHUNK..3 * CHUNK].fill(0);
+        let first = disk[..CHUNK].to_vec();
+        disk[4 * CHUNK..5 * CHUNK].copy_from_slice(&first);
+        let one = snapshot(&root, "p1", &disk);
+        // 5 unique disk chunks with data (one repeated, one zero), 2 memory chunks and the state.
+        let chunks = || {
+            fake.state
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with("points/chunks/"))
+                .count()
+        };
+        let manifest = "points/p1/manifest.json";
+
+        // A run that dies partway stores some chunks and never the manifest.
+        fake.state.refuse_puts.store(1, Ordering::SeqCst);
+        assert!(store.push_chunks("p1", &one).is_err());
+        let stored = chunks();
+        assert!(stored < 8 && !fake.state.objects.lock().unwrap().contains_key(manifest));
+        let sent = store.push_chunks("p1", &one).unwrap();
+        assert_eq!(
+            (sent["new"].as_u64(), sent["uploaded"].as_u64()),
+            (Some(8 - stored as u64), Some(8 - stored as u64)),
+            "{sent}"
+        );
+        assert_eq!(chunks(), 8);
+        assert!(fake.peak("put") <= super::super::http::transfers());
+        // The same point again sends nothing.
+        assert_eq!(store.push_chunks("p1", &one).unwrap()["uploaded"], 0);
+
+        // A chunk-sealed incremental with one changed disk chunk sends that chunk only.
+        disk[5 * CHUNK + 9] ^= 0xff;
+        let two = root.join("p2");
+        fs::create_dir(&two).unwrap();
+        for file in DATA_FILES {
+            fs::copy(one.join(file), two.join(file)).unwrap();
+        }
+        fs::write(two.join("disk.ext4"), &disk).unwrap();
+        let (files, _) = crate::snapshot_digest::seal_directory(&two, &DATA_FILES, None).unwrap();
+        let manifest = json!({"name":"p2","workspace":"box1","files":files,"digest":CHUNKS_V1});
+        fs::write(two.join("manifest.json"), manifest.to_string()).unwrap();
+        let sent = store.push_chunks("p2", &two).unwrap();
+        assert_eq!(
+            (sent["new"].as_u64(), sent["uploaded"].as_u64()),
+            (Some(1), Some(1)),
+            "{sent}"
+        );
+
+        // Both restore byte for byte, holes kept sparse.
+        for (name, original) in [("p1", &one), ("p2", &two)] {
+            let restored = root.join(format!("restored-{name}"));
+            store.pull(name, &restored).unwrap();
+            for file in DATA_FILES {
+                assert!(
+                    fs::read(restored.join(file)).unwrap()
+                        == fs::read(original.join(file)).unwrap(),
+                    "{name} {file}"
+                );
+            }
+        }
+        // A corrupted chunk fails the restore and leaves nothing behind.
+        for (key, object) in fake.state.objects.lock().unwrap().iter_mut() {
+            if key.starts_with("points/chunks/") && object.bytes.len() > 100 {
+                object.bytes = zstd::stream::encode_all(&b"other bytes"[..], 3).unwrap();
+            }
+        }
+        let broken = root.join("broken");
+        assert!(store.pull("p1", &broken).is_err() && !broken.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn retention_refuses_shared_chunk_expiry_and_short_undo() {
         let rules = |filter: Value, expiration: Value, undo: u64| json!({"Rules":[{"Status":"Enabled","Filter":filter,"Expiration":expiration,"NoncurrentVersionExpiration":{"NoncurrentDays":undo}}]});

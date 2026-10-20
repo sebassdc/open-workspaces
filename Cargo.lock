@@ -1174,6 +1174,7 @@ version = "0.9.21"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "libc",
  "reqwest",
  "rusty-s3",

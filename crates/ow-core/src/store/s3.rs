@@ -1,12 +1,28 @@
 use super::*;
-use crate::snapshot_store::S3Store;
+use crate::snapshot_store::{
+    S3Store,
+    http::{Http, checksum, transfers},
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::json;
-use std::process::{Child, ChildStdout, Stdio};
+use std::{
+    collections::VecDeque,
+    io::Cursor,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::JoinHandle,
+};
 
-/// The deployment backup root, not `store/v1` itself. Uses the normal AWS CLI role chain.
+/// Bytes per ranged download request.
+const RANGE: u64 = 16 << 20;
+
+/// The deployment backup root, not `store/v1` itself. Uses the normal AWS CLI
+/// role chain; objects move in process, in parallel parts and ranges.
 pub struct S3Objects {
     transport: S3Store,
+    http: OnceLock<Arc<Http>>,
     bucket: String,
     prefix: String,
     part_size: u64,
@@ -41,6 +57,7 @@ impl S3Objects {
         );
         Ok(Self {
             transport,
+            http: OnceLock::new(),
             bucket: bucket.into(),
             prefix: if prefix.is_empty() {
                 "store/v1/".into()
@@ -158,33 +175,112 @@ impl S3Objects {
         );
         Ok(value)
     }
-    fn same(&self, key: &str, checksum: &str, length: u64) -> Result<()> {
-        let head = self.call("head-object", key, &["--checksum-mode", "ENABLED"])?;
+    fn http(&self) -> Result<Arc<Http>> {
+        if let Some(http) = self.http.get() {
+            return Ok(http.clone());
+        }
+        let _ = self.http.set(Arc::new(Http::new(&self.transport)?));
+        Ok(self.http.get().unwrap().clone())
+    }
+    /// The existing object at full key `key` must hold exactly these bytes.
+    fn same(http: &Http, key: &str, checksum: &str, length: u64) -> Result<()> {
+        let head = http
+            .head(key, true)?
+            .context("write-once object mismatch")?;
+        let header = |name: &str| head.get(name).and_then(|v| v.to_str().ok());
         ensure!(
-            head["ChecksumSHA256"] == checksum && head["ContentLength"] == length,
+            header("x-amz-checksum-sha256") == Some(checksum)
+                && header("content-length") == Some(&length.to_string()),
             "write-once object mismatch"
         );
         Ok(())
     }
-    fn complete(&self, key: &str, upload: &str, parts: &[Value], path: &Path) -> Result<Value> {
-        // The 10,000-part document exceeds Linux's per-argument limit; keep it out of argv.
-        serde_json::to_writer(private_file(path)?, &json!({"Parts":parts}))?;
-        let manifest = format!("file://{}", path.display());
-        self.call(
-            "complete-multipart-upload",
-            key,
-            &[
-                "--upload-id",
-                upload,
-                "--multipart-upload",
-                &manifest,
-                "--if-none-match",
-                "*",
-                "--checksum-type",
-                "COMPOSITE",
-            ],
-        )
+    /// Uploads the parts of `source` after `first`, at most [`parts_in_flight`]
+    /// at a time, then commits them unless `key` exists.
+    fn multipart(
+        &self,
+        http: &Http,
+        key: &str,
+        upload: &str,
+        first: Vec<u8>,
+        source: &mut dyn Read,
+    ) -> Result<()> {
+        let done = Mutex::new(Vec::new());
+        let failed = AtomicBool::new(false);
+        // A rendezvous channel: a part is read only when a sender is free.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(u16, bytes::Bytes)>(0);
+        let receiver = Mutex::new(receiver);
+        let mut total = 0u64;
+        let mut count = 0u16;
+        std::thread::scope(|scope| -> Result<()> {
+            let workers: Vec<_> = (0..parts_in_flight())
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        let mut result = Ok(());
+                        // After a failure keep draining so the reader never blocks.
+                        loop {
+                            // Not in the loop condition: the lock must drop before the upload.
+                            let next = receiver.lock().unwrap().recv();
+                            let Ok((number, body)) = next else { break };
+                            if result.is_err() || failed.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            match http.upload_part(key, upload, number, body) {
+                                Ok((etag, checksum)) => {
+                                    done.lock().unwrap().push((number, etag, checksum))
+                                }
+                                Err(error) => {
+                                    failed.store(true, Ordering::Relaxed);
+                                    result = Err(error);
+                                }
+                            }
+                        }
+                        result
+                    })
+                })
+                .collect();
+            let read = (|| -> Result<()> {
+                let mut body = first;
+                while !body.is_empty() && !failed.load(Ordering::Relaxed) {
+                    // shortcut: 64 MiB parts cap compressed objects at 625 GiB; raise part size before supporting larger ones.
+                    ensure!(count < 10000, "multipart limit exceeded");
+                    count += 1;
+                    total += body.len() as u64;
+                    sender
+                        .send((count, body.into()))
+                        .map_err(|_| anyhow::anyhow!("part upload stopped"))?;
+                    body = part(source, self.part_size)?;
+                }
+                Ok(())
+            })();
+            drop(sender);
+            for worker in workers {
+                worker.join().expect("part upload thread panicked")?;
+            }
+            read
+        })?;
+        let mut parts = done.into_inner().unwrap();
+        parts.sort();
+        ensure!(
+            parts.len() == count as usize
+                && parts.iter().enumerate().all(|(i, p)| p.0 as usize == i + 1),
+            "multipart upload lost a part"
+        );
+        let mut composite = Sha256::new();
+        for (_, _, checksum) in &parts {
+            composite.update(STANDARD.decode(checksum)?);
+        }
+        let checksum = format!("{}-{}", STANDARD.encode(composite.finalize()), parts.len());
+        let parts: Vec<_> = parts.into_iter().map(|(_, e, c)| (e, c)).collect();
+        if http.complete_multipart(key, upload, &parts).is_err() {
+            Self::same(http, key, &checksum, total)?;
+        }
+        Ok(())
     }
+}
+/// Parts uploaded at once: each holds one part, so memory is about this x 64 MiB.
+fn parts_in_flight() -> usize {
+    (transfers() / 4).max(1)
 }
 impl gc::ControllerObjects for S3Objects {
     fn configuration(&self) -> Result<()> {
@@ -340,162 +436,85 @@ impl Drop for Scratch {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn part(source: &mut dyn Read, path: &Path, size: u64) -> Result<(u64, Vec<u8>)> {
-    let mut output = private_file(path)?;
-    let mut hash = Sha256::new();
-    let mut bytes = vec![0; 1024 * 1024];
-    let mut length = 0;
-    let mut input = source.take(size);
-    loop {
-        let n = input.read(&mut bytes)?;
-        if n == 0 {
-            break;
-        }
-        output.write_all(&bytes[..n])?;
-        hash.update(&bytes[..n]);
-        length += n as u64;
-    }
-    Ok((length, hash.finalize().to_vec()))
+/// Up to `size` bytes of `source`; fewer only at its end.
+fn part(source: &mut dyn Read, size: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(size as usize);
+    source.take(size).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 impl Objects for S3Objects {
     fn put_once(&self, key: &str, source: &mut dyn Read) -> Result<()> {
         key_path(key)?;
-        let scratch = Scratch::new()?;
-        let path = scratch.0.join("part");
-        let body = path.to_str().context("non UTF-8 staging path")?;
-        let (mut length, mut hash) = part(source, &path, self.part_size)?;
-        if length < self.part_size {
-            let checksum = STANDARD.encode(&hash);
-            if self
-                .call(
-                    "put-object",
-                    key,
-                    &[
-                        "--body",
-                        body,
-                        "--if-none-match",
-                        "*",
-                        "--checksum-algorithm",
-                        "SHA256",
-                        "--checksum-sha256",
-                        &checksum,
-                    ],
-                )
-                .is_err()
-            {
-                self.same(key, &checksum, length)?;
+        let http = self.http()?;
+        let key = format!("{}{key}", self.prefix);
+        let first = part(source, self.part_size)?;
+        if (first.len() as u64) < self.part_size {
+            let (checksum, length) = (checksum(&first), first.len() as u64);
+            if !http.put_new(&key, first).unwrap_or(false) {
+                Self::same(&http, &key, &checksum, length)?;
             }
             return Ok(());
         }
-        let created = self.call(
-            "create-multipart-upload",
-            key,
-            &[
-                "--checksum-algorithm",
-                "SHA256",
-                "--checksum-type",
-                "COMPOSITE",
-            ],
-        )?;
-        let upload = created["UploadId"].as_str().context("missing upload ID")?;
-        let result = (|| {
-            let mut parts = Vec::new();
-            let mut total = 0;
-            let mut composite = Sha256::new();
-            loop {
-                let number = parts.len() + 1;
-                // shortcut: 64 MiB parts cap compressed objects at 625 GiB; raise part size before supporting larger ones.
-                ensure!(number <= 10000, "multipart limit exceeded");
-                let checksum = STANDARD.encode(&hash);
-                let uploaded = self.call(
-                    "upload-part",
-                    key,
-                    &[
-                        "--upload-id",
-                        upload,
-                        "--part-number",
-                        &number.to_string(),
-                        "--body",
-                        body,
-                        "--checksum-sha256",
-                        &checksum,
-                    ],
-                )?;
-                ensure!(
-                    uploaded["ChecksumSHA256"] == checksum,
-                    "part checksum mismatch"
-                );
-                let etag = uploaded["ETag"].as_str().context("missing part ETag")?;
-                parts.push(json!({"PartNumber":number,"ETag":etag,"ChecksumSHA256":checksum}));
-                total += length;
-                composite.update(&hash);
-                fs::remove_file(&path)?;
-                (length, hash) = part(source, &path, self.part_size)?;
-                if length == 0 {
-                    break;
-                }
-            }
-            let checksum = format!("{}-{}", STANDARD.encode(composite.finalize()), parts.len());
-            if self
-                .complete(key, upload, &parts, &scratch.0.join("complete.json"))
-                .is_err()
-            {
-                self.same(key, &checksum, total)?;
-            }
-            Ok(())
-        })();
+        let upload = http.create_multipart(&key)?;
+        let result = self.multipart(&http, &key, &upload, first, source);
         // Also harmless after a lost completion response or successful completion.
-        let _ = self.call("abort-multipart-upload", key, &["--upload-id", upload]);
+        let _ = http.abort_multipart(&key, &upload);
         result
     }
     fn get(&self, key: &str) -> Result<Box<dyn Read>> {
         key_path(key)?;
-        // High-level cp is read-only here; its stdout streams without staging a full disk.
-        let mut child = self
-            .aws()
-            .args([
-                "s3",
-                "cp",
-                "--only-show-errors",
-                &format!("s3://{}/{}{key}", self.bucket, self.prefix),
-                "-",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let stdout = child.stdout.take().context("download stdout")?;
+        let http = self.http()?;
+        let key = format!("{}{key}", self.prefix);
+        let head = http.head(&key, false)?.context("stored object missing")?;
+        let header = |name: &str| head.get(name).and_then(|v| v.to_str().ok());
+        let size = header("content-length")
+            .and_then(|v| v.parse().ok())
+            .context("stored object size missing")?;
+        // Every range must come from this one version of the object.
+        let etag = header("etag").context("stored object ETag missing")?.into();
         Ok(Box::new(Download {
-            child,
-            stdout,
-            finished: false,
+            http,
+            key,
+            etag,
+            size,
+            next: 0,
+            pending: VecDeque::new(),
+            current: Cursor::new(Vec::new()),
         }))
     }
 }
+/// An object read in order from parallel ranged requests, a bounded number ahead.
 struct Download {
-    child: Child,
-    stdout: ChildStdout,
-    finished: bool,
+    http: Arc<Http>,
+    key: String,
+    etag: String,
+    size: u64,
+    next: u64,
+    pending: VecDeque<JoinHandle<Result<Vec<u8>>>>,
+    current: Cursor<Vec<u8>>,
 }
 impl Read for Download {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        let n = self.stdout.read(bytes)?;
-        if n == 0 && !self.finished {
-            self.finished = true;
-            if !self.child.wait()?.success() {
-                return Err(std::io::Error::other("S3 download failed"));
+        loop {
+            let n = self.current.read(bytes)?;
+            if n > 0 || bytes.is_empty() {
+                return Ok(n);
             }
-        }
-        Ok(n)
-    }
-}
-impl Drop for Download {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            while self.pending.len() < (transfers() / 2).max(1) && self.next < self.size {
+                let (start, end) = (self.next, (self.next + RANGE).min(self.size));
+                let (http, key, etag) = (self.http.clone(), self.key.clone(), self.etag.clone());
+                self.pending.push_back(std::thread::spawn(move || {
+                    http.get_range(&key, start, end, &etag)
+                }));
+                self.next = end;
+            }
+            let Some(range) = self.pending.pop_front() else {
+                return Ok(0);
+            };
+            let range = range
+                .join()
+                .map_err(|_| std::io::Error::other("download thread panicked"))?;
+            self.current = Cursor::new(range.map_err(std::io::Error::other)?);
         }
     }
 }
@@ -503,110 +522,103 @@ impl Drop for Download {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn s3_completes_ten_thousand_parts_without_large_arguments() {
-        let scratch = Scratch::new().unwrap();
-        let script = scratch.0.join("aws");
-        fs::write(
-            &script,
-            r#"#!/usr/bin/env python3
-import sys,json,pathlib,stat
-a=sys.argv[1:]
-def arg(k):return a[a.index(k)+1]
-assert max(map(len,a))<4096
-uri=arg('--multipart-upload');assert uri.startswith('file://')
-p=pathlib.Path(uri[7:]);assert stat.S_IMODE(p.stat().st_mode)==0o600
-assert p.stat().st_size>1024*1024
-parts=json.loads(p.read_text())['Parts'];assert len(parts)==10000
-for i,part in enumerate(parts,1):
-    assert part=={'PartNumber':i,'ETag':'"'+'a'*32+'"','ChecksumSHA256':'b'*43+'='}
-assert arg('--if-none-match')=='*' and arg('--checksum-type')=='COMPOSITE'
-print('{}')
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    use crate::fake_s3::FakeS3;
+    fn objects(fake: &FakeS3, part_size: u64) -> S3Objects {
         let mut objects = S3Objects::new("s3://bucket/root", None).unwrap();
-        objects.program = Some(script);
-        let parts: Vec<_> = (1..=10000).map(|n|json!({"PartNumber":n,"ETag":format!("\"{}\"","a".repeat(32)),"ChecksumSHA256":format!("{}=","b".repeat(43))})).collect();
-        let key = format!(
+        let _ = objects
+            .http
+            .set(Arc::new(Http::fixed(&fake.endpoint, "bucket", "root/")));
+        objects.part_size = part_size;
+        objects
+    }
+    fn key() -> String {
+        format!(
             "{}disk.ext4.zst",
             attempt_prefix(&token().unwrap()).unwrap()
-        );
-        let path = scratch.0.join("complete upload.json");
-        objects.complete(&key, "upload", &parts, &path).unwrap();
-        let directory = scratch.0.clone();
-        drop(scratch);
-        assert!(!directory.exists());
+        )
     }
     #[test]
-    fn s3_conditional_single_and_multipart_retries_verify_checksums() {
-        let scratch = Scratch::new().unwrap();
-        let script = scratch.0.join("aws");
-        fs::write(&script, r##"#!/usr/bin/env python3
-import sys,json,hashlib,base64,pathlib
-root=pathlib.Path(__file__).parent
-args=sys.argv[1:]
-def arg(k): return args[args.index(k)+1]
-def digest(b): return base64.b64encode(hashlib.sha256(b).digest()).decode()
-op=args[1]
-key=arg('--key'); dest=root/'object'; state=root/'state'
-with (root/'calls').open('a') as f: f.write(json.dumps(args)+'\n')
-if op=='put-object':
- assert arg('--if-none-match')=='*'
- data=pathlib.Path(arg('--body')).read_bytes(); assert digest(data)==arg('--checksum-sha256')
- if dest.exists():sys.exit(1)
- dest.write_bytes(data);state.write_text(json.dumps({'ChecksumSHA256':digest(data),'ContentLength':len(data)}));print('{}')
-elif op=='head-object':
- if not dest.exists():sys.exit(1)
- print(state.read_text())
-elif op=='create-multipart-upload':print(json.dumps({'UploadId':'test-upload'}))
-elif op=='upload-part':
- data=pathlib.Path(arg('--body')).read_bytes();h=digest(data);assert h==arg('--checksum-sha256')
- (root/('part'+arg('--part-number'))).write_bytes(data);print(json.dumps({'ETag':'etag','ChecksumSHA256':h}))
-elif op=='complete-multipart-upload':
- assert arg('--if-none-match')=='*'
- uri=arg('--multipart-upload');assert uri.startswith('file://')
- parts=json.loads(pathlib.Path(uri[7:]).read_text())['Parts'];data=b''.join((root/('part'+str(p['PartNumber']))).read_bytes() for p in parts)
- if dest.exists():sys.exit(1)
- composite=digest(b''.join(base64.b64decode(p['ChecksumSHA256']) for p in parts))+'-'+str(len(parts))
- dest.write_bytes(data);state.write_text(json.dumps({'ChecksumSHA256':composite,'ContentLength':len(data)}))
- # Deliberately lose the completion response after the effect.
- sys.exit(1)
-elif op=='abort-multipart-upload': print('{}')
-else:raise Exception(op)
-"##).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut store = S3Objects::new("s3://bucket/root", None).unwrap();
-        store.program = Some(script);
-        store.part_size = 8; // Exercise the protocol with tiny parts, not S3's real size floor.
-        let key = format!(
-            "{}disk.ext4.zst",
-            attempt_prefix(&token().unwrap()).unwrap()
-        );
-        for bytes in [&b"short"[..], &b"multipart-content"[..]] {
-            let _ = fs::remove_file(scratch.0.join("object"));
+    fn s3_conditional_single_and_multipart_writes_verify_checksums() {
+        let fake = FakeS3::start();
+        // Tiny parts exercise the protocol, not S3's real size floor.
+        let store = objects(&fake, 8);
+        for bytes in [&b"short"[..], &b"multipart-content-in-several-parts"[..]] {
+            let key = key();
             store.put_once(&key, &mut &bytes[..]).unwrap();
+            // Retrying the same bytes succeeds; different bytes never replace them.
             store.put_once(&key, &mut &bytes[..]).unwrap();
             assert!(store.put_once(&key, &mut &b"wrong"[..]).is_err());
-            assert_eq!(fs::read(scratch.0.join("object")).unwrap(), bytes);
+            assert!(
+                store
+                    .put_once(&key, &mut &b"wrong-and-long-enough"[..])
+                    .is_err()
+            );
+            let stored = fake.state.objects.lock().unwrap()[&format!("root/store/v1/{key}")]
+                .bytes
+                .clone();
+            assert_eq!(stored, bytes);
+            let mut read = Vec::new();
+            store.get(&key).unwrap().read_to_end(&mut read).unwrap();
+            assert_eq!(read, bytes);
         }
-        let calls = fs::read_to_string(scratch.0.join("calls")).unwrap();
-        assert!(calls.contains("head-object") && calls.contains("abort-multipart-upload"));
-        assert!(calls.contains("root/store/v1/u/"));
-        assert!(!calls.contains("delete-object") && !calls.contains("list-objects"));
-        for call in calls
-            .lines()
-            .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
-        {
-            if let Some(index) = call.iter().position(|arg| arg == "--multipart-upload") {
-                let path = call[index + 1].strip_prefix("file://").unwrap();
-                assert!(
-                    !Path::new(path).exists(),
-                    "completion scratch survives upload"
-                );
-            }
-        }
+        assert!(fake.calls("part") >= 5 && fake.calls("abort") >= 1);
+        assert!(store.get(&key()).is_err(), "missing object read as empty");
+    }
+    #[test]
+    fn s3_lost_completion_is_checked_not_repeated_and_failed_parts_fail_closed() {
+        let fake = FakeS3::start();
+        let store = objects(&fake, 1 << 10);
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let key = key();
+        // The completion takes effect but every response is lost.
+        fake.state.lose_completions.store(4, Ordering::SeqCst);
+        store.put_once(&key, &mut &data[..]).unwrap();
+        assert_eq!(
+            fake.state.objects.lock().unwrap()[&format!("root/store/v1/{key}")].bytes,
+            data
+        );
+        // A refused part fails the upload without committing anything.
+        fake.state.lose_completions.store(0, Ordering::SeqCst);
+        fake.state.refuse_puts.store(1, Ordering::SeqCst);
+        let other = self::key();
+        assert!(store.put_once(&other, &mut &data[..]).is_err());
+        assert!(
+            !fake
+                .state
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!("root/store/v1/{other}"))
+        );
+    }
+    #[test]
+    fn s3_parts_and_ranges_run_in_parallel_within_their_limits() {
+        let fake = FakeS3::start();
+        let store = objects(&fake, 64 << 10);
+        let data: Vec<u8> = (0..(RANGE as usize * 3 + 12_345))
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let key = key();
+        store.put_once(&key, &mut &data[..]).unwrap();
+        let parts = fake.calls("part");
+        assert_eq!(parts, data.len().div_ceil(64 << 10));
+        assert!(fake.peak("part") > 1, "parts were sent one at a time");
+        assert!(fake.peak("part") <= parts_in_flight());
+        let mut read = Vec::new();
+        store.get(&key).unwrap().read_to_end(&mut read).unwrap();
+        assert!(read == data, "ranged download reassembled wrong bytes");
+        assert_eq!(fake.calls("range"), 4);
+        assert!(fake.peak("range") > 1 && fake.peak("range") <= (transfers() / 2).max(1));
+        // A replaced object is never stitched from two versions.
+        let mut download = store.get(&key).unwrap();
+        fake.state
+            .objects
+            .lock()
+            .unwrap()
+            .get_mut(&format!("root/store/v1/{key}"))
+            .unwrap()
+            .etag = "\"other\"".into();
+        assert!(download.read_to_end(&mut Vec::new()).is_err());
     }
 }
 

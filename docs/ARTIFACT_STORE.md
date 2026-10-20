@@ -22,13 +22,19 @@ replace them. A fresh attempt uses a new token. Format 1 has one object per file
 with no cross-artifact chunk sharing. The existing snapshot adapter can evolve
 independently under its own backup namespace.
 
-The AWS CLI must support `--if-none-match` on both `s3api put-object` and
-`s3api complete-multipart-upload` (locally checked with CLI 2.34.9). Uploads stage
-one compressed 64 MiB part at a time; each part has a SHA-256 checksum. The 10,000
-part limit caps a compressed object at 625 GiB in this implementation. A lost
-completion response is checked with HEAD, including composite SHA-256 and length.
-The completion part list is a private scratch JSON file passed by file URI, so
-large uploads do not exceed the operating system's command-argument limit.
+Object transfers run in process: one `aws configure export-credentials` call
+takes the AWS CLI's usual credential chain (refreshed every five minutes), and
+each request is signed in process on a shared connection pool, with retries and
+backoff for throttling, server errors and lost connections. zstd compresses on
+several threads (the same zstd stream format). Uploads send compressed 64 MiB
+parts with SHA-256 checksums, several at once (`OW_S3_TRANSFERS / 4`, default 4;
+each in-flight part holds 64 MiB of memory), and commit them with a conditional
+`CompleteMultipartUpload`; a short object is one conditional `PutObject`. The
+10,000 part limit caps a compressed object at 625 GiB in this implementation. A
+lost completion response is checked with HEAD, including composite SHA-256 and
+length. Downloads read 16 MiB ranges in parallel (`OW_S3_TRANSFERS / 2`, default
+8), all pinned with `If-Match` to the ETag first seen, and reassemble them in
+order; the uncompressed SHA-256 is still checked against the manifest.
 
 Before image publication/build, the application checks bucket versioning,
 lifecycle, and the write-once policy. Missing read permissions or an unsafe bucket

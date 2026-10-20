@@ -236,6 +236,9 @@ pub fn push(
             size: &mut size,
         };
         let mut encoded = zstd::stream::read::Encoder::new(reader, 3)?;
+        // Same zstd stream format; compression keeps pace with parallel uploads.
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+        encoded.multithread(workers as u32)?;
         store.put_once(&manifest.files[name].objects[0].key, &mut encoded)?;
         drop(encoded);
         let after = input.metadata()?;

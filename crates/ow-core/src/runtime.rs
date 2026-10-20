@@ -1282,7 +1282,7 @@ impl Runtime {
             let actual = match snapshot.digest.as_deref() {
                 None => hash(&path)?,
                 Some(crate::snapshot_digest::CHUNKS_V1) => crate::snapshot_digest::root(
-                    &crate::snapshot_digest::seal(&path, None)?.0.chunks,
+                    &crate::snapshot_digest::seal(&path, None, false)?.0.chunks,
                 ),
                 Some(other) => bail!("unsupported snapshot digest {other}"),
             };

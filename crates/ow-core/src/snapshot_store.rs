@@ -286,7 +286,7 @@ impl SnapshotStore for S3Store {
 #[path = "snapshot_chunks.rs"]
 mod chunks;
 #[path = "snapshot_http.rs"]
-mod http;
+pub(crate) mod http;
 
 pub(crate) fn valid_hash(hash: &str) -> bool {
     hash.len() == 64

@@ -1,8 +1,14 @@
-//! In-process S3 object requests for chunked recovery points. One AWS CLI call
-//! exports the credentials of its usual chain (refreshed every few minutes);
-//! each request is then signed here, so a chunk costs a request, not a process.
+//! In-process S3 object requests for recovery points and the artifact store. One
+//! AWS CLI call exports the credentials of its usual chain (refreshed every few
+//! minutes); each request is then signed here on one shared connection pool, so
+//! an object or part costs a request, not a process.
 use super::*;
-use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle, actions::ListObjectsV2};
+use bytes::Bytes;
+use reqwest::header::HeaderMap;
+use rusty_s3::{
+    Bucket, Credentials, S3Action, UrlStyle,
+    actions::{CreateMultipartUpload, ListObjectsV2},
+};
 use std::{
     sync::Mutex,
     time::{Duration, Instant},
@@ -12,7 +18,17 @@ const SIGNED_FOR: Duration = Duration::from_secs(600);
 const REFRESH: Duration = Duration::from_secs(300);
 const ATTEMPTS: u32 = 4;
 
-pub(super) struct Http {
+/// Parallel requests per transfer: `OW_S3_TRANSFERS` (1-128), default 16. Each
+/// holds at most about 16 MiB, so memory stays near transfers x 16 MiB.
+pub(crate) fn transfers() -> usize {
+    std::env::var("OW_S3_TRANSFERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| (1..=128).contains(n))
+        .unwrap_or(16)
+}
+
+pub(crate) struct Http {
     bucket: Bucket,
     /// Key prefix of the store, with a trailing slash unless empty.
     pub prefix: String,
@@ -22,6 +38,24 @@ pub(super) struct Http {
 }
 
 impl Http {
+    /// A client for a fake store on loopback, with fixed credentials.
+    #[cfg(test)]
+    pub fn fixed(endpoint: &str, bucket: &str, prefix: &str) -> Self {
+        Self {
+            bucket: Bucket::new(
+                url::Url::parse(endpoint).unwrap(),
+                UrlStyle::Path,
+                bucket.to_owned(),
+                "us-east-1".to_owned(),
+            )
+            .unwrap(),
+            prefix: prefix.into(),
+            client: reqwest::blocking::Client::new(),
+            credentials: Mutex::new((Credentials::new("key", "secret"), Instant::now())),
+            endpoint: None,
+        }
+    }
+
     pub fn new(store: &S3Store) -> Result<Self> {
         let path = store.url.strip_prefix("s3://").context("invalid S3 URL")?;
         let (bucket, prefix) = path.split_once('/').unwrap_or((path, ""));
@@ -107,24 +141,37 @@ impl Http {
 
     /// Whether an object exists. Any answer other than found/not found fails.
     pub fn exists(&self, key: &str) -> Result<bool> {
+        Ok(self.head(key, false)?.is_some())
+    }
+
+    /// An object's headers, or None when it does not exist; `checksum` asks for
+    /// its stored checksum too.
+    pub fn head(&self, key: &str, checksum: bool) -> Result<Option<HeaderMap>> {
         let response = self.send("checking stored object", |c| {
-            let url = self.bucket.head_object(Some(c), key).sign(SIGNED_FOR);
-            self.client.head(url)
+            let mut action = self.bucket.head_object(Some(c), key);
+            if checksum {
+                action
+                    .headers_mut()
+                    .insert("x-amz-checksum-mode", "ENABLED");
+            }
+            let mut request = self.client.head(action.sign(SIGNED_FOR));
+            if checksum {
+                request = request.header("x-amz-checksum-mode", "ENABLED");
+            }
+            request
         })?;
         match response.status().as_u16() {
-            200 => Ok(true),
-            404 => Ok(false),
+            200 => Ok(Some(response.headers().clone())),
+            404 => Ok(None),
             status => bail!("checking stored object failed (HTTP {status})"),
         }
     }
 
     /// Creates `key` unless it exists; false when it already did. The body's
     /// SHA-256 is checked by the store.
-    pub fn put_new(&self, key: &str, body: Vec<u8>) -> Result<bool> {
-        let checksum = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            Sha256::digest(&body),
-        );
+    pub fn put_new(&self, key: &str, body: impl Into<Bytes>) -> Result<bool> {
+        let body = body.into();
+        let checksum = checksum(&body);
         let response = self.send("uploading object", |c| {
             let mut action = self.bucket.put_object(Some(c), key);
             action.headers_mut().insert("if-none-match", "*");
@@ -166,6 +213,151 @@ impl Http {
         Ok(bytes)
     }
 
+    /// Bytes `start..end` of the object version tagged `etag`.
+    pub fn get_range(&self, key: &str, start: u64, end: u64, etag: &str) -> Result<Vec<u8>> {
+        let range = format!("bytes={start}-{}", end - 1);
+        let response = self.send("downloading object", |c| {
+            let mut action = self.bucket.get_object(Some(c), key);
+            action.headers_mut().insert("range", range.clone());
+            action.headers_mut().insert("if-match", etag.to_owned());
+            self.client
+                .get(action.sign(SIGNED_FOR))
+                .header("range", &range)
+                .header("if-match", etag)
+        })?;
+        let status = response.status().as_u16();
+        ensure!(
+            status == 206,
+            "downloading object failed (HTTP {status}){}",
+            code(response)
+        );
+        let mut bytes = Vec::with_capacity((end - start) as usize);
+        response.take(end - start + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 == end - start,
+            "downloaded range has the wrong length"
+        );
+        Ok(bytes)
+    }
+
+    /// Starts a multipart upload whose parts carry SHA-256 checksums.
+    pub fn create_multipart(&self, key: &str) -> Result<String> {
+        let response = self.send("starting upload", |c| {
+            let mut action = self.bucket.create_multipart_upload(Some(c), key);
+            action
+                .headers_mut()
+                .insert("x-amz-checksum-algorithm", "SHA256");
+            action
+                .headers_mut()
+                .insert("x-amz-checksum-type", "COMPOSITE");
+            self.client
+                .post(action.sign(SIGNED_FOR))
+                .header("x-amz-checksum-algorithm", "SHA256")
+                .header("x-amz-checksum-type", "COMPOSITE")
+        })?;
+        let status = response.status().as_u16();
+        ensure!(
+            status == 200,
+            "starting upload failed (HTTP {status}){}",
+            code(response)
+        );
+        let created = CreateMultipartUpload::parse_response(&response.text()?)
+            .map_err(|e| anyhow!("invalid upload response: {e}"))?;
+        Ok(created.upload_id().to_owned())
+    }
+
+    /// Sends one part; returns its ETag and the base64 SHA-256 the store checked.
+    pub fn upload_part(
+        &self,
+        key: &str,
+        upload: &str,
+        number: u16,
+        body: Bytes,
+    ) -> Result<(String, String)> {
+        let checksum = checksum(&body);
+        let response = self.send("uploading part", |c| {
+            let mut action = self.bucket.upload_part(Some(c), key, number, upload);
+            action
+                .headers_mut()
+                .insert("x-amz-checksum-sha256", checksum.clone());
+            self.client
+                .put(action.sign(SIGNED_FOR))
+                .header("x-amz-checksum-sha256", &checksum)
+                .body(body.clone())
+        })?;
+        let status = response.status().as_u16();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let (etag, stored) = (header("etag"), header("x-amz-checksum-sha256"));
+        ensure!(
+            status == 200,
+            "uploading part failed (HTTP {status}){}",
+            code(response)
+        );
+        ensure!(stored == Some(checksum.clone()), "part checksum mismatch");
+        Ok((etag.context("missing part ETag")?, checksum))
+    }
+
+    /// Commits `parts` (ETag, checksum) in order unless `key` already exists.
+    /// Any failure, including a lost response after success, is an error.
+    pub fn complete_multipart(
+        &self,
+        key: &str,
+        upload: &str,
+        parts: &[(String, String)],
+    ) -> Result<()> {
+        let mut body = String::from("<CompleteMultipartUpload>");
+        for (i, (etag, checksum)) in parts.iter().enumerate() {
+            body.push_str(&format!(
+                "<Part><ETag>{}</ETag><ChecksumSHA256>{checksum}</ChecksumSHA256><PartNumber>{}</PartNumber></Part>",
+                etag.replace('&', "&amp;").replace('<', "&lt;"),
+                i + 1
+            ));
+        }
+        body.push_str("</CompleteMultipartUpload>");
+        let response = self.send("completing upload", |c| {
+            let mut action =
+                self.bucket
+                    .complete_multipart_upload(Some(c), key, upload, std::iter::empty());
+            action.headers_mut().insert("if-none-match", "*");
+            action
+                .headers_mut()
+                .insert("x-amz-checksum-type", "COMPOSITE");
+            self.client
+                .post(action.sign(SIGNED_FOR))
+                .header("if-none-match", "*")
+                .header("x-amz-checksum-type", "COMPOSITE")
+                .body(body.clone())
+        })?;
+        let status = response.status().as_u16();
+        ensure!(
+            status == 200,
+            "completing upload failed (HTTP {status}){}",
+            code(response)
+        );
+        // S3 can report a failed completion inside a 200 response.
+        let text = response.text()?;
+        ensure!(
+            text.contains("<CompleteMultipartUploadResult") && !text.contains("<Error>"),
+            "completing upload failed"
+        );
+        Ok(())
+    }
+
+    /// Discards an upload's parts; harmless when it already completed.
+    pub fn abort_multipart(&self, key: &str, upload: &str) -> Result<()> {
+        self.send("aborting upload", |c| {
+            let action = self.bucket.abort_multipart_upload(Some(c), key, upload);
+            self.client.delete(action.sign(SIGNED_FOR))
+        })?;
+        Ok(())
+    }
+
     /// Every key under `prefix` (a full key prefix).
     pub fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();
@@ -194,6 +386,14 @@ impl Http {
             }
         }
     }
+}
+
+/// The base64 SHA-256 S3 checks a body against.
+pub(crate) fn checksum(body: &[u8]) -> String {
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        Sha256::digest(body),
+    )
 }
 
 /// The S3 error code of a failed response, never its message (it can name resources).
