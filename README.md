@@ -38,9 +38,9 @@ browser test that guards it are listed in the [UI feature matrix](docs/UI_FEATUR
 | Local snapshots and forks | Capture paired RAM/disk state, restore it, and fork independent Linux disks on the same runner; the runner keeps answering while a capture is hashed. | Core | v0.1.0; hashing off the worker thread v0.9.22 | [Snapshots](docs/LOCAL_PROTOTYPE.md) |
 | Hibernate and wake | Release guest CPU/RAM while preserving state; resume on connection, with optional idle hibernation. | Core | v0.2.0 | [Daily use](docs/DAILY_USE.md) |
 | Off-host backups | Copy catalogs and sealed snapshots to S3-compatible storage; verify captures before restoring. | Opt-in | v0.2.0 | [Backups](docs/CORE.md), [snapshot store](docs/DAILY_USE.md) |
-| Recovery points | Upload periodic running captures and hibernation state; report last durable capture and failures. | Opt-in | v0.9.2; parallel SDK transfers v0.9.29 | [Recovery](docs/RECOVERY.md) |
+| Recovery points | Upload periodic running captures and hibernation state; report last durable capture and failures. | Opt-in | v0.9.2; parallel SDK transfers v0.9.30 | [Recovery](docs/RECOVERY.md) |
 | Managed restore | Adopt an existing catalog-authorized capture through durable transfer and worker fencing. | Not yet live | v0.9.5 | [Transfer lifecycle](docs/LIFECYCLE.md) |
-| Park, wake and move across runners | Store a box without placement, wake on an eligible runner, or explicitly move/fork to a compatible target. | Not yet live | v0.9.11; move/fork v0.9.12; parallel SDK transfers v0.9.29 | [Transfer lifecycle](docs/LIFECYCLE.md), [artifact store](docs/ARTIFACT_STORE.md) |
+| Park, wake and move across runners | Store a box without placement, wake on an eligible runner, or explicitly move/fork to a compatible target. | Not yet live | v0.9.11; move/fork v0.9.12; parallel SDK transfers v0.9.30 | [Transfer lifecycle](docs/LIFECYCLE.md), [artifact store](docs/ARTIFACT_STORE.md) |
 
 ### Storage and images
 
