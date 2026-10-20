@@ -35,6 +35,11 @@ test('resize grows a stopped machine disk', async ({dashboard: page}) => {
   const disk = page.getByLabel('Root disk (GiB)');
   await expect(disk).toHaveValue('32');
   await expect(disk).toHaveAttribute('min', '32');
+  // The current size changes nothing, so the dialog says so instead of resizing.
+  await page.getByRole('button', {name: 'Resize machine'}).click();
+  await expect(page.locator('#dialog-error')).toHaveText('Already 32 GiB. Choose a larger size to grow it.');
+  await expect(dialog(page)).toBeVisible();
+  await expect(notice(page)).toBeHidden();
   await disk.fill('64');
   await page.getByRole('button', {name: 'Resize machine'}).click();
   await expect(notice(page)).toHaveText('Machine resized. Start it to grow the filesystem.');
@@ -55,6 +60,10 @@ test('delete warns about snapshots and removes the machine', async ({dashboard: 
   await expect(page.locator('#dialog-title')).toHaveText('Delete this machine?');
   await expect(page.locator('#dialog-description')).toHaveText(/removed for good/);
   await expect(page.locator('#dialog-fields .field-error')).toHaveText('Its 1 snapshot will be deleted too: last-look');
+  // The dialog leads with the warning and its confirm looks destructive, unlike Create.
+  await expect(page.locator('#dialog-eyebrow')).toHaveText('CANNOT BE UNDONE');
+  await expect(page.locator('#dialog-submit')).toHaveClass('button danger');
+  await expect(page.getByRole('button', {name: 'Cancel'})).toHaveClass('button secondary');
   await page.getByRole('button', {name: 'Delete machine'}).click();
   await expect(dialog(page)).toBeHidden();
   await expect(notice(page)).toHaveText('Machine deleted.');

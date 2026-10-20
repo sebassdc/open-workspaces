@@ -604,11 +604,31 @@ pub async fn handle(
                         .into_response(),
                 );
             }
+            if let Some(taken) = error.downcast_ref::<crate::catalog::NameTaken>() {
+                return secure(
+                    (
+                        StatusCode::CONFLICT,
+                        Json(
+                            json!({"ok":false,"error_code":"name_taken","error":taken.to_string()}),
+                        ),
+                    )
+                        .into_response(),
+                );
+            }
             if let Some(rejection) = error.downcast_ref::<crate::limits::Rejection>() {
                 return secure(
                     (
                         StatusCode::CONFLICT,
                         Json(json!({"ok":false,"error":rejection.to_string()})),
+                    )
+                        .into_response(),
+                );
+            }
+            if let Some(refusal) = error.downcast_ref::<crate::catalog::Refusal>() {
+                return secure(
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({"ok":false,"error_code":refusal.code,"error":refusal.message})),
                     )
                         .into_response(),
                 );

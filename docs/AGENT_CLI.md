@@ -185,7 +185,14 @@ Recognizable failure codes are:
 - `unavailable_image`: run image list and choose a prepared online image.
 - `insufficient_capacity`: inspect nodes and image list; choose fitting resources
   or wait. The unwritten part of every box disk stays reserved even when sparse.
+- `fork_capacity`: the parent's runner has no room for the fork (other runners'
+  room does not help, since a fork stays with its parent). Hibernate or stop a
+  machine there, then retry.
+- `already_owner`: a share named your own login; share with a teammate instead.
 - `node_unavailable`: wait for the intended runner; existing placement stays fixed.
+- `name_taken`: you already have a machine with that name; choose another
+  (HTTP 409). Retrying the original create with its operation key is not a new
+  intent and still returns that create's result.
 - `not_found`: the named resource is absent or not accessible to your identity.
   Deleting an unknown machine reports `machine 'NAME' was not found.` (HTTP 404,
   CLI exit 1). No worker operation is dispatched. Replaying a successful delete
