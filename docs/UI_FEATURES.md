@@ -83,6 +83,7 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Terminal dark scrollbar (dark color scheme) | works | v0.9.31 | `console.spec.mjs › terminal opens, echoes input and reports the shell exit` |
 | Terminal notices a machine hibernated or stopped elsewhere and blocks input | works | v0.9.31 | `console.spec.mjs › terminal notices a machine hibernated elsewhere and blocks input`; `console.spec.mjs › terminal explains a machine stopped elsewhere after its connection drops` |
 | Command console: output as text, exit status, clear | works | v0.9.22 | `console.spec.mjs › command console shows output and exit status as text` |
+| Command console: 30 s limit stops the command with a plain message; the next command runs immediately with only its own output | works | v0.9.32 | `console.spec.mjs › a command past the 30 s limit shows a plain message, not the operation journal` |
 
 ## Snapshots and forks
 
@@ -125,24 +126,24 @@ dashboard.
 | --- | --- | --- | --- |
 | Worker outage error, recovery on refresh | works | v0.9.22 | `states.spec.mjs › worker outage shows an error and recovers on refresh` |
 | Failed first load: retry in the grid, New machine disabled | works | v0.9.23 | `states.spec.mjs › failed first load offers a retry and keeps New machine disabled` |
-| Expired login message | works | v0.9.32 | `states.spec.mjs › expired login asks the user to reload and sign in`; `dialogs.spec.mjs › HTTP 401 asks to sign in even with a JSON response`; `dialogs.spec.mjs › HTTP 403 asks to sign in even with a JSON response` |
+| Expired login message | works | v0.9.33 | `states.spec.mjs › expired login asks the user to reload and sign in`; `dialogs.spec.mjs › HTTP 401 asks to sign in even with a JSON response`; `dialogs.spec.mjs › HTTP 403 asks to sign in even with a JSON response` |
 | CLI installer panel (hidden on tailnet sign-in) | partial | v0.9.22 | `states.spec.mjs › the tailnet dashboard offers no CLI installer` (the Access sign-in panel and its copy button are not covered) |
 | Sidebar CLI download link (hidden on tailnet sign-in) | partial | v0.9.30 | `states.spec.mjs › the tailnet dashboard hides the sidebar CLI download` (the link shown where the binary is served is not covered) |
 | Phone width: no horizontal overflow, dialogs fit | works | v0.9.22 | `states.spec.mjs › narrow width › phone layout has no horizontal overflow and dialogs fit` |
 | Keyboard focus kept on the same card or button across the 5 s refresh | works | v0.9.25 | `focus.spec.mjs › focus stays on an action button and a machine card across a refresh`; `focus.spec.mjs › focus stays on a machine card when its disk usage changes`; `focus.spec.mjs › focus stays on the same port Unpublish when an earlier port goes away` |
-| Gateway error (502/504) says the server is not answering, clears on recovery | works | v0.9.32 | `dialogs.spec.mjs › a gateway error says the server is not answering, not that the login expired` |
-| No console errors on load and dialog open; name patterns compile | works | v0.9.32 | `dialogs.spec.mjs › no console errors on page load and dialog open` |
+| Gateway error (502/504) says the server is not answering, clears on recovery | works | v0.9.33 | `dialogs.spec.mjs › a gateway error says the server is not answering, not that the login expired` |
+| No console errors on load and dialog open; name patterns compile | works | v0.9.33 | `dialogs.spec.mjs › no console errors on page load and dialog open` |
 
 ## Dialogs and notices
 
 | Feature | Status | Last passed | Test |
 | --- | --- | --- | --- |
-| Invalid name refused in the browser, allowed characters named | works | v0.9.32 | `dialogs.spec.mjs › an invalid name is refused in the browser and names the allowed characters` |
-| Dialog shows its result and unlocks before the state reload answers | works | v0.9.32 | `dialogs.spec.mjs › a dialog unlocks with its result while the state reload is slow` |
-| Retry clears the previous error; busy label while it runs | works | v0.9.32 | `dialogs.spec.mjs › the snapshot dialog clears the last error and shows its progress` |
-| Cancelled dialog leaves no stale notice | works | v0.9.32 | `dialogs.spec.mjs › a refused operation leaves no notice behind once its dialog is cancelled` |
-| Result notice cleared on view or machine switch | works | v0.9.32 | `dialogs.spec.mjs › a result notice is cleared when the user switches view or machine` |
-| Command result not shown after leaving its view or machine mid-run | works | v0.9.32 | `dialogs.spec.mjs › a command result started elsewhere does not follow the user to another view or machine` |
-| Gateway error on an operation asks to try again | works | v0.9.32 | `dialogs.spec.mjs › a gateway error on an operation asks to try again, since an open dialog does not poll` |
-| Unexpected HTML without an auth redirect does not claim the login expired | works | v0.9.32 | `dialogs.spec.mjs › an unexpected HTML response without an auth redirect does not ask to sign in` |
-| Host node label rejects invalid characters and names the 64-character limit | works | v0.9.32 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` |
+| Invalid name refused in the browser, allowed characters named | works | v0.9.33 | `dialogs.spec.mjs › an invalid name is refused in the browser and names the allowed characters` |
+| Dialog shows its result and unlocks before the state reload answers | works | v0.9.33 | `dialogs.spec.mjs › a dialog unlocks with its result while the state reload is slow` |
+| Retry clears the previous error; busy label while it runs | works | v0.9.33 | `dialogs.spec.mjs › the snapshot dialog clears the last error and shows its progress` |
+| Cancelled dialog leaves no stale notice | works | v0.9.33 | `dialogs.spec.mjs › a refused operation leaves no notice behind once its dialog is cancelled` |
+| Result notice cleared on view or machine switch | works | v0.9.33 | `dialogs.spec.mjs › a result notice is cleared when the user switches view or machine` |
+| Command result not shown after leaving its view or machine mid-run | works | v0.9.33 | `dialogs.spec.mjs › a command result started elsewhere does not follow the user to another view or machine` |
+| Gateway error on an operation asks to try again | works | v0.9.33 | `dialogs.spec.mjs › a gateway error on an operation asks to try again, since an open dialog does not poll` |
+| Unexpected HTML without an auth redirect does not claim the login expired | works | v0.9.33 | `dialogs.spec.mjs › an unexpected HTML response without an auth redirect does not ask to sign in` |
+| Host node label rejects invalid characters and names the 64-character limit | works | v0.9.33 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` |
