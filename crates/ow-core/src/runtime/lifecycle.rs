@@ -472,6 +472,7 @@ impl Runtime {
                 cpu: self.cpu.clone(),
                 kernel_sha256: self.kernel_hash.clone(),
                 files,
+                digest: None,
             };
             // RAM copied from hibernation keeps the original compatibility tuple.
             let snapshot = if let Some(name) = &workspace.hibernation {

@@ -371,6 +371,8 @@ fn bounded_agent_inventory_reports_raw_disks_and_persistent_worker_seal() {
     );
     fs::remove_dir_all(root.join("machines/orphan")).unwrap();
     fs::remove_file(root.join("my-notes")).unwrap();
+    // The recovery uploader's chunk index is a cache, not guest data.
+    fs::create_dir(root.join("recovery-index")).unwrap();
     let inv = agent_inventory(
         &root,
         &json!({"op":"drain-inventory","seal":"fixture","close":true}),
@@ -401,6 +403,7 @@ fn recovery_journal_metadata_allows_empty_certification_but_pending_or_unknown_d
     let capture = root.join("snapshots").join(durable_name);
     fs::create_dir(&capture).unwrap();
     fs::write(capture.join("disk.ext4"), b"disk").unwrap();
+    fs::write(capture.join("chunks.json"), b"{}").unwrap();
     fs::write(capture.join("manifest.json"),json!({"name":durable_name,"workspace":"physical","files":{"disk.ext4":store::sha256(b"disk")}}).to_string()).unwrap();
     let mut durable = empty.clone();
     durable["durable"] = json!(Point {

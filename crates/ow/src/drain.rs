@@ -657,6 +657,7 @@ pub(crate) fn agent_inventory(root: &Path, request: &Value) -> Result<Value> {
                 | "host-lifecycle.lock"
                 | "host-agent.log"
                 | "recovery-upload.lock"
+                | "recovery-index"
                 | "cache.lock"
                 | "cache-space.lock"
                 | "drain"
@@ -727,7 +728,12 @@ pub(crate) fn agent_inventory(root: &Path, request: &Value) -> Result<Value> {
                     if !part.file_type()?.is_file()
                         || !(matches!(
                             part_name,
-                            "disk.ext4" | "state" | "memory" | "manifest.json" | ".artifact.json"
+                            "disk.ext4"
+                                | "state"
+                                | "memory"
+                                | "manifest.json"
+                                | "chunks.json"
+                                | ".artifact.json"
                         ) || part_name.starts_with(".published-"))
                     {
                         unmanaged.push(format!("snapshots/{name}/{part_name}"));

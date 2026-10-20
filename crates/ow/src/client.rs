@@ -362,6 +362,7 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
                 | Action::Stop { .. }
                 | Action::Hibernate { .. }
                 | Action::Snapshot { .. }
+                | Action::DeleteSnapshot { .. }
                 | Action::Restore { .. }
                 | Action::Fork { .. }
                 | Action::Share { .. }
@@ -523,6 +524,9 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         Action::Delete { id } => json!({"op":"delete","id":id}),
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),
         Action::Snapshot { id, name } => json!({"op":"snapshot","id":id,"name":name}),
+        Action::DeleteSnapshot { id, name } => {
+            json!({"op":"snapshot-delete","id":id,"name":name})
+        }
         Action::Restore {
             id,
             name,

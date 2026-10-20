@@ -326,6 +326,9 @@ enum Action {
     Snapshot { id: String, name: String },
     /// List your snapshots as JSON.
     Snapshots,
+    /// Delete one of a workspace's named snapshots. Workspaces forked or restored from it
+    /// keep their own disks; the name can be used again.
+    DeleteSnapshot { id: String, name: String },
     /// Fork a workspace's paired RAM and disk into an independent workspace.
     Fork {
         id: String,
@@ -970,6 +973,7 @@ fn operation(action: &Action) -> Option<serde_json::Value> {
         }
         Action::Snapshot { .. } => "snapshot",
         Action::Snapshots => "snapshots",
+        Action::DeleteSnapshot { .. } => "snapshot-delete",
         Action::Restore { .. } => "restore",
         Action::Hibernate { .. } => "hibernate",
         Action::Exec { .. } => "exec",
@@ -1085,6 +1089,10 @@ mod capability_tests {
             Some(Capability::Snapshot)
         );
         assert_eq!(needed(&["snapshots"]), Some(Capability::Snapshot));
+        assert_eq!(
+            needed(&["delete-snapshot", "a", "s"]),
+            Some(Capability::Snapshot)
+        );
         assert_eq!(needed(&["restore", "a", "s"]), Some(Capability::Snapshot));
         assert_eq!(needed(&["hibernate", "a"]), Some(Capability::Hibernate));
         assert_eq!(needed(&["exec", "a", "true"]), Some(Capability::Exec));

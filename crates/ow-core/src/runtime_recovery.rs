@@ -129,48 +129,73 @@ impl Runtime {
         recovery.attempted_at = at;
         atomic_json(&path, &recovery)?;
         let point = recovery.pending.as_ref().unwrap();
-        let result = (|| -> Result<()> {
-            let destination = self.snapshot_dir(&point.snapshot);
-            if destination.join("manifest.json").is_file() {
-                self.verify_snapshot(&point.snapshot, false)?;
-            } else if let Some(source) = &point.source {
-                let source = self.verify_snapshot(source, false)?;
-                let mut snapshot: Snapshot =
-                    serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
-                let staging = self.snapshot_dir(&format!(".pending-{}", vm::nonce()?));
-                fs::create_dir(&staging)?;
-                let copied = (|| -> Result<()> {
-                    // Pin the sealed inodes: wake may remove the sleep directory during upload.
-                    for file in crate::snapshot_store::DATA_FILES {
-                        fs::hard_link(source.join(file), staging.join(file))?;
+        // Chunks still in the last durable point's extents are taken from its seal unread.
+        let previous = recovery
+            .durable
+            .as_ref()
+            .map(|p| self.snapshot_dir(&p.snapshot))
+            .filter(|p| p.join(crate::snapshot_digest::SIDECAR).is_file());
+        let mut stats = Value::Null;
+        let result =
+            (|| -> Result<()> {
+                let destination = self.snapshot_dir(&point.snapshot);
+                if destination.join("manifest.json").is_file() {
+                    self.verify_snapshot(&point.snapshot, false)?;
+                } else if let Some(source) = &point.source {
+                    let source = self.verify_snapshot(source, false)?;
+                    let mut snapshot: Snapshot =
+                        serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
+                    let staging = self.snapshot_dir(&format!(".pending-{}", vm::nonce()?));
+                    fs::create_dir(&staging)?;
+                    let copied = (|| -> Result<()> {
+                        // Pin the sealed inodes: wake may remove the sleep directory during upload.
+                        for file in crate::snapshot_store::DATA_FILES {
+                            fs::hard_link(source.join(file), staging.join(file))?;
+                        }
+                        snapshot.name = point.snapshot.clone();
+                        snapshot.managed_recovery = true;
+                        let (files, counted) = crate::snapshot_digest::seal_directory(
+                            &staging,
+                            &crate::snapshot_store::DATA_FILES,
+                            previous.as_deref(),
+                        )?;
+                        snapshot.files = files;
+                        snapshot.digest = Some(crate::snapshot_digest::CHUNKS_V1.into());
+                        stats = json!(counted);
+                        atomic_json(&staging.join("manifest.json"), &snapshot)?;
+                        fs::set_permissions(
+                            staging.join("manifest.json"),
+                            fs::Permissions::from_mode(0o400),
+                        )?;
+                        fs::rename(&staging, &destination)?;
+                        File::open(self.root.join("snapshots"))?.sync_all()?;
+                        self.verified
+                            .insert(point.snapshot.clone(), fingerprints(&destination)?);
+                        Ok(())
+                    })();
+                    if copied.is_err() {
+                        let _ = fs::remove_dir_all(staging);
                     }
-                    snapshot.name = point.snapshot.clone();
-                    snapshot.managed_recovery = true;
-                    atomic_json(&staging.join("manifest.json"), &snapshot)?;
-                    fs::set_permissions(
-                        staging.join("manifest.json"),
-                        fs::Permissions::from_mode(0o400),
-                    )?;
-                    fs::rename(&staging, destination)?;
-                    File::open(self.root.join("snapshots"))?.sync_all()?;
-                    Ok(())
-                })();
-                if copied.is_err() {
-                    let _ = fs::remove_dir_all(staging);
+                    copied?;
+                } else {
+                    stats =
+                        self.capture_inner(id, &point.snapshot, false, true, previous.as_deref())?
+                            ["chunks"]
+                            .take();
                 }
-                copied?;
-            } else {
-                self.capture_inner(id, &point.snapshot, false, true)?;
-            }
-            Ok(())
-        })();
+                Ok(())
+            })();
         if let Err(error) = result {
             recovery.failures = recovery.failures.saturating_add(1);
             recovery.error = Some("Capture failed; retry scheduled.".into());
             atomic_json(&path, &recovery)?;
             return Err(error);
         }
-        Ok(json!({"snapshot":point.snapshot,"captured_at":point.captured_at}))
+        let mut result = json!({"snapshot":point.snapshot,"captured_at":point.captured_at});
+        if !stats.is_null() {
+            result["chunks"] = stats;
+        }
+        Ok(result)
     }
 
     fn prune_recovery(&self, id: &str, recovery: &Recovery) -> Result<()> {
@@ -245,6 +270,7 @@ mod tests {
                 cpu: "fixture".into(),
                 kernel_sha256: "fixture".into(),
                 files,
+                digest: None,
             };
             atomic_json(&sleep.join("manifest.json"), &snapshot).unwrap();
             if sealed {

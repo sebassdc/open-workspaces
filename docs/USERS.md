@@ -104,7 +104,7 @@ each machine, and the dashboard has Share and Unshare buttons.
 | Role | Allows |
 | --- | --- |
 | `use` (default) | exec, shell, SSH stream, `put`/`get`, `ssh-info`, start, hibernate, fork into their own namespace |
-| `admin` | `use`, plus stop, snapshot, restore and `ssh-keys` |
+| `admin` | `use`, plus stop, snapshot, restore, deleting their own snapshots and `ssh-keys` |
 
 Resize, delete and sharing stay with the owner. Delete removes the machine, its
 disk, every snapshot taken from it (a grantee's too) and its grants; past

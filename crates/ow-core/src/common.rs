@@ -378,6 +378,12 @@ pub fn node_operation(v: &serde_json::Value, op: &str) -> Result<()> {
             "worker lacks move/fork support"
         );
     }
+    if op == "snapshot-delete" {
+        ensure!(
+            v["snapshot_delete_v1"] == true,
+            "worker cannot delete single snapshots; upgrade it first"
+        );
+    }
     if PLACEMENT_OPERATIONS.contains(&op) {
         placement_capable(v)?;
     }

@@ -247,6 +247,9 @@ struct Snapshot {
     cpu: String,
     kernel_sha256: String,
     files: BTreeMap<String, String>,
+    /// How `files` were hashed; absent is whole-file SHA-256 (see `snapshot_digest`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    digest: Option<String>,
 }
 
 impl Snapshot {
@@ -984,6 +987,43 @@ impl Runtime {
         Ok(json!({"deleted":id,"snapshots":snapshots}))
     }
 
+    /// Deletes one named snapshot of `id`. Repeating a finished delete succeeds
+    /// (`existed` false); hibernation, recovery and lifecycle captures are refused.
+    fn delete_snapshot(&mut self, id: &str, name: &str) -> Result<Value> {
+        identifier(name)?;
+        self.workspace(id)?;
+        ensure!(
+            !name.starts_with(SLEEP),
+            "only named snapshots can be deleted"
+        );
+        ensure!(
+            !self.lifecycle_capture(name),
+            "snapshot name is reserved by a lifecycle operation"
+        );
+        let directory = self.snapshot_dir(name);
+        if !directory.join("manifest.json").is_file() {
+            ensure!(
+                !directory.exists(),
+                "incomplete snapshot exists; preserve and inspect it"
+            );
+            return Ok(json!({"deleted":name,"workspace":id,"existed":false}));
+        }
+        let snapshot: Snapshot =
+            serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+        ensure!(
+            snapshot.workspace == id,
+            "snapshot belongs to another workspace"
+        );
+        ensure!(
+            !snapshot.managed && !snapshot.managed_recovery,
+            "only named snapshots can be deleted"
+        );
+        fs::remove_dir_all(&directory)?;
+        self.verified.remove(name);
+        File::open(self.root.join("snapshots"))?.sync_all()?;
+        Ok(json!({"deleted":name,"workspace":id,"existed":true}))
+    }
+
     fn start(&mut self, id: &str) -> Result<Value> {
         self.require_active(id)?;
         let workspace = self.workspace(id)?;
@@ -1050,7 +1090,7 @@ impl Runtime {
     /// Seals a RAM+disk snapshot. With `hibernate` the paused VM is dropped right after
     /// the capture, so nothing the guest does while the files are hashed is lost.
     fn capture(&mut self, id: &str, name: &str, hibernate: bool) -> Result<Value> {
-        self.capture_inner(id, name, hibernate, false)
+        self.capture_inner(id, name, hibernate, false, None)
     }
 
     fn capture_inner(
@@ -1059,6 +1099,7 @@ impl Runtime {
         name: &str,
         hibernate: bool,
         managed: bool,
+        previous: Option<&Path>,
     ) -> Result<Value> {
         let captured_at = crate::recovery::now();
         identifier(name)?;
@@ -1101,11 +1142,27 @@ impl Runtime {
                 self.state.workspaces.get_mut(id).unwrap().state = "stopped".into();
                 self.save()?;
             }
-            let mut files = BTreeMap::new();
-            for file in ["state", "memory", "disk.ext4"] {
-                files.insert(file.into(), hash(&staging.join(file))?);
-            }
+            // Recovery points are chunk-sealed so unchanged reflinked extents are not reread.
+            let (files, digest, stats) = if managed {
+                let (files, stats) = crate::snapshot_digest::seal_directory(
+                    &staging,
+                    &crate::snapshot_store::DATA_FILES,
+                    previous,
+                )?;
+                (
+                    files,
+                    Some(crate::snapshot_digest::CHUNKS_V1.into()),
+                    Some(stats),
+                )
+            } else {
+                let mut files = BTreeMap::new();
+                for file in ["state", "memory", "disk.ext4"] {
+                    files.insert(file.into(), hash(&staging.join(file))?);
+                }
+                (files, None, None)
+            };
             let snapshot = Snapshot {
+                digest,
                 managed_recovery: managed,
                 captured_at,
                 name: name.into(),
@@ -1128,7 +1185,11 @@ impl Runtime {
             File::open(self.root.join("snapshots"))?.sync_all()?;
             self.verified
                 .insert(name.into(), fingerprints(&destination)?);
-            Ok(snapshot.summary())
+            let mut summary = snapshot.summary();
+            if let Some(stats) = stats {
+                summary["chunks"] = json!(stats);
+            }
+            Ok(summary)
         })();
         if result.is_err() && staging.exists() {
             if let Err(error) = fs::remove_dir_all(&staging) {
@@ -1217,8 +1278,16 @@ impl Runtime {
             return Ok(directory);
         }
         for file in snapshot.files.keys() {
+            let path = directory.join(file);
+            let actual = match snapshot.digest.as_deref() {
+                None => hash(&path)?,
+                Some(crate::snapshot_digest::CHUNKS_V1) => crate::snapshot_digest::root(
+                    &crate::snapshot_digest::seal(&path, None)?.0.chunks,
+                ),
+                Some(other) => bail!("unsupported snapshot digest {other}"),
+            };
             ensure!(
-                snapshot.files.get(file) == Some(&hash(&directory.join(file))?),
+                snapshot.files.get(file) == Some(&actual),
                 "snapshot integrity failure: {file}"
             );
         }
@@ -1422,7 +1491,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"snapshot_delete_v1":true,"guest_ssh_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
@@ -1627,6 +1696,10 @@ impl Runtime {
                 );
                 self.capture(id, name, false)
             }
+            "snapshot-delete" => {
+                let name = request["name"].as_str().context("missing snapshot name")?;
+                self.delete_snapshot(id, name)
+            }
             "snapshots" => {
                 let mut snapshots = Vec::<Snapshot>::new();
                 for item in fs::read_dir(self.root.join("snapshots"))? {
@@ -1810,6 +1883,7 @@ mod disk_tests {
             cpu: "old host".into(),
             kernel_sha256: "old kernel".into(),
             files,
+            digest: None,
         };
         atomic_json(&sleep.join("manifest.json"), &snapshot).unwrap();
         let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
@@ -1852,7 +1926,24 @@ mod disk_tests {
         let retry = runtime
             .request(&json!({"op":"recovery-prepare","id":"legacy","store":store}))
             .unwrap();
-        assert_eq!(retry, point, "restart captured a different point");
+        assert_eq!(
+            (&retry["snapshot"], &retry["captured_at"]),
+            (&point["snapshot"], &point["captured_at"]),
+            "restart captured a different point"
+        );
+        assert!(retry.get("chunks").is_none(), "a sealed pin was rehashed");
+        assert_eq!(point["chunks"]["read"], 3);
+        let pinned: Snapshot = serde_json::from_slice(
+            &fs::read(runtime.snapshot_dir(name).join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pinned.digest.as_deref(),
+            Some(crate::snapshot_digest::CHUNKS_V1)
+        );
+        assert!(runtime.snapshot_dir(name).join("chunks.json").is_file());
+        runtime.verified.clear();
+        runtime.verify_snapshot(name, false).unwrap();
         assert!(runtime.request(&json!({"op":"recovery-result","id":"legacy","store":store,"snapshot":"other","uploaded":true})).is_err());
         for old in ["sleep-recovery-old", "manual", "recovery-manual"] {
             fs::create_dir(runtime.snapshot_dir(old)).unwrap();
@@ -1896,6 +1987,64 @@ mod disk_tests {
             .unwrap();
         assert!(
             runtime.workspace_summary("legacy").unwrap()["durability"]["last_durable_at"].is_null()
+        );
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
+    fn one_named_snapshot_can_be_deleted_and_internal_captures_cannot() {
+        let mut runtime = fixture();
+        let seal = |runtime: &Runtime, name: &str, workspace: &str, managed: bool| {
+            let directory = runtime.snapshot_dir(name);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("disk.ext4"), b"disk").unwrap();
+            let snapshot = Snapshot {
+                managed_recovery: false,
+                captured_at: 1,
+                name: name.into(),
+                workspace: workspace.into(),
+                managed,
+                memory_mib: 1024,
+                vcpu_count: 2,
+                image: "alpine".into(),
+                image_digest: None,
+                runtime: crate::common::RUNTIME.into(),
+                cpu: String::new(),
+                kernel_sha256: String::new(),
+                files: [(
+                    "disk.ext4".into(),
+                    hash(&directory.join("disk.ext4")).unwrap(),
+                )]
+                .into(),
+                digest: None,
+            };
+            atomic_json(&directory.join("manifest.json"), &snapshot).unwrap();
+        };
+        seal(&runtime, "keep", "legacy", false);
+        seal(&runtime, "drop", "legacy", false);
+        seal(&runtime, "theirs", "other", false);
+        seal(&runtime, "placed", "legacy", true);
+        seal(&runtime, "sleep-x", "legacy", false);
+        runtime.verify_snapshot("drop", false).unwrap();
+        let delete = |name: &str| json!({"op":"snapshot-delete","id":"legacy","name":name});
+        assert_eq!(
+            runtime.request(&delete("drop")).unwrap(),
+            json!({"deleted":"drop","workspace":"legacy","existed":true})
+        );
+        assert!(!runtime.snapshot_dir("drop").exists());
+        assert!(!runtime.verified.contains_key("drop"));
+        // A lost response is answered again; the name is simply gone.
+        assert_eq!(runtime.request(&delete("drop")).unwrap()["existed"], false);
+        for name in ["theirs", "placed", "sleep-x", "../keep"] {
+            assert!(runtime.request(&delete(name)).is_err(), "deleted {name}");
+        }
+        assert!(runtime.snapshot_dir("theirs").exists() && runtime.snapshot_dir("placed").exists());
+        fs::create_dir(runtime.snapshot_dir("partial")).unwrap();
+        assert!(runtime.request(&delete("partial")).is_err());
+        assert!(runtime.snapshot_dir("keep").join("manifest.json").exists());
+        assert_eq!(
+            runtime.request(&json!({"op":"status"})).unwrap()["snapshot_delete_v1"],
+            true
         );
         fs::remove_dir_all(runtime.root).unwrap();
     }
@@ -1992,6 +2141,7 @@ mod disk_tests {
             cpu: String::new(),
             kernel_sha256: String::new(),
             files: BTreeMap::new(),
+            digest: None,
         };
         let directory = runtime.snapshot_dir("saved");
         fs::create_dir(&directory).unwrap();
@@ -2209,6 +2359,7 @@ mod disk_tests {
                 ("disk.ext4".into(), String::new()),
             ]
             .into(),
+            digest: None,
         };
         atomic_json(&saved.join("manifest.json"), &snapshot).unwrap();
         runtime

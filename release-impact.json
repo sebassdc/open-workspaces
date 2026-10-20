@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.20",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Recovery points read and send only what changed. The worker seals each managed recovery point under the digest of its 8 MiB chunk list (chunks.json beside the manifest; manifest digest sha256-chunks-8m-v1), taking a chunk from the last durable point's seal unread when both files map it to the same physical extents and treating holes as zero chunks; verification of such a snapshot still reads every byte. The uploader sends missing chunks with up to eight parallel in-process signed requests (credentials exported once from the AWS CLI chain), lists the store's chunks once per point in parallel (recorded in RUNNER/recovery-index) instead of checking each chunk, records each upload as it lands so a killed run resumes, and sends again any chunk missing from the store, also for a point whose manifest is already stored. Restores of chunked points download in parallel. Each run prints capture and transfer counts per point. Older readers cannot verify chunk-sealed points; upgrade the CLI used for restore first. New `ow delete-snapshot BOX NAME` deletes one named snapshot through the controller (worker flag snapshot_delete_v1; older runners refuse it before dispatch). Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Use the normal class-2 worker upgrade; no timer, unit or stage 0 change."
+    },
+    {
       "version": "0.9.19",
       "class": 0,
       "changes": [

@@ -1132,6 +1132,62 @@ fn lowering_inventory_has_absolute_deadline_without_sqlite_writer_hold() {
 }
 
 #[test]
+fn outbound_runner_relays_snapshot_delete_only_to_a_capable_worker() {
+    use std::net::TcpListener;
+    let worker = root();
+    let listener = std::os::unix::net::UnixListener::bind(worker.join("control.sock")).unwrap();
+    let runtime = std::thread::spawn(move || {
+        let (mut unix, _) = listener.accept().unwrap();
+        let request = wire::line(&mut unix).unwrap();
+        assert_eq!(request["op"], "snapshot-delete");
+        let reply = json!({"deleted":request["name"],"workspace":request["id"],"existed":true});
+        wire::send(&mut unix, &json!({"ok":true,"result":reply})).unwrap();
+    });
+    for capable in [false, true] {
+        let controller = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", controller.local_addr().unwrap());
+        let path = worker.clone();
+        let agent = std::thread::spawn(move || {
+            agent_job(
+                &path,
+                &origin,
+                "alpha",
+                "job",
+                "fixture",
+                None,
+                Busy::new(),
+                &Mutex::new(Some(
+                    json!({"worker_protocol":1,"worker_pid":std::process::id(),
+                    "snapshot_delete_v1":capable}),
+                )),
+            )
+        });
+        let (tcp, _) = controller.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut socket = tungstenite::accept(tcp).unwrap();
+        let request = json!({"op":"snapshot-delete","id":"box","name":"old"});
+        socket
+            .send(tungstenite::Message::Binary(
+                format!("{request}\n").into_bytes().into(),
+            ))
+            .unwrap();
+        if capable {
+            let reply: Value = serde_json::from_slice(&socket.read().unwrap().into_data()).unwrap();
+            assert_eq!(reply["ok"], true, "{reply}");
+            assert_eq!(reply["result"]["deleted"], "old");
+            let _ = socket.close(None);
+            drop(socket);
+            assert!(agent.join().unwrap().is_ok());
+        } else {
+            drop(socket);
+            assert!(agent.join().unwrap().is_err(), "an old worker was asked");
+        }
+    }
+    runtime.join().unwrap();
+    fs::remove_dir_all(worker).unwrap();
+}
+
+#[test]
 fn preview_tunnel_job_uses_the_existing_worker_stream() {
     use std::net::TcpListener;
     let worker = root();

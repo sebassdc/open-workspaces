@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 
 args = sys.argv[1:]
+if args[:1] == ['--endpoint-url']:
+    args = args[2:]
 root = Path(os.environ['OW_TEST_STORE'])
 
 def option(name):
@@ -22,7 +24,11 @@ def path(url):
 with (root / 'calls.jsonl').open('a') as log:
     log.write(json.dumps(args) + '\n')
 
-if args[:2] == ['s3api', 'get-bucket-versioning']:
+if args[:2] == ['configure', 'export-credentials']:
+    print(json.dumps({'Version': 1, 'AccessKeyId': 'AKIDFIXTURE', 'SecretAccessKey': 'fixture', 'SessionToken': 'token'}))
+elif args[:3] == ['configure', 'get', 'region']:
+    print('us-east-1')
+elif args[:2] == ['s3api', 'get-bucket-versioning']:
     print(json.dumps({'Status': 'Suspended' if (root / 'no-versioning').exists() else 'Enabled'}))
 elif args[:2] == ['s3api', 'get-bucket-lifecycle-configuration']:
     print(json.dumps({'Rules': [{'Status': 'Enabled', 'NoncurrentVersionExpiration': {'NoncurrentDays': 7}, **({'Expiration': {'Days': 30}} if (root / 'unsafe-lifecycle').exists() else {})}]}))
