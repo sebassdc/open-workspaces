@@ -133,10 +133,10 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
         let metadata: Value = serde_json::from_str(&text)?;
         let pending = unresolved(db, &physical)?;
         if !pending
-            && matches!(
+            && (matches!(
                 metadata["state"].as_str(),
                 None | Some("pending" | "missing")
-            )
+            ) || metadata["unmade"] == true)
         {
             continue;
         }

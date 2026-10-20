@@ -63,7 +63,7 @@ function render() {
     const supports=op=>!operations || operations.includes(op);
     const owned = !current.role, admin = owned || current.role === 'admin';
     if (live) { $('detail-actions').append(action('Open Terminal', () => openTerminal(current.id))); if (admin) $('detail-actions').append(action('Snapshot', () => openDialog('snapshot', current.id), !supports('snapshot'))); $('detail-actions').append(action('Fork', () => openDialog('fork', current.id), !supports('fork')), action('Hibernate', () => operate({op: 'hibernate', id: current.id}), !supports('hibernate'))); if (admin) $('detail-actions').append(action('Stop', () => openDialog('stop', current.id))); }
-    else if (current.state !== 'missing') { $('detail-actions').append(action(current.state === 'hibernated' ? 'Resume machine' : 'Start machine', () => operate({op: 'start', id: current.id}))); }
+    else if (current.state !== 'missing' && !current.unmade) { $('detail-actions').append(action(current.state === 'hibernated' ? 'Resume machine' : 'Start machine', () => operate({op: 'start', id: current.id}))); }
     if (owned && current.state === 'stopped') $('detail-actions').append(action('Resize', () => openDialog('resize', current.id), !supports('resize')));
     if (owned && data.previews) $('detail-actions').append(action('Publish port', () => openDialog('publish', current.id), !supports('tunnel')));
     if (owned) $('detail-actions').append(action('Rename', () => openDialog('rename', current.id)), action('Share', () => openDialog('share', current.id)));
@@ -114,6 +114,7 @@ function openDialog(op, id, snapshot) {
   if (op === 'publish') { const port = field('port', 'Guest HTTP port', '3000'), input = port.querySelector('input'); input.type = 'number'; input.removeAttribute('pattern'); input.removeAttribute('maxlength'); input.min = '1'; input.max = '65535'; input.step = '1'; $('dialog-fields').append(port); }
   if (op === 'share') { const email = field('with', 'Teammate email', '', null), input = email.querySelector('input'); input.type = 'email'; input.removeAttribute('pattern'); input.maxLength = 254; $('dialog-fields').append(email, field('role', 'Role', 'use', [['use','Use · terminal, SSH, commands, fork'],['admin','Admin · also stop, snapshot, restore, SSH keys']])); }
   if (op === 'rename') $('dialog-fields').append(field('name', 'New machine name', id, null));
+  if (op === 'delete') { const going = data.snapshots.filter(item => item.workspace === id).map(item => item.name); $('dialog-fields').append(element('p', going.length ? `Its ${going.length} snapshot${going.length === 1 ? '' : 's'} will be deleted too: ${going.join(', ')}` : 'It has no snapshots.', going.length ? 'field-error' : 'muted')); }
   if (op === 'snapshot') $('dialog-fields').append(field('name', 'Snapshot name', `snapshot-${Date.now().toString(36)}`));
   if (op === 'fork') { $('dialog-fields').append(field('child', 'New machine name', '', null)); if (!snapshot) { const choices = [['','Capture a new snapshot now'], ...data.snapshots.filter(item => item.workspace === id).map(item => [item.name,item.name])]; $('dialog-fields').append(field('snapshot', 'Start from', '', choices)); } }
   if (id) $('dialog-fields').append(element('p', `Machine: ${id}${snapshot ? ` · Snapshot: ${snapshot}` : ''}`, 'muted'));

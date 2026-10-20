@@ -523,7 +523,11 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         Action::Wake { id, accept_cold } => json!({"op":"wake","id":id,"accept_cold":accept_cold}),
         Action::Start { id } => json!({"op":"start","id":id}),
         Action::Stop { id } => json!({"op":"stop","id":id}),
-        Action::Delete { id } => json!({"op":"delete","id":id}),
+        Action::Delete { id, yes } => {
+            let state = request(&url, &token, None)?;
+            confirm_delete(&id, &state["snapshots"], yes, interactive())?;
+            json!({"op":"delete","id":id})
+        }
         Action::Hibernate { id } => json!({"op":"hibernate","id":id}),
         Action::Snapshot { id, name } => json!({"op":"snapshot","id":id,"name":name}),
         Action::DeleteSnapshot { id, name } => {
@@ -788,9 +792,60 @@ fn shell(url: &str, token: &str, id: &str) -> Result<i32> {
     }
 }
 
+/// Whether a person can answer a question on this terminal.
+pub(crate) fn interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// A box's snapshots go with it: name them and ask first, unless `yes`. Without a terminal
+/// to ask on, refuse and point at `--yes`.
+pub(crate) fn confirm_delete(id: &str, snapshots: &Value, yes: bool, ask: bool) -> Result<()> {
+    let going: Vec<&str> = snapshots
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s["workspace"] == id)
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    if going.is_empty() || yes {
+        return Ok(());
+    }
+    let what = format!(
+        "deleting {id} also deletes its {} snapshot(s): {}",
+        going.len(),
+        going.join(", ")
+    );
+    ensure!(ask, "{what}; rerun with --yes to delete them too");
+    eprint!(
+        "{}. Continue? [y/N] ",
+        what[..1].to_uppercase() + &what[1..]
+    );
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    ensure!(
+        matches!(answer.trim(), "y" | "Y" | "yes"),
+        "delete cancelled; nothing was changed"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_names_the_snapshots_that_go_with_a_box_and_needs_yes_without_a_terminal() {
+        let snapshots = json!([{"name":"before","workspace":"box"},{"name":"other","workspace":"elsewhere"},{"name":"fork-1","workspace":"box"}]);
+        let error = confirm_delete("box", &snapshots, false, false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "deleting box also deletes its 2 snapshot(s): before, fork-1; rerun with --yes to delete them too"
+        );
+        confirm_delete("box", &snapshots, true, false).unwrap();
+        confirm_delete("elsewhere-free", &snapshots, false, false).unwrap();
+        confirm_delete("box", &json!(null), false, false).unwrap();
+    }
 
     #[test]
     fn reported_owner_quotas_bound_choices_without_defaulting_unknown_limits() {

@@ -1276,6 +1276,8 @@ pub fn agent(
                         "compat",
                         "max_disk_gib",
                         "reserved_disk_bytes",
+                        "unwritten_disk_bytes",
+                        "free_disk_bytes",
                         "min_free_gib",
                         "available_disk_bytes",
                         "disk_observed_unix_s",
