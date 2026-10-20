@@ -9,7 +9,8 @@ operator configuration. **Experimental** has bounded acceptance and platform
 limits. **Not yet live** means code is merged, but activation or deployment
 acceptance remains outstanding. Versions below are the first tagged release
 containing that feature, not a claim that your host has installed or enabled it.
-Production hardening remains ongoing.
+Production hardening remains ongoing. Each dashboard action, its status and the
+browser test that guards it are listed in the [UI feature matrix](docs/UI_FEATURES.md).
 
 ### Boxes and lifecycle
 
@@ -27,7 +28,7 @@ Production hardening remains ongoing.
 | Remote CLI | Install compiled macOS/Linux clients; discover images, identity, targets and capacity. | Core | v0.8.0; discovery v0.8.5 | [Install](docs/INSTALL.md), [agent CLI](docs/AGENT_CLI.md) |
 | SSH and SFTP | Connect editors and standard SSH tools to explicitly enrolled Linux guests. | Opt-in | v0.1.0 | [SSH](docs/SSH.md) |
 | Interactive terminals | Use a guest PTY from `ow shell` or the dashboard, with resize and job control. | Core | v0.1.0 | [Terminals](docs/TERMINALS.md) |
-| Dashboard and tailnet login | Manage boxes in the browser using Tailscale identity and an operator-configured access grant; Access JWT remains an alternative. | Opt-in | v0.1.0; tailnet v0.2.0; grants v0.8.3 | [Dashboard](docs/DASHBOARD.md) |
+| Dashboard and tailnet login | Manage boxes in the browser using Tailscale identity and an operator-configured access grant; Access JWT remains an alternative. | Opt-in | v0.1.0; tailnet v0.2.0; grants v0.8.3 | [Dashboard](docs/DASHBOARD.md), [UI feature matrix](docs/UI_FEATURES.md) |
 | Private previews | Publish a guest HTTP port as a separate authenticated tailnet HTTPS URL. | Opt-in | v0.8.0 | [Previews](docs/DAILY_USE.md#tailnet-https-previews-v080) |
 
 ### Snapshots, forks and recovery
@@ -68,7 +69,7 @@ Production hardening remains ongoing.
 | --- | --- | --- | --- | --- |
 | Owner quotas and pool admission | Reserve CPU, RAM, logical disk, box count and configured pool cost estimates before admission. | Core | v0.8.1 | [Limits](docs/LIMITS.md) |
 | vCPU overcommit | Allow a Linux host operator to select 1× or 2× vCPU admission; RAM is not overcommitted. | Opt-in | v0.8.5 | [Overcommit](docs/HOSTS.md#linux-vcpu-overcommit) |
-| Host reserve | Keep CPU and RAM per host that boxes never claim; on AWS hosts, systemd protects the controller/agent and kills a VM first under memory pressure. | Core | v0.9.23 | [Host reserve](docs/HOSTS.md#host-reserve-capacity-boxes-never-claim) |
+| Host reserve | Keep CPU and RAM per host that boxes never claim; on AWS hosts, systemd protects the controller/agent and kills a VM first under memory pressure. | Core | v0.9.24 | [Host reserve](docs/HOSTS.md#host-reserve-capacity-boxes-never-claim) |
 | User ownership and sharing | Scope boxes, snapshots and access to authenticated owners with explicit use/admin grants. | Core | v0.2.0 | [Users](docs/USERS.md) |
 | Guest isolation and egress | Run Linux guests under Firecracker/KVM with private host control and filtered guest networking. | Core | v0.1.0 | [Networking](docs/NETWORKING.md) |
 | CredentialBroker | Library-only per-box authorization for temporary AWS roles and secret writes; no live provider adapter or guest endpoint. | Not yet live | v0.8.0 (library only) | [Broker boundaries](docs/CREDENTIAL_BROKER.md) |

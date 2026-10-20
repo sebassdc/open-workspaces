@@ -498,7 +498,7 @@ kernel kills a VM first. A reserve that leaves no room for boxes is refused by
 `apply` before anything changes. See
 [HOSTS.md](../../docs/HOSTS.md#host-reserve-capacity-boxes-never-claim).
 
-Upgrading to 0.9.23 changes the worker and control units and the worker budget:
+Upgrading to 0.9.24 changes the worker and control units and the worker budget:
 `apply` stages them and the class-2 `ow-host upgrade` applies them in place (no
 instance replacement). A box running beyond the lowered CPU budget stays
 hibernated after the upgrade until capacity frees, as with any box that does not

@@ -296,7 +296,7 @@ owner cap, rather than deleting the field from an overcommitted configuration.
 Low-level `ow host up --cpus N`, SSH `ow node add --cpus N`, and
 `OW_MAX_VCPUS=N ow supervisor` already take an **effective** guest budget. Set N
 explicitly to the intended ratio's budget; these operator interfaces do not
-multiply it or discover disjoint capacity. Since 0.9.23 the worker caps it at the
+multiply it or discover disjoint capacity. Since 0.9.24 the worker caps it at the
 [host reserve](#host-reserve-capacity-boxes-never-claim) limit, so an overcommitted N
 also needs `OW_VCPU_OVERCOMMIT=2`. Worker status `max_vcpus` and the node heartbeat
 advertise the capped budget for scheduler admission.
@@ -334,7 +334,7 @@ changing anything, and the controller keeps running.
 
 The disk reserve (`OW_MIN_FREE_GIB`, default 5 GiB) is unchanged. `ow nodes` shows
 all three as `host_reserve` (`cpu_millis`, `memory_mib`, `disk_gib`); workers
-older than 0.9.23 report the CPU/RAM fields as null.
+older than 0.9.24 report the CPU/RAM fields as null.
 
 The AWS components set the reserve (`hostReserveCpuMillis`, `hostReserveMemoryMib`;
 see [AWS](../deploy/aws/README.md#host-reserve)) and also make the kernel enforce it:

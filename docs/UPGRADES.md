@@ -437,7 +437,7 @@ unchanged.
 
 ### Host reserve
 
-Version 0.9.23 is class 2 on runners and controller hosts with a local worker, and
+Version 0.9.24 is class 2 on runners and controller hosts with a local worker, and
 class 1 on a controller-only host. The worker reports the
 [host reserve](HOSTS.md#host-reserve-capacity-boxes-never-claim) and AWS hosts
 lower its CPU (and, on small hosts, RAM) budget by it; every Linux worker also

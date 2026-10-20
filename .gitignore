@@ -16,3 +16,7 @@ __pycache__/
 # Dedicated bounded capacity acceptance roots (short Unix socket paths).
 /v/
 /h/
+
+# Dashboard browser test output.
+/e2e/test-results/
+/e2e/playwright-report/
