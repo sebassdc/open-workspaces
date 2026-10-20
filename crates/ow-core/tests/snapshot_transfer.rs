@@ -336,7 +336,7 @@ fn abruptly_killed_upload_resumes(root: &Path) {
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !root.join("put-paused").exists() {
+    while !fs::read_to_string(root.join("put-paused")).is_ok_and(|key| !key.is_empty()) {
         assert!(
             child.try_wait().unwrap().is_none(),
             "uploader exited before kill"
@@ -347,6 +347,7 @@ fn abruptly_killed_upload_resumes(root: &Path) {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    let committed = fs::read_to_string(root.join("put-paused")).unwrap();
     child.kill().unwrap();
     assert!(!child.wait().unwrap().success());
     fs::remove_file(root.join("pause-after-put")).unwrap();
@@ -357,7 +358,21 @@ fn abruptly_killed_upload_resumes(root: &Path) {
         .index(&root.join("kill-index"));
     assert!(!store.list().unwrap().contains(&"abrupt".into()));
     let directory = root.join("abrupt");
-    let (sealed, _) = store.upload_unsealed(&directory, None).unwrap().unwrap();
+    let (sealed, sent) = store.upload_unsealed(&directory, None).unwrap().unwrap();
+    assert_eq!(
+        sent["uploaded"], 1,
+        "only the other disk chunk should be sent: {sent}"
+    );
+    let puts = fs::read_to_string(root.join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
+        .filter(|call| call[1] == "PUT" && call[2] == committed)
+        .count();
+    assert_eq!(
+        puts, 1,
+        "resent the chunk committed just before process death"
+    );
     ow_core::snapshot_digest::write_sidecar(&directory, &sealed).unwrap();
     let manifest = json!({"name":"abrupt","workspace":"box",
         "files":ow_core::snapshot_digest::roots(&sealed),
