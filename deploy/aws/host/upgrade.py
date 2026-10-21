@@ -404,6 +404,8 @@ def captures(compat):
             m = json.loads(manifest.read_text())
         except ValueError:
             continue
+        if m.get("disk_only"):
+            continue  # no RAM state: it always boots cold, on any worker
         found.append({"name": f"{m.get('workspace')}/{m.get('name')}", "runtime": m.get("runtime"),
                       "cpu": m.get("cpu"), "kernel_sha256": m.get("kernel_sha256")})
     for box in (h.read_json(f"{h.RUNNER}/state.json") or {}).get("workspaces", {}).values():

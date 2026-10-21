@@ -2,6 +2,41 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.44",
+      "class": 0,
+      "changes": [
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Upgrader capture gate: disk-only recovery points (0.9.40 on) hold no RAM state and always boot cold, so they no longer count as captures the target cannot resume. Before, every class-2 upgrade of a host with such points was refused unless --accept-cold. Takes effect from the next upgrade, since an upgrade runs the installed upgrader. No unit restarts."
+    },
+    {
       "version": "0.9.43",
       "class": 2,
       "changes": [
