@@ -470,13 +470,18 @@ async fn authenticated(c: &Controller, node: &str, headers: &HeaderMap) -> bool 
     };
     let node = node.to_owned();
     matches!(
-        c.read(move |db| authorized(db, &node, &secret)).await,
+        c.catalog(move |db| authorized(db, &node, &secret)).await,
         Ok(true)
     )
 }
 /// Records one heartbeat for this session: the number of rows it matched (0 when the
 /// catalog no longer holds this session as the node's current one).
 fn heartbeat(db: &Connection, node: &str, generation: &str, v: &Value) -> Result<usize> {
+    // Test hook: this runner's heartbeat write is blocked in I/O while its name is set.
+    #[cfg(test)]
+    while STALLED.lock().unwrap().as_deref() == Some(node) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let (ram, slots, cpus) = db.query_row("SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16) FROM nodes WHERE id=?1",[node],|r|Ok((r.get::<_,u32>(0)? as u64,r.get::<_,u32>(1)? as u64,r.get::<_,u32>(2)? as u64)))?;
     let mut cap = v.clone();
     cap["memory_mib"] = json!(v["memory_mib"].as_u64().unwrap().min(ram));
@@ -490,6 +495,33 @@ fn heartbeat(db: &Connection, node: &str, generation: &str, v: &Value) -> Result
         "UPDATE nodes SET heartbeat=?1,capabilities=?2 WHERE id=?3 AND session=?4 AND revoked=0",
         params![now(), cap.to_string(), node, generation],
     )?)
+}
+#[cfg(test)]
+pub(crate) static STALLED: Mutex<Option<String>> = Mutex::new(None);
+/// A catalog connection for one session's heartbeats and session mark. They are rewritten
+/// every few seconds and cleared when the controller starts, so a commit skips the fsync
+/// (WAL with NORMAL stays consistent) and never checkpoints: [`checkpoints`] does that on
+/// its own thread. A commit then holds the catalog's write lock only to append to the WAL.
+fn liveness_db(root: &Path) -> Result<Connection> {
+    let db = db(root)?;
+    db.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=0;")?;
+    Ok(db)
+}
+/// Folds the WAL into the catalog every 30 s, for the connections that skip it. Only this
+/// task waits when the disk is slow; the next checkpoint starts after this one ends.
+async fn checkpoints(root: PathBuf) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let root = root.clone();
+        let done = tokio::task::spawn_blocking(move || -> Result<()> {
+            db(&root)?.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+            Ok(())
+        })
+        .await;
+        if let Ok(Err(e)) = done {
+            eprintln!("catalog checkpoint failed: {e:#}");
+        }
+    }
 }
 async fn blocking<T: Send + 'static>(
     db: Arc<Mutex<Connection>>,
@@ -512,60 +544,40 @@ struct Controller {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     jobs: Arc<Mutex<HashMap<String, Job>>>,
     slots: Arc<Semaphore>,
-    /// Catalog connections, reused and only used off the two async threads: a large
-    /// capture's writeback can hold an fsync on this filesystem for minutes, which must
-    /// not stop pings, other sessions or the proxies. Reads never wait for the writer.
-    reader: Arc<Mutex<Connection>>,
-    writer: Arc<Mutex<Connection>>,
 }
 impl Controller {
     fn new(root: &Path) -> Result<Self> {
-        let writer = db(root)?;
-        // Heartbeats and session marks are rewritten every few seconds and cleared when
-        // the controller starts: in WAL mode, NORMAL stays consistent without an fsync
-        // per beat (checkpoints still sync).
-        writer.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(Self {
             root: root.to_owned(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             slots: Arc::new(Semaphore::new(32)),
-            reader: Arc::new(Mutex::new(db(root)?)),
-            writer: Arc::new(Mutex::new(writer)),
         })
     }
-    async fn read<T: Send + 'static>(
+    /// Catalog work never runs on the two async threads, and no connection or lock is
+    /// shared between sessions or proxies: a capture's writeback can hold a call in I/O
+    /// for minutes, and that must delay only its caller, never pings or other runners.
+    /// One-off calls open their own connection here.
+    async fn catalog<T: Send + 'static>(
         &self,
         work: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        blocking(self.reader.clone(), work).await
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || work(&db(&root)?)).await?
     }
-    async fn write<T: Send + 'static>(
-        &self,
-        work: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        blocking(self.writer.clone(), work).await
-    }
-    async fn online(&self, node: &str) -> Result<()> {
-        let node = node.to_owned();
-        self.read(move |db| online_in(db, &node)).await
-    }
-    /// An open stream needs its node's live session (checked in memory) and an unrevoked
-    /// credential, not a recent recorded heartbeat: a slow catalog write must not cut it.
-    async fn admitted(&self, node: &str) -> Result<()> {
-        let node = node.to_owned();
-        let active = self
-            .read(move |db| {
-                Ok(db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND revoked=0)",
-                    [node],
-                    |r| r.get::<_, bool>(0),
-                )?)
-            })
-            .await?;
-        ensure!(active, "node revoked");
-        Ok(())
-    }
+}
+/// An open stream needs its node's live session (checked in memory) and an unrevoked
+/// credential, not a recent recorded heartbeat: a slow catalog write must not cut it.
+fn admitted_in(db: &Connection, node: &str) -> Result<()> {
+    ensure!(
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND revoked=0)",
+            [node],
+            |r| r.get::<_, bool>(0),
+        )?,
+        "node revoked"
+    );
+    Ok(())
 }
 async fn enrollment(State(c): State<Controller>, Json(v): Json<Value>) -> Response {
     // A catalog transaction: off the async threads, like every controller database call.
@@ -642,21 +654,24 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
     // runner offline without a word: refuse it, so the agent reconnects and logs why.
     // Bounded, so a stalled disk cannot park every reconnecting runner's connection.
     let opened = {
-        let (node, generation) = (node.clone(), generation.clone());
+        let (root, node, generation) = (c.root.clone(), node.clone(), generation.clone());
         tokio::time::timeout(
             Duration::from_secs(10),
-            c.write(move |db| {
-                Ok(db.execute(
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let db = liveness_db(&root)?;
+                let n = db.execute(
                     "UPDATE nodes SET session=?1,heartbeat=0 WHERE id=?2 AND revoked=0",
                     params![generation, node],
-                )?)
+                )?;
+                Ok((n, db))
             }),
         )
         .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("catalog write took over 10 s")))
+        .map_err(|_| anyhow::anyhow!("catalog write took over 10 s"))
+        .and_then(|joined| Ok(joined??))
     };
-    match opened {
-        Ok(1) => {}
+    let db = match opened {
+        Ok((1, db)) => Arc::new(Mutex::new(db)),
         Ok(_) => {
             eprintln!("node {node}: session refused: not an enrolled, active node");
             return;
@@ -665,7 +680,7 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             eprintln!("node {node}: session not recorded ({e:#}); the agent reconnects");
             return;
         }
-    }
+    };
     let (tx, mut rx) = mpsc::channel(16);
     {
         let mut sessions = c.sessions.lock().unwrap();
@@ -683,7 +698,7 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
     let (beats, pending) = tokio::sync::watch::channel(None);
     let (recorded, mut verdicts) = mpsc::channel(4);
     let recorder = tokio::spawn(record(
-        c.clone(),
+        db,
         node.clone(),
         generation.clone(),
         secret,
@@ -751,25 +766,28 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             .unwrap()
             .retain(|_, j| j.generation != generation);
     }
-    // Clearing the mark also voids a heartbeat of this session still queued for the writer.
-    let closed = c
-        .write(move |db| {
-            Ok(db.execute(
-                "UPDATE nodes SET heartbeat=0,session=NULL WHERE id=?1 AND session=?2",
-                params![node, generation],
-            )?)
-        })
-        .await;
+    // Clearing the mark also voids a heartbeat of this session still in flight.
+    let root = c.root.clone();
+    let closed = tokio::task::spawn_blocking(move || -> Result<usize> {
+        Ok(liveness_db(&root)?.execute(
+            "UPDATE nodes SET heartbeat=0,session=NULL WHERE id=?1 AND session=?2",
+            params![node, generation],
+        )?)
+    })
+    .await;
+    let closed = closed.map_err(anyhow::Error::from).and_then(|r| r);
     if let Err(e) = closed {
         eprintln!("session close not recorded: {e:#}");
     }
 }
 /// Records a session's heartbeats and re-checks its credential every 3 s, one catalog call
-/// at a time: a slow disk delays only this, while the channel keeps pinging. A failure, a
-/// revoked credential or a heartbeat that matches no row (the catalog no longer holds this
-/// session) ends the session, so the agent reconnects instead of staying offline silently.
+/// at a time on the session's own connection: a call blocked in I/O delays only this
+/// runner's recorded heartbeat, while its channel keeps pinging and other runners' beats
+/// land. A failure, a revoked credential or a heartbeat that matches no row (the catalog
+/// no longer holds this session) ends the session, so the agent reconnects instead of
+/// staying offline silently.
 async fn record(
-    c: Controller,
+    db: Arc<Mutex<Connection>>,
     node: String,
     generation: String,
     secret: String,
@@ -781,7 +799,7 @@ async fn record(
         tokio::select! {
             _ = tick.tick() => {
                 let (node, secret) = (node.clone(), secret.clone());
-                match c.read(move |db| authorized(db, &node, &secret)).await {
+                match blocking(db.clone(), move |db| authorized(db, &node, &secret)).await {
                     Ok(true) => {}
                     Ok(false) => break "credential revoked".to_owned(),
                     Err(e) => break format!("credential not checked: {e:#}"),
@@ -795,7 +813,7 @@ async fn record(
                     continue;
                 };
                 let (n, g, b) = (node.clone(), generation.clone(), beat.clone());
-                match c.write(move |db| heartbeat(db, &n, &g, &b)).await {
+                match blocking(db.clone(), move |db| heartbeat(db, &n, &g, &b)).await {
                     Ok(1) => {
                         if verdicts.send(Ok(beat)).await.is_err() {
                             return;
@@ -820,7 +838,19 @@ async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) 
         stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
         "unauthorized proxy peer"
     );
-    c.online(&node).await?;
+    let db = {
+        let (root, node) = (c.root.clone(), node.clone());
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let db = db(&root)?;
+            online_in(&db, &node)?;
+            Ok(Arc::new(Mutex::new(db)))
+        })
+        .await??
+    };
+    let admitted = || {
+        let node = node.clone();
+        blocking(db.clone(), move |db| admitted_in(db, &node))
+    };
     ensure!(
         !STOPPING.load(std::sync::atomic::Ordering::SeqCst),
         "runner restarting; retry"
@@ -855,14 +885,14 @@ async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) 
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     loop {
         tokio::select! {
-            _=tick.tick()=>{c.admitted(&node).await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"node session replaced");}
+            _=tick.tick()=>{admitted().await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"node session replaced");}
             n=reader.read(&mut buffer)=>{
                 let n=n?; if n==0 {break;}
-                c.admitted(&node).await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node input");
+                admitted().await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node input");
                 tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Binary(buffer[..n].to_vec().into()))).await??;
             }
             msg=socket.recv()=>match msg {
-                Some(Ok(Message::Binary(bytes)))=>{c.admitted(&node).await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node result");tokio::time::timeout(Duration::from_secs(5),writer.write_all(&bytes)).await??;}
+                Some(Ok(Message::Binary(bytes)))=>{admitted().await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node result");tokio::time::timeout(Duration::from_secs(5),writer.write_all(&bytes)).await??;}
                 Some(Ok(Message::Ping(_)|Message::Pong(_)))=>{}, _=>break,
             }
         }
@@ -1050,7 +1080,8 @@ pub fn controller(
         .build()?;
     rt.block_on(async move {
         let routes = routes(c.clone());
-        tokio::spawn(proxies(c));
+        tokio::spawn(proxies(c.clone()));
+        tokio::spawn(checkpoints(c.root.clone()));
         let slots = Arc::new(Semaphore::new(128));
         if let (Some(cert), Some(key)) = (cert, key) {
             let _ = rustls::crypto::ring::default_provider().install_default();

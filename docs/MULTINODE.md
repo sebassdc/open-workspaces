@@ -207,11 +207,18 @@ undone. Terminals never switch to a replacement stream automatically.
 A capture's writeback can make every fsync on the data filesystem wait for minutes.
 The controller therefore runs no catalog call on its two async threads: auth checks,
 heartbeats, session marks, enrollment and the node inventory run on blocking threads,
-over one reused reader and one writer connection (the writer commits heartbeats with
-`synchronous=NORMAL`; they are rewritten every few seconds and cleared at start). No
-lock on live sessions is held across a catalog call. Each session records its beats
-through its own task, latest beat first, so a slow write delays only that runner's
-recorded heartbeat while pings and other runners carry on. An open proxy stream
+and no connection or lock is shared between runners. Each session records its beats
+(latest first) and re-checks its credential through its own task and its own
+connection, which commits with `synchronous=NORMAL` and no automatic checkpoint
+(heartbeats are rewritten every few seconds and cleared at start), so a commit holds
+the catalog's write lock only to append to the WAL. One background task checkpoints
+the WAL every 30 seconds and alone waits if the disk is slow. Each proxy stream has its
+own connection too, and no lock on live sessions is held across a catalog call. A call
+blocked in I/O therefore delays only its own runner's recorded heartbeat: pings, the
+other runners' heartbeats (and so their `online` state and new jobs) carry on. A
+writer from another process that holds the catalog's write lock itself (a commit
+waiting on fsync) still blocks every heartbeat; after the 5-second busy timeout those
+sessions end and their runners reconnect. An open proxy stream
 needs its runner's live session and an unrevoked credential, checked per frame, not
 a recent recorded heartbeat; a new job still needs one (placement treats a runner
 without a recorded beat in 15 seconds as offline). A session mark not recorded within

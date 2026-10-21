@@ -2144,3 +2144,65 @@ async fn a_runtime_stall_does_not_drop_the_sessions_it_delayed() {
     .unwrap();
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_blocked_heartbeat_write_leaves_other_runners_online() {
+    let root = root();
+    // Names no other test uses: the stall hook is process-wide.
+    let (stalled, healthy) = (enrollment(&root, "omega"), enrollment(&root, "sigma"));
+    let c = Controller::new(&root).unwrap();
+    let (origin, server) = serve_controller(&c);
+    tokio::task::spawn_blocking(move || {
+        let runner = |name: &'static str, credential: Value| {
+            let origin = origin.clone();
+            std::thread::spawn(move || {
+                let token = credential["credential"].as_str().unwrap();
+                let mut ws = socket(&origin, &format!("/node/{name}"), token, None).unwrap();
+                timeout_socket(&ws).unwrap();
+                drive(&mut ws, Duration::from_secs(36))
+            })
+        };
+        let (omega, sigma) = (runner("omega", stalled), runner("sigma", healthy));
+        let started = std::time::Instant::now();
+        while online(&root, "omega").is_err() || online(&root, "sigma").is_err() {
+            assert!(started.elapsed() < Duration::from_secs(5), "never online");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Omega's heartbeat write blocks in I/O for 23 s, past the 15 s offline cut-off.
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *STALLED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        let release = Release;
+        *STALLED.lock().unwrap() = Some("omega".into());
+        let stalled_at = std::time::Instant::now();
+        while stalled_at.elapsed() < Duration::from_secs(23) {
+            assert!(
+                online(&root, "sigma").is_ok(),
+                "a healthy runner went offline {:?} into another runner's stalled write",
+                stalled_at.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        drop(release);
+        let released = std::time::Instant::now();
+        while online(&root, "omega").is_err() {
+            assert!(
+                released.elapsed() < Duration::from_secs(5),
+                "the stalled runner did not come back"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Both channels stayed up and kept getting frames throughout.
+        for (name, runner) in [("omega", omega), ("sigma", sigma)] {
+            let (gap, closed) = runner.join().unwrap();
+            assert!(!closed && gap < Duration::from_secs(4), "{name}: {gap:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    })
+    .await
+    .unwrap();
+    server.abort();
+}
