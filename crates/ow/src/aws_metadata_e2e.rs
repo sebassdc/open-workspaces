@@ -75,14 +75,21 @@ fn reply(mut stream: std::net::TcpStream, text: &str) {
     while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
         request.push(byte[0]);
     }
-    let _ = write!(stream, "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{text}", text.len());
+    let _ = write!(
+        stream,
+        "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{text}",
+        text.len()
+    );
 }
 
 /// Serve `answer` on `port` from inside network namespace `name`.
 fn listen_in(name: &'static str, port: u16, answer: &'static str) {
     std::thread::spawn(move || {
         let ns = std::fs::File::open(format!("/run/netns/{name}")).unwrap();
-        assert_eq!(unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) }, 0);
+        assert_eq!(
+            unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) },
+            0
+        );
         let listener = TcpListener::bind(("0.0.0.0", port)).unwrap();
         for stream in listener.incoming() {
             reply(stream.unwrap(), answer);
@@ -100,7 +107,11 @@ fn botocore(home: &Path, profile: Option<&str>) -> (String, String) {
             home.display()
         ),
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8(out.stdout).unwrap();
     let (method, key) = text.trim().split_once(' ').unwrap();
     (method.into(), key.into())
@@ -111,11 +122,17 @@ fn botocore(home: &Path, profile: Option<&str>) -> (String, String) {
 fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_transfer() {
     // This thread becomes the worker's fresh network namespace; threads and processes it
     // starts stay in it, the rest of the test binary does not.
-    assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0, "needs root");
+    assert_eq!(
+        unsafe { libc::unshare(libc::CLONE_NEWNET) },
+        0,
+        "needs root"
+    );
     ok("ip link set lo up");
     ow_core::network::initialize().unwrap();
     // The runner's uplink: slirp's side holds the real metadata address and a public host.
-    let _ = sh(&format!("ip netns del {NS}-egress; ip netns del {NS}-g1; ip netns del {NS}-g2"));
+    let _ = sh(&format!(
+        "ip netns del {NS}-egress; ip netns del {NS}-g1; ip netns del {NS}-g2"
+    ));
     ok(&format!(
         "ip netns add {NS}-egress && ip link add tap-egress type veth peer name eth0 netns {NS}-egress \
          && ip addr add 10.0.2.100/24 dev tap-egress && ip link set tap-egress up \
@@ -162,7 +179,11 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
     // No role: an immediate 404, so SDKs move on instead of waiting for a timeout.
     let started = Instant::now();
     assert_eq!(metadata(1, CREDENTIALS).0, 404);
-    assert!(started.elapsed() < Duration::from_millis(700), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(700),
+        "{:?}",
+        started.elapsed()
+    );
 
     // Attach: the refresher assumes the role and box 1 reads it at the EC2 address.
     shared
@@ -177,24 +198,46 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
     let credentials: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(credentials["AccessKeyId"], "ASIAFAKE1");
     assert_eq!(credentials["Type"], "AWS-HMAC");
-    assert_eq!(metadata(1, "/latest/meta-data/placement/region").1, "us-east-1");
+    assert_eq!(
+        metadata(1, "/latest/meta-data/placement/region").1,
+        "us-east-1"
+    );
     // Box 2 has none, and box 1's token is refused from box 2.
     assert_eq!(metadata(2, CREDENTIALS).0, 404);
-    let token = guest(1, "curl -sf --max-time 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token");
+    let token = guest(
+        1,
+        "curl -sf --max-time 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token",
+    );
     let token = String::from_utf8(token.stdout).unwrap();
     let (_, code) = curl(
         2,
-        &format!("-o /dev/null -w '%{{http_code}}' -H 'X-aws-ec2-metadata-token: {token}' http://169.254.169.254{CREDENTIALS}reader"),
+        &format!(
+            "-o /dev/null -w '%{{http_code}}' -H 'X-aws-ec2-metadata-token: {token}' http://169.254.169.254{CREDENTIALS}reader"
+        ),
     );
     assert_eq!(code, "401");
     // IMDSv1 is refused.
-    assert_eq!(curl(1, &format!("-o /dev/null -w '%{{http_code}}' http://169.254.169.254{CREDENTIALS}")).1, "401");
+    assert_eq!(
+        curl(
+            1,
+            &format!("-o /dev/null -w '%{{http_code}}' http://169.254.169.254{CREDENTIALS}")
+        )
+        .1,
+        "401"
+    );
 
     // Box 1 posing as box 2 (box 2's address) is dropped before it reaches anything.
-    ok(&format!("ip netns exec {NS}-g1 ip addr add 198.18.0.10/32 dev eth0"));
-    let (spoofed, _) = curl(1, "--interface 198.18.0.10 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token");
+    ok(&format!(
+        "ip netns exec {NS}-g1 ip addr add 198.18.0.10/32 dev eth0"
+    ));
+    let (spoofed, _) = curl(
+        1,
+        "--interface 198.18.0.10 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token",
+    );
     assert_eq!(spoofed, 28, "a spoofed source is dropped");
-    ok(&format!("ip netns exec {NS}-g1 ip addr del 198.18.0.10/32 dev eth0"));
+    ok(&format!(
+        "ip netns exec {NS}-g1 ip addr del 198.18.0.10/32 dev eth0"
+    ));
 
     // The guest agent installer's ephemeral port on the box's own host address still works;
     // another box cannot reach it.
@@ -205,14 +248,21 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
             reply(stream.unwrap(), "AGENT");
         }
     });
-    assert_eq!(curl(1, &format!("http://198.18.0.5:{port}/")), (0, "AGENT".into()));
+    assert_eq!(
+        curl(1, &format!("http://198.18.0.5:{port}/")),
+        (0, "AGENT".into())
+    );
     assert_eq!(curl(2, &format!("http://198.18.0.5:{port}/")).0, 28);
 
     // The runner's real metadata service stays out of reach, while the Internet does not;
     // port 80 at the metadata address is answered by the worker, never forwarded.
     assert_eq!(curl(1, "http://203.0.113.10:8081/"), (0, "INTERNET".into()));
     assert_eq!(curl(1, "http://169.254.169.254:8080/").0, 28);
-    assert!(!curl(1, "http://169.254.169.254/latest/api/token").1.contains("REAL-IMDS"));
+    assert!(
+        !curl(1, "http://169.254.169.254/latest/api/token")
+            .1
+            .contains("REAL-IMDS")
+    );
     // The listener is closed to the uplink side.
     let uplink = sh(&format!(
         "ip netns exec {NS}-egress curl -s --max-time 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://10.0.2.100:{}/latest/api/token",
@@ -234,7 +284,11 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
         }
     });
     // Neighbour discovery is dropped too: no connection (7) or a timeout (28), never an answer.
-    for target in ["[fd00:ec2::254]:8169", "[fd00::1]:8169", "[fd00:ec2::254]:80"] {
+    for target in [
+        "[fd00:ec2::254]:8169",
+        "[fd00::1]:8169",
+        "[fd00:ec2::254]:80",
+    ] {
         let (code, _) = curl(1, &format!("-g -6 http://{target}/"));
         assert!(matches!(code, 7 | 28), "{target}: curl exit {code}");
     }
@@ -251,7 +305,10 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
     if python {
         let home = f.root.join("home");
         std::fs::create_dir_all(home.join(".aws")).unwrap();
-        assert_eq!(botocore(&home, None), ("iam-role".into(), "ASIAFAKE1".into()));
+        assert_eq!(
+            botocore(&home, None),
+            ("iam-role".into(), "ASIAFAKE1".into())
+        );
         std::fs::write(
             home.join(".aws/credentials"),
             "[default]\naws_access_key_id = AKIAUSERDEFAULT\naws_secret_access_key = user\n[x]\naws_access_key_id = AKIAUSERPROFILEX\naws_secret_access_key = user\n",
@@ -270,7 +327,10 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
         // single-attempt lookup after it succeeds.
         ow_core::metadata::detach(1);
         ow_core::metadata::attach(1, BOXES[0]).unwrap();
-        assert_eq!(botocore(&home, None), ("iam-role".into(), "ASIAFAKE1".into()));
+        assert_eq!(
+            botocore(&home, None),
+            ("iam-role".into(), "ASIAFAKE1".into())
+        );
     }
 
     // Detach: gone at once, without waiting for a refresher pass.
@@ -309,5 +369,7 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
         ow_core::metadata::detach(i);
         ow_core::metadata::clear(BOXES[i as usize - 1]);
     }
-    let _ = sh(&format!("ip netns del {NS}-egress; ip netns del {NS}-g1; ip netns del {NS}-g2"));
+    let _ = sh(&format!(
+        "ip netns del {NS}-egress; ip netns del {NS}-g1; ip netns del {NS}-g2"
+    ));
 }

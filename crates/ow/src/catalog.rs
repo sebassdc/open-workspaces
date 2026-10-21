@@ -1122,6 +1122,8 @@ impl Catalog {
             }
             if next.terminal() {
                 c.db.execute("DELETE FROM transfer_locks WHERE transfer=?1",[id])?;
+                // A moved or woken box with a role needs credentials on its new runner now.
+                crate::aws_identity::notify();
                 c.db.execute("UPDATE operations SET state=?1,finished_at=CURRENT_TIMESTAMP WHERE id=?2",params![if next == Step::Succeeded {"succeeded"}else{"failed"},t.operation])?;
             }
             c.transfer(id)

@@ -364,7 +364,11 @@ pub fn start() -> Result<()> {
 pub(crate) fn serve(listener: TcpListener, resolve: Resolve) {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
+            let Ok(stream) = stream else {
+                // Out of descriptors or similar: do not spin.
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
             let (Ok(peer), Ok(local)) = (stream.peer_addr(), stream.local_addr()) else {
                 continue;
             };

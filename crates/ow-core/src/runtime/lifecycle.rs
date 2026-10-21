@@ -1816,11 +1816,30 @@ mod execution_tests {
             "incomplete capture cannot terminate the source"
         );
         fs::write(&memory, b"VM memory").unwrap();
+        // The box leaves this runner: AWS credentials it held here go with the export.
+        crate::metadata::set(
+            "legacy",
+            crate::metadata::Role {
+                role_arn: "arn:aws:iam::111122223333:role/ow-box/reader".into(),
+                generation: 1,
+                hop_limit: 1,
+                region: None,
+                zone: None,
+                credentials: Some(crate::metadata::Credentials {
+                    access_key_id: "ASIAEXPORT".into(),
+                    secret_access_key: String::from("secret").into(),
+                    session_token: String::from("token").into(),
+                    expiration: u64::MAX / 2,
+                    issued: 0,
+                }),
+            },
+        );
         // Effect-before-reply: complete registry is present even if acknowledgment is lost.
         runtime.crash = Some("registry");
         assert!(runtime.request(&request).is_err());
         assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
         assert!(runtime.machines.is_empty());
+        assert!(!crate::metadata::present("legacy", 1));
         runtime.crash = None;
         let result = runtime.request(&request).unwrap();
         assert_eq!(result["capture"]["files"].as_object().unwrap().len(), 3);
