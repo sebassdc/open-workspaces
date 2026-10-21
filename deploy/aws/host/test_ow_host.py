@@ -82,8 +82,8 @@ class Render(unittest.TestCase):
     def test_worker_unit_hibernates_and_control_plane_never_takes_it_down(self):
         worker = self.files["/etc/systemd/system/open-workspaces-worker.service"]
         self.assertIn("ExecStart=/srv/ow/run/worker/bin/ow --data-dir /srv/ow/.ow/runner supervisor", worker)
-        self.assertIn("ExecStop=/srv/ow/run/worker/bin/ow --data-dir /srv/ow/.ow/runner down --hibernate", worker)
-        self.assertIn("TimeoutStopSec=900", worker)
+        self.assertIn("ExecStop=/srv/ow/run/worker/bin/ow --data-dir /srv/ow/.ow/runner down --hibernate --wait", worker)
+        self.assertIn("TimeoutStopSec=infinity", worker, "a stop never kills running boxes")
         cp = self.files["/etc/systemd/system/open-workspaces.service"]
         self.assertIn("ExecStart=/srv/ow/run/agent/bin/ow host up --external-worker --memory 11776 --slots 8 --cpus 3", cp)
         self.assertNotIn("ExecStop", cp)

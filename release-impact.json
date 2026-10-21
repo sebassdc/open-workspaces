@@ -3,8 +3,9 @@
   "releases": [
     {
       "version": "0.9.43",
-      "class": 0,
+      "class": 2,
       "changes": [
+        "worker",
         "host-layout"
       ],
       "protocol": {
@@ -34,7 +35,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "Upgrader: after the pin switch the new worker is quiesced as soon as it answers, before the agent and gateway start, and stays quiesced until verify passes; rollback starts the old worker the same way. The resume step lifts it, and a lift that fails leaves the journal at resume for recover. Before, a wake on connection could reach the new worker during verify, and a large box's resume (its hibernation snapshot is hashed first) held the one-request worker past verify's deadline, so the upgrade rolled back while that resume still held the box and the rollback's stop timed out. Takes effect from the next upgrade, since an upgrade runs the installed upgrader. No unit restarts; protocol, catalog, runtime and host layout 2 unchanged."
+      "notes": "Upgrader: after the pin switch the new worker is quiesced as soon as it answers, before the agent and gateway start, and stays quiesced until verify passes; rollback starts the old worker the same way. The resume step lifts it, and a lift that fails leaves the journal at resume for recover. Before, a wake on connection could reach the new worker during verify, and a large box's resume (its hibernation snapshot is hashed first) held the one-request worker past verify's deadline, so the upgrade rolled back while that resume still held the box and the rollback's stop timed out. The worker unit's stop (`down --hibernate --wait`, no stop timeout) now retries until every box is hibernated, starts still refused, instead of giving up after 840 s or on a busy box and letting systemd kill the running VMs. The upgrader fix takes effect from the next upgrade, since an upgrade runs the installed upgrader. Class-2 worker cycle (the worker unit changes); protocol, catalog, runtime and host layout 2 unchanged."
     },
     {
       "version": "0.9.42",

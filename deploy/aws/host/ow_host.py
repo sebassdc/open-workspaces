@@ -362,9 +362,11 @@ User=ow
 EnvironmentFile=/etc/open-workspaces/worker.env
 ExecStart={worker_bin} --data-dir {RUNNER} supervisor
 # A stop (reboot, instance stop, ow-host restart --worker) hibernates the running
-# boxes first, with wakes refused, so their processes survive (about 25 s per 1 GiB).
-ExecStop={worker_bin} --data-dir {RUNNER} down --hibernate
-TimeoutStopSec=900
+# boxes first, with wakes refused, so their processes survive (about 25 s per 1 GiB,
+# much longer on a slow volume). It retries until every box is hibernated and has no
+# timeout: whatever still runs when the stop command ends is killed with the unit.
+ExecStop={worker_bin} --data-dir {RUNNER} down --hibernate --wait
+TimeoutStopSec=infinity
 Restart=on-failure
 RestartSec=5
 # The worker and its VMs stay below the host reserve. Within that, the worker runs in a

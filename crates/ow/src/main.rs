@@ -236,6 +236,10 @@ enum Action {
         /// so their processes survive the shutdown.
         #[arg(long)]
         hibernate: bool,
+        /// With --hibernate: never give up; retry until every machine is hibernated
+        /// (a service stop, which must not kill running machines).
+        #[arg(long, requires = "hibernate")]
+        wait: bool,
     },
     /// JSON selected server, identity, compatibility and placement discovery.
     Status,
