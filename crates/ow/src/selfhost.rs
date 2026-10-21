@@ -112,7 +112,7 @@ fn wait_online(controller: &Path, node: &str, since: i64, limit: Duration) -> bo
     let fresh = || -> Result<bool> {
         nodes::online(controller, node)?;
         let heartbeat: i64 = nodes::db(controller)?.query_row(
-            "SELECT heartbeat FROM nodes WHERE id=?1",
+            "SELECT heartbeat FROM live_nodes WHERE id=?1",
             [node],
             |r| r.get(0),
         )?;

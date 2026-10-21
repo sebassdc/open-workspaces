@@ -10,6 +10,8 @@
 //! - [`credential_broker`]: dormant per-box role/secret policy and host provider interfaces;
 //!   [`metadata`] (instance-metadata endpoint) and [`web_identity`] (identity token files)
 //!   are its active per-box AWS role deliveries into guests.
+#![recursion_limit = "256"]
+
 #[cfg(target_os = "linux")]
 pub mod cache;
 pub mod capability;

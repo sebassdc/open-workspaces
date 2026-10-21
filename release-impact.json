@@ -2,7 +2,7 @@
   "schema": 1,
   "releases": [
     {
-      "version": "0.9.40",
+      "version": "0.9.41",
       "class": 2,
       "changes": [
         "worker",
@@ -39,6 +39,44 @@
       "host_layout": 2,
       "in_place_from": "0.5.0",
       "notes": "Per-box AWS roles in metadata mode (opt-in, \"mode\": \"metadata\" in aws-identity.json; web identity stays the default): the controller assumes each attached role under the IAM path /ow-box/ of its own account with its EC2 instance role (explicit instance-metadata credentials, session tags ow-box and ow-owner, source identity, one hour, refreshed with 30 minutes left and kept fresh for hibernated boxes), outside the catalog lock, and pushes the credentials to the box's runner through a new aws-creds worker operation. The worker keeps them in memory only and serves them at 169.254.169.254 (IMDSv2 only, HMAC tokens bound to box, VMM and role generation, per-box connection and rate limits, hop limit 1 by default, no CORS, X-Forwarded-For refused, never the real instance metadata) from its own threads through an nft prerouting redirect; boxes without a role get an immediate 404. Detach, re-attach, transfer and allow-list removal withdraw the runner's copy before the change commits; a running box with a role on an unreachable runner cannot be transferred. Workers advertise aws_metadata_v1. The refresher now always runs, so turning access on or switching its mode needs no restart. A live-box attachment waits for STS outside the catalog lock and worker credential acknowledgement before success; failed or superseded delivery returns an error, while stopped/parked attachments remain pending. Additive catalog columns aws_roles.hop_limit and aws_roles.served, plus aws_role_generations and its delete trigger retaining generation high-water marks across detach, transfer and controller restart in both modes; catalog schema 7, worker interface 3, runtime, guest kernel and host layout 2 are unchanged. The AWS component gains boxRoles (host role may assume role/ow-box/* only). Class-2 worker upgrade; runners without aws_metadata_v1 never receive credentials."
+    },
+    {
+      "version": "0.9.40",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Automatic recovery points of running boxes are disk-only: the guest is paused only while its disk is reflinked and no RAM is written, removing the full-RAM write from that pause (real-runner pause duration remains unmeasured); such a point restores as a cold boot (its manifest says disk_only and names no CPU, so an older worker refuses to resume it). The controller runs every catalog/health call off its async threads over reused connections and never holds the session lock across one; each runner writes transient health in its own private SQLite WAL file, while the live_nodes view preserves durable catalog policy and revocation. Upgrade controller and gateway together, since older gateways read only catalog heartbeats; a session whose mark or heartbeat cannot be recorded (an error, or no matching row) ends with a log line so the agent reconnects, and a controller stall no longer drops every session. The agent reconnects after 20 s without a frame from the controller, skips DNS for IP literals and reuses the last resolved addresses while lookups hang. Runners whose worker and agent have this advertise recovery_disk_only_v1."
     },
     {
       "version": "0.9.39",

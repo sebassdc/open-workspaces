@@ -1,6 +1,6 @@
 # ADR 0009: per-box AWS roles through a box metadata endpoint
 
-Status: implemented (release 0.9.40), opt-in with `"mode": "metadata"` in
+Status: implemented (release 0.9.41), opt-in with `"mode": "metadata"` in
 `aws-identity.json`. Supersedes [ADR 0008](0008-per-box-aws-web-identity.md) for
 controllers that run on EC2 with an instance role; web identity stays the default and
 the choice for controllers outside AWS. Live acceptance against a real AWS account is

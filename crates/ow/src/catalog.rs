@@ -413,6 +413,7 @@ impl Catalog {
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
         crate::nodes::readable(&db)?;
+        nodes::health_view(&db, root)?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > 0 && version < nodes::SCHEMA {
             let backup = root.join(format!(
@@ -978,7 +979,7 @@ impl Catalog {
             limits::Rejection(format!("Runner {target} is draining."))
         );
         // Catalog capacity only; T3 additionally validates worker capability and disk headroom.
-        let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16)) FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(|| limits::Rejection(format!("Runner {target} is offline, draining or has no registered budget.")))?;
+        let (limit, slots, cpus):(i64,i64,i64) = c.db.query_row("SELECT MIN(memory_mib,COALESCE(json_extract(capabilities,'$.memory_mib'),0)),MIN(slots,COALESCE(json_extract(capabilities,'$.slots'),0)),MIN(COALESCE(json_extract(capabilities,'$.vcpus'),0),COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=live_nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=live_nodes.id),16)) FROM live_nodes WHERE id=?1 AND revoked=0 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND COALESCE(json_extract(capabilities,'$.drain'),0)=0 AND NOT EXISTS(SELECT 1 FROM node_placement_policy p WHERE p.node=live_nodes.id AND (p.active=0 OR p.controller_drain=1))",[target],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(|| limits::Rejection(format!("Runner {target} is offline, draining or has no registered budget.")))?;
         let (used_mib,used_cpus,used_slots):(i64,i64,i64) = c.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(reserved_cpus),0),COALESCE(SUM(reserved_mib>0),0) FROM resources WHERE kind='machine' AND node=?1 AND (?2=0 OR physical<>?3)",params![target,t.kind==crate::transfers::Kind::Move && target==t.source_node,t.source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         let (extra_mib, extra_cpus, extra_slots) = c.extra_usage(target)?;
         let fits = used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64
@@ -2063,7 +2064,7 @@ impl Catalog {
     /// snapshots: its route and what it knows of the box (null when nothing). None for a
     /// retired or unknown runner, which runs nothing; an offline one refuses, to retry.
     fn old_copy(&self, node: &str, physical: &str) -> Result<Option<(PathBuf, Value)>> {
-        let (known, retired): (bool, bool) = self.db.query_row("SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND revoked=0),EXISTS(SELECT 1 FROM runner_drains WHERE node=?1 AND state IN ('retained','removed'))",[node],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (known, retired): (bool, bool) = self.db.query_row("SELECT EXISTS(SELECT 1 FROM live_nodes WHERE id=?1 AND revoked=0),EXISTS(SELECT 1 FROM runner_drains WHERE node=?1 AND state IN ('retained','removed'))",[node],|r|Ok((r.get(0)?,r.get(1)?)))?;
         if !known || retired {
             return Ok(None);
         }

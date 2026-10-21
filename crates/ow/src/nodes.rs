@@ -85,6 +85,7 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     // Additive larger-cap authority; legacy readers retain conservative CPU limits.
     db.execute_batch("CREATE TABLE IF NOT EXISTS node_capacity_limits(node TEXT PRIMARY KEY REFERENCES nodes(id), vcpu_cap INTEGER NOT NULL CHECK(vcpu_cap BETWEEN 1 AND 64));")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS node_placement_policy(node TEXT PRIMARY KEY REFERENCES nodes(id),pool TEXT NOT NULL DEFAULT 'default',active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),controller_drain INTEGER NOT NULL DEFAULT 0 CHECK(controller_drain IN (0,1)));")?;
+    health_view(&db, root)?;
     Ok(db)
 }
 /// Catalog schema this binary writes (`PRAGMA user_version`).
@@ -264,7 +265,7 @@ pub fn budget(root: &Path, node: &str, memory: u32, slots: u32, cpus: u32) -> Re
     common::identifier(node)?;
     common::host_limits(memory, slots, cpus)?;
     let mut db = db(root)?;
-    let sql = "SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16),session FROM nodes WHERE id=?1 AND credential_hash IS NOT NULL AND revoked=0";
+    let sql = "SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=live_nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=live_nodes.id),16),session FROM live_nodes WHERE id=?1 AND credential_hash IS NOT NULL AND revoked=0";
     let prior: (u32, u32, u32, Option<String>) = db
         .query_row(sql, [node], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -298,7 +299,7 @@ pub fn budget(root: &Path, node: &str, memory: u32, slots: u32, cpus: u32) -> Re
     }
     if lowering {
         let fresh: bool = tx.query_row(
-            "SELECT heartbeat>?1 AND heartbeat<=?2 FROM nodes WHERE id=?3",
+            "SELECT heartbeat>?1 AND heartbeat<=?2 FROM live_nodes WHERE id=?3",
             params![now() - OFFLINE, now(), node],
             |r| r.get(0),
         )?;
@@ -318,10 +319,11 @@ pub fn budget(root: &Path, node: &str, memory: u32, slots: u32, cpus: u32) -> Re
     tx.execute("INSERT INTO node_capacity_limits(node,vcpu_cap) VALUES(?1,?2) ON CONFLICT(node) DO UPDATE SET vcpu_cap=?2",params![node,cpus])?;
     tx.execute("INSERT INTO node_limits(node,vcpu_cap) VALUES(?1,?2) ON CONFLICT(node) DO UPDATE SET vcpu_cap=?2",params![node,cpus.min(16)])?;
     // Clamp already-reported capabilities immediately; increases still need the next heartbeat.
-    let capabilities: String =
-        tx.query_row("SELECT capabilities FROM nodes WHERE id=?1", [node], |r| {
-            r.get(0)
-        })?;
+    let capabilities: String = tx.query_row(
+        "SELECT capabilities FROM live_nodes WHERE id=?1",
+        [node],
+        |r| r.get(0),
+    )?;
     let mut cap: Value = serde_json::from_str(&capabilities)?;
     for (key, bound) in [("memory_mib", memory), ("slots", slots), ("vcpus", cpus)] {
         cap[key] = json!(cap[key].as_u64().unwrap_or(0).min(bound as u64));
@@ -344,7 +346,7 @@ pub fn revoke(root: &Path, node: &str) -> Result<()> {
 }
 pub fn inventory(root: &Path) -> Result<Value> {
     let db = db(root)?;
-    let mut stmt = db.prepare("SELECT id,revoked,heartbeat,memory_mib,slots,capabilities,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16),rowid,COALESCE((SELECT pool FROM node_placement_policy WHERE node=nodes.id),'default'),COALESCE((SELECT active FROM node_placement_policy WHERE node=nodes.id),1),COALESCE((SELECT controller_drain FROM node_placement_policy WHERE node=nodes.id),0) FROM nodes ORDER BY id")?;
+    let mut stmt = db.prepare("SELECT id,revoked,heartbeat,memory_mib,slots,capabilities,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=live_nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=live_nodes.id),16),rowid,COALESCE((SELECT pool FROM node_placement_policy WHERE node=live_nodes.id),'default'),COALESCE((SELECT active FROM node_placement_policy WHERE node=live_nodes.id),1),COALESCE((SELECT controller_drain FROM node_placement_policy WHERE node=live_nodes.id),0) FROM live_nodes ORDER BY id")?;
     let rows = stmt.query_map([], |r| {
         let ram:u32 = r.get(3)?;
         let slots:u32 = r.get(4)?;
@@ -381,9 +383,12 @@ pub fn online(root: &Path, node: &str) -> Result<()> {
     if node == "local" {
         return Ok(());
     }
+    online_in(&db(root)?, node)
+}
+fn online_in(db: &Connection, node: &str) -> Result<()> {
     ensure!(
-        db(root)?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat>?2 AND heartbeat<=?3)",
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM live_nodes WHERE id=?1 AND revoked=0 AND heartbeat>?2 AND heartbeat<=?3)",
             params![node, now() - OFFLINE,now()],
             |r| r.get::<_, bool>(0)
         )?,
@@ -393,10 +398,11 @@ pub fn online(root: &Path, node: &str) -> Result<()> {
 }
 pub fn operation_capable(root: &Path, node: &str, op: &str) -> Result<()> {
     if node != "local" {
-        let cap: String =
-            db(root)?.query_row("SELECT capabilities FROM nodes WHERE id=?1", [node], |r| {
-                r.get(0)
-            })?;
+        let cap: String = db(root)?.query_row(
+            "SELECT capabilities FROM live_nodes WHERE id=?1",
+            [node],
+            |r| r.get(0),
+        )?;
         common::node_operation(&serde_json::from_str(&cap)?, op)?;
     }
     Ok(())
@@ -407,7 +413,7 @@ pub fn managed_lifecycle_capable(root: &Path, node: &str) -> Result<()> {
         crate::wire::request(root, json!({"op":"status"}))?
     } else {
         serde_json::from_str(&db(root)?.query_row(
-            "SELECT capabilities FROM nodes WHERE id=?1",
+            "SELECT capabilities FROM live_nodes WHERE id=?1",
             [node],
             |r| r.get::<_, String>(0),
         )?)?
@@ -423,10 +429,11 @@ pub fn managed_lifecycle_capable(root: &Path, node: &str) -> Result<()> {
 pub fn ssh_capable(root: &Path, node: &str) -> Result<()> {
     online(root, node)?;
     if node != "local" {
-        let cap: String =
-            db(root)?.query_row("SELECT capabilities FROM nodes WHERE id=?1", [node], |r| {
-                r.get(0)
-            })?;
+        let cap: String = db(root)?.query_row(
+            "SELECT capabilities FROM live_nodes WHERE id=?1",
+            [node],
+            |r| r.get(0),
+        )?;
         ensure!(
             serde_json::from_str::<Value>(&cap)?["guest_ssh_v1"] == true,
             "node does not support guest SSH v1"
@@ -443,7 +450,8 @@ pub fn route(root: &Path, node: &str) -> Result<PathBuf> {
         root.join("nodes").join(node)
     })
 }
-fn auth(root: &Path, node: &str, headers: &HeaderMap) -> Result<()> {
+/// The node credential a request carries, checked for shape only.
+fn bearer(node: &str, headers: &HeaderMap) -> Result<String> {
     common::identifier(node)?;
     let secret = headers
         .get("authorization")
@@ -451,15 +459,144 @@ fn auth(root: &Path, node: &str, headers: &HeaderMap) -> Result<()> {
         .and_then(|s| s.strip_prefix("Bearer "))
         .context("node credential required")?;
     ensure!(secret.len() == 64, "invalid credential");
-    ensure!(
-        db(root)?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND credential_hash=?2 AND revoked=0)",
-            params![node, digest(secret)],
-            |r| r.get::<_, bool>(0)
-        )?,
-        "invalid credential"
-    );
+    Ok(secret.to_owned())
+}
+fn authorized(db: &Connection, node: &str, secret: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND credential_hash=?2 AND revoked=0)",
+        params![node, digest(secret)],
+        |r| r.get::<_, bool>(0),
+    )?)
+}
+async fn authenticated(c: &Controller, node: &str, headers: &HeaderMap) -> bool {
+    let Ok(secret) = bearer(node, headers) else {
+        return false;
+    };
+    let node = node.to_owned();
+    matches!(
+        c.catalog(move |db| authorized(db, &node, &secret)).await,
+        Ok(true)
+    )
+}
+/// The catalog owns policy and credentials; each runner owns a separate transient
+/// WAL writer lock. A blocked append must never age out unrelated runners.
+fn liveness_db(root: &Path, node: &str) -> Result<Connection> {
+    common::identifier(node)?;
+    let dir = root.join("nodes").join(node);
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let path = dir.join("liveness.sqlite3");
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)?;
+    private(&path)?;
+    let db = Connection::open(path)?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+        CREATE TABLE IF NOT EXISTS health(singleton INTEGER PRIMARY KEY CHECK(singleton=1),session TEXT,heartbeat INTEGER NOT NULL DEFAULT 0,capabilities TEXT NOT NULL DEFAULT '{}');
+        INSERT OR IGNORE INTO health(singleton) VALUES(1);")?;
+    Ok(db)
+}
+/// Keep every SQL consumer on the same health source, including placement and drain
+/// generation checks. Catalog backups exclude transient health. Legacy/offline fixtures
+/// without a health file retain their catalog values; controller startup creates/clears it.
+pub(crate) fn health_view(db: &Connection, root: &Path) -> Result<()> {
+    use rusqlite::{functions::FunctionFlags, types::Value as SqlValue};
+    let root = root.to_owned();
+    let readers = std::cell::RefCell::new(HashMap::<String, Connection>::new());
+    db.create_scalar_function("node_health", 3, FunctionFlags::SQLITE_UTF8, move |ctx| {
+        let mut readers = readers.borrow_mut();
+        let node = ctx.get::<String>(0)?;
+        common::identifier(&node).map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?;
+        let field = ctx.get::<String>(1)?;
+        let fallback = ctx.get::<SqlValue>(2)?;
+        let read = || -> Result<Connection> {
+            common::identifier(&node)?;
+            let path = root.join("nodes").join(&node).join("liveness.sqlite3");
+            private(&path)?;
+            Ok(Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?)
+        };
+        if !readers.contains_key(&node) {
+            let path = root.join("nodes").join(&node).join("liveness.sqlite3");
+            if !path
+                .try_exists()
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
+            {
+                return Ok(fallback);
+            }
+            readers.insert(
+                node.clone(),
+                read().map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?,
+            );
+        }
+        let sql = match field.as_str() {
+            "heartbeat" => "SELECT heartbeat FROM health WHERE singleton=1",
+            "capabilities" => "SELECT capabilities FROM health WHERE singleton=1",
+            "session" => "SELECT session FROM health WHERE singleton=1",
+            _ => return Err(rusqlite::Error::InvalidParameterName(field)),
+        };
+        readers[&node].query_row(sql, [], |r| r.get::<_, SqlValue>(0))
+    })?;
+    db.execute_batch(
+        "CREATE TEMP VIEW live_nodes AS SELECT rowid,id,credential_hash,revoked,
+        node_health(id,'heartbeat',heartbeat) AS heartbeat,memory_mib,slots,
+        node_health(id,'capabilities',capabilities) AS capabilities,
+        node_health(id,'session',session) AS session FROM main.nodes;",
+    )?;
     Ok(())
+}
+/// Records one heartbeat for this session, on this runner's independent writer lock.
+fn heartbeat(
+    catalog: &Connection,
+    db: &Connection,
+    node: &str,
+    generation: &str,
+    v: &Value,
+) -> Result<usize> {
+    let (ram, slots, cpus) = catalog.query_row("SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16) FROM nodes WHERE id=?1",[node],|r|Ok((r.get::<_,u32>(0)? as u64,r.get::<_,u32>(1)? as u64,r.get::<_,u32>(2)? as u64)))?;
+    let mut cap = v.clone();
+    cap["memory_mib"] = json!(v["memory_mib"].as_u64().unwrap().min(ram));
+    cap["slots"] = json!(v["slots"].as_u64().unwrap().min(slots));
+    cap["vcpus"] = json!(v["vcpus"].as_u64().unwrap().min(cpus));
+    if let Some(o) = cap.as_object_mut() {
+        o.remove("type");
+        o.remove("ready_ack");
+    }
+    // Hold the actual SQLite writer lock in the regression, rather than sleeping before SQL.
+    #[cfg(test)]
+    let held = if STALLED.lock().unwrap().as_deref() == Some(node) {
+        let held =
+            rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+        while STALLED.lock().unwrap().as_deref() == Some(node) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(held)
+    } else {
+        None
+    };
+    let rows = db.execute(
+        "UPDATE health SET heartbeat=?1,capabilities=?2 WHERE singleton=1 AND session=?3",
+        params![now(), cap.to_string(), generation],
+    )?;
+    #[cfg(test)]
+    if let Some(held) = held {
+        held.commit()?;
+    }
+    Ok(rows)
+}
+#[cfg(test)]
+pub(crate) static STALLED: Mutex<Option<String>> = Mutex::new(None);
+async fn blocking<T: Send + 'static>(
+    db: Arc<Mutex<Connection>>,
+    work: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(move || work(&db.lock().unwrap_or_else(|e| e.into_inner()))).await?
 }
 struct Session {
     generation: String,
@@ -477,8 +614,47 @@ struct Controller {
     jobs: Arc<Mutex<HashMap<String, Job>>>,
     slots: Arc<Semaphore>,
 }
+impl Controller {
+    fn new(root: &Path) -> Result<Self> {
+        Ok(Self {
+            root: root.to_owned(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            slots: Arc::new(Semaphore::new(32)),
+        })
+    }
+    /// Catalog work never runs on the two async threads, and no connection or lock is
+    /// shared between sessions or proxies: a capture's writeback can hold a call in I/O
+    /// for minutes, and that must delay only its caller, never pings or other runners.
+    /// One-off calls open their own connection here.
+    async fn catalog<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || work(&db(&root)?)).await?
+    }
+}
+/// An open stream needs its node's live session (checked in memory) and an unrevoked
+/// credential, not a recent recorded heartbeat: a slow catalog write must not cut it.
+fn admitted_in(db: &Connection, node: &str) -> Result<()> {
+    ensure!(
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND revoked=0)",
+            [node],
+            |r| r.get::<_, bool>(0),
+        )?,
+        "node revoked"
+    );
+    Ok(())
+}
 async fn enrollment(State(c): State<Controller>, Json(v): Json<Value>) -> Response {
-    match enroll(&c.root, v) {
+    // A catalog transaction: off the async threads, like every controller database call.
+    match tokio::task::spawn_blocking(move || enroll(&c.root, v))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
+    {
         Ok(v) => Json(v).into_response(),
         Err(_) => (StatusCode::UNAUTHORIZED, "enrollment rejected").into_response(),
     }
@@ -489,7 +665,7 @@ async fn session(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if auth(&c.root, &node, &headers).is_err() {
+    if !authenticated(&c, &node, &headers).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     ws.max_message_size(32768)
@@ -502,7 +678,7 @@ async fn job(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if auth(&c.root, &node, &headers).is_err() {
+    if !authenticated(&c, &node, &headers).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let job = {
@@ -530,17 +706,58 @@ async fn job(
 async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socket: WebSocket) {
     // Latest authenticated connection wins; prior control and job generations are fenced.
     let generation = common::nonce().unwrap();
+    let Ok(secret) = bearer(&node, &headers) else {
+        return;
+    };
+    let full = |sessions: &HashMap<String, Session>| {
+        let full = sessions.len() >= 16 && !sessions.contains_key(&node);
+        if full {
+            eprintln!("node {node}: session refused: 16 runners are connected");
+        }
+        full
+    };
+    if full(&c.sessions.lock().unwrap()) {
+        return;
+    }
+    // A session the catalog did not record would heartbeat into no row and leave the
+    // runner offline without a word: refuse it, so the agent reconnects and logs why.
+    // Bounded, so a stalled disk cannot park every reconnecting runner's connection.
+    let opened = {
+        let (root, node, generation) = (c.root.clone(), node.clone(), generation.clone());
+        let secret = secret.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let catalog = db(&root)?;
+                ensure!(authorized(&catalog, &node, &secret)?, "credential revoked");
+                let db = liveness_db(&root, &node)?;
+                let n = db.execute(
+                    "UPDATE health SET session=?1,heartbeat=0 WHERE singleton=1",
+                    params![generation],
+                )?;
+                Ok((n, db, catalog))
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("session write took over 10 s"))
+        .and_then(|joined| Ok(joined??))
+    };
+    let (db, catalog) = match opened {
+        Ok((1, db, catalog)) => (Arc::new(Mutex::new(db)), Arc::new(Mutex::new(catalog))),
+        Ok(_) => {
+            eprintln!("node {node}: session refused: not an enrolled, active node");
+            return;
+        }
+        Err(e) => {
+            eprintln!("node {node}: session not recorded ({e:#}); the agent reconnects");
+            return;
+        }
+    };
     let (tx, mut rx) = mpsc::channel(16);
     {
         let mut sessions = c.sessions.lock().unwrap();
-        if sessions.len() >= 16 && !sessions.contains_key(&node) {
+        if full(&sessions) {
             return;
-        }
-        if let Ok(db) = db(&c.root) {
-            let _ = db.execute(
-                "UPDATE nodes SET session=?1,heartbeat=?2 WHERE id=?3 AND revoked=0",
-                params![generation, 0, node],
-            );
         }
         sessions.insert(
             node.clone(),
@@ -550,58 +767,72 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             },
         );
     }
+    let (beats, pending) = tokio::sync::watch::channel(None);
+    let (recorded, mut verdicts) = mpsc::channel(4);
+    let recorder = tokio::spawn(record(
+        db,
+        catalog,
+        node.clone(),
+        generation.clone(),
+        secret,
+        pending,
+        recorded,
+    ));
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     let mut last = tokio::time::Instant::now();
     // A new worker process holds no per-box AWS credentials: deliver them now.
     #[cfg(target_os = "linux")]
     let mut worker_pid = None;
-    loop {
+    let mut ticked = tokio::time::Instant::now();
+    let reason: String = loop {
         tokio::select! {
             _=tick.tick()=>{
+                // A tick this late means this process stalled, not the runner: its frames are
+                // only now being read, so the silence is not held against it.
+                if ticked.elapsed()>Duration::from_secs(9) {last=tokio::time::Instant::now();}
+                ticked=tokio::time::Instant::now();
                 let current=c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation);
-                if !current || last.elapsed()>Duration::from_secs(15) || auth(&c.root,&node,&headers).is_err() {break;}
-                if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Ping(vec![].into()))).await,Ok(Ok(()))) {break;}
+                if !current {break "replaced by a newer session".into();}
+                if last.elapsed()>Duration::from_secs(15) {break "no heartbeat for 15 s".into();}
+                if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Ping(vec![].into()))).await,Ok(Ok(()))) {break "ping not sent within 3 s".into();}
             }
             msg=socket.recv()=>{
                 match msg {Some(Ok(Message::Text(text)))=>{
-                    let Ok(v)=serde_json::from_str::<Value>(&text) else {break;};
+                    let Ok(v)=serde_json::from_str::<Value>(&text) else {break "invalid heartbeat".into();};
                     if let Err(e)=common::node_capabilities(&v) {
                         // Say why, so a runner newer than this controller logs it instead of retrying blind.
                         let reason:String=format!("{e:#}").chars().take(120).collect();
-                        let _=tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code:4001,reason:reason.into()})))).await;
-                        break;
+                        let _=tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code:4001,reason:reason.clone().into()})))).await;
+                        break format!("heartbeat refused: {reason}");
                     }
                     last=tokio::time::Instant::now();
                     if !c.root.join("nodes").join(&node).join("control.sock").exists(){continue;}
-                    if let Ok(db)=db(&c.root)
-                        && let Ok((ram,slots,cpus)) = db.query_row("SELECT memory_mib,slots,COALESCE((SELECT vcpu_cap FROM node_capacity_limits WHERE node=nodes.id),(SELECT vcpu_cap FROM node_limits WHERE node=nodes.id),16) FROM nodes WHERE id=?1",[&node],|r|Ok((r.get::<_,u32>(0)? as u64,r.get::<_,u32>(1)? as u64,r.get::<_,u32>(2)? as u64))) {
-                            let mut cap=v.clone();
-                            cap["memory_mib"]=json!(v["memory_mib"].as_u64().unwrap().min(ram));
-                            cap["slots"]=json!(v["slots"].as_u64().unwrap().min(slots));
-                            cap["vcpus"]=json!(v["vcpus"].as_u64().unwrap().min(cpus));
-                            if let Some(o)=cap.as_object_mut(){o.remove("type");o.remove("ready_ack");}
-                            if db.execute("UPDATE nodes SET heartbeat=?1,capabilities=?2 WHERE id=?3 AND session=?4 AND revoked=0",params![now(),cap.to_string(),node,generation]).is_ok_and(|n|n==1) {
-                                #[cfg(target_os="linux")]
-                                if v["aws_metadata_v1"]==true && worker_pid.replace(v["worker_pid"].clone())!=Some(v["worker_pid"].clone()) {
-                                    crate::aws_identity::notify();
-                                }
-                                #[cfg(target_os="linux")]
-                                if v["image_store_v1"]==true {
-                                    let (root,node,images)=(c.root.clone(),node.clone(),v["image_digests"].clone());
-                                    tokio::task::spawn_blocking(move||{let _=crate::image_store::prefetch(&root,&node,&images);});
-                                }
-                                // Old native agents expect job IDs only; acknowledge only the guided agent's optional extension.
-                                if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation,"extensions":["cache-inventory-v1"]}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break;}}
-                            }
-                    }
-                }, Some(Ok(Message::Pong(_)))=>{}, _=>break}
+                    // Only the latest beat waits while the catalog is slow.
+                    beats.send_replace(Some(v));
+                }, Some(Ok(Message::Pong(_)))=>{}, _=>break "channel closed".into()}
+            }
+            verdict=verdicts.recv()=>{
+                let v:Value=match verdict {Some(Ok(v))=>v, Some(Err(reason))=>break reason, None=>break "recorder stopped".into()};
+                #[cfg(target_os="linux")]
+                if v["aws_metadata_v1"]==true && worker_pid.replace(v["worker_pid"].clone())!=Some(v["worker_pid"].clone()) {
+                    crate::aws_identity::notify();
+                }
+                #[cfg(target_os="linux")]
+                if v["image_store_v1"]==true {
+                    let (root,node,images)=(c.root.clone(),node.clone(),v["image_digests"].clone());
+                    tokio::task::spawn_blocking(move||{let _=crate::image_store::prefetch(&root,&node,&images);});
+                }
+                // Old native agents expect job IDs only; acknowledge only the guided agent's optional extension.
+                if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation,"extensions":["cache-inventory-v1"]}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break "acknowledgement not sent within 3 s".into();}}
             }
             id=rx.recv()=>{
-                let Some(id)=id else {break;};
-                if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(id.into()))).await,Ok(Ok(()))) {break;}
+                let Some(id)=id else {break "dispatch closed".into();};
+                if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(id.into()))).await,Ok(Ok(()))) {break "job not sent within 3 s".into();}
             }
         }
-    }
+    };
+    recorder.abort();
+    eprintln!("node {node}: session ended ({reason})");
     {
         let mut sessions = c.sessions.lock().unwrap();
         if sessions
@@ -615,12 +846,68 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             .unwrap()
             .retain(|_, j| j.generation != generation);
     }
-    if let Ok(db) = db(&c.root) {
-        let _ = db.execute(
-            "UPDATE nodes SET heartbeat=0 WHERE id=?1 AND session=?2",
-            params![node, generation],
-        );
+    // Clearing the mark also voids a heartbeat of this session still in flight.
+    let root = c.root.clone();
+    let closed = tokio::task::spawn_blocking(move || -> Result<usize> {
+        Ok(liveness_db(&root, &node)?.execute(
+            "UPDATE health SET heartbeat=0,session=NULL WHERE singleton=1 AND session=?1",
+            params![generation],
+        )?)
+    })
+    .await;
+    let closed = closed.map_err(anyhow::Error::from).and_then(|r| r);
+    if let Err(e) = closed {
+        eprintln!("session close not recorded: {e:#}");
     }
+}
+/// Records a session's heartbeats and re-checks its credential every 3 s, using
+/// independent health and catalog connections: a call blocked in I/O delays only this
+/// runner's recorded heartbeat, while its channel keeps pinging and other runners' beats
+/// land. A failure, a revoked credential or a heartbeat that matches no row (the health
+/// store no longer holds this session) ends the session, so the agent reconnects instead of
+/// staying offline silently.
+async fn record(
+    db: Arc<Mutex<Connection>>,
+    catalog: Arc<Mutex<Connection>>,
+    node: String,
+    generation: String,
+    secret: String,
+    mut beats: tokio::sync::watch::Receiver<Option<Value>>,
+    verdicts: mpsc::Sender<std::result::Result<Value, String>>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(3));
+    let failure = loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let (node, secret) = (node.clone(), secret.clone());
+                match blocking(catalog.clone(), move |db| authorized(db, &node, &secret)).await {
+                    Ok(true) => {}
+                    Ok(false) => break "credential revoked".to_owned(),
+                    Err(e) => break format!("credential not checked: {e:#}"),
+                }
+            }
+            changed = beats.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let Some(beat) = beats.borrow_and_update().clone() else {
+                    continue;
+                };
+                let (n, g, b) = (node.clone(), generation.clone(), beat.clone());
+                let catalog = catalog.clone();
+                match blocking(db.clone(), move |db| heartbeat(&catalog.lock().unwrap_or_else(|e| e.into_inner()), db, &n, &g, &b)).await {
+                    Ok(1) => {
+                        if verdicts.send(Ok(beat)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => break "the health store no longer holds this session (heartbeat matched no row)".to_owned(),
+                    Err(e) => break format!("heartbeat not recorded: {e:#}"),
+                }
+            }
+        }
+    };
+    let _ = verdicts.send(Err(failure)).await;
 }
 async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) -> Result<()> {
     let _permit = c
@@ -633,7 +920,19 @@ async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) 
         stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
         "unauthorized proxy peer"
     );
-    online(&c.root, &node)?;
+    let db = {
+        let (root, node) = (c.root.clone(), node.clone());
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let db = db(&root)?;
+            online_in(&db, &node)?;
+            Ok(Arc::new(Mutex::new(db)))
+        })
+        .await??
+    };
+    let admitted = || {
+        let node = node.clone();
+        blocking(db.clone(), move |db| admitted_in(db, &node))
+    };
     ensure!(
         !STOPPING.load(std::sync::atomic::Ordering::SeqCst),
         "runner restarting; retry"
@@ -668,14 +967,14 @@ async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) 
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     loop {
         tokio::select! {
-            _=tick.tick()=>{online(&c.root,&node)?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"node session replaced");}
+            _=tick.tick()=>{admitted().await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"node session replaced");}
             n=reader.read(&mut buffer)=>{
                 let n=n?; if n==0 {break;}
-                online(&c.root,&node)?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node input");
+                admitted().await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node input");
                 tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Binary(buffer[..n].to_vec().into()))).await??;
             }
             msg=socket.recv()=>match msg {
-                Some(Ok(Message::Binary(bytes)))=>{online(&c.root,&node)?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node result");tokio::time::timeout(Duration::from_secs(5),writer.write_all(&bytes)).await??;}
+                Some(Ok(Message::Binary(bytes)))=>{admitted().await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node result");tokio::time::timeout(Duration::from_secs(5),writer.write_all(&bytes)).await??;}
                 Some(Ok(Message::Ping(_)|Message::Pong(_)))=>{}, _=>break,
             }
         }
@@ -685,21 +984,40 @@ async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) 
 async fn proxies(c: Controller) -> Result<()> {
     let mut bound = HashMap::new();
     loop {
-        let entries = inventory(&c.root)?;
+        let root = c.root.clone();
+        // Off the async threads; a failed read is retried, never the end of new node sockets.
+        let entries = match tokio::task::spawn_blocking(move || inventory(&root)).await? {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("node inventory unavailable: {e:#}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
         for node in entries.as_array().unwrap() {
             let node = node["id"].as_str().unwrap();
             if bound.contains_key(node) {
                 continue;
             }
             let dir = c.root.join("nodes").join(node);
-            fs::create_dir_all(&dir)?;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
             let path = dir.join("control.sock");
-            if path.exists() {
-                fs::remove_file(&path)?;
-            }
-            let listener = tokio::net::UnixListener::bind(&path)?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            let listener = match (|| -> Result<_> {
+                fs::create_dir_all(&dir)?;
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+                if path.exists() {
+                    fs::remove_file(&path)?;
+                }
+                let listener = tokio::net::UnixListener::bind(&path)?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+                Ok(listener)
+            })() {
+                Ok(listener) => listener,
+                // Retried next second; other runners' sockets are still bound.
+                Err(e) => {
+                    eprintln!("node {node}: control socket not bound: {e:#}");
+                    continue;
+                }
+            };
             let child = c.clone();
             let node = node.to_owned();
             bound.insert(node.clone(), true);
@@ -813,6 +1131,18 @@ fn routes(c: Controller) -> Router {
         ))
         .with_state(c)
 }
+fn reset_health(root: &Path) -> Result<()> {
+    let catalog = db(root)?;
+    catalog.execute("UPDATE nodes SET heartbeat=0,session=NULL", [])?;
+    let nodes = catalog
+        .prepare("SELECT id FROM nodes")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for node in nodes {
+        liveness_db(root, &node)?.execute("UPDATE health SET heartbeat=0,session=NULL", [])?;
+    }
+    Ok(())
+}
 pub fn controller(
     root: &Path,
     listen: SocketAddr,
@@ -836,20 +1166,15 @@ pub fn controller(
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "controller already running"
     );
-    db(root)?.execute("UPDATE nodes SET heartbeat=0,session=NULL", [])?;
-    let c = Controller {
-        root: root.into(),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        jobs: Arc::new(Mutex::new(HashMap::new())),
-        slots: Arc::new(Semaphore::new(32)),
-    };
+    reset_health(root)?;
+    let c = Controller::new(root)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
     rt.block_on(async move {
         let routes = routes(c.clone());
-        tokio::spawn(proxies(c));
+        tokio::spawn(proxies(c.clone()));
         let slots = Arc::new(Semaphore::new(128));
         if let (Some(cert), Some(key)) = (cert, key) {
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -945,28 +1270,11 @@ fn socket(
         None
     };
     // Resolve and connect under bounded deadlines before sending the bearer header.
-    use std::net::ToSocketAddrs;
-    static RESOLVERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    use std::sync::atomic::Ordering;
-    RESOLVERS
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            (n < 4).then_some(n + 1)
-        })
-        .map_err(|_| anyhow::anyhow!("DNS resolver capacity"))?;
     let u = reqwest::Url::parse(&url)?;
-    let host = u.host_str().context("host")?.to_owned();
-    let port = u.port_or_known_default().context("port")?;
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result = (host.as_str(), port)
-            .to_socket_addrs()
-            .map(|a| a.collect::<Vec<_>>());
-        let _ = tx.send(result);
-        RESOLVERS.fetch_sub(1, Ordering::SeqCst);
-    });
-    let addresses = rx
-        .recv_timeout(Duration::from_secs(5))
-        .context("DNS timeout")??;
+    let addresses = resolve(
+        u.host_str().context("host")?,
+        u.port_or_known_default().context("port")?,
+    )?;
     let start = std::time::Instant::now();
     let mut connected = None;
     for address in addresses {
@@ -997,6 +1305,52 @@ fn socket(
     let result = tungstenite::client_tls_with_config(request, tcp, Some(config), connector);
     let _ = done_tx.send(());
     Ok(result?.0)
+}
+/// Resolves under a 5 s deadline. A hung getaddrinfo keeps its thread, so at most four
+/// lookups run at once; an IP literal needs none, and while lookups fail, hang or are all
+/// busy the addresses that last resolved for this host are used again (TLS still checks
+/// the controller), so hung lookups cannot block every later connect.
+fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RESOLVERS: AtomicUsize = AtomicUsize::new(0);
+    static LAST: Mutex<Option<(String, u16, Vec<SocketAddr>)>> = Mutex::new(None);
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let looked_up = (|| -> Result<Vec<SocketAddr>> {
+        RESOLVERS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < 4).then_some(n + 1)
+            })
+            .map_err(|_| anyhow::anyhow!("DNS resolver capacity"))?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let name = host.to_owned();
+        std::thread::spawn(move || {
+            let result = (name.as_str(), port)
+                .to_socket_addrs()
+                .map(|a| a.collect::<Vec<_>>());
+            let _ = tx.send(result);
+            RESOLVERS.fetch_sub(1, Ordering::SeqCst);
+        });
+        let addresses = rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("DNS timeout")??;
+        ensure!(!addresses.is_empty(), "no address for {host}");
+        Ok(addresses)
+    })();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    match looked_up {
+        Ok(addresses) => {
+            *last = Some((host.to_owned(), port, addresses.clone()));
+            Ok(addresses)
+        }
+        Err(error) => match last.as_ref() {
+            Some((h, p, addresses)) if h == host && *p == port => Ok(addresses.clone()),
+            _ => Err(error),
+        },
+    }
 }
 fn timeout_socket(
     socket: &tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
@@ -1134,6 +1488,9 @@ fn build_beat(
         json!(status["managed_lifecycle_v1"] == true && common::placement_capable(status).is_ok());
     beat["aws_identity_v1"] = json!(status["aws_identity_v1"] == true);
     beat["aws_metadata_v1"] = json!(status["aws_metadata_v1"] == true);
+    // Disk-only automatic recovery points from the worker, and this agent's reconnect when
+    // the controller goes silent: together a capture no longer takes the runner offline.
+    beat["recovery_disk_only_v1"] = json!(status["recovery_disk_only_v1"] == true);
     #[cfg(target_os = "linux")]
     {
         beat["move_fork_v1"] = json!(
@@ -1194,6 +1551,10 @@ fn base_images() -> Vec<&'static str> {
 /// A beat this old means the status thread is stuck (worker requests already time out
 /// after 1200 s): the channel closes and the runner shows offline.
 const BEAT_STALE: Duration = Duration::from_secs(1500);
+/// The controller pings every 3 s and drops a runner silent for 15 s; a channel with no
+/// frame for this long is dead (a lost controller or path), so the agent reconnects
+/// instead of waiting minutes for TCP to give up.
+const CONTROLLER_SILENT: Duration = Duration::from_secs(20);
 
 pub fn agent(
     root: &Path,
@@ -1365,7 +1726,13 @@ pub fn agent(
             timeout_socket(&ws)?;
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
             let mut unconfirmed = None;
+            let mut heard = std::time::Instant::now();
             loop {
+                ensure!(
+                    heard.elapsed() < CONTROLLER_SILENT,
+                    "no frame from the controller for {} s",
+                    heard.elapsed().as_secs()
+                );
                 // A refused heartbeat closes the channel at once; one still open a second
                 // later was accepted.
                 if heartbeat.elapsed() > Duration::from_secs(1)
@@ -1410,7 +1777,11 @@ pub fn agent(
                     heartbeat = std::time::Instant::now();
                     unconfirmed = Some(beat);
                 }
-                match ws.read() {
+                let frame = ws.read();
+                if frame.is_ok() {
+                    heard = std::time::Instant::now();
+                }
+                match frame {
                     Ok(tungstenite::Message::Text(id)) => {
                         if let Ok(v) = serde_json::from_str::<Value>(&id) {
                             ensure!(
@@ -1854,10 +2225,11 @@ pub(crate) fn drain_inventory(
     seal: Option<&str>,
     close: bool,
 ) -> Result<Value> {
-    let cap: String =
-        db(root)?.query_row("SELECT capabilities FROM nodes WHERE id=?1", [node], |r| {
-            r.get(0)
-        })?;
+    let cap: String = db(root)?.query_row(
+        "SELECT capabilities FROM live_nodes WHERE id=?1",
+        [node],
+        |r| r.get(0),
+    )?;
     ensure!(
         serde_json::from_str::<Value>(&cap)?["drain_inventory_v1"] == true,
         "runner lacks bounded drain inventory"

@@ -5,7 +5,7 @@ that role through the standard AWS credential chain (the AWS CLI, every SDK,
 Terraform); no AWS access key is stored in the box or on its disk. Off by default.
 There are two modes, chosen by the operator in `aws-identity.json` on the controller:
 
-| | Metadata mode (0.9.40) | Web-identity mode (0.9.37, the default) |
+| | Metadata mode (0.9.41) | Web-identity mode (0.9.37, the default) |
 | --- | --- | --- |
 | Where the controller runs | on EC2 with an instance role | anywhere |
 | What the box sees | EC2's instance metadata at `169.254.169.254`, nothing in the box | a token file and `AWS_ROLE_ARN`/`AWS_WEB_IDENTITY_TOKEN_FILE` in login shells |

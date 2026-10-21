@@ -196,10 +196,67 @@ undone. Terminals never switch to a replacement stream automatically.
 | Node initial job request / dispatch wait | 10 seconds |
 | DNS / TCP connect / TLS+upgrade agent deadline | 5 / 5 / 10 seconds |
 | Reconnect / heartbeat / offline | 2 / 3 / 15 seconds |
+| Agent with no frame from the controller (pings every 3 s) | reconnects after 20 seconds |
 | Job write / guest RPC read / terminal idle | 5 / existing 120 / 90 seconds |
 | Human guest file / PTY frame | 256 KiB / 4096 bytes |
 | Human non-file / file request body | 16 KiB / 384 KiB |
-| Runtime free storage reserve | 128 MiB; capture also reserves RAM-sized free space |
+| Runtime free storage reserve | 128 MiB; a RAM capture also reserves RAM-sized free space (a disk-only recovery point does not) |
+
+### Staying up while the disk is slow
+
+A capture's writeback can make every fsync on the data filesystem wait for minutes.
+The controller therefore runs no catalog or health call on its two async threads:
+auth checks, heartbeats, session marks, enrollment and inventory run on blocking
+threads, and no session-map lock is held across a database call. Each session and
+proxy reuses its own connections.
+
+Ownership, credentials, revocation and capacity policy remain in `catalog.sqlite3`.
+Transient session generation, heartbeat and reported capabilities live in
+`nodes/<id>/liveness.sqlite3`, one private SQLite WAL database per runner. Health
+commits use `synchronous=NORMAL`; checkpointing can delay that runner, but neither
+a blocked WAL append nor a held catalog writer lock can hold another runner's
+health writer lock. Separate connections to one WAL file would still share its
+writer lock and would **not** provide this isolation.
+
+All controller/gateway health readers use the connection-local `live_nodes` view,
+which combines durable catalog authority with the runner's current health. This
+includes `ow nodes`, placement/admission, transfer, park/wake, drain generation
+fences, capability checks and scaler reconciliation. Reported budgets remain capped
+by the controller's durable policy. The health files contain no credentials or
+durable policy and are excluded from catalog backups; startup clears their session
+marks before serving. Missing health files on older deployments use the legacy
+catalog fields until the new controller creates them. Unreadable health fails
+closed. Upgrade the controller and gateway together: older gateway binaries read
+only catalog heartbeats and will conservatively report new sessions offline.
+Rollback needs both binaries reverted together and the controller restarted; no
+durable catalog migration or workspace data rollback is needed.
+
+A new job needs a heartbeat recorded in the last 15 seconds; an open proxy also
+requires its runner's live session and an unrevoked credential. A runner's own
+blocked health write can still make it appear offline temporarily, but its pings
+continue. Health write errors or no matching session end that session with a log
+line, so the agent reconnects. A session mark not recorded within 10 seconds
+refuses the connection. A catalog writer blocked in I/O may still delay durable
+mutations such as enrollment or creating a new workspace; this does not stall
+other runners' health or existing-workspace proxy dispatch.
+
+A session ends, with a `node NAME: session ended (REASON)` line in the controller log,
+when a heartbeat cannot be recorded (an error, or a heartbeat that matches no row
+because the health store no longer holds this session), when its credential is revoked,
+or after 15 seconds without a heartbeat; a session refused at the start (its mark not
+recorded, or 16 runners already connected) logs `session refused` or `session not
+recorded`. Ending a session clears its mark, so a late beat cannot revive it. The
+agent then reconnects by itself, so a lost session mark no longer leaves a runner
+offline until a restart. A tick that arrives far behind schedule means the controller
+itself stalled, so that silence is not held against the runner. The agent in turn
+reconnects after 20 seconds without any frame from the controller, so a lost
+controller or network path is noticed in seconds rather than when TCP gives up.
+Controller and agent from 0.9.40 behave this way; a runner whose worker and agent
+both have it advertises `recovery_disk_only_v1` (see [recovery](RECOVERY.md)).
+
+An IP-literal controller address needs no DNS lookup. Lookups run on at most four
+threads with a 5-second wait; while they fail, time out or are all busy, the agent
+reuses the addresses that last resolved for the controller (TLS still verifies it).
 
 Authenticated WebSocket redirects are never followed; custom CA trust applies to
 the first and only TLS handshake. No bearer secret is sent in a URL/query or

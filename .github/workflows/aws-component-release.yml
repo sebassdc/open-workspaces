@@ -91,6 +91,10 @@ jobs:
         run: |
           cargo +1.97.0 test --locked -p ow --bin ow restored_controller_rejects_previously_issued_job_and_old_session_results
           python3 -m unittest discover -s scripts -p 'test_controller_recovery_acceptance.py'
+      - name: Check recovery control-plane isolation
+        working-directory: .
+        run: |
+          cargo +1.97.0 test --locked -p ow --bin ow -- one_blocked_heartbeat_write_leaves_other_runners_online a_stalled_health_write_neither_stops_the_controller_nor_strands_a_runner a_runtime_stall_does_not_drop_the_sessions_it_delayed live_health_preserves_catalog_policy_revocation_and_restart_fences an_agent_reconnects_by_itself_when_the_controller_goes_silent
       - name: Check snapshot admission and failure recovery before tagging
         working-directory: .
         run: |
