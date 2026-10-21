@@ -104,6 +104,8 @@ instance metadata (the AWS CLI, Go v2, Rust) take the controller's region.
   from the allow-list withdraw the runner's credentials before the change is saved.
   If the runner of a running (or hibernated) box with a role cannot be reached,
   transfer and detach are refused until it is back.
+- An IMDSv2 token names the role generation it was issued under: after a detach or
+  re-attach, programs fetch a new token (every SDK does on `401`).
 - **Credentials an SDK already fetched stay valid until they expire (at most one
   hour)**, including copies in the box's RAM, and so in its hibernation snapshot, a
   full-state fork made from it, or a recovery point. To end them at once, revoke
@@ -430,7 +432,9 @@ cd e2e && npx playwright test aws.spec.mjs            # Linux
 Metadata mode:
 
 - `metadata` (worker): IMDSv2 only, `X-Forwarded-For`, `OPTIONS` and bodies refused,
-  no CORS header, a token from one box refused at another and after a new VMM start,
+  no CORS header, a token from one box refused at another, after a new VMM start and
+  after its role was detached or replaced, headers over 4 KiB refused however they
+  arrive,
   the EC2 credential and `iam/info` shapes, an immediate `404` without a role and the
   0.8 s wait for credentials on their way, connection, header and rate limits, the
   hop limit as IP TTL. `runtime` checks that the worker keeps credentials only in

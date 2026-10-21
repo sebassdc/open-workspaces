@@ -539,3 +539,63 @@ fn switching_back_to_web_identity_withdraws_served_credentials() {
         .unwrap();
     assert!(!served);
 }
+
+#[test]
+fn reattaching_after_a_switch_to_web_identity_withdraws_before_commit() {
+    let f = Fixture::new();
+    f.lists.store(true, Ordering::SeqCst);
+    f.configure(metadata_config());
+    let shared = Arc::new(Mutex::new(Catalog::open(&f.root, "test", None).unwrap()));
+    let mut sts = FakeSts::new(&shared);
+    let mut cleared = HashSet::new();
+    const BOX: &str = "m-meta-web-reattach";
+    let a = {
+        let mut c = shared.lock().unwrap();
+        let a = c.user(&identity("a", "a@example.test")).unwrap();
+        running(&c, a, "box", BOX);
+        c.operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
+            .unwrap();
+        a
+    };
+    pass(&shared, &mut sts, &mut cleared);
+    assert!(ow_core::metadata::present(BOX, 1));
+    f.configure(
+        json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":READER},{"role_arn":ADMIN_ONLY}]}),
+    );
+    let attach = json!({"op":"aws-role","id":"box","role_arn":ADMIN_ONLY});
+    // The runner still serves READER and cannot be reached: nothing is recorded.
+    f.down.store(true, Ordering::SeqCst);
+    {
+        let mut c = shared.lock().unwrap();
+        let refused = c.operation(a, attach.clone());
+        assert_eq!(refusal(refused.unwrap_err()), "aws_runner_unreachable");
+        let row: (String, i64) =
+            c.db.query_row(
+                "SELECT role_arn,generation FROM aws_roles WHERE physical=?1",
+                [BOX],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (READER.to_owned(), 1));
+    }
+    assert!(ow_core::metadata::present(BOX, 1));
+    // Reachable again: withdrawn while READER was still the committed role, then recorded.
+    f.down.store(false, Ordering::SeqCst);
+    f.creds();
+    shared.lock().unwrap().operation(a, attach).unwrap();
+    let withdrawn = f.creds();
+    assert!(withdrawn[0].0.get("role_arn").is_none());
+    assert_eq!(withdrawn[0].1, Some((a, true)));
+    assert!(!ow_core::metadata::present(BOX, 1));
+    let role: String = shared
+        .lock()
+        .unwrap()
+        .db
+        .query_row(
+            "SELECT role_arn FROM aws_roles WHERE physical=?1",
+            [BOX],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(role, ADMIN_ONLY);
+}

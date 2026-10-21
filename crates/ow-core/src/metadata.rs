@@ -321,23 +321,25 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A stateless IMDSv2 token: expiry and a MAC over box, VMM nonce and expiry.
-fn mint(peer: &Peer, expires: u64) -> String {
+/// A stateless IMDSv2 token: expiry and a MAC over box, VMM nonce, role generation (0
+/// without a role) and expiry. A detach, re-attach, move or fork of the box changes the
+/// generation, so tokens issued before it stop working.
+fn mint(peer: &Peer, generation: u64, expires: u64) -> String {
     let mac = hmac(
         &*KEY,
-        format!("{}\n{}\n{expires}", peer.id, peer.nonce).as_bytes(),
+        format!("{}\n{}\n{generation}\n{expires}", peer.id, peer.nonce).as_bytes(),
     );
     format!("{expires}.{}", hex(&mac))
 }
 
-fn valid(peer: &Peer, token: &str, now: u64) -> bool {
+fn valid(peer: &Peer, generation: u64, token: &str, now: u64) -> bool {
     let Some((expires, _)) = token.split_once('.') else {
         return false;
     };
     let Ok(expires) = expires.parse::<u64>() else {
         return false;
     };
-    let expected = mint(peer, expires);
+    let expected = mint(peer, generation, expires);
     // Constant time over equal lengths; the length itself is public.
     expires > now
         && expires <= now + MAX_TOKEN_TTL
@@ -455,6 +457,7 @@ fn read_head(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<Option<Vec<
     let mut deadline = (!buffer.is_empty()).then(|| Instant::now() + HEADER_TIME);
     loop {
         if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            ensure!(end + 4 <= HEADER_BYTES, "request headers too large");
             return Ok(Some(buffer.drain(..end + 4).collect()));
         }
         ensure!(buffer.len() < HEADER_BYTES, "request headers too large");
@@ -582,6 +585,7 @@ fn answer(index: u32, request: &Request) -> Response {
     let Some(peer) = state.peers.get(&index) else {
         return status(404);
     };
+    let generation = state.roles.get(&peer.id).map_or(0, |r| r.generation);
     if request.path == "/latest/api/token" {
         if request.method != "PUT" {
             return status(405);
@@ -593,7 +597,7 @@ fn answer(index: u32, request: &Request) -> Response {
         else {
             return status(400);
         };
-        let mut response = ok(mint(peer, now + ttl));
+        let mut response = ok(mint(peer, generation, now + ttl));
         response.ttl = Some(ttl);
         return response;
     }
@@ -603,7 +607,7 @@ fn answer(index: u32, request: &Request) -> Response {
     // IMDSv2 only: no token, a wrong or expired one, or another box's, is 401.
     if !request
         .header("x-aws-ec2-metadata-token")
-        .is_some_and(|t| valid(peer, t, now))
+        .is_some_and(|t| valid(peer, generation, t, now))
     {
         return status(401);
     }
@@ -623,6 +627,10 @@ fn answer(index: u32, request: &Request) -> Response {
     .flatten() else {
         return status(404);
     };
+    // Replaced while this request waited for credentials: its token named the old role.
+    if role.generation != generation {
+        return status(401);
+    }
     let credentials = role.credentials.as_ref().expect("current credentials");
     let updated = timestamp(credentials.issued);
     match path.strip_prefix(CREDENTIALS) {

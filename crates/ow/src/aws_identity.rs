@@ -427,6 +427,9 @@ impl Catalog {
             // A new attachment is a new credential authority: a new generation, key and token.
             // Forks made before it are not this attachment's concern.
             let mark = self.fork_mark(&physical)?;
+            // Credentials an earlier metadata mode gave its runner go before the new role is
+            // recorded; refused while that runner holds them unreached.
+            self.withdraw_aws(&physical, None)?;
             revoke(&self.root, &physical)?;
             self.db.execute(
                 "INSERT INTO aws_roles(physical,owner,role_arn,generation,fork_mark) VALUES(?1,?2,?3,1,?4)

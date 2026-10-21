@@ -162,6 +162,7 @@ fn imdsv2_only_without_cors_forwarding_or_bodies() {
             id: "m-v2".into(),
             nonce: state().peers[&9001].nonce.clone(),
         },
+        1,
         unix() - 1,
     );
     assert_eq!(
@@ -310,18 +311,22 @@ fn credentials_have_the_ec2_shape_and_stay_with_their_box() {
         get(a, "/latest/meta-data/iam/security-credentials/", &token_a).status,
         401
     );
-    // Detach: the role is gone at once.
+    // Detach: the role is gone at once, and so are the tokens issued under it.
     let token_a = token(a);
     assert!(clear("m-shape-a"));
-    assert_eq!(
-        get(
-            a,
-            "/latest/meta-data/iam/security-credentials/reader",
-            &token_a
-        )
-        .status,
-        404
-    );
+    let path = "/latest/meta-data/iam/security-credentials/reader";
+    assert_eq!(get(a, path, &token_a).status, 401);
+    assert_eq!(get(a, path, &token(a)).status, 404);
+    // Re-attached (a new generation) on the same VMM: an old token reads nothing.
+    let mut next = role(Some(credentials(22)));
+    next.generation = 2;
+    set("m-shape-a", next);
+    assert_eq!(get(a, path, &token_a).status, 401);
+    let fresh = token(a);
+    let reply = get(a, path, &fresh);
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.contains("ASIATEST22"));
+    assert!(clear("m-shape-a"));
     // A TAP without a VMM answers nothing.
     detach(9002);
     assert_eq!(
@@ -490,4 +495,22 @@ fn handled_requests_lose_their_secrets() {
     for key in ["secret_access_key", "session_token"] {
         assert!(!request[key].as_str().unwrap().contains(|c: char| c != '\0'));
     }
+}
+
+#[test]
+fn fragmented_headers_cannot_pass_the_limit() {
+    let port = listener(9007);
+    attach(9007, "m-fragments").unwrap();
+    let head = format!(
+        "PUT /latest/api/token HTTP/1.1\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\nX-Pad: {}\r\n\r\n",
+        "a".repeat(4100)
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream.write_all(&head.as_bytes()[..4000]).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(exchange(&mut stream, &head[4000..]).is_none());
+    detach(9007);
 }
