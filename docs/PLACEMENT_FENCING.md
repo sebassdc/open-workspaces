@@ -86,7 +86,8 @@ live workspace slots. Create, legacy import, staged import and status share that
 live count; a returning cleaned subject still needs a free slot. Ordinary captures
 respect names reserved by lifecycle intents and imports, even before publication.
 
-The node effect journal retries these tested steps, plus epoch-bearing start.
+The node effect journal retries these tested steps, plus epoch-bearing start,
+managed delete and managed named-snapshot deletion.
 Arbitrary exec remains uncertain after a lost effect reply. Cached managed replies
 are rechecked against current worker authority; on fencing workers this also
 covers cached legacy requests without an epoch. Revalidation acknowledges authority
@@ -94,6 +95,31 @@ without requiring a machine summary, so a completed unmanaged delete remains
 replayable after its record is gone. Controller completion must still
 conditionally match its transfer and epoch: a worker reply never changes catalog
 authority by itself.
+
+## Managed delete and named snapshots
+
+Workers advertising `managed_lifecycle_v1` accept `delete` for a managed copy with
+its exact authority: an activated copy that is not running, or a cleaned export left
+on a runner the box moved or was parked from. An export not yet cleaned may still be
+a transfer's fallback, so the controller sends `export-cleanup` first; a copy
+mid-export or mid-import is refused. The machine directory, recovery journal and the
+box's local snapshots go, export and hibernation captures included, except a capture
+another managed copy still imports from. The fence stays as a **tombstone**: phase
+`cleaned` with no export or import intent, workspace state `deleted`, kept across
+restart. A fork child's imported capture (it names the parent) goes with the child
+when no other copy imports it and the parent has no live copy on that runner; a
+parent still here removes it in its own delete. A capture still sealing when its copy
+is deleted is never committed. The snapshot inventory reports each capture's disk size. A repeated delete
+with that authority answers from it, and a cached delete reply revalidates against
+it. Every other request, an `export-cleanup` and an `import-prepare` at any newer
+epoch included, is refused. Tombstones consume no live workspace slot.
+
+`snapshot-delete` of a named snapshot sealed `managed` needs the box's own exact
+authority, which may be fenced (exported or cleaned): removing a named snapshot
+never executes or changes the copy. Hibernation, recovery and lifecycle captures,
+and the copy's own import capture, are still refused. An unmanaged workspace still
+cannot delete a managed capture. Older workers refuse both, so the controller asks
+for this capability first.
 
 ## Compatibility and remaining integration
 

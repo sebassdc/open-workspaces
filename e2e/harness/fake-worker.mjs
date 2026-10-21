@@ -17,11 +17,13 @@ export function fakeWorker(socketPath, log = () => {}) {
     // The subset of the real worker's "status" (crates/ow-core/src/runtime.rs) that admission reads.
     status: () => ({
       runtime: 'fake', running: [...machines.values()].filter(m => m.state === 'running').length, workspace_count: machines.size,
-      snapshot_delete_v1: true, disk_resize_v1: true, aws_identity_v1: true, max_disk_gib: 16384, reserved_disk_bytes: 0, unwritten_disk_bytes: 0,
+      snapshot_delete_v1: true, managed_lifecycle_v1: true, disk_resize_v1: true, aws_identity_v1: true, max_disk_gib: 16384, reserved_disk_bytes: 0, unwritten_disk_bytes: 0,
       free_disk_bytes: 4096 * GIB, available_disk_bytes: 4096 * GIB, disk_observed_unix_s: Math.floor(Date.now() / 1000), min_free_gib: 0,
       max_running: 16, max_memory_mib: MAX_MEMORY_MIB, max_vcpus: 16, max_workspaces: 64, max_guest_memory_mib: 16384, max_guest_vcpus: 16,
       max_snapshots: 64, images: ['alpine', 'arch', 'ubuntu'], internet: true, prototype: true,
     }),
+    // What the controller reads back after a lifecycle effect on a managed (moved) machine.
+    inspect: r => ({...get(r.id), vmm_running: get(r.id).state === 'running'}),
     stats: () => ({running: Object.fromEntries([...machines.values()].filter(m => m.state === 'running').map(m => [m.id, {pss_kib: m.memory_mib * 256}])), reserved_memory_mib: 0}),
     create: r => {
       // Like the real runner: a repeated create with the same shape returns the machine, any other is refused.
@@ -100,6 +102,12 @@ export function fakeWorker(socketPath, log = () => {}) {
     const running = [...machines.values()].filter(m => m.state === 'running').reduce((sum, m) => sum + m.memory_mib, 0);
     if (running + memory > MAX_MEMORY_MIB) throw Error(`insufficient host memory for ${memory} MiB`);
   }
+  // Like the real worker, a managed machine accepts only its exact placement.
+  function fence(r) {
+    const m = r.id && r.op !== 'inspect' && machines.get(r.id);
+    if (!m?.placement) return;
+    if (JSON.stringify(r.placement) !== JSON.stringify(m.placement)) throw Error('stale or wrong placement epoch, node or transfer');
+  }
   function get(id) {
     const m = machines.get(id);
     if (!m) throw Error(`no workspace ${id}`);
@@ -127,7 +135,7 @@ export function fakeWorker(socketPath, log = () => {}) {
         return frames();
       }
       let reply;
-      try { reply = {ok: true, result: (handlers[request.op] ?? (() => ({})))(request)}; }
+      try { fence(request); reply = {ok: true, result: (handlers[request.op] ?? (() => ({})))(request)}; }
       catch (error) { reply = {ok: false, error: error.message}; }
       socket.end(JSON.stringify(reply) + '\n');
     });
@@ -152,5 +160,7 @@ export function fakeWorker(socketPath, log = () => {}) {
       }
     }
   });
+  // Test-only: the machine now has a committed placement, as after a move between runners.
+  server.manage = (id, placement) => { get(id).placement = placement; };
   return new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, () => resolve(server)));
 }

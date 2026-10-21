@@ -140,8 +140,10 @@ After a verified pull and unstarted import, the catalog conditionally switches
 placement, then activates the target. The original logical name, owner and grants
 remain; remote list, exec, shell, SSH and previews use the committed epoch.
 Public SSH policy is copied separately from the artifact. A guest host-key mismatch
-fails closed during boot. Managed resize/delete/snapshot/fork and public-key changes
-remain refused until their lifecycle coordination is implemented.
+fails closed during boot. The restored box then deletes, resizes, snapshots and
+changes public keys like any other, under its committed placement; its named
+snapshots are published to the artifact store and fork on any runner (see
+[lifecycle of a moved box](LIFECYCLE.md#lifecycle-of-a-moved-box)).
 
 Saved RAM must match the target runtime, CPU/host-kernel identity and guest-kernel
 hash. An incompatible capture stays stored and the operation fails before import.

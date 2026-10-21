@@ -110,21 +110,7 @@ fn admit(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> 
                 owner,
             });
             if let Some(snapshot) = request["snapshot"].as_str() {
-                common::identifier(snapshot)?;
-                let metadata: String = c.db.query_row("SELECT metadata FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4",params![c.snapshot_owner(user, address)?,snapshot,node,physical],|r|r.get(0)).optional()?.ok_or_else(|| crate::limits::Rejection(format!("Snapshot {snapshot} is not a snapshot of this box on its current runner.")))?;
-                let meta: Value = serde_json::from_str(&metadata)?;
-                input.memory_mib = meta["memory_mib"]
-                    .as_u64()
-                    .context("unknown snapshot memory")?
-                    .try_into()?;
-                input.cpus = meta["vcpu_count"]
-                    .as_u64()
-                    .context("unknown snapshot CPUs")?
-                    .try_into()?;
-                input.disk_bytes = meta["disk_bytes"]
-                    .as_u64()
-                    .context("unknown snapshot disk size")?;
-                input.snapshot = Some(snapshot.into());
+                named_snapshot(&c, user, address, &physical, &node, snapshot, &mut input)?;
             }
         }
         capable_move(&c, &node, 0)?;
@@ -180,6 +166,43 @@ fn admit(shared: Shared, identity: &Identity, request: &Value) -> Result<Value> 
     drop(c);
     launch(shared, t.id);
     Ok(info)
+}
+
+/// Binds a fork to a named snapshot of its source and takes its shape. A snapshot in the
+/// artifact store forks from any runner, with no new capture; one that is not must still be
+/// on the box's current runner.
+pub(super) fn named_snapshot(
+    c: &Catalog,
+    user: i64,
+    address: &str,
+    physical: &str,
+    node: &str,
+    snapshot: &str,
+    input: &mut Intent,
+) -> Result<()> {
+    common::identifier(snapshot)?;
+    let (metadata, here, stored): (String, bool, Option<String>) = c.db.query_row("SELECT s.metadata,s.node=?3,(SELECT a.id FROM artifacts a JOIN resources m ON m.kind='machine' AND m.physical=?4 WHERE a.kind='snapshot' AND a.owner=s.owner AND a.owner=m.owner AND a.machine=m.physical AND a.local_name=s.physical AND a.state='stored' AND a.digest IS NOT NULL) FROM resources s WHERE s.owner=?1 AND s.kind='snapshot' AND s.name=?2 AND json_extract(s.metadata,'$.workspace')=?4",params![c.snapshot_owner(user, address)?,snapshot,node,physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(|| crate::limits::Rejection(format!("Snapshot {snapshot} is not a snapshot of this box.")))?;
+    ensure!(
+        here || stored.is_some(),
+        crate::limits::Rejection(format!(
+            "Snapshot {snapshot} is on another runner and not in the artifact store yet; retry shortly."
+        ))
+    );
+    input.capture = stored;
+    let meta: Value = serde_json::from_str(&metadata)?;
+    input.memory_mib = meta["memory_mib"]
+        .as_u64()
+        .context("unknown snapshot memory")?
+        .try_into()?;
+    input.cpus = meta["vcpu_count"]
+        .as_u64()
+        .context("unknown snapshot CPUs")?
+        .try_into()?;
+    input.disk_bytes = meta["disk_bytes"]
+        .as_u64()
+        .context("unknown snapshot disk size")?;
+    input.snapshot = Some(snapshot.into());
+    Ok(())
 }
 
 pub(super) fn source_authority(c: &Catalog, t: &Transfer) -> Result<common::Placement> {
@@ -248,6 +271,12 @@ pub(super) fn prepare(
             return export_source(shared, t, &input, &policy, &auth, call).map(Some);
         }
         let c = shared.lock().unwrap();
+        if stored {
+            // A named snapshot already in the store is the fork's capture: nothing to take.
+            authorized(&c, t)?;
+            c.advance_transfer(t.id, t.epoch, t.step, Step::Exported, &Evidence::default())?;
+            return Ok(Some(true));
+        }
         let snapshot: Option<String> = c.db.query_row(
             "SELECT json_extract(response,'$.fork_snapshot') FROM operations WHERE id=?1",
             [t.operation],
@@ -306,7 +335,8 @@ pub(super) fn cleanup(
         return Ok(false);
     };
     let c = shared.lock().unwrap();
-    if t.step == Step::Succeeded && !c.db.query_row("SELECT placement_epoch=?2 AND node=?3 FROM resources WHERE kind='machine' AND physical=?1",params![t.machine,t.epoch,t.target],|r|r.get::<_,bool>(0)).optional()?.unwrap_or(false) { return Ok(true); }
+    // A later placement owns the cleanup; a deleted box still has its old source copy removed.
+    if t.step == Step::Succeeded && !c.db.query_row("SELECT placement_epoch=?2 AND node=?3 FROM resources WHERE kind='machine' AND physical=?1",params![t.machine,t.epoch,t.target],|r|r.get::<_,bool>(0)).optional()?.unwrap_or(true) { return Ok(true); }
     let auth = source_authority(&c, t)?;
     if let Err(error) = source_fence(&c, t, &seen, &auth) {
         // A contradictory returning source blocks access again; it never becomes an alternate winner.

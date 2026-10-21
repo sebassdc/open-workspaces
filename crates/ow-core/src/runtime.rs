@@ -1153,6 +1153,10 @@ impl Runtime {
         if self.workspace(id).is_err() {
             return self.delete_unregistered(id);
         }
+        if self.deleted(id) {
+            return Ok(json!({"deleted":id,"snapshots":[]}));
+        }
+        self.require_deletable(id)?;
         ensure!(
             !self.machines.contains_key(id),
             "workspace is running; stop or hibernate it first"
@@ -1166,7 +1170,8 @@ impl Runtime {
                 continue;
             }
             let snapshot: Snapshot = serde_json::from_slice(&fs::read(manifest)?)?;
-            if snapshot.workspace == id {
+            // Another managed copy may still import from this box's capture (a prepared fork).
+            if snapshot.workspace == id && !self.lifecycle_capture_of_another(id, &snapshot.name) {
                 fs::remove_dir_all(&directory)?;
                 self.verified.remove(&snapshot.name);
                 snapshots.push(snapshot.name);
@@ -1184,7 +1189,18 @@ impl Runtime {
         if let Some(name) = self.cleanup_fork_capture(id)? {
             snapshots.push(name);
         }
-        self.state.workspaces.remove(id);
+        if let Some(name) = self.orphaned_import(id) {
+            fs::remove_dir_all(self.snapshot_dir(&name))?;
+            File::open(self.root.join("snapshots"))?.sync_all()?;
+            self.verified.remove(&name);
+            snapshots.push(name);
+        }
+        if self.state.placements.contains_key(id) {
+            // Keep the fence as a tombstone: a late request must never recreate this copy.
+            self.mark_deleted(id);
+        } else {
+            self.state.workspaces.remove(id);
+        }
         self.save()?;
         Ok(json!({"deleted":id,"snapshots":snapshots}))
     }
@@ -1234,9 +1250,8 @@ impl Runtime {
     /// (`existed` false); hibernation, recovery and lifecycle captures are refused.
     fn delete_snapshot(&mut self, id: &str, name: &str) -> Result<Value> {
         identifier(name)?;
-        self.workspace(id)?;
         ensure!(
-            !name.starts_with(SLEEP),
+            !name.starts_with(SLEEP) && self.workspace(id)?.hibernation.as_deref() != Some(name),
             "only named snapshots can be deleted"
         );
         ensure!(
@@ -1257,8 +1272,10 @@ impl Runtime {
             snapshot.workspace == id,
             "snapshot belongs to another workspace"
         );
+        // A managed capture goes only through its own box's placement authority (checked by
+        // the caller); lifecycle captures are refused above.
         ensure!(
-            !snapshot.managed && !snapshot.managed_recovery,
+            !snapshot.managed_recovery && (!snapshot.managed || self.state.workspaces[id].managed),
             "only named snapshots can be deleted"
         );
         fs::remove_dir_all(&directory)?;
@@ -1460,7 +1477,7 @@ impl Runtime {
             let name = staged.snapshot.name.clone();
             // The worker served other requests while this was hashed: re-check what they may change.
             ensure!(
-                self.workspace(&id).is_ok_and(|w| w.index == staged.index),
+                self.workspace(&id).is_ok_and(|w| w.index == staged.index) && !self.deleted(&id),
                 "workspace was deleted during the capture"
             );
             if let Some((_, child)) = &staged.fork {
@@ -1859,10 +1876,12 @@ impl Runtime {
             return self.lifecycle_request(request);
         }
         if !id.is_empty() && !matches!(op, "inspect" | "placement-check") {
-            self.authorize(request, true)?;
+            // Deleting a named snapshot never runs the copy, so a fenced source may do it; a
+            // managed delete checks the copy's phase itself (an old fenced copy may go too).
+            self.authorize(request, !matches!(op, "snapshot-delete" | "delete"))?;
             ensure!(
                 !self.state.placements.contains_key(id)
-                    || !matches!(op, "delete" | "restore" | "fork" | "image-save"),
+                    || !matches!(op, "restore" | "fork" | "image-save"),
                 "managed operation requires lifecycle coordination"
             );
         }
@@ -1915,7 +1934,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"snapshot_delete_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
@@ -2169,8 +2188,20 @@ impl Runtime {
                         }
                     }
                 }
+                // The disk size lets the controller publish a snapshot it recorded without one.
                 Ok(json!(
-                    snapshots.iter().map(Snapshot::summary).collect::<Vec<_>>()
+                    snapshots
+                        .iter()
+                        .map(|s| {
+                            let mut summary = s.summary();
+                            summary["disk_bytes"] = json!(
+                                fs::metadata(self.snapshot_dir(&s.name).join("disk.ext4"))
+                                    .ok()
+                                    .map(|m| m.len())
+                            );
+                            summary
+                        })
+                        .collect::<Vec<_>>()
                 ))
             }
             "fork" => {

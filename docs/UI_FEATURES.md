@@ -22,7 +22,10 @@ binary with tailnet sign-in, behind a local TLS proxy that plays
 `tailscale serve`, and a fake runner worker on the dashboard's `control.sock`
 that keeps machines and snapshots in memory and runs an echo shell for the
 terminal. The dashboard's API validation, ownership catalog, quotas and
-operation journal are the real ones; no guest VM runs. Each test signs in as
+operation journal are the real ones; no guest VM runs. A test can give one of its
+machines a committed placement, as a move between runners leaves it, through the
+harness-only `/__e2e/manage` route of that proxy; the fake worker then refuses any
+other placement for it, as the real worker does. Each test signs in as
 its own tailnet user, so tests never see each other's machines. The real-VM
 browser test in `crates/ow/src/remote.rs` (`dashboard_browser_real_vm`) remains
 the check that actual guests work.
@@ -73,6 +76,8 @@ go in one cell separated by `;`. A test no row names is reported as a note.
 | Delete with snapshot warnings | works | v0.9.22 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `lifecycle.spec.mjs › delete of a machine without snapshots says so` |
 | Resize dialog prefilled with the current size; the same size answers "Already N GiB" | works | v0.9.27 | `lifecycle.spec.mjs › resize grows a stopped machine disk` |
 | Destructive confirms (delete, restore) lead with a warning and use a danger button | works | v0.9.27 | `lifecycle.spec.mjs › delete warns about snapshots and removes the machine`; `snapshots.spec.mjs › fork and restore from the snapshot list` |
+| Moved machine (placed by a move between runners): snapshot, stop, resize the disk and delete with its snapshots | works | v0.9.39 | `managed.spec.mjs › a moved machine snapshots, stops, resizes and deletes with its snapshots` |
+| Moved machine: resize memory and vCPUs while stopped | works | v0.9.39 | `managed.spec.mjs › a moved machine resizes its memory and vCPUs while stopped` |
 
 ## Terminal and console
 

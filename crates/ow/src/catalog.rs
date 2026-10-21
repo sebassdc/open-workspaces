@@ -927,7 +927,12 @@ impl Catalog {
                 common::identifier(snapshot)?;
                 // A pool admin forks the box owner's named snapshots; others their own.
                 let snapshots = c.snapshot_owner(user, &intent.machine)?;
-                Some(c.db.query_row("SELECT physical FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4 AND json_extract(metadata,'$.memory_mib')=?5 AND json_extract(metadata,'$.vcpu_count')=?6 AND json_extract(metadata,'$.disk_bytes')=?7",params![snapshots,snapshot,source_node,source,intent.memory_mib,intent.cpus,intent.disk_bytes as i64],|r|r.get::<_,String>(0)).context("snapshot identity or shape changed during admission")?)
+                // A stored snapshot forks from its artifact, wherever its runner copy is.
+                let physical = c.db.query_row("SELECT physical FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND (node=?3 OR ?8 IS NOT NULL) AND json_extract(metadata,'$.workspace')=?4 AND json_extract(metadata,'$.memory_mib')=?5 AND json_extract(metadata,'$.vcpu_count')=?6 AND json_extract(metadata,'$.disk_bytes')=?7",params![snapshots,snapshot,source_node,source,intent.memory_mib,intent.cpus,intent.disk_bytes as i64,intent.capture],|r|r.get::<_,String>(0)).context("snapshot identity or shape changed during admission")?;
+                if let Some(capture) = &intent.capture {
+                    ensure!(c.db.query_row("SELECT local_name=?2 AND kind='snapshot' FROM artifacts WHERE id=?1",params![capture,physical],|r|r.get::<_,bool>(0))?,"stored capture is not this snapshot");
+                }
+                Some(physical)
             } else { None };
             // Global high-watermark survives aborts, deleted children and controller restarts.
             c.db.execute("INSERT INTO settings(key,value) VALUES('transfer_epoch','0') ON CONFLICT(key) DO NOTHING",[])?;
@@ -1414,7 +1419,12 @@ impl Catalog {
                 if let Some(owner) = owner {
                     let name=if self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND physical<>?2)",params![owner,physical],|r|r.get::<_,bool>(0))?{format!("auto-{}",&common::nonce()?[..24])}else{physical.to_owned()};
                     self.db.execute("INSERT OR IGNORE INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'snapshot',?2,?3,?4,?5)",params![owner,name,physical,snapshot.to_string(),node])?;
-                    self.save_node(&node, "snapshot", physical, snapshot)?;
+                    // The worker's summary has no disk size; keep the one recorded at capture.
+                    let mut snapshot = snapshot.clone();
+                    if snapshot["disk_bytes"].is_null() {
+                        snapshot["disk_bytes"] = self.db.query_row("SELECT json_extract(metadata,'$.disk_bytes') FROM resources WHERE kind='snapshot' AND physical=?1",[physical],|r|r.get::<_,Option<i64>>(0))?.map_or(Value::Null, |n| json!(n));
+                    }
+                    self.save_node(&node, "snapshot", physical, &snapshot)?;
                     all_snapshots.push(snapshot.clone());
                 }
             }
@@ -1618,7 +1628,13 @@ impl Catalog {
         let mut value: Value = serde_json::from_str(metadata)?;
         value[if kind == "machine" { "id" } else { "name" }] = json!(physical);
         value["node"] = json!(node);
-        let online = if node == "local" {
+        if kind == "snapshot" {
+            // A stored snapshot restores or forks from the artifact store on any runner.
+            value["artifact"] = json!(self.db.query_row("SELECT a.id FROM artifacts a JOIN resources s ON s.kind='snapshot' AND s.physical=?1 AND a.owner=s.owner WHERE a.kind='snapshot' AND a.local_name=?1 AND a.state='stored' AND a.digest IS NOT NULL ORDER BY a.stored_at DESC LIMIT 1",[physical],|r|r.get::<_,String>(0)).optional()?);
+        }
+        let online = if node.is_empty() && kind == "snapshot" {
+            true
+        } else if node == "local" {
             self.root.join("control.sock").exists()
         } else {
             nodes::online(&self.root, node).is_ok()
@@ -1988,9 +2004,165 @@ impl Catalog {
         physical: &str,
         input: &Value,
     ) -> Result<Value> {
+        self.without_runner(user, "delete", name, physical, input, |c| {
+            Ok(json!({"deleted":name,"snapshots":c.forget(user, physical)?}))
+        })
+    }
+    fn parked(&self, physical: &str) -> Result<bool> {
+        Ok(self.db.query_row("SELECT node='' AND placement_managed=1 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1) FROM resources WHERE kind='machine' AND physical=?1",[physical],|r|r.get(0))?)
+    }
+    /// A named snapshot that is not on its box's runner: the box moved or was parked. One in
+    /// the artifact store goes from the catalog alone; a runner still holding a copy has it
+    /// removed by the publication janitor, which owns that runner's publication record. One
+    /// not yet stored is removed from its runner first, under that copy's own placement.
+    fn delete_stored_snapshot(
+        &mut self,
+        user: i64,
+        name: &str,
+        physical: &str,
+        input: &Value,
+    ) -> Result<Option<Value>> {
+        let snapshot = input["name"].as_str().context("snapshot name")?;
+        let id = self.physical(user, "snapshot", snapshot)?;
+        self.snapshot_source(user, &id, physical)?;
+        let (node, here, stored): (String, bool, bool) = self.db.query_row("SELECT s.node,s.node=m.node AND s.node<>'',EXISTS(SELECT 1 FROM artifacts a WHERE a.kind='snapshot' AND a.owner=s.owner AND a.local_name=s.physical AND a.state='stored') FROM resources s JOIN resources m ON m.kind='machine' AND m.physical=?2 WHERE s.kind='snapshot' AND s.physical=?1",params![id,physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        if here {
+            return Ok(None);
+        }
+        let moving: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1)",
+            [physical],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            !moving,
+            limits::Rejection(
+                "snapshot is in use by a move or fork; retry when it finishes".into()
+            )
+        );
+        if !node.is_empty() && !stored {
+            self.remove_snapshot_copy(&node, physical, &id)?;
+        }
+        let value = self.without_runner(user, "snapshot-delete", snapshot, physical, input, |c| {
+            let tx = c.db.transaction()?;
+            tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND owner=?1 AND resource=?2",params![user,snapshot])?;
+            tx.execute(
+                "DELETE FROM resources WHERE kind='snapshot' AND physical=?1",
+                [&id],
+            )?;
+            tx.commit()?;
+            Ok(json!({"deleted":snapshot,"workspace":name}))
+        })?;
+        Ok(Some(value))
+    }
+    /// A runner other than the box's own that may still hold a copy of the box or its
+    /// snapshots: its route and what it knows of the box (null when nothing). None for a
+    /// retired or unknown runner, which runs nothing; an offline one refuses, to retry.
+    fn old_copy(&self, node: &str, physical: &str) -> Result<Option<(PathBuf, Value)>> {
+        let (known, retired): (bool, bool) = self.db.query_row("SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND revoked=0),EXISTS(SELECT 1 FROM runner_drains WHERE node=?1 AND state IN ('retained','removed'))",[node],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if !known || retired {
+            return Ok(None);
+        }
+        ensure!(
+            nodes::online(&self.root, node).is_ok(),
+            limits::Rejection(format!(
+                "Runner {node} still holds a copy of this box or its snapshots and is offline; retry when it is back, or revoke that runner if it is gone."
+            ))
+        );
+        nodes::managed_lifecycle_capable(&self.root, node)?;
+        let route = nodes::route(&self.root, node)?;
+        match wire::request(&route, json!({"op":"inspect","id":physical})) {
+            Ok(seen) => Ok(Some((route, seen))),
+            Err(error) if format!("{error:#}").contains("workspace not found") => {
+                Ok(Some((route, Value::Null)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn remove_snapshot_copy(&self, node: &str, physical: &str, snapshot: &str) -> Result<()> {
+        let Some((route, seen)) = self.old_copy(node, physical)? else {
+            return Ok(());
+        };
+        if seen.is_null() {
+            return Ok(()); // That runner no longer knows the box; it went with its snapshots.
+        }
+        let mut request = json!({"op":"snapshot-delete","id":physical,"name":snapshot});
+        if !seen["placement"].is_null() {
+            request["placement"] = seen["placement"].clone();
+        }
+        let result = wire::request(&route, request)?;
+        ensure!(
+            result["deleted"] == snapshot && result["workspace"] == physical,
+            "snapshot removal on runner {node} unconfirmed"
+        );
+        Ok(())
+    }
+    /// A managed box leaves fenced copies on the runners it was moved or parked from, and
+    /// may leave snapshots there not yet in the store. Its delete removes them, each under
+    /// that copy's own placement, so nothing of the box is left on a runner.
+    fn remove_old_copies(&self, physical: &str, current: &str) -> Result<()> {
+        let nodes: Vec<String> = self.db.prepare("SELECT source_node FROM transfers WHERE source=?1 AND source_node NOT IN ('',?2) UNION SELECT node FROM resources WHERE kind='snapshot' AND json_extract(metadata,'$.workspace')=?1 AND node NOT IN ('',?2)")?.query_map(params![physical,current],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        for node in nodes {
+            let Some((route, seen)) = self.old_copy(&node, physical)? else {
+                continue;
+            };
+            if seen.is_null() {
+                continue;
+            }
+            ensure!(
+                !seen["placement"].is_null(),
+                "runner {node} holds an unmanaged copy of this box; reconcile it first"
+            );
+            match seen["lifecycle"]["phase"].as_str() {
+                Some(phase @ ("exported" | "cleaned")) => {
+                    if phase == "exported" {
+                        // Every transfer of the box is finished: its source copy is no fallback.
+                        let intent = &seen["lifecycle"]["intent"];
+                        wire::request(
+                            &route,
+                            json!({"op":"export-cleanup","id":physical,"placement":seen["placement"],"transfer":intent["transfer"],"capture":intent["capture"]}),
+                        )?;
+                    }
+                    let result = wire::request(
+                        &route,
+                        json!({"op":"delete","id":physical,"placement":seen["placement"]}),
+                    )?;
+                    ensure!(
+                        result["deleted"] == physical,
+                        "old copy removal on runner {node} unconfirmed"
+                    );
+                }
+                // An excluded import attempt has no disk; only snapshots taken there remain.
+                Some("discarded") => {
+                    let snapshots: Vec<String> = self.db.prepare("SELECT physical FROM resources WHERE kind='snapshot' AND node=?1 AND json_extract(metadata,'$.workspace')=?2")?.query_map(params![node,physical],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                    for snapshot in snapshots {
+                        self.remove_snapshot_copy(&node, physical, &snapshot)?;
+                    }
+                }
+                _ => {
+                    return Err(limits::Rejection(format!(
+                        "Runner {node} holds an unfinished copy of this box; check ow status before deleting it."
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Record an operation that needs no runner under its key, with the fingerprint a
+    /// dispatched one would have, then apply its catalog effect.
+    fn without_runner(
+        &mut self,
+        user: i64,
+        op: &str,
+        resource: &str,
+        physical: &str,
+        input: &Value,
+        effect: impl FnOnce(&mut Self) -> Result<Value>,
+    ) -> Result<Value> {
         ensure!(
             !limits::unresolved(&self.db, physical)?,
-            "missing workspace has unresolved operations; reconcile their outcomes before deleting it"
+            "machine has unresolved operations; reconcile their outcomes first"
         );
         let node = self.placement("machine", physical)?;
         let mut request = input.clone();
@@ -2024,11 +2196,11 @@ impl Catalog {
                 id
             }
             None => {
-                self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,'delete',?2,'pending',?3,?4,?5)",params![user,name,node,key,fingerprint])?;
+                self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,?2,?3,'pending',?4,?5,?6)",params![user,op,resource,node,key,fingerprint])?;
                 self.db.last_insert_rowid()
             }
         };
-        let mut value = json!({"deleted":name,"snapshots":self.forget(user, physical)?});
+        let mut value = effect(self)?;
         value["operation"] = self.operation_info(user, operation)?;
         value["operation"]["state"] = json!("succeeded");
         value["operation_id"] = json!(operation);
@@ -2489,8 +2661,28 @@ impl Catalog {
                     };
                 }
             }
+            if op == "delete" && self.parked(&physical)? {
+                // No runner runs it; the runners it was parked or moved from keep fenced copies.
+                ensure!(
+                    !limits::unresolved(&self.db, &physical)?,
+                    "machine has unresolved operations; reconcile their outcomes first"
+                );
+                self.remove_old_copies(&physical, "")?;
+                return self.delete_missing(user, &name, &physical, &input);
+            }
+            if op == "snapshot-delete"
+                && let Some(value) = self.delete_stored_snapshot(user, &name, &physical, &input)?
+            {
+                return Ok(value);
+            }
             self.legacy_access(&physical)?;
             if let Some(placement) = self.managed_placement(&physical)? {
+                if op == "restore" {
+                    return Err(limits::Rejection(format!(
+                        "machine '{name}' was moved between runners; restore it from its snapshot's artifact (ow restore {name} --artifact ID --node RUNNER, the ID is in ow snapshots)"
+                    ))
+                    .into());
+                }
                 ensure!(
                     matches!(
                         op.as_str(),
@@ -2502,9 +2694,16 @@ impl Catalog {
                             | "put"
                             | "get"
                             | "hibernate"
+                            | "resize"
+                            | "snapshot"
+                            | "snapshot-delete"
+                            | "delete"
                     ),
                     "managed mutation requires lifecycle coordination"
                 );
+                if matches!(op.as_str(), "delete" | "snapshot-delete") {
+                    nodes::managed_lifecycle_capable(&self.root, &placement.node)?;
+                }
                 request["placement"] = json!(placement);
             }
             // Confirmed gone from its runner: only the row is left. A runner that is online now
@@ -3009,7 +3208,7 @@ impl Catalog {
             return Err(self.outcome_error(owner, operation));
         }
         if request.get("placement").is_some()
-            && matches!(op.as_str(), "start" | "stop" | "hibernate")
+            && matches!(op.as_str(), "start" | "stop" | "hibernate" | "resize")
         {
             // Lifecycle replies predate placement fields; observe the actual current copy.
             let observed = (|| -> Result<Value> {
@@ -3049,12 +3248,20 @@ impl Catalog {
         ) {
         } else if op == "snapshot" {
             let id = request["name"].as_str().unwrap();
+            if value["disk_bytes"].is_null() {
+                // Its store publication and any fork from it are checked against this size.
+                value["disk_bytes"] = self.db.query_row("SELECT json_extract(metadata,'$.disk_bytes') FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|r.get::<_,Option<i64>>(0))?.map_or(Value::Null, |n| json!(n));
+            }
             self.save_node(&node, "snapshot", id, &value)?;
             value = self.public(user, "snapshot", &value)?;
         } else if op == "stop" {
             self.save_node(&node, "machine", &physical, &value["workspace"])?;
             value["workspace"] = self.public(user, "machine", &value["workspace"])?;
         } else if op == "delete" {
+            if request.get("placement").is_some() {
+                // An error leaves this operation pending: its retry finds the tombstone.
+                self.remove_old_copies(&physical, &node)?;
+            }
             value = json!({"deleted":name,"snapshots":self.forget(user, &physical)?});
         } else if op == "snapshot-delete" {
             let snapshot = input["name"].as_str().unwrap();
@@ -3065,6 +3272,11 @@ impl Catalog {
             tx.execute(
                 "DELETE FROM resources WHERE kind='snapshot' AND physical=?1",
                 [id],
+            )?;
+            // This runner's copy is gone; its store publication is no longer a root.
+            tx.execute(
+                "DELETE FROM drain_publications WHERE node=?1 AND name=?2",
+                params![node, id],
             )?;
             tx.commit()?;
             value = json!({"deleted":snapshot,"workspace":name});
