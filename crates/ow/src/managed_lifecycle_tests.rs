@@ -15,6 +15,10 @@ struct Runner {
 }
 impl Runner {
     fn serve(root: &Path, node: &str, copies: Vec<Value>) -> Self {
+        Self::serve_with(root, node, copies, Vec::new())
+    }
+    /// Also holding these named snapshots, as the worker lists them.
+    fn serve_with(root: &Path, node: &str, copies: Vec<Value>, held: Vec<Value>) -> Self {
         let path = root.join("nodes").join(node);
         fs::create_dir_all(&path).unwrap();
         let listener = UnixListener::bind(path.join("control.sock")).unwrap();
@@ -27,7 +31,10 @@ impl Runner {
                 .into_iter()
                 .map(|m| (m["id"].as_str().unwrap().to_owned(), m))
                 .collect();
-            let mut snapshots = BTreeMap::<String, Value>::new();
+            let mut snapshots: BTreeMap<String, Value> = held
+                .into_iter()
+                .map(|s| (s["name"].as_str().unwrap().to_owned(), s))
+                .collect();
             while !done.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(1));
@@ -893,4 +900,65 @@ fn a_snapshot_a_fork_already_uploaded_is_still_published_as_a_snapshot() {
         ),
         1
     );
+}
+
+#[test]
+fn a_snapshot_recorded_without_a_disk_size_follows_its_moved_box_through_the_store() {
+    let (f, peers) = completed(Kind::Move, false);
+    // Recorded before captures carried a disk size; the upgraded runner reports it.
+    f.shared.lock().unwrap().db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'snapshot','before-upgrade','s-old-upgrade',?2,'source')",params![f.user,json!({"name":"s-old-upgrade","workspace":"physical","memory_mib":256,"vcpu_count":1,"state":"ready"}).to_string()]).unwrap();
+    let mut copy = peers.borrow().source.clone().unwrap();
+    copy["memory_mib"] = json!(256);
+    copy["vcpu_count"] = json!(1);
+    let source = Runner::serve_with(
+        &f.root,
+        "source",
+        vec![copy],
+        vec![
+            json!({"name":"s-old-upgrade","workspace":"physical","memory_mib":256,"vcpu_count":1,"state":"ready","disk_bytes":4}),
+        ],
+    );
+    let pushes = RefCell::new(Vec::new());
+    let call = |node: &str, r: Value| -> Result<Value> {
+        match r["op"].as_str().unwrap() {
+            "capture-published" => Ok(json!({"present":false})),
+            "capture-push" => {
+                pushes
+                    .borrow_mut()
+                    .push((node.to_owned(), r["artifact"]["disk_bytes"].clone()));
+                Ok(publication(&r, true))
+            }
+            _ => rpc(&f.root, node, r),
+        }
+    };
+    for _ in 0..3 {
+        for (item, result) in publication::pass(&f.shared, &call) {
+            result.unwrap_or_else(|e| panic!("{item}: {e:#}"));
+        }
+    }
+    assert_eq!(*pushes.borrow(), [("source".to_owned(), json!(4))]);
+    // Rehomed to the store, its old runner copy removed, and it forks on any runner.
+    assert_eq!(
+        rows(
+            &f,
+            "SELECT COUNT(*) FROM resources WHERE kind='snapshot' AND node='' AND json_extract(metadata,'$.disk_bytes')=4"
+        ),
+        1
+    );
+    assert_eq!(source.last("snapshot-delete")["name"], "s-old-upgrade");
+    let c = f.shared.lock().unwrap();
+    let mut input = parking::shape(&c, "physical", Kind::Fork, "box").unwrap();
+    input.target = Some("source".into());
+    movement::named_snapshot(
+        &c,
+        f.user,
+        "box",
+        "physical",
+        "target",
+        "before-upgrade",
+        &mut input,
+    )
+    .unwrap();
+    assert!(input.capture.is_some());
+    assert_eq!(input.disk_bytes, 4);
 }

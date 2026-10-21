@@ -417,12 +417,14 @@ the [collector](STORE_GC.md) removes it after its grace period.
 A runner copy whose box that runner no longer knows (a capture a fork pulled, say)
 keeps its publication record, and so its store root, for as long as the runner lists it.
 
-Limits: snapshots taken before this release have no recorded disk size and are not
-published (they stay on their runner, are deleted there, and fork only there); every
-capture now records it. A shared user's own snapshot of a box is published and
-rehomed, but forks from the store only for the box owner. A fork child's imported
-capture stays on its runner after the child is deleted. Snapshots of boxes that were
-never managed keep their runner-bound behavior.
+A snapshot recorded without a disk size (taken before this release) gets it from its
+runner's snapshot inventory, which upgraded workers report, and is then published like
+any other. A fork child's imported capture goes with the child when its parent has no
+live copy on that runner; otherwise the parent's own delete removes it.
+
+Limits: a shared user's own snapshot of a box is published and rehomed, but forks
+from the store only for the box owner. Snapshots of boxes that were never managed
+keep their runner-bound behavior.
 
 The focused tests run real move and fork transfers, then each operation against
 runner sockets that refuse any other placement, including after the move's source

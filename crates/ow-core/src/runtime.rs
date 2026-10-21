@@ -1189,6 +1189,12 @@ impl Runtime {
         if let Some(name) = self.cleanup_fork_capture(id)? {
             snapshots.push(name);
         }
+        if let Some(name) = self.orphaned_import(id) {
+            fs::remove_dir_all(self.snapshot_dir(&name))?;
+            File::open(self.root.join("snapshots"))?.sync_all()?;
+            self.verified.remove(&name);
+            snapshots.push(name);
+        }
         if self.state.placements.contains_key(id) {
             // Keep the fence as a tombstone: a late request must never recreate this copy.
             self.mark_deleted(id);
@@ -1471,7 +1477,7 @@ impl Runtime {
             let name = staged.snapshot.name.clone();
             // The worker served other requests while this was hashed: re-check what they may change.
             ensure!(
-                self.workspace(&id).is_ok_and(|w| w.index == staged.index),
+                self.workspace(&id).is_ok_and(|w| w.index == staged.index) && !self.deleted(&id),
                 "workspace was deleted during the capture"
             );
             if let Some((_, child)) = &staged.fork {
@@ -2182,8 +2188,20 @@ impl Runtime {
                         }
                     }
                 }
+                // The disk size lets the controller publish a snapshot it recorded without one.
                 Ok(json!(
-                    snapshots.iter().map(Snapshot::summary).collect::<Vec<_>>()
+                    snapshots
+                        .iter()
+                        .map(|s| {
+                            let mut summary = s.summary();
+                            summary["disk_bytes"] = json!(
+                                fs::metadata(self.snapshot_dir(&s.name).join("disk.ext4"))
+                                    .ok()
+                                    .map(|m| m.len())
+                            );
+                            summary
+                        })
+                        .collect::<Vec<_>>()
                 ))
             }
             "fork" => {

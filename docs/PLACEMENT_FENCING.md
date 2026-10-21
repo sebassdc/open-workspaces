@@ -106,7 +106,10 @@ mid-export or mid-import is refused. The machine directory, recovery journal and
 box's local snapshots go, export and hibernation captures included, except a capture
 another managed copy still imports from. The fence stays as a **tombstone**: phase
 `cleaned` with no export or import intent, workspace state `deleted`, kept across
-restart; releasing the import intent frees the capture a deleted fork child came from. A repeated delete
+restart. A fork child's imported capture (it names the parent) goes with the child
+when no other copy imports it and the parent has no live copy on that runner; a
+parent still here removes it in its own delete. A capture still sealing when its copy
+is deleted is never committed. The snapshot inventory reports each capture's disk size. A repeated delete
 with that authority answers from it, and a cached delete reply revalidates against
 it. Every other request, an `export-cleanup` and an `import-prepare` at any newer
 epoch included, is refused. Tombstones consume no live workspace slot.

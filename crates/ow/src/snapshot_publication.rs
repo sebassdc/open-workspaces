@@ -43,7 +43,7 @@ pub(super) fn pass(
     shared: &Shared,
     call: &impl Fn(&str, Value) -> Result<Value>,
 ) -> Vec<(String, Result<()>)> {
-    let mut results = Vec::new();
+    let mut results = vec![("sizes".to_owned(), sizes(shared, call))];
     let unpublished = (|| -> Result<Vec<(String, String, String, (u32, u32, u64))>> {
         let c = shared.lock().unwrap();
         let mut stmt = c.db.prepare("SELECT s.node,s.physical,m.physical,json_extract(s.metadata,'$.memory_mib'),json_extract(s.metadata,'$.vcpu_count'),json_extract(s.metadata,'$.disk_bytes') FROM resources s JOIN resources m ON m.kind='machine' AND m.physical=json_extract(s.metadata,'$.workspace') JOIN nodes n ON n.id=s.node WHERE s.kind='snapshot' AND s.node<>'' AND json_extract(s.metadata,'$.state')='ready' AND m.placement_managed=1 AND json_extract(s.metadata,'$.disk_bytes') IS NOT NULL AND json_extract(n.capabilities,'$.managed_restore_v1')=1 AND NOT EXISTS(SELECT 1 FROM drain_publications p WHERE p.node=s.node AND p.name=s.physical) ORDER BY s.created_at")?;
@@ -83,6 +83,34 @@ pub(super) fn pass(
         Err(error) => results.push(("copies".into(), Err(error))),
     }
     results
+}
+
+/// Snapshots recorded before captures carried a disk size (or by an older worker) get it
+/// from their runner's inventory, which upgraded workers report, so they can be published.
+fn sizes(shared: &Shared, call: &impl Fn(&str, Value) -> Result<Value>) -> Result<()> {
+    let nodes: Vec<String> = {
+        let c = shared.lock().unwrap();
+        let mut stmt = c.db.prepare("SELECT DISTINCT s.node FROM resources s JOIN resources m ON m.kind='machine' AND m.physical=json_extract(s.metadata,'$.workspace') JOIN nodes n ON n.id=s.node WHERE s.kind='snapshot' AND s.node<>'' AND json_extract(s.metadata,'$.state')='ready' AND json_extract(s.metadata,'$.disk_bytes') IS NULL AND m.placement_managed=1 AND json_extract(n.capabilities,'$.managed_lifecycle_v1')=1 ORDER BY s.node")?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for node in nodes {
+        if nodes::online(&shared.lock().unwrap().root, &node).is_err() {
+            continue;
+        }
+        let listed = call(&node, json!({"op":"snapshots"}))?;
+        let c = shared.lock().unwrap();
+        for s in listed.as_array().context("invalid snapshot inventory")? {
+            if let (Some(name), Some(workspace), Some(bytes)) = (
+                s["name"].as_str(),
+                s["workspace"].as_str(),
+                s["disk_bytes"].as_u64(),
+            ) {
+                c.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.disk_bytes',?1),updated_at=CURRENT_TIMESTAMP WHERE kind='snapshot' AND node=?2 AND physical=?3 AND json_extract(metadata,'$.workspace')=?4 AND json_extract(metadata,'$.disk_bytes') IS NULL",params![bytes as i64,node,name,workspace])?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A published snapshot whose box left its runner belongs to the store, not to that runner.

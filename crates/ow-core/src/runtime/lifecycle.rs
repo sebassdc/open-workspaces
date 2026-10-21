@@ -143,6 +143,20 @@ impl Runtime {
         }
         Ok(())
     }
+    /// The capture a fork child imported names its parent, so the delete loop keeps it. It
+    /// goes with the child when nothing else here can still own it: no other copy imports it,
+    /// and the parent has no live copy on this runner (whose own delete would remove it).
+    pub(super) fn orphaned_import(&self, id: &str) -> Option<String> {
+        let import = self.state.placements.get(id)?.import.as_ref()?;
+        let parent = import.fork_source.as_deref()?;
+        let name = &import.snapshot;
+        let manifest = fs::read(self.snapshot_dir(name).join("manifest.json")).ok()?;
+        let snapshot: Snapshot = serde_json::from_slice(&manifest).ok()?;
+        (snapshot.workspace == parent
+            && !self.lifecycle_capture_of_another(id, name)
+            && (!self.state.workspaces.contains_key(parent) || self.deleted(parent)))
+        .then(|| name.clone())
+    }
     pub(super) fn mark_deleted(&mut self, id: &str) {
         let managed = self.state.placements.get_mut(id).unwrap();
         managed.phase = Phase::Cleaned;
@@ -2017,19 +2031,15 @@ mod managed_lifecycle_tests {
                 .snapshot_dir("onward-capture/manifest.json")
                 .exists()
         );
-        // Deleting the child releases that reservation. The capture names its parent, and the
-        // worker cannot tell a generated fork capture from the parent's own named snapshot
-        // (a same-runner fork imports that directly), so it is left for the parent's owner.
-        runtime
+        // Deleting the child releases that reservation, and with its parent already deleted
+        // here nothing else could ever remove the capture: it goes with the child.
+        let deleted = runtime
             .request(&json!({"op":"delete","id":"child","placement":child}))
             .unwrap();
+        assert_eq!(deleted["snapshots"], json!(["onward-capture"]));
         assert!(runtime.deleted("child"));
         assert!(!runtime.lifecycle_capture("onward-capture"));
-        assert!(
-            runtime
-                .snapshot_dir("onward-capture/manifest.json")
-                .exists()
-        );
+        assert!(!runtime.snapshot_dir("onward-capture").exists());
         fs::remove_dir_all(runtime.root).unwrap();
     }
 
@@ -2094,6 +2104,107 @@ mod managed_lifecycle_tests {
                 .snapshot_dir("onward-capture/manifest.json")
                 .exists()
         );
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    /// Exports `legacy` on a source runner and imports that capture as fork child `child` on
+    /// a separate target runner, where the parent has never been.
+    fn cross_runner_child() -> (Runtime, Value) {
+        let (mut source, placement) = runtime();
+        source
+            .request(&json!({"op":"export","id":"legacy","placement":placement,"transfer":"cross","capture":"fork-import"}))
+            .unwrap();
+        let mut target = super::super::disk_tests::fixture();
+        target
+            .request(&json!({"op":"delete","id":"legacy"}))
+            .unwrap();
+        let to = target.snapshot_dir("fork-import");
+        fs::create_dir(&to).unwrap();
+        for entry in fs::read_dir(source.snapshot_dir("fork-import")).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+        let child = json!({"epoch":8,"node":"beta","transfer":"cross"});
+        let digest = hash(&to.join("manifest.json")).unwrap();
+        target.request(&json!({"op":"fork-prepare","id":"child","fork_source":"legacy","snapshot":"fork-import","manifest_sha256":digest,"placement":child})).unwrap();
+        target
+            .request(&json!({"op":"activate","id":"child","placement":child,"committed":true}))
+            .unwrap();
+        fs::remove_dir_all(source.root).unwrap();
+        (target, child)
+    }
+
+    #[test]
+    fn a_cross_runner_fork_child_takes_its_imported_capture_with_it() {
+        let (mut target, child) = cross_runner_child();
+        let delete = json!({"op":"delete","id":"child","placement":child});
+        assert_eq!(
+            target.request(&delete).unwrap()["snapshots"],
+            json!(["fork-import"])
+        );
+        assert!(target.deleted("child"));
+        assert!(!target.snapshot_dir("fork-import").exists());
+        assert_eq!(
+            target.request(&json!({"op":"snapshots"})).unwrap(),
+            json!([])
+        );
+        // A repeat answers from the tombstone.
+        assert_eq!(target.request(&delete).unwrap()["deleted"], "child");
+        fs::remove_dir_all(target.root).unwrap();
+    }
+
+    #[test]
+    fn a_fork_childs_capture_stays_while_its_parent_lives_on_that_runner_and_goes_with_it() {
+        // Same runner: the child imports the parent's own capture, which the parent still owns.
+        let (mut runtime, placement) = runtime();
+        named(&mut runtime, &placement, "parents-own");
+        let child = json!({"epoch":8,"node":"alpha","transfer":"fork"});
+        let digest = hash(&runtime.snapshot_dir("parents-own/manifest.json")).unwrap();
+        runtime.request(&json!({"op":"fork-prepare","id":"child","fork_source":"legacy","snapshot":"parents-own","manifest_sha256":digest,"placement":child})).unwrap();
+        runtime
+            .request(&json!({"op":"activate","id":"child","placement":child,"committed":true}))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .request(&json!({"op":"delete","id":"child","placement":child}))
+                .unwrap()["snapshots"],
+            json!([])
+        );
+        assert!(runtime.snapshot_dir("parents-own/manifest.json").exists());
+        // The parent's own delete removes it.
+        let removed = runtime
+            .request(&json!({"op":"delete","id":"legacy","placement":placement}))
+            .unwrap();
+        assert_eq!(removed["snapshots"], json!(["parents-own"]));
+        assert!(!runtime.snapshot_dir("parents-own").exists());
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
+    fn a_capture_sealing_when_its_box_is_deleted_is_never_committed() {
+        let (mut runtime, placement) = runtime();
+        let _ = fs::remove_file(runtime.machine_dir("legacy").join("fixture-api.sock"));
+        let (machine, server) = vm::capture_fixture(&runtime.machine_dir("legacy"), true);
+        runtime.machines.insert("legacy".into(), machine);
+        let super::super::Step::Seal(staged) = runtime
+            .begin(&json!({"op":"snapshot","id":"legacy","name":"late","placement":placement}))
+        else {
+            panic!("capture not deferred")
+        };
+        server.join().unwrap();
+        runtime
+            .request(&json!({"op":"stop","id":"legacy","placement":placement}))
+            .unwrap();
+        runtime
+            .request(&json!({"op":"delete","id":"legacy","placement":placement}))
+            .unwrap();
+        let sealed = staged.seal();
+        let error = runtime.finish(staged, sealed).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("deleted during the capture"),
+            "{error:#}"
+        );
+        assert!(!runtime.snapshot_dir("late").exists());
         fs::remove_dir_all(runtime.root).unwrap();
     }
 }
