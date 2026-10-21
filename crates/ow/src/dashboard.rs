@@ -580,10 +580,22 @@ pub async fn handle(
             None => Err(anyhow::anyhow!("ownership catalog unavailable")),
         }
     } else if operation["op"] == "aws-role" {
-        with_catalog(catalog, identity, move |catalog, user| {
-            catalog.aws_role(user, &operation, pool_owner == Some(user))
-        })
-        .await
+        match catalog {
+            Some(catalog) => tokio::task::spawn_blocking(move || {
+                let user = catalog.lock().unwrap().user(&identity)?;
+                crate::aws_metadata::role(
+                    &catalog,
+                    user,
+                    &operation,
+                    pool_owner == Some(user),
+                    &mut crate::aws_metadata::Instance::default(),
+                )
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r),
+            None => Err(anyhow::anyhow!("ownership catalog unavailable")),
+        }
     } else if matches!(operation["op"].as_str(), Some("publish" | "unpublish")) {
         match preview_host {
             Some(host) => {

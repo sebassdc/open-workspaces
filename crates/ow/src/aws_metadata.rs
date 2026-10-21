@@ -99,6 +99,78 @@ pub(crate) struct Pending {
     session: String,
 }
 
+fn refresh(shared: &Arc<Mutex<Catalog>>, pending: &Pending, sts: &mut dyn Assume) -> Result<()> {
+    let session = sts.assume(&sts::Request {
+        role_arn: &pending.role,
+        session: &pending.session,
+        box_id: &pending.physical,
+        owner: &pending.email,
+    });
+    let host = sts.host().ok();
+    shared.lock().unwrap().aws_finish(pending, session, host)
+}
+
+/// Complete a CLI/dashboard role change. A live box's attachment succeeds only after its
+/// runner acknowledges credentials; STS never holds the catalog lock or an SDK request open.
+pub(crate) fn role(
+    shared: &Arc<Mutex<Catalog>>,
+    user: i64,
+    request: &Value,
+    pool_admin: bool,
+    sts: &mut dyn Assume,
+) -> Result<Value> {
+    let (mut answer, pending) = {
+        let mut c = shared.lock().unwrap();
+        let (answer, metadata) = c.prepare_aws_role(user, request, pool_admin)?;
+        let Some(physical) = metadata else {
+            return Ok(answer);
+        };
+        let (node, state): (String, Option<String>) = c.db.query_row(
+            "SELECT node,json_extract(metadata,'$.state') FROM resources WHERE kind='machine' AND physical=?1",
+            [&physical], |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // No live guest can query metadata here; stopped/parked attachments remain pending.
+        if node.is_empty() || !matches!(state.as_deref(), Some("running" | "hibernated")) {
+            return Ok(answer);
+        }
+        let pending = c.aws_plan(&physical)?.ok_or_else(not_ready)?;
+        (answer, pending)
+    };
+    refresh(shared, &pending, sts)?;
+    let c = shared.lock().unwrap();
+    let current = view(&c.db, &pending.physical)?;
+    let placement: Option<(i64, String)> = c.db.query_row(
+        "SELECT owner,node FROM resources WHERE kind='machine' AND physical=?1 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1)",
+        [&pending.physical], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    if placement != Some((pending.owner, pending.node.clone()))
+        || current["generation"] != pending.generation
+        || current["role_arn"] != pending.role
+        || current["state"] != "active"
+        || !config(&c.root)?
+            .is_some_and(|c| c.mode == Mode::Metadata && c.allows(&pending.role, &pending.email))
+        || c.creds_call(
+            &pending.node,
+            &pending.physical,
+            json!({"check":true,"generation":pending.generation}),
+        )?["present"]
+            != true
+    {
+        return Err(not_ready().into());
+    }
+    // A first SDK lookup must not select token files left by the previous web-identity mode.
+    c.aws_call(&pending.node, &pending.physical, json!({}))?;
+    answer["aws_role"] = current;
+    Ok(answer)
+}
+
+fn not_ready() -> Refusal {
+    Refusal {
+        code: "aws_credentials_not_ready",
+        message: "AWS credentials are not ready for this attachment. Check the box's AWS role status and retry.".into(),
+    }
+}
+
 /// One refresher step in metadata mode.
 pub(crate) fn step(
     shared: &Arc<Mutex<Catalog>>,
@@ -110,17 +182,7 @@ pub(crate) fn step(
         Work::Attached(physical) => {
             let plan = shared.lock().unwrap().aws_plan(&physical);
             let result = match plan {
-                Ok(Some(pending)) => {
-                    // The catalog lock is released: an STS slowdown stalls nothing else.
-                    let session = sts.assume(&sts::Request {
-                        role_arn: &pending.role,
-                        session: &pending.session,
-                        box_id: &pending.physical,
-                        owner: &pending.email,
-                    });
-                    let host = sts.host().ok();
-                    shared.lock().unwrap().aws_finish(&pending, session, host)
-                }
+                Ok(Some(pending)) => refresh(shared, &pending, sts),
                 Ok(None) => Ok(()),
                 Err(error) => Err(error),
             };
@@ -211,7 +273,7 @@ impl Catalog {
     }
 
     /// Attach in metadata mode: the runner drops the old role's credentials and waits for
-    /// the new ones, then the attachment is recorded and the refresher assumes the role.
+    /// the new ones, then the attachment is recorded for unlocked STS and delivery.
     pub(crate) fn attach_metadata(
         &mut self,
         name: &str,

@@ -387,8 +387,14 @@ impl Catalog {
         )?)
     }
 
-    /// `{"op":"aws-role","id":NAME,"role_arn":ARN}` attaches; without `role_arn` it detaches.
-    pub fn aws_role(&mut self, user: i64, request: &Value, pool_admin: bool) -> Result<Value> {
+    /// Catalog preparation only. Returns the metadata box requiring unlocked completion.
+    /// The CLI/dashboard must use the shared AWS role handler before reporting success.
+    pub(crate) fn prepare_aws_role(
+        &mut self,
+        user: i64,
+        request: &Value,
+        pool_admin: bool,
+    ) -> Result<(Value, Option<String>)> {
         let name = request["id"].as_str().context("id")?;
         let physical = if pool_admin && let Some((owner, logical)) = name.split_once('/') {
             common::address(name)?;
@@ -422,7 +428,8 @@ impl Catalog {
                 .into());
             }
             if config.mode == Mode::Metadata {
-                return self.attach_metadata(name, &physical, owner, role, request);
+                let answer = self.attach_metadata(name, &physical, owner, role, request)?;
+                return Ok((answer, Some(physical)));
             }
             ensure!(
                 request["hop_limit"].is_null(),
@@ -471,7 +478,10 @@ impl Catalog {
         {
             let _ = self.sync_aws(&physical, true);
         }
-        Ok(json!({"id":name,"aws_role":view(&self.db, &physical)?}))
+        Ok((
+            json!({"id":name,"aws_role":view(&self.db, &physical)?}),
+            None,
+        ))
     }
 
     /// Only the verified pool administrator receives this limited AWS settings list.

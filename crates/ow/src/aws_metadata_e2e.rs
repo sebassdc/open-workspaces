@@ -185,13 +185,33 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
         started.elapsed()
     );
 
-    // Attach: the refresher assumes the role and box 1 reads it at the EC2 address.
-    shared
-        .lock()
-        .unwrap()
-        .operation(a, json!({"op":"aws-role","id":"one","role_arn":READER}))
-        .unwrap();
-    pass(&shared, &mut sts, &mut cleared);
+    let python = sh("python3 -c 'import botocore'").status.success();
+    if std::env::var("OW_E2E_REQUIRE_BOTOCORE").as_deref() == Ok("1") {
+        assert!(python, "python3-botocore is required");
+    }
+    let home = f.root.join("home");
+    std::fs::create_dir_all(home.join(".aws")).unwrap();
+    // Attach through the CLI/dashboard handler with STS slower than the 800 ms IMDS hold.
+    // No refresher pass or guest retry may be needed after the successful response.
+    sts.during = Some(Box::new(|_| std::thread::sleep(Duration::from_secs(2))));
+    let started = Instant::now();
+    let attached = crate::aws_metadata::role(
+        &shared,
+        a,
+        &json!({"op":"aws-role","id":"one","role_arn":READER}),
+        false,
+        &mut sts,
+    )
+    .unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert_eq!(attached["aws_role"]["state"], "active");
+    sts.during = None;
+    if python {
+        assert_eq!(
+            botocore(&home, None),
+            ("iam-role".into(), "ASIAFAKE1".into())
+        );
+    }
     assert_eq!(metadata(1, CREDENTIALS), (200, "reader".into()));
     let (status, body) = metadata(1, &format!("{CREDENTIALS}reader"));
     assert_eq!(status, 200);
@@ -298,13 +318,7 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
 
     // The SDK credential chain (botocore, which the AWS CLI uses), one IMDS attempt as the
     // CLI makes: the role when the user has nothing, the user's own keys and profiles first.
-    let python = sh("python3 -c 'import botocore'").status.success();
-    if std::env::var("OW_E2E_REQUIRE_BOTOCORE").as_deref() == Ok("1") {
-        assert!(python, "python3-botocore is required");
-    }
     if python {
-        let home = f.root.join("home");
-        std::fs::create_dir_all(home.join(".aws")).unwrap();
         assert_eq!(
             botocore(&home, None),
             ("iam-role".into(), "ASIAFAKE1".into())
@@ -345,11 +359,14 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
     );
     assert_eq!(curl(1, &replay).1, "200");
     // Detach: gone at once, without waiting for a refresher pass.
-    shared
-        .lock()
-        .unwrap()
-        .operation(a, json!({"op":"aws-role","id":"one"}))
-        .unwrap();
+    crate::aws_metadata::role(
+        &shared,
+        a,
+        &json!({"op":"aws-role","id":"one"}),
+        false,
+        &mut sts,
+    )
+    .unwrap();
     let started = Instant::now();
     assert_eq!(metadata(1, CREDENTIALS).0, 404);
     assert!(started.elapsed() < Duration::from_millis(700));
@@ -359,12 +376,14 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
     }
 
     // Re-attach, then transfer to another owner: gone the moment the transfer returns.
-    shared
-        .lock()
-        .unwrap()
-        .operation(a, json!({"op":"aws-role","id":"one","role_arn":ADMIN_ONLY}))
-        .unwrap();
-    pass(&shared, &mut sts, &mut cleared);
+    crate::aws_metadata::role(
+        &shared,
+        a,
+        &json!({"op":"aws-role","id":"one","role_arn":ADMIN_ONLY}),
+        false,
+        &mut sts,
+    )
+    .unwrap();
     assert_eq!(
         curl(1, &replay).1,
         "401",

@@ -234,7 +234,7 @@ fn roles_need_the_allow_list_and_owner_or_admin() {
     let set = |role: &str| json!({"op":"aws-role","id":"box","role_arn":role});
     // Off by default: nothing to attach to and nothing published.
     assert_eq!(
-        refusal(c.operation(a, set(ROLE)).unwrap_err()),
+        refusal(c.stage_operation(a, set(ROLE)).unwrap_err()),
         "aws_access_off"
     );
     assert!(public_document(&f.root, DISCOVERY).is_none());
@@ -242,12 +242,12 @@ fn roles_need_the_allow_list_and_owner_or_admin() {
     f.configure(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":ROLE},{"role_arn":OTHER,"owners":["b@example.test"]},{"role_arn":OWNED,"owners":["a@example.test"]}]}));
     let unlisted = "arn:aws:iam::111122223333:role/admin";
     assert_eq!(
-        refusal(c.operation(a, set(unlisted)).unwrap_err()),
+        refusal(c.stage_operation(a, set(unlisted)).unwrap_err()),
         "aws_role_not_allowed"
     );
     // Restricted to another owner's boxes.
     assert_eq!(
-        refusal(c.operation(a, set(OTHER)).unwrap_err()),
+        refusal(c.stage_operation(a, set(OTHER)).unwrap_err()),
         "aws_role_not_allowed"
     );
     assert!(f.requests().is_empty());
@@ -261,10 +261,10 @@ fn roles_need_the_allow_list_and_owner_or_admin() {
         } else {
             "d@example.test"
         };
-        c.operation(a, json!({"op":"share","id":"box","with":email,"role":role}))
+        c.stage_operation(a, json!({"op":"share","id":"box","with":email,"role":role}))
             .unwrap();
         let shared = json!({"op":"aws-role","id":"a@example.test/box","role_arn":ROLE});
-        let result = c.operation(grantee, shared);
+        let result = c.stage_operation(grantee, shared);
         assert_eq!(result.is_ok(), role == "admin", "{role}: {result:?}");
     }
     let attached = c.state(a).unwrap()["workspaces"][0]["aws_role"].clone();
@@ -277,7 +277,7 @@ fn roles_need_the_allow_list_and_owner_or_admin() {
     assert_eq!(shared["shared"][0]["aws_role"]["role_arn"], ROLE);
     assert_eq!(shared["aws_identity"]["roles"], json!([ROLE]));
     assert_eq!(shared["shared"][0]["aws_roles"], json!([ROLE, OWNED]));
-    c.operation(
+    c.stage_operation(
         admin,
         json!({"op":"aws-role","id":"a@example.test/box","role_arn":OWNED}),
     )
@@ -296,13 +296,16 @@ fn roles_need_the_allow_list_and_owner_or_admin() {
         )
         .unwrap();
     }
-    c.operation(a, set(ROLE)).unwrap(); // the box itself is already counted
+    c.stage_operation(a, set(ROLE)).unwrap(); // the box itself is already counted
     running(&c, a, "more", "m-more");
     let more = json!({"op":"aws-role","id":"more","role_arn":ROLE});
-    assert_eq!(refusal(c.operation(a, more).unwrap_err()), "aws_role_limit");
+    assert_eq!(
+        refusal(c.stage_operation(a, more).unwrap_err()),
+        "aws_role_limit"
+    );
     // Bad config fails closed.
     f.configure(json!({"issuer":"http://ow.example.test","allowed_roles":[]}));
-    assert!(c.operation(a, set(ROLE)).is_err());
+    assert!(c.stage_operation(a, set(ROLE)).is_err());
 }
 
 #[test]
@@ -313,7 +316,7 @@ fn tokens_are_short_lived_rotate_and_follow_the_incarnation() {
     let a = c.user(&identity("a", "A@Example.test")).unwrap();
     let b = c.user(&identity("b", "b@example.test")).unwrap();
     running(&c, a, "box", "m-box");
-    c.operation(a, json!({"op":"aws-role","id":"box","role_arn":ROLE}))
+    c.stage_operation(a, json!({"op":"aws-role","id":"box","role_arn":ROLE}))
         .unwrap();
     let first = f.requests();
     assert_eq!(first.len(), 1);
@@ -384,7 +387,7 @@ fn tokens_are_short_lived_rotate_and_follow_the_incarnation() {
     }
 
     // Re-attaching is a new credential authority too.
-    c.operation(a, json!({"op":"aws-role","id":"box","role_arn":ROLE}))
+    c.stage_operation(a, json!({"op":"aws-role","id":"box","role_arn":ROLE}))
         .unwrap();
     let reattached = f.requests();
     assert_eq!(verified(&f.root, &reattached[0])["ow_generation"], 3);
@@ -470,7 +473,8 @@ fn tokens_are_short_lived_rotate_and_follow_the_incarnation() {
         .unwrap();
 
     // Detach removes the row and the guest files.
-    c.operation(a, json!({"op":"aws-role","id":"box"})).unwrap();
+    c.stage_operation(a, json!({"op":"aws-role","id":"box"}))
+        .unwrap();
     let detached = f.requests();
     assert_eq!(detached.len(), 1);
     assert!(detached[0].get("token").is_none());
@@ -534,7 +538,7 @@ fn parked_boxes_withdraw_keys_without_contacting_a_worker() {
         f.configure(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":ROLE}]}));
         c.db.execute("UPDATE resources SET node='local'", [])
             .unwrap();
-        c.operation(owner, attach.clone()).unwrap();
+        c.stage_operation(owner, attach.clone()).unwrap();
         let old = f.requests().pop().unwrap();
         verified(&f.root, &old);
         c.db.execute(
@@ -544,7 +548,7 @@ fn parked_boxes_withdraw_keys_without_contacting_a_worker() {
         .unwrap();
         match action {
             "reattach" => {
-                c.operation(owner, attach.clone()).unwrap();
+                c.stage_operation(owner, attach.clone()).unwrap();
                 assert!(rejected(&f.root, &old), "re-attachment revokes immediately");
             }
             "remove-role" => f.configure(json!({"issuer":ISSUER,"allowed_roles":[]})),
@@ -605,7 +609,7 @@ fn revoked_roles_retry_cleanup_after_stop_and_restored_credentials() {
     let mut c = Catalog::open(&f.root, "test", None).unwrap();
     let owner = c.user(&identity("a", "a@example.test")).unwrap();
     running(&c, owner, "box", "m-box");
-    c.operation(owner, json!({"op":"aws-role","id":"box","role_arn":ROLE}))
+    c.stage_operation(owner, json!({"op":"aws-role","id":"box","role_arn":ROLE}))
         .unwrap();
     let old = f.requests().pop().unwrap();
     let mut cleared = HashSet::new();
@@ -648,26 +652,26 @@ fn configured_pool_admin_and_transfer_reset_follow_aws_authority() {
     c.pool_admins = vec!["pool@example.test".into()];
     running(&c, owner, "box", "m-box");
     let attach = json!({"op":"aws-role","id":"a@example.test/box","role_arn":OWNED});
-    c.operation(admin, attach.clone()).unwrap();
+    c.stage_operation(admin, attach.clone()).unwrap();
     let old = f.requests().pop().unwrap();
     verified(&f.root, &old);
     let pool = c.state(admin).unwrap()["pool"].clone();
     assert_eq!(pool[0]["aws_role"]["role_arn"], OWNED);
     assert_eq!(pool[0]["aws_roles"], json!([OWNED]));
     assert!(c.machine(admin, "a@example.test/box", "exec").is_err());
-    c.operation(admin, json!({"op":"aws-role","id":"a@example.test/box"}))
+    c.stage_operation(admin, json!({"op":"aws-role","id":"a@example.test/box"}))
         .unwrap();
     assert!(view(&c.db, "m-box").unwrap().is_null());
-    c.operation(admin, attach.clone()).unwrap();
+    c.stage_operation(admin, attach.clone()).unwrap();
     let old = f.requests().pop().unwrap();
-    c.operation(
+    c.stage_operation(
         owner,
         json!({"op":"transfer","id":"box","to":"b@example.test"}),
     )
     .unwrap();
     assert!(rejected(&f.root, &old));
     assert!(view(&c.db, "m-box").unwrap().is_null());
-    c.operation(
+    c.stage_operation(
         next,
         json!({"op":"transfer","id":"box","to":"a@example.test"}),
     )
@@ -676,10 +680,23 @@ fn configured_pool_admin_and_transfer_reset_follow_aws_authority() {
         view(&c.db, "m-box").unwrap().is_null(),
         "transferring back cannot revive a role"
     );
-    c.operation(admin, attach).unwrap();
+    c.stage_operation(admin, attach).unwrap();
     let new = f.requests().pop().unwrap();
     verified(&f.root, &new);
     assert!(rejected(&f.root, &old));
+}
+
+// These catalog tests exercise preparation and the refresher separately. API readiness is
+// tested through the unlocked handler in the metadata unit and network tests.
+impl Catalog {
+    fn stage_operation(&mut self, user: i64, request: Value) -> Result<Value> {
+        if request["op"] == "aws-role" {
+            self.prepare_aws_role(user, &request, false)
+                .map(|(answer, _)| answer)
+        } else {
+            self.operation(user, request)
+        }
+    }
 }
 
 #[path = "aws_metadata_tests.rs"]

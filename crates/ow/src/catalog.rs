@@ -2564,15 +2564,11 @@ impl Catalog {
                 "delete",
                 "snapshot-delete",
                 "rename",
-                "aws-role",
                 "transfer"
             ]
             .contains(&op.as_str()),
             "unsupported user operation"
         );
-        if op == "aws-role" {
-            return self.aws_role(user, &request, false);
-        }
         // A started box with a role needs credentials when this returns, not at the next pass.
         let _credentials =
             matches!(op.as_str(), "start" | "restore").then_some(crate::aws_identity::Notify);

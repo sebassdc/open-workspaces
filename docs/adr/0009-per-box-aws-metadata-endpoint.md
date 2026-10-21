@@ -42,7 +42,11 @@ instance role, and the worker already owns each box's network path.
    catalog lock and one box at a time, what each attached box needs; it calls STS
    with the lock released; it re-locks and delivers only if the box's role, owner,
    generation, hop limit and runner are unchanged, otherwise the credentials are
-   dropped unseen. Sessions are renewed once less than 30 minutes remain, for
+   dropped unseen. The CLI/dashboard attachment handler also performs this unlocked
+   STS/delivery step synchronously for a running or hibernated box: success requires
+   the same attachment to be active and its worker to confirm credentials present.
+   STS/delivery failure or concurrent replacement returns an error. Stopped and
+   parked attachments remain pending without a wake. Sessions are renewed once less than 30 minutes remain, for
    running and hibernated boxes, so a wake never waits for STS. Stopped boxes get
    none until they run.
 4. **Delivery.** The worker operation `aws-creds` (capability `aws_metadata_v1`)

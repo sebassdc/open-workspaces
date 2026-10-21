@@ -42,6 +42,8 @@ sequenceDiagram
     C->>S: AssumeRole(ARN, tags ow-box, ow-owner; source identity) as the instance role
     S-->>C: credentials, one hour
     C->>W: aws-creds (credentials; kept in memory only)
+    W-->>C: credentials stored
+    C-->>O: attached, active
     G->>W: PUT /latest/api/token, GET .../security-credentials/ROLE at 169.254.169.254
     W-->>G: credentials, as EC2 answers
     loop every minute
@@ -56,6 +58,11 @@ sequenceDiagram
    the session carries the transitive tags `ow-box` (the box ID `ow inspect` shows)
    and `ow-owner` (the owner's login email, lower case). STS runs with the catalog
    unlocked; credentials for an attachment that changed meanwhile are dropped.
+   For a running or hibernated box, `ow aws-role set` waits for STS and the runner's
+   credential acknowledgement before reporting success. A failed STS call, failed
+   delivery or concurrent attachment change returns an error, never an early success.
+   The saved attachment can remain pending for the refresher to retry; inspect its
+   status before retrying. Stopped or parked boxes attach as `pending`, without a wake.
 2. The runner's worker keeps the credentials in memory, never on disk or in the
    box, and answers the box at `169.254.169.254:80`, which its network policy
    redirects to one listener in the worker's network namespace. The box is
@@ -67,8 +74,9 @@ sequenceDiagram
 3. Answers leave with an IP TTL of 1 by default, so containers inside the box
    (one routed hop further) cannot read the role; `--hop-limit 2` allows them.
 4. A box without a role gets `404` at once, so SDKs move on instead of waiting for
-   a timeout. A box whose role was just attached, or that just started, waits up
-   to 0.8 s for its credentials.
+   a timeout. If credentials are temporarily missing during an in-progress attach,
+   cold start or move, a metadata request waits up to 0.8 s. Successful attachment
+   to a live box already has credentials ready and does not depend on that wait.
 5. Sessions last one hour and are renewed with 30 minutes left, for hibernated boxes
    too, so a woken box answers at once. A stopped box holds none; it gets them when
    it starts. A move to another runner is a new generation and session; the runner

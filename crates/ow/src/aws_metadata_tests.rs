@@ -19,10 +19,10 @@ type During = Box<dyn FnMut(&Arc<Mutex<Catalog>>)>;
 /// STS stand-in: checks it is called with the catalog unlocked and records each request.
 pub(super) struct FakeSts {
     catalog: Weak<Mutex<Catalog>>,
-    calls: Vec<(String, String, String, String)>,
-    fail: bool,
+    pub(super) calls: Vec<(String, String, String, String)>,
+    pub(super) fail: bool,
     /// Runs inside the STS call, as another request would while STS is slow.
-    during: Option<During>,
+    pub(super) during: Option<During>,
 }
 
 impl FakeSts {
@@ -90,6 +90,114 @@ fn set_state(c: &Catalog, physical: &str, state: &str) {
 }
 
 #[test]
+fn attachment_waits_for_sts_without_holding_the_catalog_lock() {
+    let f = Fixture::new();
+    f.configure(metadata_config());
+    let shared = Arc::new(Mutex::new(Catalog::open(&f.root, "test", None).unwrap()));
+    const BOX: &str = "m-meta-ready";
+    let a = {
+        let mut c = shared.lock().unwrap();
+        let a = c.user(&identity("a", "a@example.test")).unwrap();
+        running(&c, a, "box", BOX);
+        // The generic locked operation cannot bypass attachment completion.
+        assert!(
+            c.operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
+                .is_err()
+        );
+        a
+    };
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (done, result) = std::sync::mpsc::channel();
+    let catalog = shared.clone();
+    let worker = std::thread::spawn(move || {
+        let mut sts = FakeSts::new(&catalog);
+        sts.during = Some(Box::new(move |_| {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+        }));
+        done.send(crate::aws_metadata::role(
+            &catalog,
+            a,
+            &json!({"op":"aws-role","id":"box","role_arn":READER}),
+            false,
+            &mut sts,
+        ))
+        .unwrap();
+    });
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        shared.try_lock().is_ok(),
+        "other controller requests can proceed during STS"
+    );
+    let early = result.recv_timeout(Duration::from_millis(1200));
+    release.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(
+        matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "attachment must outwait the 800 ms IMDS hold"
+    );
+    let answer = result.recv().unwrap().unwrap();
+    assert_eq!(answer["aws_role"]["state"], "active");
+    assert!(ow_core::metadata::present(BOX, 1));
+    assert!(
+        f.requests().iter().any(|r| r.get("token").is_none()),
+        "legacy identity files are cleared before success"
+    );
+    ow_core::metadata::clear(BOX);
+}
+
+#[test]
+fn attachment_never_reports_success_for_failed_or_superseded_delivery() {
+    let f = Fixture::new();
+    f.configure(metadata_config());
+    let shared = Arc::new(Mutex::new(Catalog::open(&f.root, "test", None).unwrap()));
+    const BOX: &str = "m-meta-ready-error";
+    let a = {
+        let mut c = shared.lock().unwrap();
+        let a = c.user(&identity("a", "a@example.test")).unwrap();
+        running(&c, a, "box", BOX);
+        a
+    };
+    let attach = json!({"op":"aws-role","id":"box","role_arn":READER});
+    let mut sts = FakeSts::new(&shared);
+    sts.fail = true;
+    assert!(crate::aws_metadata::role(&shared, a, &attach, false, &mut sts).is_err());
+    assert!(!ow_core::metadata::present(BOX, 1));
+    sts.fail = false;
+    f.written.store(false, Ordering::SeqCst);
+    assert!(crate::aws_metadata::role(&shared, a, &attach, false, &mut sts).is_err());
+    assert!(!ow_core::metadata::present(BOX, 2));
+    f.written.store(true, Ordering::SeqCst);
+    sts.during = Some(Box::new(move |catalog| {
+        let mut c = catalog.lock().unwrap();
+        c.stage_operation(a, json!({"op":"aws-role","id":"box"}))
+            .unwrap();
+        c.stage_operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
+            .unwrap();
+    }));
+    assert!(crate::aws_metadata::role(&shared, a, &attach, false, &mut sts).is_err());
+    assert!(!ow_core::metadata::present(BOX, 3));
+    assert!(!ow_core::metadata::present(BOX, 4));
+    sts.during = None;
+    assert_eq!(
+        crate::aws_metadata::role(&shared, a, &attach, false, &mut sts).unwrap()["aws_role"]["state"],
+        "active"
+    );
+    assert!(ow_core::metadata::present(BOX, 5));
+    // Non-running boxes still attach as pending, without an STS call or a wake.
+    set_state(&shared.lock().unwrap(), BOX, "stopped");
+    f.written.store(false, Ordering::SeqCst);
+    let calls = sts.calls.len();
+    assert_eq!(
+        crate::aws_metadata::role(&shared, a, &attach, false, &mut sts).unwrap()["aws_role"]["state"],
+        "pending"
+    );
+    assert_eq!(sts.calls.len(), calls);
+    ow_core::metadata::clear(BOX);
+}
+
+#[test]
 fn metadata_config_is_validated() {
     let role = |arn: &str, owners: &[&str]| AllowedRole {
         role_arn: arn.into(),
@@ -153,12 +261,12 @@ fn metadata_mode_assumes_outside_the_lock_and_follows_the_box() {
         running(&c, a, "box", BOX);
         // An operator-allowed role outside /ow-box/ never reaches metadata mode, nor a role
         // of another owner; the issuer is not published.
-        let refused = c.operation(a, json!({"op":"aws-role","id":"box","role_arn":ROLE}));
+        let refused = c.stage_operation(a, json!({"op":"aws-role","id":"box","role_arn":ROLE}));
         assert_eq!(refusal(refused.unwrap_err()), "aws_role_not_allowed");
         assert!(public_document(&f.root, DISCOVERY).is_none());
         assert_eq!(c.state(a).unwrap()["aws_identity"]["mode"], "metadata");
         let attached = c
-            .operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
+            .stage_operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
             .unwrap();
         assert_eq!(attached["aws_role"]["state"], "pending");
         assert_eq!(attached["aws_role"]["hop_limit"], 1);
@@ -300,7 +408,7 @@ fn credentials_assumed_for_an_old_attachment_are_never_delivered() {
         let a = c.user(&identity("a", "a@example.test")).unwrap();
         c.user(&identity("b", "b@example.test")).unwrap();
         running(&c, a, "box", BOX);
-        c.operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
+        c.stage_operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
             .unwrap();
         a
     };
@@ -309,7 +417,7 @@ fn credentials_assumed_for_an_old_attachment_are_never_delivered() {
         catalog
             .lock()
             .unwrap()
-            .operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}))
+            .stage_operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}))
             .unwrap();
     }));
     pass(&shared, &mut sts, &mut cleared);
@@ -325,12 +433,13 @@ fn credentials_assumed_for_an_old_attachment_are_never_delivered() {
     {
         let mut c = shared.lock().unwrap();
         let b = c.user(&identity("b", "b@example.test")).unwrap();
-        c.operation(b, json!({"op":"aws-role","id":"box","role_arn":READER}))
+        c.stage_operation(b, json!({"op":"aws-role","id":"box","role_arn":READER}))
             .unwrap();
         sts.during = Some(Box::new(move |catalog| {
             let mut c = catalog.lock().unwrap();
-            c.operation(b, json!({"op":"aws-role","id":"box"})).unwrap();
-            c.operation(b, json!({"op":"aws-role","id":"box","role_arn":READER}))
+            c.stage_operation(b, json!({"op":"aws-role","id":"box"}))
+                .unwrap();
+            c.stage_operation(b, json!({"op":"aws-role","id":"box","role_arn":READER}))
                 .unwrap();
         }));
     }
@@ -391,22 +500,25 @@ fn detached_generations_survive_restart_transfer_and_mode_switch() {
     .unwrap();
     let attach = |c: &mut Catalog, owner, role, generation| {
         let result = c
-            .operation(owner, json!({"op":"aws-role","id":"box","role_arn":role}))
+            .stage_operation(owner, json!({"op":"aws-role","id":"box","role_arn":role}))
             .unwrap();
         assert_eq!(result["aws_role"]["generation"], generation);
     };
     attach(&mut c, a, READER, 1);
-    c.operation(a, json!({"op":"aws-role","id":"box"})).unwrap();
+    c.stage_operation(a, json!({"op":"aws-role","id":"box"}))
+        .unwrap();
     drop(c);
     let mut c = Catalog::open(&f.root, "test", None).unwrap();
     attach(&mut c, a, ADMIN_ONLY, 2);
-    c.operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}))
+    c.stage_operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}))
         .unwrap();
     attach(&mut c, b, READER, 3);
-    c.operation(b, json!({"op":"aws-role","id":"box"})).unwrap();
+    c.stage_operation(b, json!({"op":"aws-role","id":"box"}))
+        .unwrap();
     f.configure(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":READER}]}));
     attach(&mut c, b, READER, 4);
-    c.operation(b, json!({"op":"aws-role","id":"box"})).unwrap();
+    c.stage_operation(b, json!({"op":"aws-role","id":"box"}))
+        .unwrap();
     f.configure(metadata_config());
     attach(&mut c, b, READER, 5);
     ow_core::metadata::clear(BOX);
@@ -429,7 +541,7 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
         running(&c, a, "box", BOX);
         running(&c, a, "cold", STOPPED);
         for name in ["box", "cold"] {
-            c.operation(a, json!({"op":"aws-role","id":name,"role_arn":READER}))
+            c.stage_operation(a, json!({"op":"aws-role","id":name,"role_arn":READER}))
                 .unwrap();
         }
         (a, b)
@@ -441,7 +553,7 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
     shared
         .lock()
         .unwrap()
-        .operation(a, json!({"op":"aws-role","id":"box"}))
+        .stage_operation(a, json!({"op":"aws-role","id":"box"}))
         .unwrap();
     let detach = f.creds();
     assert_eq!(detach.len(), 1);
@@ -452,7 +564,7 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
     shared
         .lock()
         .unwrap()
-        .operation(
+        .stage_operation(
             a,
             json!({"op":"aws-role","id":"box","role_arn":ADMIN_ONLY,"hop_limit":2}),
         )
@@ -471,9 +583,10 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
     f.down.store(true, Ordering::SeqCst);
     {
         let mut c = shared.lock().unwrap();
-        let transfer = c.operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}));
+        let transfer =
+            c.stage_operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}));
         assert_eq!(refusal(transfer.unwrap_err()), "aws_runner_unreachable");
-        let detach = c.operation(a, json!({"op":"aws-role","id":"box"}));
+        let detach = c.stage_operation(a, json!({"op":"aws-role","id":"box"}));
         assert_eq!(refusal(detach.unwrap_err()), "aws_runner_unreachable");
         let owner: i64 =
             c.db.query_row(
@@ -486,7 +599,7 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
         assert!(!crate::aws_identity::view(&c.db, BOX).unwrap().is_null());
         // A stopped box's runner holds no credentials: its transfer goes ahead.
         set_state(&c, STOPPED, "stopped");
-        c.operation(
+        c.stage_operation(
             a,
             json!({"op":"transfer","id":"cold","to":"b@example.test"}),
         )
@@ -504,7 +617,8 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
             Some(config) => f.configure(config.clone()),
         }
         let mut c = shared.lock().unwrap();
-        let transfer = c.operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}));
+        let transfer =
+            c.stage_operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}));
         assert_eq!(
             refusal(transfer.unwrap_err()),
             "aws_runner_unreachable",
@@ -519,7 +633,7 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
     shared
         .lock()
         .unwrap()
-        .operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}))
+        .stage_operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}))
         .unwrap();
     let transfer = f.creds();
     assert_eq!(transfer.len(), 1);
@@ -557,7 +671,7 @@ fn switching_back_to_web_identity_withdraws_served_credentials() {
         let mut c = shared.lock().unwrap();
         let a = c.user(&identity("a", "a@example.test")).unwrap();
         running(&c, a, "box", BOX);
-        c.operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
+        c.stage_operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
             .unwrap();
     }
     pass(&shared, &mut sts, &mut cleared);
@@ -593,7 +707,7 @@ fn reattaching_after_a_switch_to_web_identity_withdraws_before_commit() {
         let mut c = shared.lock().unwrap();
         let a = c.user(&identity("a", "a@example.test")).unwrap();
         running(&c, a, "box", BOX);
-        c.operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
+        c.stage_operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
             .unwrap();
         a
     };
@@ -607,7 +721,7 @@ fn reattaching_after_a_switch_to_web_identity_withdraws_before_commit() {
     f.down.store(true, Ordering::SeqCst);
     {
         let mut c = shared.lock().unwrap();
-        let refused = c.operation(a, attach.clone());
+        let refused = c.stage_operation(a, attach.clone());
         assert_eq!(refusal(refused.unwrap_err()), "aws_runner_unreachable");
         let row: (String, i64) =
             c.db.query_row(
@@ -622,7 +736,7 @@ fn reattaching_after_a_switch_to_web_identity_withdraws_before_commit() {
     // Reachable again: withdrawn while READER was still the committed role, then recorded.
     f.down.store(false, Ordering::SeqCst);
     f.creds();
-    shared.lock().unwrap().operation(a, attach).unwrap();
+    shared.lock().unwrap().stage_operation(a, attach).unwrap();
     let withdrawn = f.creds();
     assert!(withdrawn[0].0.get("role_arn").is_none());
     assert_eq!(withdrawn[0].1, Some((a, true)));
