@@ -592,14 +592,21 @@ impl Vm {
     /// is left as it was. Returns how long the guest was paused.
     pub fn capture_disk(&mut self, directory: &Path, disk: &Path) -> Result<Duration> {
         self.checked("sync")?;
+        // A reflink first writes back the source's dirty pages: do that while the guest runs,
+        // so the pause covers only what it wrote since.
+        File::open(disk)?.sync_data()?;
         let paused = Instant::now();
-        self.api("PATCH", "/vm", json!({"state":"Paused"}))?;
+        if let Err(error) = self.api("PATCH", "/vm", json!({"state":"Paused"})) {
+            // The VMM may have paused before its reply was lost.
+            let _ = self.resume();
+            return Err(error);
+        }
         let cloned = clone_file(disk, &directory.join("disk.ext4"));
-        let resumed = self.resume();
+        // A guest left paused would stall every later point too: try once more.
+        let resumed = self.resume().or_else(|_| self.resume());
         let paused_for = paused.elapsed();
-        let cloned = cloned?;
         resumed?;
-        cloned.sync_all()?;
+        cloned?.sync_all()?;
         Ok(paused_for)
     }
 
@@ -1275,11 +1282,14 @@ mod memory_tests {
     #[test]
     fn a_disk_only_point_resumes_the_guest_when_the_reflink_fails() {
         let root = scratch();
+        let disk = root.join("disk.ext4");
+        std::fs::write(&disk, b"disk").unwrap();
         let (mut vm, server) = disk_capture_fixture(&root);
         let staging = root.join("point");
-        std::fs::create_dir(&staging).unwrap();
+        // The clone's destination cannot be created.
+        std::fs::create_dir_all(staging.join("disk.ext4")).unwrap();
         // The fixture only finishes after it saw Resumed and the clock resync.
-        assert!(vm.capture_disk(&staging, &root.join("missing")).is_err());
+        assert!(vm.capture_disk(&staging, &disk).is_err());
         server.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -59,8 +59,9 @@ per-box error updates; monitor timer/service failure as well as box timestamps.
 A running box is due immediately on first participation, then 30 minutes after
 its last durable capture started. From 0.9.39 a running box's recovery point is
 **disk-only**: the worker syncs the guest, pauses it only while it reflinks the
-disk (milliseconds on Btrfs/XFS; the clone is flushed after the guest runs again),
-and writes no RAM. The point keeps the usual three files with empty `state` and
+disk (a metadata copy on Btrfs/XFS, after the disk file was flushed with the guest
+running; the clone is flushed after it runs again), and writes no RAM. The pause
+has not yet been measured on a real runner; each capture logs it (`guest paused N ms`). The point keeps the usual three files with empty `state` and
 `memory`, and its manifest says `"disk_only": true`. Earlier releases also saved the
 whole guest RAM inside the pause: 15-52 s guest freezes for large boxes, and a
 multi-GB writeback burst that stalled every fsync on the data volume, including the

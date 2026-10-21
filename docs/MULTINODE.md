@@ -211,17 +211,23 @@ over one reused reader and one writer connection (the writer commits heartbeats 
 `synchronous=NORMAL`; they are rewritten every few seconds and cleared at start). No
 lock on live sessions is held across a catalog call. Each session records its beats
 through its own task, latest beat first, so a slow write delays only that runner's
-recorded heartbeat while pings, other runners and the proxies carry on.
+recorded heartbeat while pings and other runners carry on. An open proxy stream
+needs its runner's live session and an unrevoked credential, checked per frame, not
+a recent recorded heartbeat; a new job still needs one (placement treats a runner
+without a recorded beat in 15 seconds as offline). A session mark not recorded within
+10 seconds refuses the connection, so a stalled disk cannot park reconnecting runners.
 
 A session ends, with a `node NAME: session ended (REASON)` line in the controller log,
-when its session mark or a heartbeat cannot be recorded (an error, or a heartbeat that
-matches no row because the catalog no longer holds this session), when its credential
-is revoked, or after 15 seconds without a heartbeat. The agent then reconnects by
-itself; a runner is never left connected in the agent's view and offline in the
-catalog without either side saying so. A tick that arrives far behind schedule means
-the controller itself stalled, so that silence is not held against the runner. The
-agent in turn reconnects after 20 seconds without any frame from the controller, so a
-lost controller or network path is noticed in seconds rather than when TCP gives up.
+when a heartbeat cannot be recorded (an error, or a heartbeat that matches no row
+because the catalog no longer holds this session), when its credential is revoked,
+or after 15 seconds without a heartbeat; a session refused at the start (its mark not
+recorded, or 16 runners already connected) logs `session refused` or `session not
+recorded`. Ending a session clears its mark, so a late beat cannot revive it. The
+agent then reconnects by itself, so a lost session mark no longer leaves a runner
+offline until a restart. A tick that arrives far behind schedule means the controller
+itself stalled, so that silence is not held against the runner. The agent in turn
+reconnects after 20 seconds without any frame from the controller, so a lost
+controller or network path is noticed in seconds rather than when TCP gives up.
 Controller and agent from 0.9.39 behave this way; a runner whose worker and agent
 both have it advertises `recovery_disk_only_v1` (see [recovery](RECOVERY.md)).
 

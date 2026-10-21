@@ -550,6 +550,22 @@ impl Controller {
         let node = node.to_owned();
         self.read(move |db| online_in(db, &node)).await
     }
+    /// An open stream needs its node's live session (checked in memory) and an unrevoked
+    /// credential, not a recent recorded heartbeat: a slow catalog write must not cut it.
+    async fn admitted(&self, node: &str) -> Result<()> {
+        let node = node.to_owned();
+        let active = self
+            .read(move |db| {
+                Ok(db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND revoked=0)",
+                    [node],
+                    |r| r.get::<_, bool>(0),
+                )?)
+            })
+            .await?;
+        ensure!(active, "node revoked");
+        Ok(())
+    }
 }
 async fn enrollment(State(c): State<Controller>, Json(v): Json<Value>) -> Response {
     // A catalog transaction: off the async threads, like every controller database call.
@@ -612,17 +628,32 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
     let Ok(secret) = bearer(&node, &headers) else {
         return;
     };
+    let full = |sessions: &HashMap<String, Session>| {
+        let full = sessions.len() >= 16 && !sessions.contains_key(&node);
+        if full {
+            eprintln!("node {node}: session refused: 16 runners are connected");
+        }
+        full
+    };
+    if full(&c.sessions.lock().unwrap()) {
+        return;
+    }
     // A session the catalog did not record would heartbeat into no row and leave the
     // runner offline without a word: refuse it, so the agent reconnects and logs why.
+    // Bounded, so a stalled disk cannot park every reconnecting runner's connection.
     let opened = {
         let (node, generation) = (node.clone(), generation.clone());
-        c.write(move |db| {
-            Ok(db.execute(
-                "UPDATE nodes SET session=?1,heartbeat=0 WHERE id=?2 AND revoked=0",
-                params![generation, node],
-            )?)
-        })
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            c.write(move |db| {
+                Ok(db.execute(
+                    "UPDATE nodes SET session=?1,heartbeat=0 WHERE id=?2 AND revoked=0",
+                    params![generation, node],
+                )?)
+            }),
+        )
         .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("catalog write took over 10 s")))
     };
     match opened {
         Ok(1) => {}
@@ -638,7 +669,7 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
     let (tx, mut rx) = mpsc::channel(16);
     {
         let mut sessions = c.sessions.lock().unwrap();
-        if sessions.len() >= 16 && !sessions.contains_key(&node) {
+        if full(&sessions) {
             return;
         }
         sessions.insert(
@@ -720,10 +751,11 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             .unwrap()
             .retain(|_, j| j.generation != generation);
     }
+    // Clearing the mark also voids a heartbeat of this session still queued for the writer.
     let closed = c
         .write(move |db| {
             Ok(db.execute(
-                "UPDATE nodes SET heartbeat=0 WHERE id=?1 AND session=?2",
+                "UPDATE nodes SET heartbeat=0,session=NULL WHERE id=?1 AND session=?2",
                 params![node, generation],
             )?)
         })
@@ -823,14 +855,14 @@ async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) 
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     loop {
         tokio::select! {
-            _=tick.tick()=>{c.online(&node).await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"node session replaced");}
+            _=tick.tick()=>{c.admitted(&node).await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"node session replaced");}
             n=reader.read(&mut buffer)=>{
                 let n=n?; if n==0 {break;}
-                c.online(&node).await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node input");
+                c.admitted(&node).await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node input");
                 tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Binary(buffer[..n].to_vec().into()))).await??;
             }
             msg=socket.recv()=>match msg {
-                Some(Ok(Message::Binary(bytes)))=>{c.online(&node).await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node result");tokio::time::timeout(Duration::from_secs(5),writer.write_all(&bytes)).await??;}
+                Some(Ok(Message::Binary(bytes)))=>{c.admitted(&node).await?;ensure!(c.sessions.lock().unwrap().get(&node).is_some_and(|s|s.generation==generation),"stale node result");tokio::time::timeout(Duration::from_secs(5),writer.write_all(&bytes)).await??;}
                 Some(Ok(Message::Ping(_)|Message::Pong(_)))=>{}, _=>break,
             }
         }
@@ -856,14 +888,24 @@ async fn proxies(c: Controller) -> Result<()> {
                 continue;
             }
             let dir = c.root.join("nodes").join(node);
-            fs::create_dir_all(&dir)?;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
             let path = dir.join("control.sock");
-            if path.exists() {
-                fs::remove_file(&path)?;
-            }
-            let listener = tokio::net::UnixListener::bind(&path)?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            let listener = match (|| -> Result<_> {
+                fs::create_dir_all(&dir)?;
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+                if path.exists() {
+                    fs::remove_file(&path)?;
+                }
+                let listener = tokio::net::UnixListener::bind(&path)?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+                Ok(listener)
+            })() {
+                Ok(listener) => listener,
+                // Retried next second; other runners' sockets are still bound.
+                Err(e) => {
+                    eprintln!("node {node}: control socket not bound: {e:#}");
+                    continue;
+                }
+            };
             let child = c.clone();
             let node = node.to_owned();
             bound.insert(node.clone(), true);
