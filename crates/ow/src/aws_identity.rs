@@ -42,7 +42,7 @@ pub(crate) enum Mode {
     #[default]
     WebIdentity,
     /// The controller assumes each role with its EC2 instance role and runners serve the
-    /// credentials at the instance metadata address (ADR 0009, [`crate::aws_metadata`]).
+    /// credentials at the instance metadata address (ADR 0010, [`crate::aws_metadata`]).
     Metadata,
 }
 

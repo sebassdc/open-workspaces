@@ -51,6 +51,7 @@ mod ssh_client;
 mod ssh_gateway;
 #[cfg(target_os = "linux")]
 mod store_gc;
+mod telemetry;
 #[cfg(target_os = "linux")]
 mod terminal;
 #[cfg(target_os = "linux")]
@@ -64,6 +65,16 @@ use ow_core::{network, runtime, ssh_guest, vm};
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Every setting with its current value and the configuration version.
+    List,
+    /// One setting's current value.
+    Get { key: String },
+    /// Change one setting; runners receive it within seconds.
+    Set { key: String, value: String },
+}
 
 #[derive(Parser)]
 #[command(
@@ -197,6 +208,13 @@ enum Action {
     NodeRevoke { node: String },
     /// JSON placement resources on the selected server (or local node inventory).
     Nodes,
+    /// Host-only: fleet health as JSON (alerts, latest node telemetry); exits 1 on an alert.
+    Health,
+    /// Host-only: controller-held settings that runners receive (see docs/TELEMETRY.md).
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Connect this worker outbound; credentials are stored outside the guest.
     NodeAgent {
         #[arg(long)]
@@ -978,6 +996,8 @@ fn main_result() -> anyhow::Result<i32> {
             | Action::NodeJoin { .. }
             | Action::NodeRevoke { .. }
             | Action::NodeAgent { .. }
+            | Action::Health
+            | Action::Config { .. }
             | Action::Worker
             | Action::Supervisor
             | Action::Gateway { .. }

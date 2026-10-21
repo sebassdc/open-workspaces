@@ -117,6 +117,17 @@ See [wake on connect, snapshot store and golden images](DAILY_USE.md).
   and the dashboard, `ow share` / `ow unshare`; unshare closes the grantee's
   open terminal and SSH streams. A grantee's fork copies the owner's
   credentials ([USERS.md](USERS.md#sharing-a-machine)).
+- [x] 0.9.41, node telemetry ([TELEMETRY.md](TELEMETRY.md),
+  [ADR 0009](adr/0009-node-telemetry-otlp.md)): runners send OTLP JSON
+  metrics and events over the node channel (host CPU, memory, load, disk, agent
+  and worker memory, per-box memory, channel connects/disconnects with reason
+  classes, capture and restore timings); the controller keeps the latest values
+  and 200 events per runner, raises `node_offline` and `disk_low`, shows fleet
+  health in the dashboard and `ow health`, and forwards to an OTLP collector when
+  `telemetry.forward_endpoint` is set. Settings are controller-held
+  (`ow config`), versioned and applied by runners within seconds; runners
+  advertise `telemetry_v1`. Pending: Firecracker per-VM counters and per-box
+  CPU/network counters (worker changes), telemetry history, webhook alerts.
 
 ## Completed local pilot checks
 
@@ -175,7 +186,7 @@ Gate: reproducible evidence and runtime decision, per HANDOFF.md.
   Its web-identity mode is implemented: [per-box AWS access](AWS_ACCESS.md) issues
   controller-signed OIDC tokens to boxes with an operator-allowed role; the
   real-AWS acceptance (OIDC provider and a test role) is the consumer's next step.
-  Its metadata mode (0.9.41) serves controller-assumed role credentials at the box's
+  Its metadata mode (0.9.42) serves controller-assumed role credentials at the box's
   instance metadata address for AWS-hosted controllers; live acceptance with a
   throwaway `ow-box/` role is pending.
 - Persistent disk, initial immutable base images, protected HTTP publishing and explicit public routes.

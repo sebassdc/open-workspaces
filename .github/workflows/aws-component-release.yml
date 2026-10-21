@@ -83,6 +83,9 @@ jobs:
           cargo +1.97.0 test --locked -p ow --bin ow missing_machine_delete
           cargo +1.97.0 test --locked -p ow --test discovery
           cargo +1.97.0 test --locked -p ow --bin ow -- heartbeats_continue_while nodes_show_the_host_reserve
+      - name: Check node telemetry and alerts before tagging
+        working-directory: .
+        run: cargo +1.97.0 test --locked -p ow --bin ow telemetry
       - name: Check tailnet previews before tagging
         working-directory: .
         run: cargo +1.97.0 test --locked -p ow --bin ow preview

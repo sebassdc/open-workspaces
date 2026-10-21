@@ -7,4 +7,4 @@
 
 .cli-install{border:1px solid var(--border,#dfe5de);border-radius:14px;background:#fff;padding:20px;margin:0 0 24px;min-width:0}.cli-install p{margin:6px 0;color:#657366;font-size:13px}.install-command{display:flex;gap:12px;align-items:center;margin:12px 0;min-width:0}.install-command code{display:block;flex:1;min-width:0;overflow-wrap:anywhere;background:#f3f6ef;padding:12px;border-radius:8px;font-size:12px}.cli-install>p code{overflow-wrap:anywhere}.sidebar-bottom a{color:inherit;font-size:12px}@media(max-width:600px){.install-command{align-items:stretch;flex-direction:column}.cli-install{padding:16px}}
 
-.recovery-warning{color:#9b5239}
+.recovery-warning{color:#9b5239}.node-health{display:block;font-size:10px;color:#82917e;margin:4px 0 10px}#fleet-alerts{margin:12px 0}

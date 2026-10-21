@@ -1,6 +1,6 @@
 //! Metadata mode of per-box AWS access: role credentials served to guests at the EC2
 //! instance metadata address, `169.254.169.254`, so the AWS CLI, every SDK and Terraform
-//! find them as they do on EC2. See docs/AWS_ACCESS.md and ADR 0009.
+//! find them as they do on EC2. See docs/AWS_ACCESS.md and ADR 0010.
 //!
 //! The controller assumes each box's role and pushes the temporary credentials to the worker
 //! that hosts the box (`aws-creds`); they live only in this process's memory, never on disk or

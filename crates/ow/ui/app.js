@@ -36,6 +36,23 @@ function loadFailed() { const retry = element('button', 'Retry', 'text-button');
 function action(label, callback, disabled = false) { const button = element('button', label, 'button secondary'); button.disabled = disabled || busy; button.addEventListener('click', () => Promise.resolve(callback()).catch(() => {})); return button; }
 // A result belongs to the view and machine it came from; drop it when the user moves on.
 function select(id) { if (id !== selected) notice(''); selected = id; render(); if (matchMedia('(max-width:700px)').matches) document.querySelector('.detail-heading').scrollIntoView({block: 'start'}); }
+// One line of a runner's latest telemetry (docs/TELEMETRY.md) for the host list.
+function fleetHealth(id) {
+  const node = (data.fleet?.nodes || []).find(n => n.id === id), m = node?.telemetry?.metrics;
+  if (!node) return '';
+  const gib = bytes => `${(bytes / 2 ** 30).toFixed(1)} GiB`, parts = [];
+  if (m) {
+    if (m['system.cpu.utilization'] !== undefined) parts.push(`CPU ${Math.round(m['system.cpu.utilization'] * 100)}%`);
+    if (m['system.memory.limit'] !== undefined) parts.push(`memory ${gib(m['system.memory.usage{system.memory.state=used}'] || 0)} of ${gib(m['system.memory.limit'])}`);
+    if (m['system.cpu.load_average.1m'] !== undefined) parts.push(`load ${m['system.cpu.load_average.1m'].toFixed(2)}`);
+    if (m['system.filesystem.usage{system.filesystem.state=free}'] !== undefined) parts.push(`disk ${gib(m['system.filesystem.usage{system.filesystem.state=free}'])} free`);
+    if (m['process.memory.usage{ow.process=agent}'] !== undefined) parts.push(`agent ${mib(m['process.memory.usage{ow.process=agent}'] / 2 ** 20)}`);
+    if (m['ow.node.channel.connects'] !== undefined) parts.push(`${m['ow.node.channel.connects']} channel connects`);
+    parts.push(`updated ${ago(node.telemetry.unix_s)}`);
+  } else if (!node.telemetry_v1) parts.push('no telemetry from this runner version');
+  const last = node.events?.[0]; if (last) parts.push(`last event: ${last.name.replace(/^ow\./, '')}${last.attributes?.reason ? ` (${last.attributes.reason})` : ''} ${ago(last.unix_s)}`);
+  return parts.join(' · ');
+}
 const ago = at => { const s = Date.now() / 1000 - at; return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)} min ago` : s < 86400 ? `${Math.floor(s / 3600)} h ago` : `${Math.floor(s / 86400)} d ago`; };
 const fullTime = at => new Date(at * 1000).toLocaleString();
 // [text, warning, title]: warn only once the one-hour target is really missed or an upload failed.
@@ -137,8 +154,13 @@ function renderState() {
     const row = element('p', `${entry.by} ${what} · ${ago(entry.at)}`); row.title = fullTime(entry.at); $('audit-list').append(row);
   }
   $('host-node-list').replaceChildren();
+  const alerts = data.host_controls ? data.fleet?.alerts || [] : [];
+  $('fleet-alerts').replaceChildren(...alerts.map(alert => element('div', alert.message)));
+  $('fleet-alerts').hidden = !alerts.length;
   if(data.host_controls) for(const node of (data.nodes||[]).filter(n=>!n.revoked)) {
-    const row=element('div'); row.dataset.key=node.id; row.append(element('span',`${node.id} · ${node.online?'online':'offline'} · ${mib(node.memory_mib)} `),action('Adjust budget',()=>hostDialog('budget',node.id))); $('host-node-list').append(row);
+    const row=element('div'); row.dataset.key=node.id; row.append(element('span',`${node.id} · ${node.online?'online':'offline'} · ${mib(node.memory_mib)} `),action('Adjust budget',()=>hostDialog('budget',node.id)));
+    const health = fleetHealth(node.id); if (health) row.append(element('small', health, 'node-health'));
+    $('host-node-list').append(row);
   }
   $('pool-aws-roles').replaceChildren();
   if (data.host_controls) for (const box of data.aws_boxes || []) {

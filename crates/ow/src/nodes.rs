@@ -85,6 +85,13 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     // Additive larger-cap authority; legacy readers retain conservative CPU limits.
     db.execute_batch("CREATE TABLE IF NOT EXISTS node_capacity_limits(node TEXT PRIMARY KEY REFERENCES nodes(id), vcpu_cap INTEGER NOT NULL CHECK(vcpu_cap BETWEEN 1 AND 64));")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS node_placement_policy(node TEXT PRIMARY KEY REFERENCES nodes(id),pool TEXT NOT NULL DEFAULT 'default',active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),controller_drain INTEGER NOT NULL DEFAULT 0 CHECK(controller_drain IN (0,1)));")?;
+    // Controller-held settings and node telemetry (docs/TELEMETRY.md); additive tables.
+    db.execute_batch("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS config_changes(id INTEGER PRIMARY KEY,key TEXT NOT NULL,value TEXT NOT NULL,unix_s INTEGER NOT NULL,actor TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS node_telemetry(node TEXT PRIMARY KEY,summary TEXT NOT NULL,unix_s INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS node_seen(node TEXT PRIMARY KEY,unix_s INTEGER NOT NULL,reason TEXT NOT NULL,closed_unix_s INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS node_events(id INTEGER PRIMARY KEY,node TEXT NOT NULL,unix_s INTEGER NOT NULL,severity TEXT NOT NULL,name TEXT NOT NULL,attrs TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS node_events_node ON node_events(node,id);")?;
     health_view(&db, root)?;
     Ok(db)
 }
@@ -784,9 +791,14 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
     #[cfg(target_os = "linux")]
     let mut worker_pid = None;
     let mut ticked = tokio::time::Instant::now();
+    // Telemetry frames are taken only from a runner that advertised telemetry_v1, at most
+    // FRAMES_PER_TICK per tick. `seen`: when this session last recorded a heartbeat; a
+    // session that never did leaves the runner's last-seen time as it was.
+    let (mut telemetry, mut frames, mut seen) = (false, 0u32, None::<i64>);
     let reason: String = loop {
         tokio::select! {
             _=tick.tick()=>{
+                frames=0;
                 // A tick this late means this process stalled, not the runner: its frames are
                 // only now being read, so the silence is not held against it.
                 if ticked.elapsed()>Duration::from_secs(9) {last=tokio::time::Instant::now();}
@@ -799,12 +811,29 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             msg=socket.recv()=>{
                 match msg {Some(Ok(Message::Text(text)))=>{
                     let Ok(v)=serde_json::from_str::<Value>(&text) else {break "invalid heartbeat".into();};
+                    // Never a heartbeat: telemetry does not keep a runner online.
+                    if v["type"]=="otlp" {
+                        if !telemetry {break "invalid telemetry: not negotiated".into();}
+                        frames+=1;
+                        if frames>crate::telemetry::FRAMES_PER_TICK {continue;}
+                        match crate::telemetry::receive(&node,&v) {
+                            Ok((received,signal,body))=>{
+                                let (root,node)=(c.root.clone(),node.clone());
+                                tokio::task::spawn_blocking(move||{let _=crate::telemetry::store(&root,&node,&received);});
+                                crate::telemetry::forward(signal,body);
+                            }
+                            // Escaped: runner-sent text must not forge journal lines.
+                            Err(e)=>eprintln!("node {node}: telemetry refused: {}",format!("{e:#}").escape_debug()),
+                        }
+                        continue;
+                    }
                     if let Err(e)=common::node_capabilities(&v) {
                         // Say why, so a runner newer than this controller logs it instead of retrying blind.
                         let reason:String=format!("{e:#}").chars().take(120).collect();
                         let _=tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code:4001,reason:reason.clone().into()})))).await;
                         break format!("heartbeat refused: {reason}");
                     }
+                    telemetry=v["telemetry_v1"]==true;
                     last=tokio::time::Instant::now();
                     if !c.root.join("nodes").join(&node).join("control.sock").exists(){continue;}
                     // Only the latest beat waits while the catalog is slow.
@@ -812,7 +841,11 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
                 }, Some(Ok(Message::Pong(_)))=>{}, _=>break "channel closed".into()}
             }
             verdict=verdicts.recv()=>{
-                let v:Value=match verdict {Some(Ok(v))=>v, Some(Err(reason))=>break reason, None=>break "recorder stopped".into()};
+                let (v,offer):(Value,Value)=match verdict {Some(Ok(v))=>v, Some(Err(reason))=>break reason, None=>break "recorder stopped".into()};
+                if seen.replace(now()).is_none() {
+                    let (root,node)=(c.root.clone(),node.clone());
+                    tokio::task::spawn_blocking(move||{let _=crate::nodes::db(&root).and_then(|db|crate::telemetry::record_event(&db,&node,"INFO","ow.node.session.opened",&json!({})));});
+                }
                 #[cfg(target_os="linux")]
                 if v["aws_metadata_v1"]==true && worker_pid.replace(v["worker_pid"].clone())!=Some(v["worker_pid"].clone()) {
                     crate::aws_identity::notify();
@@ -823,7 +856,8 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
                     tokio::task::spawn_blocking(move||{let _=crate::image_store::prefetch(&root,&node,&images);});
                 }
                 // Old native agents expect job IDs only; acknowledge only the guided agent's optional extension.
-                if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation,"extensions":["cache-inventory-v1"]}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break "acknowledgement not sent within 3 s".into();}}
+                // Telemetry settings ride on every acknowledgement: a change on the controller reaches runners within one beat.
+                if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation,"extensions":["cache-inventory-v1","telemetry-v1"],"telemetry":offer}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break "acknowledgement not sent within 3 s".into();}}
             }
             id=rx.recv()=>{
                 let Some(id)=id else {break "dispatch closed".into();};
@@ -833,6 +867,17 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
     };
     recorder.abort();
     eprintln!("node {node}: session ended ({reason})");
+    {
+        let (root, node, class) = (
+            c.root.clone(),
+            node.clone(),
+            crate::telemetry::session_reason(&reason),
+        );
+        tokio::task::spawn_blocking(move || {
+            let _ = crate::nodes::db(&root)
+                .and_then(|db| crate::telemetry::session_closed(&db, &node, seen, class));
+        });
+    }
     {
         let mut sessions = c.sessions.lock().unwrap();
         if sessions
@@ -873,7 +918,7 @@ async fn record(
     generation: String,
     secret: String,
     mut beats: tokio::sync::watch::Receiver<Option<Value>>,
-    verdicts: mpsc::Sender<std::result::Result<Value, String>>,
+    verdicts: mpsc::Sender<std::result::Result<(Value, Value), String>>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     let failure = loop {
@@ -895,9 +940,13 @@ async fn record(
                 };
                 let (n, g, b) = (node.clone(), generation.clone(), beat.clone());
                 let catalog = catalog.clone();
-                match blocking(db.clone(), move |db| heartbeat(&catalog.lock().unwrap_or_else(|e| e.into_inner()), db, &n, &g, &b)).await {
-                    Ok(1) => {
-                        if verdicts.send(Ok(beat)).await.is_err() {
+                // The telemetry settings for this beat's acknowledgement are read here too.
+                match blocking(db.clone(), move |db| {
+                    let catalog = catalog.lock().unwrap_or_else(|e| e.into_inner());
+                    Ok((heartbeat(&catalog, db, &n, &g, &b)?, crate::telemetry::offer(&catalog)))
+                }).await {
+                    Ok((1, offer)) => {
+                        if verdicts.send(Ok((beat, offer))).await.is_err() {
                             return;
                         }
                     }
@@ -1166,6 +1215,18 @@ pub fn controller(
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "controller already running"
     );
+    {
+        let db = db(root)?;
+        // Runners connected to the previous controller process: when they were last seen.
+        let seen: Vec<(String, i64)> = db
+            .prepare("SELECT id,heartbeat FROM live_nodes WHERE heartbeat>0 AND revoked=0")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (node, heartbeat) in seen {
+            crate::telemetry::session_closed(&db, &node, Some(heartbeat), "controller_restart")?;
+        }
+        crate::telemetry::controller_started(&db)?;
+    }
     reset_health(root)?;
     let c = Controller::new(root)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1174,6 +1235,7 @@ pub fn controller(
         .build()?;
     rt.block_on(async move {
         let routes = routes(c.clone());
+        crate::telemetry::spawn_controller_tasks(c.root.clone());
         tokio::spawn(proxies(c.clone()));
         let slots = Arc::new(Semaphore::new(128));
         if let (Some(cert), Some(key)) = (cert, key) {
@@ -1637,9 +1699,9 @@ pub fn agent(
     };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
     #[cfg(target_os = "linux")]
-    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true,"disk_resize_v1":status["disk_resize_v1"]==true,"snapshot_delete_v1":status["snapshot_delete_v1"]==true});
+    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true,"disk_resize_v1":status["disk_resize_v1"]==true,"snapshot_delete_v1":status["snapshot_delete_v1"]==true,"telemetry_v1":true});
     #[cfg(target_os = "macos")]
-    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS});
+    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS,"telemetry_v1":true});
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1657,6 +1719,23 @@ pub fn agent(
         std::time::Instant::now(),
         first,
     ))));
+    let telemetry = crate::telemetry::Agent::new(&node, crate::telemetry::salt(root));
+    {
+        let prepared = prepared.clone();
+        crate::telemetry::collector(
+            telemetry.clone(),
+            root.to_owned(),
+            latest.clone(),
+            active.clone(),
+            move || {
+                prepared
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|(built, _)| built.elapsed().as_secs())
+            },
+        );
+    }
     {
         let (latest, prepared, negotiated, root, hello) = (
             latest.clone(),
@@ -1722,9 +1801,11 @@ pub fn agent(
                 }));
             }
             cache_negotiated.store(false, Ordering::SeqCst);
+            let connecting = std::time::Instant::now();
             let mut ws = socket(&origin, &format!("/node/{node}"), &credential, ca)?;
             timeout_socket(&ws)?;
             let mut heartbeat = std::time::Instant::now() - Duration::from_secs(5);
+            let mut sent = heartbeat;
             let mut unconfirmed = None;
             let mut heard = std::time::Instant::now();
             loop {
@@ -1777,6 +1858,13 @@ pub fn agent(
                     heartbeat = std::time::Instant::now();
                     unconfirmed = Some(beat);
                 }
+                // At most 5 frames a second: under the controller's 20 per 3 s.
+                if sent.elapsed() >= Duration::from_millis(200)
+                    && let Some(frame) = telemetry.next()
+                {
+                    ws.send(tungstenite::Message::Text(frame.into()))?;
+                    sent = std::time::Instant::now();
+                }
                 let frame = ws.read();
                 if frame.is_ok() {
                     heard = std::time::Instant::now();
@@ -1799,6 +1887,7 @@ pub fn agent(
                                     }),
                                 Ordering::SeqCst,
                             );
+                            telemetry.acknowledged(&v, connecting);
                             if guided {
                                 let (root, instance, generation) =
                                     (root.to_owned(), instance.clone(), generation.to_owned());
@@ -1827,7 +1916,7 @@ pub fn agent(
                         {
                             continue;
                         }
-                        let (root, origin, node, credential, ca, active, worker) = (
+                        let (root, origin, node, credential, ca, active, worker, telemetry) = (
                             root.to_owned(),
                             origin.clone(),
                             node.clone(),
@@ -1835,6 +1924,7 @@ pub fn agent(
                             ca.map(Path::to_owned),
                             active.clone(),
                             latest.clone(),
+                            telemetry.clone(),
                         );
                         let busy = Busy::new();
                         std::thread::spawn(move || {
@@ -1847,6 +1937,7 @@ pub fn agent(
                                 ca.as_deref(),
                                 busy,
                                 &worker,
+                                Some(&telemetry),
                             );
                             active.fetch_sub(1, Ordering::SeqCst);
                         });
@@ -1862,6 +1953,7 @@ pub fn agent(
             }
         })();
         if let Err(e) = result {
+            telemetry.disconnected(&e);
             // After any online record still queued.
             let (root, instance) = (root.to_owned(), instance.clone());
             record(Box::new(move || {
@@ -1884,6 +1976,7 @@ fn agent_job(
     ca: Option<&Path>,
     busy: Busy,
     worker: &std::sync::Mutex<Option<Value>>,
+    telemetry: Option<&crate::telemetry::Agent>,
 ) -> Result<()> {
     let mut socket = socket(origin, &format!("/job/{node}/{id}"), credential, ca)?;
     timeout_socket(&socket)?;
@@ -1905,6 +1998,7 @@ fn agent_job(
     ensure!(end + 1 == bytes.len(), "unexpected request suffix");
     let request: Value = serde_json::from_slice(&bytes[..end])?;
     let op = request["op"].as_str().context("op")?;
+    let mut timer = telemetry.map(|t| t.timer(op));
     ensure!(
         [
             "drain-inventory",
@@ -2007,6 +2101,9 @@ fn agent_job(
         #[cfg(not(target_os = "linux"))]
         let response =
             journal_request(root, &request, common::placement_capable(&checked).is_ok())?;
+        if let Some(timer) = &mut timer {
+            timer.ok = response["ok"] == true;
+        }
         let data = serde_json::to_vec(&response)?;
         ensure!(data.len() < 1024 * 1024, "response too large");
         for chunk in data.chunks(FRAME) {

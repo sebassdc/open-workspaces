@@ -1,4 +1,4 @@
-//! Controller side of the metadata mode of per-box AWS access (ADR 0009): the controller
+//! Controller side of the metadata mode of per-box AWS access (ADR 0010): the controller
 //! assumes each attached role with its own EC2 instance role and pushes the temporary
 //! credentials to the box's runner, which serves them at `169.254.169.254`
 //! ([`ow_core::metadata`]). STS runs with the catalog lock released. Every change that ends

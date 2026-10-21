@@ -6,9 +6,9 @@ reuses this module's `WorkloadIdentity` (physical box ID plus generation, hashed
 controller signs OIDC tokens and the guest's AWS SDK calls
 `AssumeRoleWithWebIdentity`, so no host AWS credential or guest-to-host channel is
 needed ([ADR 0008](adr/0008-per-box-aws-web-identity.md)). **Metadata mode is live
-too (0.9.41, opt-in):** an AWS-hosted controller calls `AssumeRole` with its
+too (0.9.42, opt-in):** an AWS-hosted controller calls `AssumeRole` with its
 instance role and runners serve the box's credentials at the instance metadata
-address ([ADR 0009](adr/0009-per-box-aws-metadata-endpoint.md)). The host-side
+address ([ADR 0010](adr/0010-per-box-aws-metadata-endpoint.md)). The host-side
 `AssumeRole` and secret-write broker described below remains dormant.
 
 **Implemented:** a dormant host-side library in

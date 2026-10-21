@@ -143,6 +143,8 @@ isolated-network end-to-end test listed there.
 | Revoke a host | partial | v0.9.22 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` (revokes an invited host that never enrolled) |
 | Pool banner says who can see guest data; invitation policy only in the invite dialog | works | v0.9.23 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` |
 | Host controls only for the pool owner | works | v0.9.22 | `hosts.spec.mjs › host controls are hidden from other users` |
+| Fleet health: alert banner and a health line per host (CPU, memory, load, disk, agent memory, last event) | works | v0.9.41 | `hosts.spec.mjs › fleet health shows node metrics and alerts` |
+| Fleet health only for the pool owner | works | v0.9.41 | `hosts.spec.mjs › fleet health is hidden from other users` |
 
 ## Errors, sign-in and layout
 
