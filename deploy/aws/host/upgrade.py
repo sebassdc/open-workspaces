@@ -695,8 +695,8 @@ def abort(j, ops):
     if "worker" in ops.units() and not ops.active("worker"):
         ops.start("worker")
         wait_worker(ops)
-    else:
-        ops.quiesce_off()
+    elif not ops.quiesce_off():
+        j.value["error"] = f"{j.value.get('error')}; the worker did not lift its quiesce (restart it)"
     failed = resume(j, ops)
     for name in ("agent", "dashboard"):
         if name in ops.units() and not ops.active(name):

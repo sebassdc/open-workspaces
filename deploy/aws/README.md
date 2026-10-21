@@ -130,7 +130,9 @@ the worker refuses new starts and wakes, hibernates the running boxes, then
 stops, so their processes carry on when they next wake. If a box stays running
 (busy, or its capture failed), the stop retries every 5 s with starts still
 refused, and the unit has no stop timeout, so systemd never kills a running box;
-each failed round is in the journal. EC2 does not promise an instance stop that long a
+each failed round is in the journal. The trade-off: a box that can never be
+hibernated (a full disk, say) holds the stop until an operator acts, and EC2
+eventually forces an instance stop. EC2 does not promise an instance stop that long a
 shutdown window (captures run one at a time, about 25 s per 1 GiB box), so for
 planned stops and replacements stop the service first and wait for it
 (`ow-aws stop`, or `sudo systemctl stop open-workspaces-worker` before

@@ -483,8 +483,8 @@ fn hibernate_all_waiting(root: &Path) {
 /// stays running (its capture failed), starts are allowed again and this fails, so
 /// the caller does not shut the worker down under it.
 fn hibernate_all(root: &Path) -> Result<()> {
-    // The upgrader's hibernate step allows 1800 s; the worker captures one machine at a time.
-    let result = hibernate_round(root, Duration::from_secs(1740));
+    // Callers run this under 900-1800 s caps (SSM, the upgrader); one machine at a time.
+    let result = hibernate_round(root, Duration::from_secs(840));
     if result.is_err() {
         // Called off: the worker keeps running, so it must accept starts and wakes again.
         // Sent even when the quiesce itself failed: a timed-out one may still be applied.
@@ -908,9 +908,14 @@ pub fn run(cli: Cli) -> Result<i32> {
                     hibernate_all(&root)?;
                 }
                 if let Err(e) = unpublish_all(&root, None) {
-                    // Called off after the hibernation: the worker keeps running and accepts starts.
-                    let _ = wire::request(&root, json!({"op":"quiesce","closing":false}));
-                    return Err(e);
+                    if wait {
+                        // A service stop goes on: nothing runs, and the gateways stop with the worker.
+                        eprintln!("unpublishing before the stop: {e:#}");
+                    } else {
+                        // Called off after the hibernation: the worker keeps running and accepts starts.
+                        let _ = wire::request(&root, json!({"op":"quiesce","closing":false}));
+                        return Err(e);
+                    }
                 }
             } else {
                 unpublish_all(&root, None)?;

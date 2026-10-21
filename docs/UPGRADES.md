@@ -190,7 +190,8 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   (a large box's resume hashes its hibernation snapshot first and would hold the
   one-request worker past verify's deadline). Rollback starts the old worker the
   same way. The resume step lifts the quiesce; a lift that fails stops the upgrade
-  at resume, where the next recover lifts it again.
+  at resume, where the next recover lifts it again (on rollback, the next recover
+  restarts the old worker, which starts unquiesced).
 - **verify** (each unit against its own pin): the unit is active and its
   `/proc/PID/exe` is its pin's `bin/ow`; the worker answers with its pin's
   version; the runner is online with the agent's and worker's versions; the
