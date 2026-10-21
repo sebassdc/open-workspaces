@@ -139,6 +139,8 @@ fn worker(root: PathBuf) -> Result<()> {
         "worker requires a fresh isolated network namespace; use ow up"
     );
     network::initialize()?;
+    // Per-box AWS role credentials at 169.254.169.254, on its own threads and state.
+    ow_core::metadata::start()?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -193,7 +195,7 @@ fn worker(root: PathBuf) -> Result<()> {
                 let result = (|| -> Result<()> {
                     assert_owner(&stream)?;
                     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
-                    let request = wire::line(&mut stream)?;
+                    let mut request = wire::line(&mut stream)?;
                     let operation = request["op"].as_str().unwrap_or("");
                     if operation == "ssh" {
                         let connection = (|| -> Result<_> {
@@ -353,6 +355,9 @@ fn worker(root: PathBuf) -> Result<()> {
                                 });
                             }
                         }
+                    }
+                    if request["op"] == "aws-creds" {
+                        ow_core::metadata::wipe(&mut request);
                     }
                     Ok(())
                 })();

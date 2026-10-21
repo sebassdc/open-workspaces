@@ -18,7 +18,7 @@ test('aws role dialog attaches an allowed role, shows its token and detaches it'
   expect(attached.token_expires_at - Date.now() / 1000).toBeLessThanOrEqual(900);
 
   await page.locator('#aws-role').getByRole('button', {name: 'Detach'}).click();
-  await expect(notice(page)).toHaveText('AWS role detached; its token was removed.');
+  await expect(notice(page)).toHaveText('AWS role detached; its credentials were withdrawn.');
   await expect(page.locator('#aws-role')).toBeHidden();
 });
 
@@ -62,7 +62,7 @@ test('pool administrator manages AWS roles without a share and ordinary users ca
   expect((await api(page)).workspaces.find(m => m.id === 'managed').aws_role.role_arn).toBe(ROLE);
   await expect(api(pool, {op: 'aws-role', id: address, role_arn: 'arn:aws:iam::111122223333:role/admin'})).rejects.toThrow(/not on this server's allow-list/);
   await row.getByRole('button', {name: 'Detach', exact: true}).click();
-  await expect(notice(pool)).toHaveText('AWS role detached; its token was removed.');
+  await expect(notice(pool)).toHaveText('AWS role detached; its credentials were withdrawn.');
   expect((await api(page)).workspaces.find(m => m.id === 'managed').aws_role).toBeNull();
   const outsider = await browser.newContext({baseURL: 'https://dashboard.e2e.ts.net', ignoreHTTPSErrors: true});
   await signIn(outsider, `${user}-outsider`);
@@ -95,7 +95,7 @@ test('configured pool admin manages an unshared box role without guest access', 
   await expect(pool.locator('#aws-role')).toContainText(ROLE);
   expect((await api(page)).workspaces.find(m => m.id === 'pool-role').aws_role.role_arn).toBe(ROLE);
   await pool.locator('#aws-role').getByRole('button', {name: 'Detach'}).click();
-  await expect(notice(pool)).toHaveText('AWS role detached; its token was removed.');
+  await expect(notice(pool)).toHaveText('AWS role detached; its credentials were withdrawn.');
   expect((await api(page)).workspaces.find(m => m.id === 'pool-role').aws_role).toBeNull();
   await admin.close();
 });

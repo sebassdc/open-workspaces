@@ -1,0 +1,18 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OpenWorkspacesControllerForOneOwner",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::111122223333:role/CONTROLLER-HOST-ROLE"},
+      "Action": ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ow-owner": "alice@example.com",
+          "aws:RequestTag/ow-box": "m-0123456789abcdef01234567"
+        },
+        "ForAllValues:StringEquals": {"sts:TransitiveTagKeys": ["ow-box", "ow-owner"]}
+      }
+    }
+  ]
+}

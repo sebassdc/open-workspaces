@@ -17,7 +17,7 @@ export function fakeWorker(socketPath, log = () => {}) {
     // The subset of the real worker's "status" (crates/ow-core/src/runtime.rs) that admission reads.
     status: () => ({
       runtime: 'fake', running: [...machines.values()].filter(m => m.state === 'running').length, workspace_count: machines.size,
-      snapshot_delete_v1: true, managed_lifecycle_v1: true, disk_resize_v1: true, aws_identity_v1: true, max_disk_gib: 16384, reserved_disk_bytes: 0, unwritten_disk_bytes: 0,
+      snapshot_delete_v1: true, managed_lifecycle_v1: true, disk_resize_v1: true, aws_identity_v1: true, aws_metadata_v1: true, max_disk_gib: 16384, reserved_disk_bytes: 0, unwritten_disk_bytes: 0,
       free_disk_bytes: 4096 * GIB, available_disk_bytes: 4096 * GIB, disk_observed_unix_s: Math.floor(Date.now() / 1000), min_free_gib: 0,
       max_running: 16, max_memory_mib: MAX_MEMORY_MIB, max_vcpus: 16, max_workspaces: 64, max_guest_memory_mib: 16384, max_guest_vcpus: 16,
       max_snapshots: 64, images: ['alpine', 'arch', 'ubuntu'], internet: true, prototype: true,
@@ -68,6 +68,8 @@ export function fakeWorker(socketPath, log = () => {}) {
     restore: r => Object.assign(get(r.id), {state: 'running'}),
     // Per-box AWS access: a running guest takes the token; any other state is skipped, never woken.
     'aws-token': r => ({written: get(r.id).state === 'running'}),
+    // Metadata mode: credentials kept in worker memory for running and hibernated boxes.
+    'aws-creds': r => r.check ? {present: false} : r.role_arn ? {stored: !!r.access_key_id && ['running', 'hibernated'].includes(get(r.id).state)} : {cleared: true},
     fork: r => {
       // Forks of a 3 vCPU parent are refused as the real worker refuses one on a full runner.
       if (get(r.id).vcpu_count === 3) throw Error('CPU reservation limit (16 vCPUs) reached');

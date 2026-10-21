@@ -2,6 +2,20 @@
 use crate::{common, nodes::*, wire};
 
 #[test]
+fn heartbeats_advertise_aws_metadata_and_disk_only_recovery_independently() {
+    let root = root();
+    for metadata in [false, true] {
+        for recovery in [false, true] {
+            let status = json!({"aws_metadata_v1":metadata,"recovery_disk_only_v1":recovery});
+            let beat = build_beat(&json!({"images":[]}), &status, &root, true, false).unwrap();
+            assert_eq!(beat["aws_metadata_v1"], metadata);
+            assert_eq!(beat["recovery_disk_only_v1"], recovery);
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn node_stream_100_mib_each_way() {
     use std::{
         net::{Shutdown, TcpListener},

@@ -8,7 +8,10 @@
 //!   `ssh`) a provider supports, checked before each command.
 //! - [`SnapshotStore`]: off-host copies of sealed snapshots (S3 and compatible).
 //! - [`credential_broker`]: dormant per-box role/secret policy and host provider interfaces;
-//!   [`web_identity`] is its active per-box AWS role delivery into guests.
+//!   [`metadata`] (instance-metadata endpoint) and [`web_identity`] (identity token files)
+//!   are its active per-box AWS role deliveries into guests.
+#![recursion_limit = "256"]
+
 #[cfg(target_os = "linux")]
 pub mod cache;
 pub mod capability;
@@ -21,6 +24,7 @@ pub mod disk;
 #[cfg(test)]
 mod fake_s3;
 pub mod idle;
+pub mod metadata;
 #[cfg(target_os = "linux")]
 pub mod network;
 pub mod recovery;
@@ -31,6 +35,7 @@ pub mod snapshot_store;
 #[cfg(target_os = "linux")]
 pub mod ssh_guest;
 pub mod store;
+pub mod sts;
 #[cfg(target_os = "linux")]
 pub mod vm;
 pub mod web_identity;

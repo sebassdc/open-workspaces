@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 mod aws_identity;
 #[cfg(target_os = "linux")]
+mod aws_metadata;
+#[cfg(target_os = "linux")]
 mod backup;
 #[cfg(any(target_os = "linux", test))]
 mod cache_catalog;
@@ -454,14 +456,18 @@ enum Action {
 
 #[derive(Subcommand)]
 enum AwsRoleAction {
-    /// Attach a role (owner or admin); `ow inspect` shows it and its token expiry.
+    /// Attach a role (owner or admin); `ow inspect` shows it and until when its credentials last.
     Set {
         id: String,
         /// An exact role ARN the server's operator allows for this box's owner.
         #[arg(long)]
         role_arn: String,
+        /// Metadata mode: how many routed hops the box's credentials travel (1, the default,
+        /// keeps containers inside the box from reading them; 2 lets them).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
+        hop_limit: Option<u8>,
     },
-    /// Detach the role and remove the box's token now.
+    /// Detach the role and withdraw the box's credentials now.
     Unset { id: String },
 }
 
@@ -1108,6 +1114,26 @@ mod capability_tests {
             }
         ));
         assert!(Cli::try_parse_from(["ow", "aws-role", "set", "demo"]).is_err());
+        let role = [
+            "ow",
+            "aws-role",
+            "set",
+            "demo",
+            "--role-arn",
+            "arn:aws:iam::111122223333:role/ow-box/r",
+        ];
+        assert!(matches!(
+            Cli::try_parse_from([&role[..], &["--hop-limit", "2"]].concat())
+                .unwrap()
+                .command,
+            Action::AwsRole {
+                command: AwsRoleAction::Set {
+                    hop_limit: Some(2),
+                    ..
+                }
+            }
+        ));
+        assert!(Cli::try_parse_from([&role[..], &["--hop-limit", "3"]].concat()).is_err());
         assert!(matches!(
             Cli::try_parse_from(["ow", "unpublish", "demo"])
                 .unwrap()

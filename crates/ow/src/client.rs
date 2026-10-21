@@ -514,8 +514,16 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
         Action::Share { id, with, role } => json!({"op":"share","id":id,"with":with,"role":role}),
         Action::Unshare { id, with } => json!({"op":"unshare","id":id,"with":with}),
         Action::AwsRole { command } => match command {
-            AwsRoleAction::Set { id, role_arn } => {
-                json!({"op":"aws-role","id":id,"role_arn":role_arn})
+            AwsRoleAction::Set {
+                id,
+                role_arn,
+                hop_limit,
+            } => {
+                let mut request = json!({"op":"aws-role","id":id,"role_arn":role_arn});
+                if let Some(hops) = hop_limit {
+                    request["hop_limit"] = json!(hops);
+                }
+                request
             }
             AwsRoleAction::Unset { id } => json!({"op":"aws-role","id":id}),
         },

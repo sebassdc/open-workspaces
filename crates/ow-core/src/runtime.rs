@@ -898,6 +898,8 @@ impl Runtime {
             &self.machine_dir(&workspace.id),
             workspace.index,
         )?;
+        // Dropping `machine` (any failure below, a stop, a hibernation) detaches it again.
+        crate::metadata::attach(workspace.index, &workspace.id)?;
         if let Some(snapshot) = snapshot {
             machine.restore(snapshot)?;
         } else {
@@ -1151,6 +1153,7 @@ impl Runtime {
             .and_then(|machine| machine.checked("sync").err())
             .map(|e| format!("{e:#}"));
         self.machines.remove(id);
+        crate::metadata::stopped(id);
         let workspace = self.state.workspaces.get_mut(id).unwrap();
         workspace.state = "stopped".into();
         workspace.hibernation = None;
@@ -1170,6 +1173,7 @@ impl Runtime {
             !self.machines.contains_key(id),
             "workspace is running; stop or hibernate it first"
         );
+        crate::metadata::clear(id);
         // Its snapshots go too: a later workspace reusing this ID must not fork them.
         let mut snapshots = Vec::new();
         for item in fs::read_dir(self.root.join("snapshots"))? {
@@ -1896,6 +1900,7 @@ impl Runtime {
             .collect();
         for id in &exited {
             self.machines.remove(id);
+            crate::metadata::stopped(id);
             self.state.workspaces.get_mut(id).unwrap().state = "failed".into();
         }
         if !exited.is_empty() {
@@ -1909,7 +1914,12 @@ impl Runtime {
         if !id.is_empty() && !matches!(op, "inspect" | "placement-check") {
             // Deleting a named snapshot never runs the copy, so a fenced source may do it; a
             // managed delete checks the copy's phase itself (an old fenced copy may go too).
-            self.authorize(request, !matches!(op, "snapshot-delete" | "delete"))?;
+            // Withdrawing a box's AWS credentials is always allowed.
+            let withdraw = op == "aws-creds" && request["role_arn"].is_null();
+            self.authorize(
+                request,
+                !matches!(op, "snapshot-delete" | "delete") && !withdraw,
+            )?;
             ensure!(
                 !self.state.placements.contains_key(id)
                     || !matches!(op, "restore" | "fork" | "image-save"),
@@ -1924,6 +1934,7 @@ impl Runtime {
                     | "recovery-result"
                     | "recovery-seal"
                     | "aws-token"
+                    | "aws-creds"
             )
         {
             self.idle.touch(id, std::time::Instant::now());
@@ -1965,7 +1976,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"recovery_disk_only_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"recovery_disk_only_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"aws_metadata_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
@@ -2129,6 +2140,16 @@ impl Runtime {
                     self.aws_delivered.insert(id.to_owned(), pid);
                 }
                 Ok(json!({"written":true}))
+            }
+            // Metadata mode: credentials for `crate::metadata`, in this process's memory only.
+            // Like `aws-token`, never wakes a box; a hibernated one keeps them for its wake.
+            "aws-creds" => {
+                let live = self.machines.contains_key(id)
+                    || self.workspace(id).is_ok_and(|w| w.state == "hibernated");
+                if !request["role_arn"].is_null() {
+                    self.workspace(id)?;
+                }
+                crate::metadata::request(request, live)
             }
             "exec" => {
                 let command = request["command"].as_str().context("missing command")?;
@@ -3004,6 +3025,90 @@ mod disk_tests {
             runtime.request(&json!({"op":"status"})).unwrap()["aws_identity_v1"],
             true
         );
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
+    fn aws_creds_stay_in_memory_and_are_served_while_the_runtime_is_busy() {
+        use std::io::{Read, Write};
+        let mut runtime = fixture();
+        // Its own box ID: the credential store is the process's, shared by parallel tests.
+        let mut workspace = runtime.state.workspaces["legacy"].clone();
+        workspace.id = "aws-meta".into();
+        workspace.state = "hibernated".into();
+        workspace.hibernation = Some("sleep-fixture".into());
+        runtime
+            .state
+            .workspaces
+            .insert("aws-meta".into(), workspace);
+        let expiration = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let creds = json!({"op":"aws-creds","id":"aws-meta","role_arn":"arn:aws:iam::111122223333:role/ow-box/reader","generation":1,"hop_limit":1,
+            "access_key_id":"ASIARUNTIME","secret_access_key":"runtimeSecret","session_token":"runtimeToken","expiration":expiration,"region":"us-east-1"});
+        // A hibernated box keeps them for its wake, and is neither woken nor kept awake.
+        assert_eq!(runtime.request(&creds).unwrap(), json!({"stored":true}));
+        assert_eq!(runtime.state.workspaces["aws-meta"].state, "hibernated");
+        assert!(!runtime.machines.contains_key("aws-meta"));
+        let check = json!({"op":"aws-creds","id":"aws-meta","check":true,"generation":1});
+        assert_eq!(runtime.request(&check).unwrap(), json!({"present":true}));
+        // Only for a box this worker hosts; never written to disk.
+        let mut elsewhere = creds.clone();
+        elsewhere["id"] = json!("not-here");
+        assert!(runtime.request(&elsewhere).is_err());
+        let mut files = vec![runtime.root.clone()];
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            } else if path.metadata().unwrap().len() < 1 << 20 {
+                let text = String::from_utf8_lossy(&fs::read(&path).unwrap()).to_string();
+                assert!(!text.contains("runtimeSecret"), "{}", path.display());
+            }
+        }
+        // Answers while the worker's runtime lock is held, as during a fork or restore.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        crate::metadata::serve(listener, std::sync::Arc::new(|_, _| Some(9100)));
+        crate::metadata::attach(9100, "aws-meta").unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let busy = shared.lock().unwrap();
+        let ask = |request: String| {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            reply.split_once("\r\n\r\n").unwrap().1.to_owned()
+        };
+        let token = ask("PUT /latest/api/token HTTP/1.1\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\nConnection: close\r\n\r\n".into());
+        let answer = ask(format!(
+            "GET /latest/meta-data/iam/security-credentials/reader HTTP/1.1\r\nX-aws-ec2-metadata-token: {token}\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(answer.contains("ASIARUNTIME"), "{answer}");
+        drop(busy);
+        let mut runtime = std::sync::Arc::into_inner(shared)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        crate::metadata::detach(9100);
+        // A stop drops them; deleting the box forgets its role.
+        runtime
+            .request(&json!({"op":"stop","id":"aws-meta"}))
+            .unwrap();
+        assert_eq!(runtime.request(&check).unwrap(), json!({"present":false}));
+        assert_eq!(
+            runtime
+                .request(&json!({"op":"aws-creds","id":"aws-meta"}))
+                .unwrap(),
+            json!({"cleared":true})
+        );
+        let status = runtime.request(&json!({"op":"status"})).unwrap();
+        assert_eq!(status["aws_metadata_v1"], true);
+        assert_eq!(status["recovery_disk_only_v1"], true);
         fs::remove_dir_all(runtime.root).unwrap();
     }
 

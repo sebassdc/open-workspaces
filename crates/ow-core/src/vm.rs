@@ -58,8 +58,7 @@ fn split_cgroup(cgroup: &Path) -> Result<PathBuf> {
 }
 
 /// Runs in a forked VMM before exec (async-signal-safe calls only): joins the guests'
-/// cgroup when there is one and raises its OOM score, so under memory pressure the kernel
-/// kills a VM before the worker (-900 in its unit) or the controller and agent.
+/// cgroup when there is one.
 fn as_guest() -> std::io::Result<()> {
     let write = |path: *const libc::c_char, value: &[u8]| unsafe {
         let fd = libc::open(path, libc::O_WRONLY | libc::O_CLOEXEC);
@@ -77,7 +76,21 @@ fn as_guest() -> std::io::Result<()> {
     if let Some(procs) = GUEST_CGROUP.get() {
         write(procs.as_ptr(), b"0")?;
     }
-    write(c"/proc/self/oom_score_adj".as_ptr(), b"500")
+    Ok(())
+}
+
+fn guest_command(binary: &Path) -> Command {
+    // Exec first discards worker credentials and resets /proc ownership; a non-dumpable
+    // unprivileged child cannot write its OOM score before exec.
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-ec",
+            "printf 500 > /proc/self/oom_score_adj; exec \"$@\"",
+            "ow-vmm",
+        ])
+        .arg(binary);
+    command
 }
 
 pub fn reflink(source: &Path, destination: &Path) -> Result<()> {
@@ -239,7 +252,7 @@ impl Vm {
                 .append(true)
                 .open(directory.join("vmm.log"))?;
             let parent_pid = std::process::id();
-            let mut command = Command::new(binary);
+            let mut command = guest_command(binary);
             command
                 .args([
                     "--log-path",
@@ -632,9 +645,13 @@ impl Drop for Vm {
         if let Some(thread) = self.diagnostics.take() {
             let _ = thread.join();
         }
-        let _ = host("ip", &["link", "del", &self.tap]);
         if let Ok(index) = self.tap.trim_start_matches("ow").parse() {
+            // Before the TAP goes: a later box on this index must not answer as this one.
+            crate::metadata::detach(index);
+            let _ = host("ip", &["link", "del", &self.tap]);
             crate::network::unregister(index);
+        } else {
+            let _ = host("ip", &["link", "del", &self.tap]);
         }
     }
 }
@@ -1320,10 +1337,23 @@ mod guest_isolation_tests {
 
     #[test]
     fn a_vmm_starts_with_an_oom_score_above_the_worker() {
-        let mut command = Command::new("cat");
+        let mut command = guest_command(Path::new("cat"));
         command.arg("/proc/self/oom_score_adj");
-        unsafe { command.pre_exec(as_guest) };
+        unsafe {
+            command.pre_exec(|| {
+                // Match a worker already holding metadata credentials, including without root.
+                if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                as_guest()
+            })
+        };
         let out = command.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "500");
     }
 

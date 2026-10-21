@@ -1123,6 +1123,8 @@ impl Catalog {
             }
             if next.terminal() {
                 c.db.execute("DELETE FROM transfer_locks WHERE transfer=?1",[id])?;
+                // A moved or woken box with a role needs credentials on its new runner now.
+                crate::aws_identity::notify();
                 c.db.execute("UPDATE operations SET state=?1,finished_at=CURRENT_TIMESTAMP WHERE id=?2",params![if next == Step::Succeeded {"succeeded"}else{"failed"},t.operation])?;
             }
             c.transfer(id)
@@ -1584,7 +1586,7 @@ impl Catalog {
                 let email: String =
                     self.db
                         .query_row("SELECT email FROM users WHERE id=?1", [user], |r| r.get(0))?;
-                json!({"enabled":true,"issuer":config.issuer,"roles":config.roles_for(&email)})
+                json!({"enabled":true,"mode":config.mode.name(),"issuer":config.issuer,"roles":config.roles_for(&email)})
             }
             _ => json!({"enabled":false}),
         };
@@ -1926,6 +1928,8 @@ impl Catalog {
                 [&physical],
                 |r| r.get::<_, bool>(0),
             )? {
+                // The old owner's role leaves the runner before the new owner is committed.
+                self.withdraw_aws(&physical, None)?;
                 crate::aws_identity::revoke(&self.root, &physical)?;
                 self.db
                     .execute("DELETE FROM aws_roles WHERE physical=?1", [&physical])?;
@@ -2561,15 +2565,14 @@ impl Catalog {
                 "delete",
                 "snapshot-delete",
                 "rename",
-                "aws-role",
                 "transfer"
             ]
             .contains(&op.as_str()),
             "unsupported user operation"
         );
-        if op == "aws-role" {
-            return self.aws_role(user, &request, false);
-        }
+        // A started box with a role needs credentials when this returns, not at the next pass.
+        let _credentials =
+            matches!(op.as_str(), "start" | "restore").then_some(crate::aws_identity::Notify);
         if matches!(op.as_str(), "share" | "unshare") {
             return self.share(user, &op, &request);
         }

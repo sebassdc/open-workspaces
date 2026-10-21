@@ -787,6 +787,9 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
     ));
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     let mut last = tokio::time::Instant::now();
+    // A new worker process holds no per-box AWS credentials: deliver them now.
+    #[cfg(target_os = "linux")]
+    let mut worker_pid = None;
     let mut ticked = tokio::time::Instant::now();
     // Telemetry frames are taken only from a runner that advertised telemetry_v1, at most
     // FRAMES_PER_TICK per tick. `seen`: when this session last recorded a heartbeat; a
@@ -842,6 +845,10 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
                 if seen.replace(now()).is_none() {
                     let (root,node)=(c.root.clone(),node.clone());
                     tokio::task::spawn_blocking(move||{let _=crate::nodes::db(&root).and_then(|db|crate::telemetry::record_event(&db,&node,"INFO","ow.node.session.opened",&json!({})));});
+                }
+                #[cfg(target_os="linux")]
+                if v["aws_metadata_v1"]==true && worker_pid.replace(v["worker_pid"].clone())!=Some(v["worker_pid"].clone()) {
+                    crate::aws_identity::notify();
                 }
                 #[cfg(target_os="linux")]
                 if v["image_store_v1"]==true {
@@ -1542,6 +1549,7 @@ fn build_beat(
     beat["managed_lifecycle_v1"] =
         json!(status["managed_lifecycle_v1"] == true && common::placement_capable(status).is_ok());
     beat["aws_identity_v1"] = json!(status["aws_identity_v1"] == true);
+    beat["aws_metadata_v1"] = json!(status["aws_metadata_v1"] == true);
     // Disk-only automatic recovery points from the worker, and this agent's reconnect when
     // the controller goes silent: together a capture no longer takes the runner offline.
     beat["recovery_disk_only_v1"] = json!(status["recovery_disk_only_v1"] == true);
@@ -1556,6 +1564,7 @@ fn build_beat(
     beat["placement_fencing_v1"] = json!(common::placement_capable(status).is_ok());
     for field in [
         "compat",
+        "worker_pid",
         "max_disk_gib",
         "reserved_disk_bytes",
         "unwritten_disk_bytes",
@@ -2027,6 +2036,7 @@ fn agent_job(
             "ssh-keys",
             "ssh-policy",
             "aws-token",
+            "aws-creds",
             "delete"
         ]
         .contains(&op)

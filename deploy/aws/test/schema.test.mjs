@@ -32,6 +32,8 @@ test("pulumi package get-schema finds every component", (t) => {
     assert.equal(schema.resources["open-workspaces-aws:index:Host"].inputProperties.dashboardCapability.type, "string");
     assert.equal(schema.resources["open-workspaces-aws:index:Host"].inputProperties.storeGc.type, "boolean");
     assert.ok(!("storeGc" in schema.resources["open-workspaces-aws:index:Runner"].inputProperties));
+    assert.equal(schema.resources["open-workspaces-aws:index:Host"].inputProperties.boxRoles.type, "boolean");
+    assert.ok(!("boxRoles" in schema.resources["open-workspaces-aws:index:Runner"].inputProperties));
     assert.ok(!("dashboardCapability" in schema.resources["open-workspaces-aws:index:Runner"].inputProperties));
     assert.equal(schema.resources["open-workspaces-aws:index:Host"].inputProperties.poolAdmins.type, "array");
     assert.ok(!("poolAdmins" in schema.resources["open-workspaces-aws:index:Runner"].inputProperties));
