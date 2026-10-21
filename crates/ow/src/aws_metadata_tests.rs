@@ -6,7 +6,7 @@ use ow_core::sts;
 use std::sync::Weak;
 
 pub(super) const READER: &str = "arn:aws:iam::111122223333:role/ow-box/reader";
-const ADMIN_ONLY: &str = "arn:aws:iam::111122223333:role/ow-box/a-only";
+pub(super) const ADMIN_ONLY: &str = "arn:aws:iam::111122223333:role/ow-box/a-only";
 
 pub(super) fn metadata_config() -> Value {
     json!({"mode":"metadata","allowed_roles":[
@@ -328,10 +328,9 @@ fn credentials_assumed_for_an_old_attachment_are_never_delivered() {
         c.operation(b, json!({"op":"aws-role","id":"box","role_arn":READER}))
             .unwrap();
         sts.during = Some(Box::new(move |catalog| {
-            catalog
-                .lock()
-                .unwrap()
-                .operation(b, json!({"op":"aws-role","id":"box","role_arn":READER}))
+            let mut c = catalog.lock().unwrap();
+            c.operation(b, json!({"op":"aws-role","id":"box"})).unwrap();
+            c.operation(b, json!({"op":"aws-role","id":"box","role_arn":READER}))
                 .unwrap();
         }));
     }
@@ -371,6 +370,45 @@ fn credentials_assumed_for_an_old_attachment_are_never_delivered() {
             .iter()
             .all(|(r, _)| r.get("access_key_id").is_none())
     );
+    ow_core::metadata::clear(BOX);
+}
+
+#[test]
+fn detached_generations_survive_restart_transfer_and_mode_switch() {
+    let f = Fixture::new();
+    f.lists.store(true, Ordering::SeqCst);
+    f.configure(metadata_config());
+    const BOX: &str = "m-meta-generation";
+    let mut c = Catalog::open(&f.root, "test", None).unwrap();
+    let a = c.user(&identity("a", "a@example.test")).unwrap();
+    let b = c.user(&identity("b", "b@example.test")).unwrap();
+    running(&c, a, "box", BOX);
+    crate::limits::observe(
+        &c.db,
+        BOX,
+        &json!({"vcpu_count":1,"memory_mib":256,"disk_bytes":8*common::GIB}),
+    )
+    .unwrap();
+    let attach = |c: &mut Catalog, owner, role, generation| {
+        let result = c
+            .operation(owner, json!({"op":"aws-role","id":"box","role_arn":role}))
+            .unwrap();
+        assert_eq!(result["aws_role"]["generation"], generation);
+    };
+    attach(&mut c, a, READER, 1);
+    c.operation(a, json!({"op":"aws-role","id":"box"})).unwrap();
+    drop(c);
+    let mut c = Catalog::open(&f.root, "test", None).unwrap();
+    attach(&mut c, a, ADMIN_ONLY, 2);
+    c.operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}))
+        .unwrap();
+    attach(&mut c, b, READER, 3);
+    c.operation(b, json!({"op":"aws-role","id":"box"})).unwrap();
+    f.configure(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":READER}]}));
+    attach(&mut c, b, READER, 4);
+    c.operation(b, json!({"op":"aws-role","id":"box"})).unwrap();
+    f.configure(metadata_config());
+    attach(&mut c, b, READER, 5);
     ow_core::metadata::clear(BOX);
 }
 
@@ -421,10 +459,12 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
         .unwrap();
     let reattach = f.creds();
     assert_eq!(reattach[0].0["role_arn"], ADMIN_ONLY);
+    assert_eq!(reattach[0].0["generation"], 2);
     assert_eq!(reattach[0].0["hop_limit"], 2);
     assert_eq!(reattach[0].1, Some((a, false)));
     pass(&shared, &mut sts, &mut cleared);
-    assert!(ow_core::metadata::present(BOX, 1));
+    assert!(!ow_core::metadata::present(BOX, 1));
+    assert!(ow_core::metadata::present(BOX, 2));
     f.creds();
 
     // An unreachable runner refuses a transfer and a detach of the running box; nothing changes.
@@ -473,7 +513,7 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
     }
     f.configure(metadata_config());
     f.down.store(false, Ordering::SeqCst);
-    assert!(ow_core::metadata::present(BOX, 1));
+    assert!(ow_core::metadata::present(BOX, 2));
 
     // Transfer: withdrawn while the old owner and the role were still committed.
     shared
@@ -485,7 +525,7 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
     assert_eq!(transfer.len(), 1);
     assert!(transfer[0].0.get("role_arn").is_none());
     assert_eq!(transfer[0].1, Some((a, true)));
-    assert!(!ow_core::metadata::present(BOX, 1));
+    assert!(!ow_core::metadata::present(BOX, 2));
     let c = shared.lock().unwrap();
     assert!(crate::aws_identity::view(&c.db, BOX).unwrap().is_null());
     let owner: i64 =

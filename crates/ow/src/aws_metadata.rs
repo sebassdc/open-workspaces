@@ -231,15 +231,7 @@ impl Catalog {
             }
             .into());
         }
-        let generation: i64 = self
-            .db
-            .query_row(
-                "SELECT generation+1 FROM aws_roles WHERE physical=?1",
-                [physical],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(1);
+        let generation = self.next_aws_generation(physical)?;
         let mark = self.fork_mark(physical)?;
         self.withdraw_aws(physical, Some((role, generation, hops as i64)))?;
         self.db.execute(

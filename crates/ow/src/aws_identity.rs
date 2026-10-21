@@ -156,6 +156,14 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
         // must be reached before the attachment ends, whatever mode the controller is in now.
         db.execute_batch("ALTER TABLE aws_roles ADD COLUMN hop_limit INTEGER NOT NULL DEFAULT 1 CHECK(hop_limit IN (1,2)); ALTER TABLE aws_roles ADD COLUMN served INTEGER NOT NULL DEFAULT 0;")?;
     }
+    // Detached/transferred rows disappear, but their generations must never authorize again.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS aws_role_generations(physical TEXT PRIMARY KEY,generation INTEGER NOT NULL CHECK(generation>0));
+         CREATE TRIGGER IF NOT EXISTS remember_aws_role_generation BEFORE DELETE ON aws_roles BEGIN
+           INSERT INTO aws_role_generations(physical,generation) VALUES(OLD.physical,OLD.generation)
+           ON CONFLICT(physical) DO UPDATE SET generation=MAX(generation,excluded.generation);
+         END;",
+    )?;
     Ok(())
 }
 
@@ -369,6 +377,16 @@ pub(crate) enum Work {
 }
 
 impl Catalog {
+    pub(crate) fn next_aws_generation(&self, physical: &str) -> Result<i64> {
+        Ok(self.db.query_row(
+            "SELECT COALESCE(MAX(generation),0)+1 FROM (
+               SELECT generation FROM aws_roles WHERE physical=?1
+               UNION ALL SELECT generation FROM aws_role_generations WHERE physical=?1)",
+            [physical],
+            |r| r.get(0),
+        )?)
+    }
+
     /// `{"op":"aws-role","id":NAME,"role_arn":ARN}` attaches; without `role_arn` it detaches.
     pub fn aws_role(&mut self, user: i64, request: &Value, pool_admin: bool) -> Result<Value> {
         let name = request["id"].as_str().context("id")?;
@@ -427,14 +445,15 @@ impl Catalog {
             // A new attachment is a new credential authority: a new generation, key and token.
             // Forks made before it are not this attachment's concern.
             let mark = self.fork_mark(&physical)?;
+            let generation = self.next_aws_generation(&physical)?;
             // Credentials an earlier metadata mode gave its runner go before the new role is
             // recorded; refused while that runner holds them unreached.
             self.withdraw_aws(&physical, None)?;
             revoke(&self.root, &physical)?;
             self.db.execute(
-                "INSERT INTO aws_roles(physical,owner,role_arn,generation,fork_mark) VALUES(?1,?2,?3,1,?4)
-                 ON CONFLICT(physical) DO UPDATE SET owner=excluded.owner,role_arn=excluded.role_arn,generation=generation+1,node=NULL,epoch=NULL,fork_mark=excluded.fork_mark,expires_at=NULL,error=NULL,updated_at=CURRENT_TIMESTAMP",
-                params![physical, owner, role, mark],
+                "INSERT INTO aws_roles(physical,owner,role_arn,generation,fork_mark) VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(physical) DO UPDATE SET owner=excluded.owner,role_arn=excluded.role_arn,generation=excluded.generation,node=NULL,epoch=NULL,fork_mark=excluded.fork_mark,expires_at=NULL,error=NULL,updated_at=CURRENT_TIMESTAMP",
+                params![physical, owner, role, generation, mark],
             )?;
         } else {
             // Its runner forgets the credentials first; refused while it may hold them unreached.

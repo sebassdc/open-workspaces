@@ -65,8 +65,11 @@ instance role, and the worker already owns each box's network path.
    must be a guest `.2` and the local end the host `.1` of the same /30. IMDSv2
    only: tokens are an HMAC over box, a nonce new with every VMM start of it, the
    role generation (0 without a role) and the expiry, so a detach, re-attach, move
-   or fork ends the tokens issued before it, with a key random per worker process; they need no memory and are
-   compared in constant time. Requests carrying `X-Forwarded-For`, a body or
+   or fork ends the tokens issued before it, with a key random per worker process.
+   Tokens need no memory and are compared in constant time. The catalog retains a
+   per-box generation high-water mark when an attachment is deleted; both modes
+   allocate above the active and deleted generations, including after transfer or
+   controller restart. Requests carrying `X-Forwarded-For`, a body or
    `OPTIONS` are refused and no CORS header is ever sent. The real instance
    metadata service is never contacted. Paths: the token, the role name and
    credentials, `iam/info` with a synthetic `instance-profile/ow-box/...` ARN, and

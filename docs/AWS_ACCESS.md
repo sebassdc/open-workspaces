@@ -105,7 +105,10 @@ instance metadata (the AWS CLI, Go v2, Rust) take the controller's region.
   If the runner of a running (or hibernated) box with a role cannot be reached,
   transfer and detach are refused until it is back.
 - An IMDSv2 token names the role generation it was issued under: after a detach or
-  re-attach, programs fetch a new token (every SDK does on `401`).
+  re-attach, programs fetch a new token (every SDK does on `401`). The catalog
+  retains the last generation when an attachment is deleted, including on owner
+  transfer, so re-attaching cannot make a withdrawn token valid again. This
+  history survives controller restarts and applies to both modes.
 - **Credentials an SDK already fetched stay valid until they expire (at most one
   hour)**, including copies in the box's RAM, and so in its hibernation snapshot, a
   full-state fork made from it, or a recovery point. To end them at once, revoke

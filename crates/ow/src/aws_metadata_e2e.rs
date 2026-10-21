@@ -5,7 +5,7 @@
 //! own `aws-creds` handler. A box reads its attached role's credentials from
 //! 169.254.169.254 through curl and botocore, and loses them the moment its role is
 //! detached or the box is transferred.
-use super::metadata::{FakeSts, READER, metadata_config};
+use super::metadata::{ADMIN_ONLY, FakeSts, READER, metadata_config};
 use super::*;
 use std::{
     io::Write as _,
@@ -333,6 +333,17 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
         );
     }
 
+    // Retain a token from this VMM incarnation across a real detach/re-attach.
+    let token = guest(
+        1,
+        "curl -sf --max-time 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token",
+    );
+    assert!(token.status.success());
+    let token = String::from_utf8(token.stdout).unwrap();
+    let replay = format!(
+        "-o /dev/null -w '%{{http_code}}' -H 'X-aws-ec2-metadata-token: {token}' http://169.254.169.254{CREDENTIALS}"
+    );
+    assert_eq!(curl(1, &replay).1, "200");
     // Detach: gone at once, without waiting for a refresher pass.
     shared
         .lock()
@@ -342,6 +353,7 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
     let started = Instant::now();
     assert_eq!(metadata(1, CREDENTIALS).0, 404);
     assert!(started.elapsed() < Duration::from_millis(700));
+    assert_eq!(curl(1, &replay).1, "401");
     if python {
         assert_eq!(botocore(&f.root.join("home"), None).0, "none");
     }
@@ -350,10 +362,21 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
     shared
         .lock()
         .unwrap()
-        .operation(a, json!({"op":"aws-role","id":"one","role_arn":READER}))
+        .operation(a, json!({"op":"aws-role","id":"one","role_arn":ADMIN_ONLY}))
         .unwrap();
     pass(&shared, &mut sts, &mut cleared);
-    assert_eq!(metadata(1, CREDENTIALS), (200, "reader".into()));
+    assert_eq!(
+        curl(1, &replay).1,
+        "401",
+        "withdrawn tokens must stay revoked"
+    );
+    assert_eq!(metadata(1, CREDENTIALS), (200, "a-only".into()));
+    let (status, body) = metadata(1, &format!("{CREDENTIALS}a-only"));
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["AccessKeyId"],
+        "ASIAFAKE2"
+    );
     shared
         .lock()
         .unwrap()
