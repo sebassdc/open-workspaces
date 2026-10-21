@@ -476,8 +476,7 @@ class HostOps:
 
     def quiesce_off(self):
         """Lets a quiesced worker take starts and wakes again (idempotent)."""
-        if h.role() != "controller":
-            self._quiesce(False)
+        return h.role() == "controller" or self._quiesce(False)
 
     def start_box(self, box):
         h.ow("start", box, timeout=1200)
@@ -645,15 +644,7 @@ def execute(plan_, ops, frm, to, target_name):
         j.step("switch")
         ops.switch(to)
         j.step("start")
-        for name in ("worker", "agent", "dashboard"):
-            if name in restart:
-                ops.start(name)
-            if name == "worker" and worker:
-                # The new worker starts open to wakes: quiesce it before the agent and the
-                # gateway can wake a box, or a long resume (a large snapshot is hashed first)
-                # holds the one-request worker past verify's deadline. finish() lifts it.
-                wait_worker(ops)
-                ops.quiesce()
+        start_quiesced(ops, restart)
         j.step("verify")
         ops.verify({name: version_of(to[name]) for name in j["from"] if name != "current"})
     except Exception as e:
@@ -671,8 +662,7 @@ def finish(j, ops):
     """Resume and undrain; a box that does not resume stays hibernated (it wakes on its
     next connection) and is reported, never rolled back: its capture may be spent."""
     j.step("resume")
-    if "worker" in j["restart"]:
-        ops.quiesce_off()
+    lift(j, ops)
     failed = resume(j, ops)
     if j["class"] == 2 and not j["resume"]:
         ops.canary()
@@ -729,16 +719,33 @@ def rollback(j, ops):
         if name in restart and ops.active(name):
             ops.stop(name)
     ops.switch(j["from"])
-    for name in ("worker", "agent", "dashboard"):
-        if name in restart:
-            ops.start(name)
+    start_quiesced(ops, restart)
     ops.verify({name: version_of(j["from"][name]) for name in j["from"] if name != "current"})
     if "worker" in restart:
         wait_worker(ops)
+    lift(j, ops)
     resume(j, ops)
     ops.drain(False)
     j.step("rolled-back")
     say(f"upgrade rolled back: {j.value['error']}")
+
+
+def start_quiesced(ops, restart):
+    """Starts the restarted units; a started worker is quiesced before the agent and the
+    gateway can wake a box on it: a resume hashes the box's snapshot first and would hold
+    the one-request worker past verify's deadline. lift() opens it again."""
+    for name in ("worker", "agent", "dashboard"):
+        if name in restart:
+            ops.start(name)
+        if name == "worker" and name in restart:
+            wait_worker(ops, limit=180)
+            ops.quiesce()
+
+
+def lift(j, ops):
+    # Raises so the journal stays before "done" and recover() lifts it again.
+    if "worker" in j["restart"] and not ops.quiesce_off():
+        raise RuntimeError("the worker did not lift its quiesce")
 
 
 def wait_worker(ops, limit=120):
