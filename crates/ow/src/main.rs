@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 mod aws_identity;
 #[cfg(target_os = "linux")]
+mod aws_metadata;
+#[cfg(target_os = "linux")]
 mod backup;
 #[cfg(any(target_os = "linux", test))]
 mod cache_catalog;

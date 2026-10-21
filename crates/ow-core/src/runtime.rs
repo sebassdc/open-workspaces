@@ -889,6 +889,8 @@ impl Runtime {
             &self.machine_dir(&workspace.id),
             workspace.index,
         )?;
+        // Dropping `machine` (any failure below, a stop, a hibernation) detaches it again.
+        crate::metadata::attach(workspace.index, &workspace.id)?;
         if let Some(snapshot) = snapshot {
             machine.restore(snapshot)?;
         } else {
@@ -1142,6 +1144,7 @@ impl Runtime {
             .and_then(|machine| machine.checked("sync").err())
             .map(|e| format!("{e:#}"));
         self.machines.remove(id);
+        crate::metadata::stopped(id);
         let workspace = self.state.workspaces.get_mut(id).unwrap();
         workspace.state = "stopped".into();
         workspace.hibernation = None;
@@ -1161,6 +1164,7 @@ impl Runtime {
             !self.machines.contains_key(id),
             "workspace is running; stop or hibernate it first"
         );
+        crate::metadata::clear(id);
         // Its snapshots go too: a later workspace reusing this ID must not fork them.
         let mut snapshots = Vec::new();
         for item in fs::read_dir(self.root.join("snapshots"))? {
@@ -1865,6 +1869,7 @@ impl Runtime {
             .collect();
         for id in &exited {
             self.machines.remove(id);
+            crate::metadata::stopped(id);
             self.state.workspaces.get_mut(id).unwrap().state = "failed".into();
         }
         if !exited.is_empty() {
@@ -1878,7 +1883,12 @@ impl Runtime {
         if !id.is_empty() && !matches!(op, "inspect" | "placement-check") {
             // Deleting a named snapshot never runs the copy, so a fenced source may do it; a
             // managed delete checks the copy's phase itself (an old fenced copy may go too).
-            self.authorize(request, !matches!(op, "snapshot-delete" | "delete"))?;
+            // Withdrawing a box's AWS credentials is always allowed.
+            let withdraw = op == "aws-creds" && request["role_arn"].is_null();
+            self.authorize(
+                request,
+                !matches!(op, "snapshot-delete" | "delete") && !withdraw,
+            )?;
             ensure!(
                 !self.state.placements.contains_key(id)
                     || !matches!(op, "restore" | "fork" | "image-save"),
@@ -1893,6 +1903,7 @@ impl Runtime {
                     | "recovery-result"
                     | "recovery-seal"
                     | "aws-token"
+                    | "aws-creds"
             )
         {
             self.idle.touch(id, std::time::Instant::now());
@@ -1934,7 +1945,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"aws_metadata_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
@@ -2098,6 +2109,16 @@ impl Runtime {
                     self.aws_delivered.insert(id.to_owned(), pid);
                 }
                 Ok(json!({"written":true}))
+            }
+            // Metadata mode: credentials for `crate::metadata`, in this process's memory only.
+            // Like `aws-token`, never wakes a box; a hibernated one keeps them for its wake.
+            "aws-creds" => {
+                let live = self.machines.contains_key(id)
+                    || self.workspace(id).is_ok_and(|w| w.state == "hibernated");
+                if !request["role_arn"].is_null() {
+                    self.workspace(id)?;
+                }
+                crate::metadata::request(request, live)
             }
             "exec" => {
                 let command = request["command"].as_str().context("missing command")?;

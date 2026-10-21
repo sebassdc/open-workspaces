@@ -604,9 +604,13 @@ impl Drop for Vm {
         if let Some(thread) = self.diagnostics.take() {
             let _ = thread.join();
         }
-        let _ = host("ip", &["link", "del", &self.tap]);
         if let Ok(index) = self.tap.trim_start_matches("ow").parse() {
+            // Before the TAP goes: a later box on this index must not answer as this one.
+            crate::metadata::detach(index);
+            let _ = host("ip", &["link", "del", &self.tap]);
             crate::network::unregister(index);
+        } else {
+            let _ = host("ip", &["link", "del", &self.tap]);
         }
     }
 }

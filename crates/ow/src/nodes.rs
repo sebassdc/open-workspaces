@@ -1126,6 +1126,7 @@ fn build_beat(
     beat["managed_lifecycle_v1"] =
         json!(status["managed_lifecycle_v1"] == true && common::placement_capable(status).is_ok());
     beat["aws_identity_v1"] = json!(status["aws_identity_v1"] == true);
+    beat["aws_metadata_v1"] = json!(status["aws_metadata_v1"] == true);
     #[cfg(target_os = "linux")]
     {
         beat["move_fork_v1"] = json!(
@@ -1562,6 +1563,7 @@ fn agent_job(
             "ssh-keys",
             "ssh-policy",
             "aws-token",
+            "aws-creds",
             "delete"
         ]
         .contains(&op)

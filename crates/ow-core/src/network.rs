@@ -21,30 +21,44 @@ fn nft(text: &str) -> Result<()> {
     Ok(())
 }
 pub fn initialize() -> Result<()> {
-    nft(r#"table inet ow {
- set guests { type ifname . ipv4_addr; }
- set hosts { type ifname . ipv4_addr; }
- set local_addresses { type ipv4_addr; }
- set protected { type ipv4_addr; flags interval; elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }; }
- chain validate { iifname . ip saddr @guests return; drop; }
- chain input { type filter hook input priority 0; policy accept;
+    nft(&policy())
+}
+/// The worker namespace's whole policy. Guests reach the per-box AWS metadata endpoint
+/// (`crate::metadata`) at EC2's address: `prerouting` redirects it to the TAP's own host
+/// address, which `input` already accepts (on any port: the guest agent's installer uses an
+/// ephemeral one). The listener binds every address, so its port is closed to all but TAPs.
+fn policy() -> String {
+    let port = crate::metadata::PORT;
+    format!(
+        r#"table inet ow {{
+ set guests {{ type ifname . ipv4_addr; }}
+ set hosts {{ type ifname . ipv4_addr; }}
+ set local_addresses {{ type ipv4_addr; }}
+ set protected {{ type ipv4_addr; flags interval; elements = {{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }}; }}
+ chain validate {{ iifname . ip saddr @guests return; drop; }}
+ chain prerouting {{ type nat hook prerouting priority dstnat; policy accept;
+  iifname "ow*" ip daddr 169.254.169.254 tcp dport 80 redirect to :{port}
+ }}
+ chain input {{ type filter hook input priority 0; policy accept;
+  iifname != "ow*" tcp dport {port} drop
   iifname "ow*" jump validate
   iifname "ow*" iifname . ip daddr @hosts accept
   iifname "ow*" drop
- }
- chain forward { type filter hook forward priority 0; policy drop;
+ }}
+ chain forward {{ type filter hook forward priority 0; policy drop;
   iifname "ow*" jump validate
-  iifname "ow*" oifname "tap-egress" ip daddr 10.0.2.3 meta l4proto { tcp, udp } th dport 53 accept
+  iifname "ow*" oifname "tap-egress" ip daddr 10.0.2.3 meta l4proto {{ tcp, udp }} th dport 53 accept
   iifname "ow*" ip daddr @local_addresses drop
   iifname "ow*" ip daddr @protected drop
-  iifname "ow*" oifname "tap-egress" meta l4proto { tcp, udp } accept
+  iifname "ow*" oifname "tap-egress" meta l4proto {{ tcp, udp }} accept
   iifname "tap-egress" oifname "ow*" ct state established,related accept
- }
- chain nat { type nat hook postrouting priority srcnat; policy accept;
+ }}
+ chain nat {{ type nat hook postrouting priority srcnat; policy accept;
   oifname "tap-egress" ip saddr 198.18.0.0/15 masquerade
- }
-}
-"#)
+ }}
+}}
+"#
+    )
 }
 pub fn register(index: u32) -> Result<()> {
     ensure!(index < 16384, "invalid network index");

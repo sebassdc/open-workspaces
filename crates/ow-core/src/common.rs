@@ -384,6 +384,12 @@ pub fn node_operation(v: &serde_json::Value, op: &str) -> Result<()> {
             "runner cannot deliver per-box AWS access; upgrade it first"
         );
     }
+    if op == "aws-creds" {
+        ensure!(
+            v["aws_metadata_v1"] == true,
+            "runner cannot serve per-box AWS credentials; upgrade it first"
+        );
+    }
     if op == "snapshot-delete" {
         ensure!(
             v["snapshot_delete_v1"] == true,

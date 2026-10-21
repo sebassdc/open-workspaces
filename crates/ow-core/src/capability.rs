@@ -41,7 +41,9 @@ impl Capability {
             "fork" if request["snapshot"].is_null() => Self::LiveFork,
             "fork" => Self::Snapshot,
             "hibernate" => Self::Hibernate,
-            "exec" | "shell-exec" | "terminal" | "put" | "get" | "aws-token" => Self::Exec,
+            "exec" | "shell-exec" | "terminal" | "put" | "get" | "aws-token" | "aws-creds" => {
+                Self::Exec
+            }
             "ssh" | "ssh-info" | "ssh-keys" => Self::Ssh,
             _ => return None,
         })

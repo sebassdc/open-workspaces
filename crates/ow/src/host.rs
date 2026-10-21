@@ -139,6 +139,8 @@ fn worker(root: PathBuf) -> Result<()> {
         "worker requires a fresh isolated network namespace; use ow up"
     );
     network::initialize()?;
+    // Per-box AWS role credentials at 169.254.169.254, on its own threads and state.
+    ow_core::metadata::start()?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)

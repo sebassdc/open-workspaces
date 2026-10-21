@@ -33,11 +33,37 @@ const REFRESH_BEFORE: u64 = 600;
 pub(crate) const DISCOVERY: &str = "/.well-known/openid-configuration";
 pub(crate) const JWKS: &str = "/.well-known/jwks.json";
 
+/// How boxes get their role's credentials.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Mode {
+    /// Signed identity tokens in the guest; AWS trusts the controller as an OIDC provider
+    /// (ADR 0008).
+    #[default]
+    WebIdentity,
+    /// The controller assumes each role with its EC2 instance role and runners serve the
+    /// credentials at the instance metadata address (ADR 0009, [`crate::aws_metadata`]).
+    Metadata,
+}
+
+impl Mode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::WebIdentity => "web-identity",
+            Self::Metadata => "metadata",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
-    /// Public HTTPS URL that serves the discovery document and JWKS, as AWS fetches them.
-    pub issuer: String,
+    #[serde(default)]
+    pub mode: Mode,
+    /// Web-identity mode: public HTTPS URL that serves the discovery document and JWKS, as
+    /// AWS fetches them. Metadata mode has none.
+    #[serde(default)]
+    pub issuer: Option<String>,
     pub allowed_roles: Vec<AllowedRole>,
 }
 
@@ -52,7 +78,21 @@ pub(crate) struct AllowedRole {
 
 impl Config {
     fn validate(&self) -> Result<()> {
-        let url = reqwest::Url::parse(&self.issuer).context("invalid issuer URL")?;
+        ensure!(self.allowed_roles.len() <= 100, "at most 100 allowed roles");
+        for role in &self.allowed_roles {
+            ow_core::credential_broker::role_arn(&role.role_arn)?;
+            for owner in &role.owners {
+                common::email(owner)?;
+            }
+        }
+        if self.mode == Mode::Metadata {
+            return crate::aws_metadata::validate(self);
+        }
+        let issuer = self
+            .issuer
+            .as_deref()
+            .context("web-identity mode needs an issuer")?;
+        let url = reqwest::Url::parse(issuer).context("invalid issuer URL")?;
         ensure!(
             url.scheme() == "https"
                 && url.host_str().is_some()
@@ -61,21 +101,14 @@ impl Config {
                 && url.password().is_none()
                 && url.query().is_none()
                 && url.fragment().is_none()
-                && !self.issuer.ends_with('/')
-                && self.issuer.len() <= 255,
+                && !issuer.ends_with('/')
+                && issuer.len() <= 255,
             "issuer must be an https:// URL without port, query or trailing slash"
         );
-        ensure!(self.allowed_roles.len() <= 100, "at most 100 allowed roles");
-        for role in &self.allowed_roles {
-            ow_core::credential_broker::role_arn(&role.role_arn)?;
-            for owner in &role.owners {
-                common::email(owner)?;
-            }
-        }
         Ok(())
     }
 
-    fn allows(&self, role_arn: &str, owner: &str) -> bool {
+    pub(crate) fn allows(&self, role_arn: &str, owner: &str) -> bool {
         self.allowed_roles.iter().any(|r| {
             r.role_arn == role_arn
                 && (r.owners.is_empty() || r.owners.iter().any(|o| o.eq_ignore_ascii_case(owner)))
@@ -112,6 +145,15 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
     // Additive: an older binary ignores it, so boxes simply stop receiving new tokens.
     // `owner` pins the attachment to who made it: a box with another owner has no role.
     db.execute_batch("CREATE TABLE IF NOT EXISTS aws_roles(physical TEXT PRIMARY KEY,owner INTEGER NOT NULL REFERENCES users(id),role_arn TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>0),node TEXT,epoch INTEGER,fork_mark TEXT,expires_at INTEGER,error TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);")?;
+    // Metadata mode: the IP TTL of the box's metadata answers (2 lets containers in the box in).
+    let hops: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('aws_roles') WHERE name='hop_limit')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !hops {
+        db.execute_batch("ALTER TABLE aws_roles ADD COLUMN hop_limit INTEGER NOT NULL DEFAULT 1 CHECK(hop_limit IN (1,2));")?;
+    }
     Ok(())
 }
 
@@ -258,7 +300,7 @@ pub(crate) fn discovery(issuer: &str) -> Value {
 pub(crate) fn public_document(root: &Path, path: &str) -> Option<Value> {
     let config = config(root).ok()??;
     match path {
-        DISCOVERY => Some(discovery(&config.issuer)),
+        DISCOVERY => Some(discovery(config.issuer.as_deref()?)),
         JWKS => jwks(root).ok(),
         _ => None,
     }
@@ -292,11 +334,11 @@ fn now() -> u64 {
 pub(crate) fn view(db: &Connection, physical: &str) -> Result<Value> {
     Ok(db
         .query_row(
-            "SELECT a.role_arn,a.generation,a.expires_at,a.error,a.owner=r.owner,u.email FROM aws_roles a JOIN resources r ON r.kind='machine' AND r.physical=a.physical JOIN users u ON u.id=r.owner WHERE a.physical=?1",
+            "SELECT a.role_arn,a.generation,a.expires_at,a.error,a.owner=r.owner,u.email,a.hop_limit FROM aws_roles a JOIN resources r ON r.kind='machine' AND r.physical=a.physical JOIN users u ON u.id=r.owner WHERE a.physical=?1",
             [physical],
             |r| {
-                let (role, generation, expires, error, current, owner): (String, i64, Option<i64>, Option<String>, bool, String) =
-                    (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?);
+                let (role, generation, expires, error, current, owner, hops): (String, i64, Option<i64>, Option<String>, bool, String, i64) =
+                    (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?);
                 let state = if !current {
                     "inactive"
                 } else if error.is_some() {
@@ -308,7 +350,7 @@ pub(crate) fn view(db: &Connection, physical: &str) -> Result<Value> {
                     "pending"
                 };
                 Ok(json!({"role_arn":role,"state":state,"token_expires_at":expires,"generation":generation,
-                    "subject":subject(&owner, physical),"error":error}))
+                    "subject":subject(&owner, physical),"hop_limit":hops,"error":error}))
             },
         )
         .optional()?
@@ -359,6 +401,13 @@ impl Catalog {
                 }
                 .into());
             }
+            if config.mode == Mode::Metadata {
+                return self.attach_metadata(name, &physical, owner, role, request);
+            }
+            ensure!(
+                request["hop_limit"].is_null(),
+                "a hop limit applies to metadata mode only"
+            );
             let attached: i64 = self.db.query_row(
                 "SELECT COUNT(*) FROM aws_roles WHERE physical<>?1",
                 [&physical],
@@ -383,12 +432,21 @@ impl Catalog {
                 params![physical, owner, role, mark],
             )?;
         } else {
+            // Its runner forgets the credentials first; refused while it may hold them unreached.
+            self.withdraw_aws(&physical, None)?;
             self.db
                 .execute("DELETE FROM aws_roles WHERE physical=?1", [&physical])?;
             revoke(&self.root, &physical)?;
         }
-        // Deliver (or remove) now; a stopped box gets its token when it next runs.
-        let _ = self.sync_aws(&physical, true);
+        // Deliver (or remove) now; a stopped box gets its token when it next runs. Metadata
+        // mode withdrew already.
+        if !config(&self.root)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.mode == Mode::Metadata)
+        {
+            let _ = self.sync_aws(&physical, true);
+        }
         Ok(json!({"id":name,"aws_role":view(&self.db, &physical)?}))
     }
 
@@ -407,7 +465,7 @@ impl Catalog {
 
     /// Changes whenever a fork of this box is started or made (here or on another runner):
     /// a fork's RAM holds the parent's token, so the parent then moves to a new generation.
-    fn fork_mark(&self, physical: &str) -> Result<String> {
+    pub(crate) fn fork_mark(&self, physical: &str) -> Result<String> {
         Ok(self.db.query_row(
             "SELECT (SELECT COUNT(*)||'/'||COALESCE(MAX(rowid),0) FROM resources WHERE kind='machine' AND json_extract(metadata,'$.source')=?1)||':'||(SELECT COUNT(*)||'/'||COALESCE(MAX(id),0) FROM transfers WHERE kind='fork' AND source=?1)",
             [physical],
@@ -506,7 +564,7 @@ impl Catalog {
         };
         let issued = now();
         let token = Signer::current(&self.root, physical, generation)?.sign(&claims(
-            &config.issuer,
+            config.issuer.as_deref().context("no issuer")?,
             &email,
             &workload,
             issued,
@@ -547,11 +605,14 @@ impl Catalog {
         if let Some(d) = delivery {
             d.validate()?;
             fields = json!({"token":d.token,"role_arn":d.role_arn,"session_name":d.session_name});
+        } else {
+            // Credentials an earlier metadata mode left on the runner go too.
+            let _ = self.creds_call(node, physical, json!({}));
         }
         Ok(self.aws_call(node, physical, fields)?["written"] == true)
     }
 
-    fn aws_call(&self, node: &str, physical: &str, fields: Value) -> Result<Value> {
+    pub(crate) fn aws_call(&self, node: &str, physical: &str, fields: Value) -> Result<Value> {
         crate::nodes::operation_capable(&self.root, node, "aws-token")?;
         let mut request = fields;
         request["op"] = json!("aws-token");
@@ -562,15 +623,17 @@ impl Catalog {
         crate::wire::request(&crate::nodes::route(&self.root, node)?, request)
     }
 
-    pub(crate) fn aws_work(&self) -> Result<Vec<Work>> {
+    /// `every_running`: also running boxes with a role (metadata mode clears the identity
+    /// files an earlier web-identity mode wrote into them).
+    pub(crate) fn aws_work(&self, every_running: bool) -> Result<Vec<Work>> {
         let mut work = self
             .db
             .prepare("SELECT physical FROM aws_roles")?
             .query_map([], |r| r.get::<_, String>(0))?
             .map(|p| p.map(Work::Attached))
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let bare = self.db.prepare("SELECT physical,node,placement_epoch,(SELECT COALESCE(MAX(o.id),0) FROM operations o WHERE (json_extract(o.request,'$.request.id')=r.physical OR (o.owner=r.owner AND o.resource=r.name)) AND o.op IN ('restore','start')) FROM resources r WHERE kind='machine' AND node<>'' AND json_extract(metadata,'$.state')='running' AND NOT EXISTS(SELECT 1 FROM aws_roles a WHERE a.physical=r.physical) AND NOT EXISTS(SELECT 1 FROM transfer_locks t WHERE t.machine=r.physical)")?
-            .query_map([], |r| Ok(Work::Bare((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?
+        let bare = self.db.prepare("SELECT physical,node,placement_epoch,(SELECT COALESCE(MAX(o.id),0) FROM operations o WHERE (json_extract(o.request,'$.request.id')=r.physical OR (o.owner=r.owner AND o.resource=r.name)) AND o.op IN ('restore','start')) FROM resources r WHERE kind='machine' AND node<>'' AND json_extract(metadata,'$.state')='running' AND (?1 OR NOT EXISTS(SELECT 1 FROM aws_roles a WHERE a.physical=r.physical)) AND NOT EXISTS(SELECT 1 FROM transfer_locks t WHERE t.machine=r.physical)")?
+            .query_map([every_running], |r| Ok(Work::Bare((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         work.extend(bare);
         Ok(work)
@@ -597,32 +660,101 @@ impl Catalog {
     }
 }
 
-/// Keep tokens fresh while `aws-identity.json` exists. Each box takes the catalog lock on its
-/// own, so lifecycle and API calls interleave with a long pass.
+static WAKE: std::sync::LazyLock<(Mutex<bool>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Run a refresher pass now: an attachment, a start or a restarted worker needs credentials.
+pub(crate) fn notify() {
+    let (wake, signal) = &*WAKE;
+    *wake.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    signal.notify_all();
+}
+
+/// Calls [`notify`] when dropped, after the operation that holds it.
+pub(crate) struct Notify;
+
+impl Drop for Notify {
+    fn drop(&mut self) {
+        notify();
+    }
+}
+
+/// Up to a minute, ended early by [`notify`] or an edit of `aws-identity.json`, so turning
+/// access on or switching its mode takes effect within seconds, without a restart.
+fn pause(root: &Path) {
+    let edited = || {
+        std::fs::metadata(root.join(CONFIG))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let before = edited();
+    let (wake, signal) = &*WAKE;
+    let mut woken = wake.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..12 {
+        if std::mem::take(&mut *woken)
+            || edited() != before
+            || crate::nodes::STOPPING.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        woken = signal
+            .wait_timeout(woken, Duration::from_secs(5))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+}
+
+/// One refresher pass. Each box takes the catalog lock on its own, and STS calls run with it
+/// released, so lifecycle and API calls interleave with a long pass.
+pub(crate) fn pass(
+    shared: &Arc<Mutex<Catalog>>,
+    sts: &mut dyn crate::aws_metadata::Assume,
+    cleared: &mut HashSet<(String, String, i64, i64)>,
+) {
+    let (work, mode) = {
+        let catalog = shared.lock().unwrap();
+        let mode = config(&catalog.root).ok().flatten().map(|c| c.mode);
+        let attached = catalog
+            .db
+            .query_row("SELECT EXISTS(SELECT 1 FROM aws_roles)", [], |r| {
+                r.get::<_, bool>(0)
+            })
+            .unwrap_or(true);
+        // Never configured: nothing to deliver or clean up.
+        if mode.is_none() && !attached && !catalog.root.join(CONFIG).exists() {
+            return;
+        }
+        (catalog.aws_work(mode == Some(Mode::Metadata)), mode)
+    };
+    match work {
+        Ok(work) => {
+            for item in work {
+                if mode == Some(Mode::Metadata) {
+                    crate::aws_metadata::step(shared, item, sts, cleared);
+                } else {
+                    shared.lock().unwrap().aws_step(item, cleared);
+                }
+            }
+        }
+        Err(error) => eprintln!("aws identity refresh failed: {error:#}"),
+    }
+}
+
+/// Keep credentials fresh. Always running, idle until `aws-identity.json` exists.
 pub(crate) fn start(shared: &Arc<Mutex<Catalog>>) {
     let root = shared.lock().unwrap().root.clone();
-    if !root.join(CONFIG).exists() {
-        return;
-    }
     let weak = Arc::downgrade(shared);
     std::thread::spawn(move || {
         let mut cleared = HashSet::new();
+        let mut sts = crate::aws_metadata::Instance::default();
         loop {
             let Some(shared) = weak.upgrade() else { break };
-            let work = shared.lock().unwrap().aws_work();
-            match work {
-                Ok(work) => {
-                    for item in work {
-                        shared.lock().unwrap().aws_step(item, &mut cleared);
-                    }
-                }
-                Err(error) => eprintln!("aws identity refresh failed: {error:#}"),
-            }
+            pass(&shared, &mut sts, &mut cleared);
             drop(shared);
             if crate::nodes::STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
-            std::thread::sleep(Duration::from_secs(60));
+            pause(&root);
         }
     });
 }

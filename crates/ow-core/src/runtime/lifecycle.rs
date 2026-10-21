@@ -158,6 +158,7 @@ impl Runtime {
         .then(|| name.clone())
     }
     pub(super) fn mark_deleted(&mut self, id: &str) {
+        crate::metadata::clear(id);
         let managed = self.state.placements.get_mut(id).unwrap();
         managed.phase = Phase::Cleaned;
         // Its export and import captures are released: nothing may resume this copy.
@@ -507,6 +508,8 @@ impl Runtime {
                 machine.terminate()?;
             }
             self.machines.remove(id);
+            // The box leaves this runner: its AWS credentials stay with the controller.
+            crate::metadata::clear(id);
             let mut files = BTreeMap::new();
             for file in components {
                 ensure!(

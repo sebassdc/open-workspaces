@@ -1583,7 +1583,7 @@ impl Catalog {
                 let email: String =
                     self.db
                         .query_row("SELECT email FROM users WHERE id=?1", [user], |r| r.get(0))?;
-                json!({"enabled":true,"issuer":config.issuer,"roles":config.roles_for(&email)})
+                json!({"enabled":true,"mode":config.mode.name(),"issuer":config.issuer,"roles":config.roles_for(&email)})
             }
             _ => json!({"enabled":false}),
         };
@@ -1925,6 +1925,8 @@ impl Catalog {
                 [&physical],
                 |r| r.get::<_, bool>(0),
             )? {
+                // The old owner's role leaves the runner before the new owner is committed.
+                self.withdraw_aws(&physical, None)?;
                 crate::aws_identity::revoke(&self.root, &physical)?;
                 self.db
                     .execute("DELETE FROM aws_roles WHERE physical=?1", [&physical])?;
@@ -2569,6 +2571,9 @@ impl Catalog {
         if op == "aws-role" {
             return self.aws_role(user, &request, false);
         }
+        // A started box with a role needs credentials when this returns, not at the next pass.
+        let _credentials =
+            matches!(op.as_str(), "start" | "restore").then_some(crate::aws_identity::Notify);
         if matches!(op.as_str(), "share" | "unshare") {
             return self.share(user, &op, &request);
         }
