@@ -285,9 +285,9 @@ Write `aws-identity.json` next to the catalog in the controller's data directory
   every request, and an edit wakes the refresher, so turning access on, switching
   modes or changing the allow-list takes effect within seconds, without a restart.
   Removing a role, or the file, refuses new attachments at once and withdraws the
-  boxes' credentials at the next pass. Switching back to web identity leaves
-  credentials already on runners until they expire (at most an hour); detach first
-  to end them at once.
+  boxes' credentials at the next pass. Switching back to web identity withdraws the
+  credentials runners hold at the next pass; until a runner that was given some is
+  reached again, its running boxes cannot be transferred or detached.
 
 ### 4. Runners
 
@@ -446,7 +446,10 @@ Metadata mode:
   children; detach, re-attach, transfer and allow-list removal withdraw the
   runner's copy while the old attachment is still committed (read from another
   catalog connection), and an unreachable runner refuses transfer and detach of a
-  running box but not of a stopped one; config validation.
+  running box but not of a stopped one, also right after the operator removed the
+  file or switched modes; credentials assumed while the role left the allow-list are
+  dropped; switching back to web identity withdraws what runners hold; config
+  validation.
 - `aws_identity::tests::e2e`, ignored, run in CI as root in an Ubuntu container
   (`OW_E2E_REQUIRE_BOTOCORE=1`): the worker's real nft policy and metadata server in
   a fresh network namespace, with guest namespaces on `ow1`/`ow2` in place of

@@ -350,6 +350,27 @@ fn credentials_assumed_for_an_old_attachment_are_never_delivered() {
     sts.during = None;
     pass(&shared, &mut sts, &mut cleared);
     assert!(ow_core::metadata::present(BOX, generation as u64 + 1));
+    // The operator removes the role while STS answers: what was assumed is not delivered.
+    ow_core::metadata::clear(BOX);
+    shared
+        .lock()
+        .unwrap()
+        .db
+        .execute("UPDATE aws_roles SET expires_at=NULL", [])
+        .unwrap();
+    let root = f.root.clone();
+    sts.during = Some(Box::new(move |_| {
+        let narrowed = json!({"mode":"metadata","allowed_roles":[{"role_arn":ADMIN_ONLY,"owners":["a@example.test"]}]});
+        std::fs::write(root.join(CONFIG), narrowed.to_string()).unwrap();
+    }));
+    f.creds();
+    pass(&shared, &mut sts, &mut cleared);
+    assert!(!ow_core::metadata::present(BOX, generation as u64 + 1));
+    assert!(
+        f.creds()
+            .iter()
+            .all(|(r, _)| r.get("access_key_id").is_none())
+    );
     ow_core::metadata::clear(BOX);
 }
 
@@ -432,6 +453,25 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
         .unwrap();
         assert!(crate::aws_identity::view(&c.db, STOPPED).unwrap().is_null());
     }
+    // Also when the operator just removed the file or switched modes: the runner was given
+    // credentials for this attachment, so it must be reached first.
+    for config in [
+        None,
+        Some(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":READER}]})),
+    ] {
+        match &config {
+            None => std::fs::remove_file(f.root.join(CONFIG)).unwrap(),
+            Some(config) => f.configure(config.clone()),
+        }
+        let mut c = shared.lock().unwrap();
+        let transfer = c.operation(a, json!({"op":"transfer","id":"box","to":"b@example.test"}));
+        assert_eq!(
+            refusal(transfer.unwrap_err()),
+            "aws_runner_unreachable",
+            "{config:?}"
+        );
+    }
+    f.configure(metadata_config());
     f.down.store(false, Ordering::SeqCst);
     assert!(ow_core::metadata::present(BOX, 1));
 
@@ -462,4 +502,40 @@ fn ending_or_reowning_a_role_withdraws_it_before_commit() {
     pass(&shared, &mut sts, &mut cleared);
     assert_eq!(sts.calls.len(), before);
     ow_core::metadata::clear(STOPPED);
+}
+
+#[test]
+fn switching_back_to_web_identity_withdraws_served_credentials() {
+    let f = Fixture::new();
+    f.lists.store(true, Ordering::SeqCst);
+    f.configure(metadata_config());
+    let shared = Arc::new(Mutex::new(Catalog::open(&f.root, "test", None).unwrap()));
+    let mut sts = FakeSts::new(&shared);
+    let mut cleared = HashSet::new();
+    const BOX: &str = "m-meta-switch";
+    {
+        let mut c = shared.lock().unwrap();
+        let a = c.user(&identity("a", "a@example.test")).unwrap();
+        running(&c, a, "box", BOX);
+        c.operation(a, json!({"op":"aws-role","id":"box","role_arn":READER}))
+            .unwrap();
+    }
+    pass(&shared, &mut sts, &mut cleared);
+    assert!(ow_core::metadata::present(BOX, 1));
+    // The same role, now through web identity: the runner's metadata copy goes first.
+    f.configure(json!({"issuer":ISSUER,"allowed_roles":[{"role_arn":READER}]}));
+    pass(&shared, &mut sts, &mut cleared);
+    assert!(!ow_core::metadata::present(BOX, 1));
+    assert!(f.requests().iter().any(|r| r.get("token").is_some()));
+    let served: bool = shared
+        .lock()
+        .unwrap()
+        .db
+        .query_row(
+            "SELECT served FROM aws_roles WHERE physical=?1",
+            [BOX],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!served);
 }

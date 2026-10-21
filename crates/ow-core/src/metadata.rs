@@ -249,6 +249,16 @@ pub fn request(request: &serde_json::Value, live: bool) -> Result<serde_json::Va
     Ok(serde_json::json!({"stored": stored}))
 }
 
+/// Overwrite the secrets of an `aws-creds` request once it is handled.
+pub fn wipe(request: &mut serde_json::Value) {
+    use zeroize::Zeroize;
+    for key in ["secret_access_key", "session_token"] {
+        if let Some(serde_json::Value::String(secret)) = request.get_mut(key) {
+            secret.zeroize();
+        }
+    }
+}
+
 /// A worker holding role credentials keeps them out of core dumps and away from same-user
 /// ptrace; set once, when the first credentials arrive.
 fn undumpable() {
@@ -618,16 +628,27 @@ fn answer(index: u32, request: &Request) -> Response {
     match path.strip_prefix(CREDENTIALS) {
         Some("" | "/") => return ok(role.name().to_owned()),
         Some(name) if name.strip_prefix('/') == Some(role.name()) => {
-            return ok(serde_json::json!({
-                "Code": "Success",
-                "LastUpdated": updated,
-                "Type": "AWS-HMAC",
-                "AccessKeyId": credentials.access_key_id,
-                "SecretAccessKey": credentials.secret_access_key.as_str(),
-                "Token": credentials.session_token.as_str(),
-                "Expiration": timestamp(credentials.expiration),
-            })
-            .to_string());
+            // Written straight into a wiped buffer sized up front (no reallocation leaves a
+            // copy). Every value is from a JSON-safe alphabet (`Role::validate`).
+            let mut body = Zeroizing::new(String::with_capacity(
+                256 + credentials.access_key_id.len()
+                    + credentials.secret_access_key.len()
+                    + credentials.session_token.len(),
+            ));
+            use std::fmt::Write as _;
+            let _ = write!(
+                body,
+                r#"{{"Code":"Success","LastUpdated":"{updated}","Type":"AWS-HMAC","AccessKeyId":"{}","SecretAccessKey":"{}","Token":"{}","Expiration":"{}"}}"#,
+                credentials.access_key_id,
+                credentials.secret_access_key.as_str(),
+                credentials.session_token.as_str(),
+                timestamp(credentials.expiration),
+            );
+            return Response {
+                status: 200,
+                body,
+                ttl: None,
+            };
         }
         Some(_) => return status(404),
         None => {}

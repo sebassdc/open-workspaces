@@ -163,15 +163,15 @@ impl Catalog {
         physical: &str,
         next: Option<(&str, i64, i64)>,
     ) -> Result<()> {
-        let row: Option<(String, Option<String>)> = self
+        let row: Option<(String, Option<String>, bool)> = self
             .db
             .query_row(
-                "SELECT node,json_extract(metadata,'$.state') FROM resources WHERE kind='machine' AND physical=?1",
+                "SELECT node,json_extract(metadata,'$.state'),COALESCE((SELECT served FROM aws_roles WHERE physical=?1),0) FROM resources WHERE kind='machine' AND physical=?1",
                 [physical],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((node, state)) = row.filter(|(node, _)| !node.is_empty()) else {
+        let Some((node, state, served)) = row.filter(|(node, _, _)| !node.is_empty()) else {
             return Ok(());
         };
         // A runner without the capability never held any.
@@ -184,13 +184,22 @@ impl Catalog {
             }
             None => json!({}),
         };
-        let metadata = config(&self.root)
-            .ok()
-            .flatten()
-            .is_some_and(|c| c.mode == Mode::Metadata);
+        // Not the current mode alone: the operator may have switched modes, or broken or
+        // removed the file, while the runner still holds credentials it was given.
+        let held = served
+            || config(&self.root)
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.mode == Mode::Metadata);
         match self.creds_call(&node, physical, fields) {
-            Ok(_) => Ok(()),
-            Err(_) if !metadata || state.as_deref() == Some("stopped") => Ok(()),
+            Ok(_) => {
+                self.db.execute(
+                    "UPDATE aws_roles SET served=0 WHERE physical=?1",
+                    [physical],
+                )?;
+                Ok(())
+            }
+            Err(_) if !held || state.as_deref() == Some("stopped") => Ok(()),
             Err(_) => Err(Refusal {
                 code: "aws_runner_unreachable",
                 message: format!(
@@ -235,7 +244,7 @@ impl Catalog {
         self.withdraw_aws(physical, Some((role, generation, hops as i64)))?;
         self.db.execute(
             "INSERT INTO aws_roles(physical,owner,role_arn,generation,fork_mark,hop_limit) VALUES(?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(physical) DO UPDATE SET owner=excluded.owner,role_arn=excluded.role_arn,generation=excluded.generation,node=NULL,epoch=NULL,fork_mark=excluded.fork_mark,expires_at=NULL,error=NULL,hop_limit=excluded.hop_limit,updated_at=CURRENT_TIMESTAMP",
+             ON CONFLICT(physical) DO UPDATE SET owner=excluded.owner,role_arn=excluded.role_arn,generation=excluded.generation,node=NULL,epoch=NULL,fork_mark=excluded.fork_mark,expires_at=NULL,error=NULL,hop_limit=excluded.hop_limit,served=0,updated_at=CURRENT_TIMESTAMP",
             params![physical, owner, role, generation, mark, hops as i64],
         )?;
         notify();
@@ -300,8 +309,8 @@ impl Catalog {
             };
             let withdrawn = self.creds_call(&node, physical, json!({}));
             self.db.execute(
-                "UPDATE aws_roles SET expires_at=NULL,error=?2 WHERE physical=?1",
-                params![physical, error],
+                "UPDATE aws_roles SET expires_at=NULL,error=?2,served=served AND ?3 WHERE physical=?1",
+                params![physical, error, withdrawn.is_err()],
             )?;
             withdrawn?;
             return Ok(None);
@@ -375,6 +384,10 @@ impl Catalog {
                 pending.owner,
                 pending.node.clone(),
             ))
+            // Removed from the allow-list (or access turned off) while STS answered.
+            || !config(&self.root)?.is_some_and(|c| {
+                c.mode == Mode::Metadata && c.allows(&pending.role, &pending.email)
+            })
         {
             return Ok(());
         }
@@ -401,11 +414,12 @@ impl Catalog {
         match self.creds_call(&pending.node, &pending.physical, fields) {
             Ok(answer) => {
                 self.db.execute(
-                    "UPDATE aws_roles SET expires_at=?2,error=NULL WHERE physical=?1 AND generation=?3",
+                    "UPDATE aws_roles SET expires_at=?2,error=NULL,served=served OR ?4 WHERE physical=?1 AND generation=?3",
                     params![
                         pending.physical,
                         (answer["stored"] == true).then_some(session.expiration as i64),
-                        pending.generation
+                        pending.generation,
+                        answer["stored"] == true
                     ],
                 )?;
                 Ok(())

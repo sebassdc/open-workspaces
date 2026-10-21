@@ -481,3 +481,13 @@ fn controller_values_are_validated() {
     injected.session_token = Zeroizing::new("a\"b".into());
     assert!(role(Some(injected)).validate().is_err());
 }
+
+#[test]
+fn handled_requests_lose_their_secrets() {
+    let mut request = serde_json::json!({"op":"aws-creds","access_key_id":"ASIAX","secret_access_key":"s3cret","session_token":"t0ken"});
+    wipe(&mut request);
+    assert_eq!(request["access_key_id"], "ASIAX");
+    for key in ["secret_access_key", "session_token"] {
+        assert!(!request[key].as_str().unwrap().contains(|c: char| c != '\0'));
+    }
+}

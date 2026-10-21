@@ -152,7 +152,9 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
         |r| r.get(0),
     )?;
     if !hops {
-        db.execute_batch("ALTER TABLE aws_roles ADD COLUMN hop_limit INTEGER NOT NULL DEFAULT 1 CHECK(hop_limit IN (1,2));")?;
+        // `served`: the runner may hold metadata-mode credentials for this attachment, so it
+        // must be reached before the attachment ends, whatever mode the controller is in now.
+        db.execute_batch("ALTER TABLE aws_roles ADD COLUMN hop_limit INTEGER NOT NULL DEFAULT 1 CHECK(hop_limit IN (1,2)); ALTER TABLE aws_roles ADD COLUMN served INTEGER NOT NULL DEFAULT 0;")?;
     }
     Ok(())
 }
@@ -602,12 +604,25 @@ impl Catalog {
         delivery: Option<&ow_core::web_identity::Delivery>,
     ) -> Result<bool> {
         let mut fields = json!({});
+        let served: bool = self
+            .db
+            .query_row(
+                "SELECT served FROM aws_roles WHERE physical=?1",
+                [physical],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
         if let Some(d) = delivery {
             d.validate()?;
             fields = json!({"token":d.token,"role_arn":d.role_arn,"session_name":d.session_name});
-        } else {
-            // Credentials an earlier metadata mode left on the runner go too.
-            let _ = self.creds_call(node, physical, json!({}));
+        }
+        // Credentials an earlier metadata mode left on the runner go too.
+        if (delivery.is_none() || served) && self.creds_call(node, physical, json!({})).is_ok() {
+            self.db.execute(
+                "UPDATE aws_roles SET served=0 WHERE physical=?1",
+                [physical],
+            )?;
         }
         Ok(self.aws_call(node, physical, fields)?["written"] == true)
     }
@@ -679,15 +694,17 @@ impl Drop for Notify {
     }
 }
 
-/// Up to a minute, ended early by [`notify`] or an edit of `aws-identity.json`, so turning
-/// access on or switching its mode takes effect within seconds, without a restart.
-fn pause(root: &Path) {
-    let edited = || {
-        std::fs::metadata(root.join(CONFIG))
-            .and_then(|m| m.modified())
-            .ok()
-    };
-    let before = edited();
+fn edited(root: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(root.join(CONFIG))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// Up to a minute, ended early by [`notify`] or an edit of `aws-identity.json` since `before`
+/// (taken when the last pass began), so turning access on, switching its mode or removing a
+/// role takes effect within seconds, without a restart.
+fn pause(root: &Path, before: Option<std::time::SystemTime>) {
+    let edited = || edited(root);
     let (wake, signal) = &*WAKE;
     let mut woken = wake.lock().unwrap_or_else(|e| e.into_inner());
     for _ in 0..12 {
@@ -749,12 +766,13 @@ pub(crate) fn start(shared: &Arc<Mutex<Catalog>>) {
         let mut sts = crate::aws_metadata::Instance::default();
         loop {
             let Some(shared) = weak.upgrade() else { break };
+            let before = edited(&root);
             pass(&shared, &mut sts, &mut cleared);
             drop(shared);
             if crate::nodes::STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
-            pause(&root);
+            pause(&root, before);
         }
     });
 }
