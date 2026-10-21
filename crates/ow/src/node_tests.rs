@@ -123,11 +123,14 @@ fn enrollment_atomic_expiring_scoped_private_and_revoked() {
             .parse()
             .unwrap(),
     );
-    assert!(auth(&root, "alpha", &headers).is_ok());
-    assert!(auth(&root, "beta", &headers).is_err());
+    let auth = |node: &str| {
+        bearer(node, &headers).is_ok_and(|s| authorized(&db(&root).unwrap(), node, &s).unwrap())
+    };
+    assert!(auth("alpha"));
+    assert!(!auth("beta"));
     assert!(enroll(&root, v).is_err());
     revoke(&root, "alpha").unwrap();
-    assert!(auth(&root, "alpha", &headers).is_err());
+    assert!(!auth("alpha"));
     let join = root.join("expired");
     mint(&root, "beta", &join, 60, 512, 2).unwrap();
     db(&root)
@@ -264,12 +267,7 @@ async fn transport_auth_job_binding_generation_revocation_and_bounds() {
     let root = root();
     let alpha = enrollment(&root, "alpha");
     let beta = enrollment(&root, "beta");
-    let c = Controller {
-        root: root.clone(),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        jobs: Arc::new(Mutex::new(HashMap::new())),
-        slots: Arc::new(Semaphore::new(32)),
-    };
+    let c = Controller::new(&root).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let proxy_loop = tokio::spawn(proxies(c.clone()));
@@ -305,12 +303,7 @@ async fn transport_auth_job_binding_generation_revocation_and_bounds() {
 async fn active_proxy_fences_both_directions_and_revocation() {
     let root = root();
     let credentials = enrollment(&root, "alpha");
-    let c = Controller {
-        root: root.clone(),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        jobs: Arc::new(Mutex::new(HashMap::new())),
-        slots: Arc::new(Semaphore::new(32)),
-    };
+    let c = Controller::new(&root).unwrap();
     db(&root)
         .unwrap()
         .execute("UPDATE nodes SET heartbeat=?1 WHERE id='alpha'", [now()])
@@ -401,12 +394,7 @@ async fn active_proxy_fences_both_directions_and_revocation() {
 async fn malformed_oversized_frames_and_enrollment_are_bounded() {
     let root = root();
     let credentials = enrollment(&root, "alpha");
-    let c = Controller {
-        root: root.clone(),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        jobs: Arc::new(Mutex::new(HashMap::new())),
-        slots: Arc::new(Semaphore::new(32)),
-    };
+    let c = Controller::new(&root).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let app = routes(c.clone());
@@ -452,12 +440,7 @@ async fn malformed_oversized_frames_and_enrollment_are_bounded() {
 async fn refused_heartbeat_closes_with_reason_and_drain_is_stored() {
     let root = root();
     let credentials = enrollment(&root, "alpha");
-    let c = Controller {
-        root: root.clone(),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        jobs: Arc::new(Mutex::new(HashMap::new())),
-        slots: Arc::new(Semaphore::new(32)),
-    };
+    let c = Controller::new(&root).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let proxy_loop = tokio::spawn(proxies(c.clone()));
@@ -513,6 +496,10 @@ struct FakeController {
     beats: Arc<std::sync::atomic::AtomicUsize>,
     jobs: std::sync::mpsc::Sender<String>,
     replies: Arc<Mutex<Vec<Value>>>,
+    /// Node channels opened so far.
+    sessions: Arc<std::sync::atomic::AtomicUsize>,
+    /// While set, open channels stay connected but get no frame (a stalled controller).
+    silent: Arc<std::sync::atomic::AtomicBool>,
 }
 impl FakeController {
     fn start(request: Value) -> Self {
@@ -523,15 +510,24 @@ impl FakeController {
         let ids = Arc::new(Mutex::new(ids));
         let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let replies = Arc::new(Mutex::new(Vec::new()));
-        let (beats1, replies1) = (beats.clone(), replies.clone());
+        let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (beats1, replies1, sessions1, silent1) = (
+            beats.clone(),
+            replies.clone(),
+            sessions.clone(),
+            silent.clone(),
+        );
         std::thread::spawn(move || {
             for stream in tcp.incoming() {
                 let stream = stream.unwrap();
-                let (ids, beats, replies, request) = (
+                let (ids, beats, replies, request, sessions, silent) = (
                     ids.clone(),
                     beats1.clone(),
                     replies1.clone(),
                     request.clone(),
+                    sessions1.clone(),
+                    silent1.clone(),
                 );
                 std::thread::spawn(move || {
                     let mut path = String::new();
@@ -567,7 +563,20 @@ impl FakeController {
                         return;
                     }
                     let node = path.trim_start_matches("/node/").to_owned();
+                    sessions.fetch_add(1, Ordering::SeqCst);
+                    // As the real controller does: a ping every 3 s.
+                    let mut pinged = std::time::Instant::now();
                     loop {
+                        if silent.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(50));
+                            continue;
+                        }
+                        if pinged.elapsed() > Duration::from_secs(3) {
+                            pinged = std::time::Instant::now();
+                            if ws.send(tungstenite::Message::Ping(vec![].into())).is_err() {
+                                return;
+                            }
+                        }
                         match ws.read() {
                             Ok(tungstenite::Message::Text(t)) if t.contains("heartbeat") => {
                                 // Acknowledge the first beat, offering the cache extension.
@@ -580,6 +589,7 @@ impl FakeController {
                             Ok(tungstenite::Message::Ping(v)) => {
                                 let _ = ws.send(tungstenite::Message::Pong(v));
                             }
+                            Ok(tungstenite::Message::Pong(_)) => {}
                             Err(e) if timed_out(&e) => {}
                             _ => return,
                         }
@@ -595,6 +605,8 @@ impl FakeController {
             beats,
             jobs,
             replies,
+            sessions,
+            silent,
         }
     }
 }
@@ -853,12 +865,7 @@ async fn worker_accepted_lost_reply_reopens_with_one_create_and_one_exec() {
         }
     });
     let credential = enrollment(&root, "alpha");
-    let c = Controller {
-        root: root.clone(),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        jobs: Arc::new(Mutex::new(HashMap::new())),
-        slots: Arc::new(Semaphore::new(32)),
-    };
+    let c = Controller::new(&root).unwrap();
     db(&root)
         .unwrap()
         .execute(
@@ -985,12 +992,7 @@ fn invited_caps_replacement_revoked_and_publication_failure() {
 async fn public_aliases_share_native_generation_and_clamp_forged_capacity() {
     let root = root();
     let invite = invitation(&root, "friend", 600, 512, 2, 1, None, |_| Ok(())).unwrap();
-    let c = Controller {
-        root: root.clone(),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        jobs: Arc::new(Mutex::new(HashMap::new())),
-        slots: Arc::new(Semaphore::new(32)),
-    };
+    let c = Controller::new(&root).unwrap();
     // Simulated proxy presence only; no worker or VM runs in this fixture.
     fs::create_dir_all(root.join("nodes/friend")).unwrap();
     fs::write(root.join("nodes/friend/control.sock"), b"fixture").unwrap();
@@ -1688,6 +1690,67 @@ fn controller_placement_policy_survives_runner_drain_changes() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn live_health_preserves_catalog_policy_revocation_and_restart_fences() {
+    let root = root();
+    let c = crate::catalog::Catalog::open(&root, "fixture", None).unwrap();
+    let credential = enrollment(&root, "alpha");
+    assert!(online(&root, "alpha").is_err());
+    let health = liveness_db(&root, "alpha").unwrap();
+    health
+        .execute(
+            "UPDATE health SET session='generation',heartbeat=?1,capabilities=?2",
+            params![
+                now(),
+                json!({"memory_mib":9999,"slots":99,"vcpus":99,"managed_lifecycle_v1":true})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+    // A catalog connection opened before the health file must discover it too.
+    let generation: String =
+        c.db.query_row("SELECT session FROM live_nodes WHERE id='alpha'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(generation, "generation");
+    assert!(online(&root, "alpha").is_ok());
+    assert!(managed_lifecycle_capable(&root, "alpha").is_ok());
+    c.db.execute(
+        "UPDATE nodes SET memory_mib=256,slots=1 WHERE id='alpha'",
+        [],
+    )
+    .unwrap();
+    c.db.execute(
+        "UPDATE node_capacity_limits SET vcpu_cap=1 WHERE node='alpha'",
+        [],
+    )
+    .unwrap();
+    let inventory = inventory(&root).unwrap();
+    for (key, expected) in [("memory_mib", 256), ("slots", 1), ("vcpus", 1)] {
+        assert_eq!(inventory[0]["capabilities"][key], expected);
+    }
+    assert!(authorized(&c.db, "alpha", credential["credential"].as_str().unwrap()).unwrap());
+    reset_health(&root).unwrap();
+    assert!(online(&root, "alpha").is_err());
+    let generation: Option<String> =
+        c.db.query_row("SELECT session FROM live_nodes WHERE id='alpha'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(generation.is_none());
+    // Even a fresh health record cannot undo durable revocation.
+    health
+        .execute("UPDATE health SET session='later',heartbeat=?1", [now()])
+        .unwrap();
+    revoke(&root, "alpha").unwrap();
+    assert!(online(&root, "alpha").is_err());
+    assert!(!authorized(&c.db, "alpha", credential["credential"].as_str().unwrap()).unwrap());
+    drop(health);
+    drop(c);
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Keep a genuinely issued old job present on the restored authority: an unknown
 /// ID would test only lookup failure and could miss a broken generation fence.
 #[test]
@@ -1703,12 +1766,7 @@ fn restored_controller_rejects_previously_issued_job_and_old_session_results() {
     drop(crate::catalog::Catalog::open(&old_root, "fixture", None).unwrap());
     let enrolled = enrollment(&old_root, "alpha");
     let token = enrolled["credential"].as_str().unwrap();
-    let controller = |root: &Path| Controller {
-        root: root.to_owned(),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        jobs: Arc::new(Mutex::new(HashMap::new())),
-        slots: Arc::new(Semaphore::new(32)),
-    };
+    let controller = |root: &Path| Controller::new(root).unwrap();
     let serve = |c: &Controller| {
         let listener = rt
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -1817,9 +1875,11 @@ fn restored_controller_rejects_previously_issued_job_and_old_session_results() {
     let since = std::time::Instant::now();
     while db(&old_root)
         .unwrap()
-        .query_row("SELECT heartbeat FROM nodes WHERE id='alpha'", [], |r| {
-            r.get::<_, i64>(0)
-        })
+        .query_row(
+            "SELECT heartbeat FROM live_nodes WHERE id='alpha'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
         .unwrap()
         != 0
     {
@@ -1896,4 +1956,401 @@ fn restored_controller_rejects_previously_issued_job_and_old_session_results() {
     drop(rt);
     fs::remove_dir_all(old_root).unwrap();
     fs::remove_dir_all(replacement_root).unwrap();
+}
+
+/// A minimal worker for an agent: answers `status`, nothing else.
+fn status_worker() -> PathBuf {
+    let worker = root();
+    let listener = std::os::unix::net::UnixListener::bind(worker.join("control.sock")).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let Ok(req) = wire::line(&mut stream) else {
+                continue;
+            };
+            assert_eq!(req["op"], "status");
+            let value = json!({"max_memory_mib":512,"max_running":2,"max_vcpus":2,"max_guest_memory_mib":512,"max_guest_vcpus":2,
+                "guest_ssh_v1":true,"internet":true,"images":[],"version":"0.5.0","worker_pid":std::process::id(),
+                "worker_protocol":common::WORKER_PROTOCOL,"recovery_disk_only_v1":true,
+                "host_reserve":{"cpu_millis":500,"memory_mib":1024}});
+            let _ = wire::send(&mut stream, &json!({"ok":true,"result":value}));
+        }
+    });
+    worker
+}
+
+#[test]
+fn an_agent_reconnects_by_itself_when_the_controller_goes_silent() {
+    use std::sync::atomic::Ordering;
+    let worker = status_worker();
+    let fake = FakeController::start(json!({"op":"status"}));
+    let credential = worker.join("node.json");
+    write_private(
+        &credential,
+        &json!({"node":"alpha","credential":"a".repeat(64)}),
+    )
+    .unwrap();
+    {
+        let (worker, origin, credential) =
+            (worker.clone(), fake.origin.clone(), credential.clone());
+        std::thread::spawn(move || agent(&worker, &origin, &credential, None, None, true));
+    }
+    let wait = |what: &str, limit: Duration, done: &dyn Fn() -> bool| {
+        let started = std::time::Instant::now();
+        while !done() {
+            assert!(started.elapsed() < limit, "{what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        started.elapsed()
+    };
+    wait("no heartbeat", Duration::from_secs(20), &|| {
+        fake.beats.load(Ordering::SeqCst) >= 2
+    });
+    // A controller that pings keeps the channel however long it runs.
+    std::thread::sleep(Duration::from_secs(25));
+    assert_eq!(
+        fake.sessions.load(Ordering::SeqCst),
+        1,
+        "a live channel was dropped"
+    );
+    // The controller stalls with the TCP connection still open: no frame reaches the agent.
+    fake.silent.store(true, Ordering::SeqCst);
+    let took = wait(
+        "the agent stayed on a silent controller",
+        Duration::from_secs(35),
+        &|| fake.sessions.load(Ordering::SeqCst) >= 2,
+    );
+    fake.silent.store(false, Ordering::SeqCst);
+    assert!(
+        took >= Duration::from_secs(15),
+        "reconnected too eagerly: {took:?}"
+    );
+    let beats = fake.beats.load(Ordering::SeqCst);
+    wait(
+        "no heartbeat after reconnecting",
+        Duration::from_secs(10),
+        &|| fake.beats.load(Ordering::SeqCst) > beats,
+    );
+    let _ = fs::remove_dir_all(worker);
+}
+
+#[test]
+fn ip_literals_need_no_lookup_slot() {
+    assert_eq!(
+        resolve("127.0.0.1", 8790).unwrap(),
+        ["127.0.0.1:8790".parse().unwrap()]
+    );
+    assert_eq!(
+        resolve("[::1]", 8790).unwrap(),
+        ["[::1]:8790".parse().unwrap()]
+    );
+    assert!(!resolve("localhost", 8790).unwrap().is_empty());
+}
+
+type Channel = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>;
+
+/// An agent's side of a session for `period`: a heartbeat each second and a pong to each
+/// ping. Returns the longest wait between controller frames and whether it closed.
+fn drive(ws: &mut Channel, period: Duration) -> (Duration, bool) {
+    let heartbeat = json!({"type":"heartbeat","protocol":1,"backend":"firecracker","arch":"x86_64","runtime":"firecracker-v1.17.0","memory_mib":512,"slots":2,"vcpus":2,"images":["alpine"]}).to_string();
+    let start = std::time::Instant::now();
+    let (mut heard, mut gap) = (start, Duration::ZERO);
+    let mut sent = start - Duration::from_secs(2);
+    while start.elapsed() < period {
+        if sent.elapsed() >= Duration::from_secs(1) {
+            sent = std::time::Instant::now();
+            if ws
+                .send(tungstenite::Message::Text(heartbeat.clone().into()))
+                .is_err()
+            {
+                return (gap, true);
+            }
+        }
+        match ws.read() {
+            Ok(tungstenite::Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => {
+                return (gap, true);
+            }
+            Ok(frame) => {
+                gap = gap.max(heard.elapsed());
+                heard = std::time::Instant::now();
+                if let tungstenite::Message::Ping(v) = frame {
+                    let _ = ws.send(tungstenite::Message::Pong(v));
+                }
+            }
+            Err(e) if timed_out(&e) => {}
+            Err(_) => return (gap.max(heard.elapsed()), true),
+        }
+    }
+    (gap.max(heard.elapsed()), false)
+}
+
+fn serve_controller(c: &Controller) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let (app, c) = (routes(c.clone()), c.clone());
+    let server = tokio::spawn(async move {
+        tokio::spawn(proxies(c));
+        axum::serve(listener, app).await.unwrap();
+    });
+    (origin, server)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_health_write_neither_stops_the_controller_nor_strands_a_runner() {
+    let root = root();
+    let alpha = enrollment(&root, "alpha");
+    let c = Controller::new(&root).unwrap();
+    let (origin, server) = serve_controller(&c);
+    tokio::task::spawn_blocking(move || {
+        let token = alpha["credential"].as_str().unwrap();
+        let connect = || {
+            let ws = socket(&origin, "/node/alpha", token, None).unwrap();
+            timeout_socket(&ws).unwrap();
+            ws
+        };
+        let online = || online(&root, "alpha").is_ok();
+        let mut ws = connect();
+        assert!(!drive(&mut ws, Duration::from_secs(4)).1 && online());
+
+        // The catalog lost this session's mark (as a write lost in a storm would): its
+        // heartbeats match no row, so the controller ends it and the runner reconnects.
+        liveness_db(&root, "alpha")
+            .unwrap()
+            .execute("UPDATE health SET session='lost'", [])
+            .unwrap();
+        assert!(
+            drive(&mut ws, Duration::from_secs(8)).1,
+            "a session whose heartbeat matched no row stayed open"
+        );
+        let mut ws = connect();
+        assert!(!drive(&mut ws, Duration::from_secs(4)).1 && online());
+
+        // A capture's writeback holds this runner's health writes (its real writer lock, 8 s).
+        let held = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let db = liveness_db(&root, "alpha").unwrap();
+                db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                std::thread::sleep(Duration::from_secs(8));
+                db.execute_batch("COMMIT").unwrap();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        // The controller keeps answering: it refuses a wrong credential at once ...
+        let asked = std::time::Instant::now();
+        assert!(socket(&origin, "/node/alpha", &"0".repeat(64), None).is_err());
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            asked.elapsed()
+        );
+        // ... and keeps pinging the runner whose heartbeat waits for the disk.
+        let (gap, closed) = drive(&mut ws, Duration::from_secs(4));
+        assert!(!closed && gap < Duration::from_secs(4), "{gap:?}");
+        // The write gives up after the busy timeout: that session ends, with a log line,
+        // and the runner's reconnect is recorded once the disk answers again.
+        assert!(
+            drive(&mut ws, Duration::from_secs(6)).1,
+            "a session whose heartbeat failed stayed open"
+        );
+        held.join().unwrap();
+        let mut ws = connect();
+        assert!(!drive(&mut ws, Duration::from_secs(4)).1 && online());
+        let _ = fs::remove_dir_all(&root);
+    })
+    .await
+    .unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_stall_does_not_drop_the_sessions_it_delayed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = root();
+    let alpha = enrollment(&root, "alpha");
+    let c = Controller::new(&root).unwrap();
+    let (origin, server) = serve_controller(&c);
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let token = alpha["credential"].as_str().unwrap();
+        let mut ws = socket(&origin, "/node/alpha", token, None).unwrap();
+        timeout_socket(&ws).unwrap();
+        assert!(!drive(&mut ws, Duration::from_secs(4)).1);
+        let generation = c.sessions.lock().unwrap()["alpha"].generation.clone();
+        // Both runtime threads block for 17 s (as on blocking disk I/O), past the 15 s cut-off.
+        let started = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let started = started.clone();
+            runtime.spawn(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let since = std::time::Instant::now();
+                while started.load(Ordering::SeqCst) < 2 && since.elapsed() < Duration::from_secs(1)
+                {
+                }
+                std::thread::sleep(Duration::from_secs(17));
+            });
+        }
+        let (gap, closed) = drive(&mut ws, Duration::from_secs(24));
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "the stall held one thread only"
+        );
+        assert!(gap > Duration::from_secs(15), "no stall: {gap:?}");
+        assert!(!closed, "the stall dropped the session");
+        assert_eq!(c.sessions.lock().unwrap()["alpha"].generation, generation);
+        let _ = fs::remove_dir_all(&root);
+    })
+    .await
+    .unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_blocked_heartbeat_write_leaves_other_runners_online() {
+    let root = root();
+    // Names no other test uses: the stall hook is process-wide.
+    let (stalled, healthy) = (enrollment(&root, "omega"), enrollment(&root, "sigma"));
+    let c = Controller::new(&root).unwrap();
+    let (origin, server) = serve_controller(&c);
+    tokio::task::spawn_blocking(move || {
+        let runner = |name: &'static str, credential: Value| {
+            let origin = origin.clone();
+            std::thread::spawn(move || {
+                let token = credential["credential"].as_str().unwrap();
+                let mut ws = socket(&origin, &format!("/node/{name}"), token, None).unwrap();
+                timeout_socket(&ws).unwrap();
+                drive(&mut ws, Duration::from_secs(40))
+            })
+        };
+        let healthy_token = healthy["credential"].as_str().unwrap().to_owned();
+        let (omega, sigma) = (runner("omega", stalled), runner("sigma", healthy));
+        let started = std::time::Instant::now();
+        while online(&root, "omega").is_err() || online(&root, "sigma").is_err() {
+            assert!(started.elapsed() < Duration::from_secs(5), "never online");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Omega's heartbeat write blocks in I/O for 23 s, past the 15 s offline cut-off.
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *STALLED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        let release = Release;
+        if let Ok(arm) = std::env::var("OW_TEST_WAL_STALL") {
+            fs::write(arm, b"armed").unwrap();
+        } else {
+            *STALLED.lock().unwrap() = Some("omega".into());
+        }
+        // Prove the fault holds SQLite's real writer lock, rather than a Rust mutex.
+        let locked = Connection::open(root.join("nodes/omega/liveness.sqlite3")).unwrap();
+        locked.busy_timeout(Duration::ZERO).unwrap();
+        let waiting = std::time::Instant::now();
+        loop {
+            match locked.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => locked.execute_batch("ROLLBACK").unwrap(),
+                Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => break,
+                Err(e) => panic!("unexpected lock error: {e}"),
+            }
+            assert!(
+                waiting.elapsed() < Duration::from_secs(5),
+                "the fault never held the WAL writer lock"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // A catalog writer held too: health/session writes must not need that lock either.
+        let catalog = db(&root).unwrap();
+        catalog.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let stalled_at = std::time::Instant::now();
+        let mut dispatched = false;
+        while stalled_at.elapsed() < Duration::from_secs(23) {
+            assert!(
+                online(&root, "sigma").is_ok(),
+                "a healthy runner went offline {:?} into another runner's stalled write",
+                stalled_at.elapsed()
+            );
+            if !dispatched && stalled_at.elapsed() > Duration::from_secs(16) {
+                let pool = inventory(&root).unwrap();
+                assert_eq!(
+                    pool.as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|n| n["id"] == "sigma")
+                        .unwrap()["online"],
+                    true
+                );
+                let asked = std::time::Instant::now();
+                assert!(socket(&origin, "/node/sigma", &"0".repeat(64), None).is_err());
+                assert!(
+                    asked.elapsed() < Duration::from_secs(2),
+                    "controller stopped answering"
+                );
+                // The real proxy must admit and finish a new job, past the old offline cut-off.
+                let (mut local, upstream) = std::os::unix::net::UnixStream::pair().unwrap();
+                local
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                upstream.set_nonblocking(true).unwrap();
+                let task = tokio::spawn(proxy(
+                    c.clone(),
+                    "sigma".into(),
+                    tokio::net::UnixStream::from_std(upstream).unwrap(),
+                ));
+                local.write_all(b"probe\n").unwrap();
+                let asked = std::time::Instant::now();
+                let id = loop {
+                    if let Some(id) = c
+                        .jobs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(_, j)| j.node == "sigma")
+                        .map(|(id, _)| id.clone())
+                    {
+                        break id;
+                    }
+                    assert!(
+                        asked.elapsed() < Duration::from_secs(3),
+                        "healthy runner refused a new job"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let mut job =
+                    socket(&origin, &format!("/job/sigma/{id}"), &healthy_token, None).unwrap();
+                timeout_socket(&job).unwrap();
+                assert_eq!(job.read().unwrap().into_data().as_ref(), b"probe\n");
+                job.send(tungstenite::Message::Binary(b"ok\n".to_vec().into()))
+                    .unwrap();
+                let mut reply = [0; 3];
+                local.read_exact(&mut reply).unwrap();
+                assert_eq!(&reply, b"ok\n");
+                task.abort();
+                dispatched = true;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(dispatched);
+        catalog.execute_batch("ROLLBACK").unwrap();
+        drop(release);
+        let released = std::time::Instant::now();
+        while online(&root, "omega").is_err() {
+            assert!(
+                released.elapsed() < Duration::from_secs(5),
+                "the stalled runner did not come back"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Both channels stayed up and kept getting frames throughout.
+        for (name, runner) in [("omega", omega), ("sigma", sigma)] {
+            let (gap, closed) = runner.join().unwrap();
+            assert!(!closed && gap < Duration::from_secs(4), "{name}: {gap:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    })
+    .await
+    .unwrap();
+    server.abort();
 }

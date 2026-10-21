@@ -46,7 +46,7 @@ pub(super) fn pass(
     let mut results = vec![("sizes".to_owned(), sizes(shared, call))];
     let unpublished = (|| -> Result<Vec<(String, String, String, (u32, u32, u64))>> {
         let c = shared.lock().unwrap();
-        let mut stmt = c.db.prepare("SELECT s.node,s.physical,m.physical,json_extract(s.metadata,'$.memory_mib'),json_extract(s.metadata,'$.vcpu_count'),json_extract(s.metadata,'$.disk_bytes') FROM resources s JOIN resources m ON m.kind='machine' AND m.physical=json_extract(s.metadata,'$.workspace') JOIN nodes n ON n.id=s.node WHERE s.kind='snapshot' AND s.node<>'' AND json_extract(s.metadata,'$.state')='ready' AND m.placement_managed=1 AND json_extract(s.metadata,'$.disk_bytes') IS NOT NULL AND json_extract(n.capabilities,'$.managed_restore_v1')=1 AND NOT EXISTS(SELECT 1 FROM drain_publications p WHERE p.node=s.node AND p.name=s.physical) ORDER BY s.created_at")?;
+        let mut stmt = c.db.prepare("SELECT s.node,s.physical,m.physical,json_extract(s.metadata,'$.memory_mib'),json_extract(s.metadata,'$.vcpu_count'),json_extract(s.metadata,'$.disk_bytes') FROM resources s JOIN resources m ON m.kind='machine' AND m.physical=json_extract(s.metadata,'$.workspace') JOIN live_nodes n ON n.id=s.node WHERE s.kind='snapshot' AND s.node<>'' AND json_extract(s.metadata,'$.state')='ready' AND m.placement_managed=1 AND json_extract(s.metadata,'$.disk_bytes') IS NOT NULL AND json_extract(n.capabilities,'$.managed_restore_v1')=1 AND NOT EXISTS(SELECT 1 FROM drain_publications p WHERE p.node=s.node AND p.name=s.physical) ORDER BY s.created_at")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -90,7 +90,7 @@ pub(super) fn pass(
 fn sizes(shared: &Shared, call: &impl Fn(&str, Value) -> Result<Value>) -> Result<()> {
     let nodes: Vec<String> = {
         let c = shared.lock().unwrap();
-        let mut stmt = c.db.prepare("SELECT DISTINCT s.node FROM resources s JOIN resources m ON m.kind='machine' AND m.physical=json_extract(s.metadata,'$.workspace') JOIN nodes n ON n.id=s.node WHERE s.kind='snapshot' AND s.node<>'' AND json_extract(s.metadata,'$.state')='ready' AND json_extract(s.metadata,'$.disk_bytes') IS NULL AND m.placement_managed=1 AND json_extract(n.capabilities,'$.managed_lifecycle_v1')=1 ORDER BY s.node")?;
+        let mut stmt = c.db.prepare("SELECT DISTINCT s.node FROM resources s JOIN resources m ON m.kind='machine' AND m.physical=json_extract(s.metadata,'$.workspace') JOIN live_nodes n ON n.id=s.node WHERE s.kind='snapshot' AND s.node<>'' AND json_extract(s.metadata,'$.state')='ready' AND json_extract(s.metadata,'$.disk_bytes') IS NULL AND m.placement_managed=1 AND json_extract(n.capabilities,'$.managed_lifecycle_v1')=1 ORDER BY s.node")?;
         stmt.query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
@@ -147,7 +147,7 @@ fn remove_copy(
     };
     let (known, retired, capable): (bool, bool, bool) = {
         let c = shared.lock().unwrap();
-        c.db.query_row("SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND revoked=0),EXISTS(SELECT 1 FROM runner_drains WHERE node=?1 AND state IN ('retained','removed')),COALESCE((SELECT json_extract(capabilities,'$.managed_lifecycle_v1')=1 FROM nodes WHERE id=?1),0)",[node],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
+        c.db.query_row("SELECT EXISTS(SELECT 1 FROM live_nodes WHERE id=?1 AND revoked=0),EXISTS(SELECT 1 FROM runner_drains WHERE node=?1 AND state IN ('retained','removed')),COALESCE((SELECT json_extract(capabilities,'$.managed_lifecycle_v1')=1 FROM live_nodes WHERE id=?1),0)",[node],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
     };
     // A retired or removed runner runs nothing; only its publication root is released.
     if !known || retired {

@@ -246,7 +246,7 @@ fn refuse(node: &str, reason: &str) -> crate::limits::Rejection {
     crate::limits::Rejection(format!("Runner {node} {reason}."))
 }
 fn capable(c: &Catalog, node: &str, disk: u64) -> Result<()> {
-    let text: String = c.db.query_row("SELECT capabilities FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND COALESCE(json_extract(capabilities,'$.drain'),0)=0",[node],|r|r.get(0)).optional()?.ok_or_else(|| refuse(node, "is offline, revoked or draining"))?;
+    let text: String = c.db.query_row("SELECT capabilities FROM live_nodes WHERE id=?1 AND revoked=0 AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15 AND heartbeat<=CAST(strftime('%s','now') AS INTEGER) AND COALESCE(json_extract(capabilities,'$.drain'),0)=0",[node],|r|r.get(0)).optional()?.ok_or_else(|| refuse(node, "is offline, revoked or draining"))?;
     let caps: Value = serde_json::from_str(&text)?;
     common::placement_capable(&caps).map_err(|_| {
         refuse(

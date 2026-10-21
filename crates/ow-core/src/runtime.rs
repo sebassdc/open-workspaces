@@ -338,13 +338,22 @@ struct Snapshot {
     /// The child a live fork took this capture for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fork: Option<String>,
+    /// An automatic recovery point of a running box: its disk only (`state` and `memory`
+    /// are empty), so it restores as a cold boot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    disk_only: bool,
 }
+
+/// The `cpu` of a disk-only point: no host matches it, so a worker that predates
+/// `disk_only` refuses to resume it and asks for a cold restore.
+const NO_RAM_STATE: &str = "none: disk-only recovery point";
 
 impl Snapshot {
     /// Whether this host can resume the captured RAM state: same runtime, CPU
     /// (including the host kernel) and guest kernel.
     fn resumable(&self, cpu: &str, kernel_sha256: &str) -> bool {
-        self.runtime == crate::common::RUNTIME
+        !self.disk_only
+            && self.runtime == crate::common::RUNTIME
             && self.cpu == cpu
             && self.kernel_sha256 == kernel_sha256
     }
@@ -1402,8 +1411,13 @@ impl Runtime {
             );
             return Ok(Ok(previous.summary()));
         }
+        // An automatic recovery point copies the disk alone: no multi-GB RAM write while the
+        // guest is paused, and no writeback burst that stalls the host's other fsyncs.
+        let disk_only = managed && !hibernate;
         // A capture reflinks an existing disk; only RAM is a new data allocation.
-        self.storage_headroom(workspace.memory_mib as u64 * 1024 * 1024)?;
+        if !disk_only {
+            self.storage_headroom(workspace.memory_mib as u64 * 1024 * 1024)?;
+        }
         if !hibernate && !managed {
             ensure!(
                 self.named_snapshot_count()? < MAX_SNAPSHOTS,
@@ -1437,9 +1451,14 @@ impl Runtime {
                 image: workspace.image,
                 image_digest: workspace.image_digest,
                 runtime: crate::common::RUNTIME.into(),
-                cpu: self.cpu.clone(),
+                cpu: if disk_only {
+                    NO_RAM_STATE.into()
+                } else {
+                    self.cpu.clone()
+                },
                 kernel_sha256: self.kernel_hash.clone(),
                 files: BTreeMap::new(),
+                disk_only,
             },
             staging,
             previous: previous.map(Path::to_path_buf),
@@ -1450,10 +1469,17 @@ impl Runtime {
         };
         let result = (|| {
             let disk = self.machine_dir(id).join("disk.ext4");
-            staged.paused_ms = self
-                .running(id)?
-                .capture(&staged.staging, &disk, !hibernate)?
-                .as_millis() as u64;
+            let machine = self.running(id)?;
+            staged.paused_ms = if disk_only {
+                // Empty RAM files keep the three-file format every store and reader expects.
+                for file in ["state", "memory"] {
+                    File::create(staged.staging.join(file))?.sync_all()?;
+                }
+                machine.capture_disk(&staged.staging, &disk)?
+            } else {
+                machine.capture(&staged.staging, &disk, !hibernate)?
+            }
+            .as_millis() as u64;
             if hibernate {
                 self.machines.remove(id);
                 // Until the capture is sealed, the live disk is the machine's state.
@@ -1736,6 +1762,11 @@ impl Runtime {
     /// state resumed, or with `cold` its disk booted fresh (for a host whose CPU or
     /// kernel differs).
     fn import(&mut self, name: &str, cold: bool) -> Result<Value> {
+        identifier(name)?;
+        let manifest: Snapshot =
+            serde_json::from_slice(&fs::read(self.snapshot_dir(name).join("manifest.json"))?)?;
+        // A disk-only recovery point has no RAM to resume: it always boots cold.
+        let cold = cold || manifest.disk_only;
         let directory = self.validate_snapshot(name, !cold)?;
         let snapshot: Snapshot =
             serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
@@ -1934,7 +1965,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
+                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"recovery_disk_only_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":16384,"max_guest_vcpus":16,
@@ -2403,6 +2434,74 @@ mod disk_tests {
     }
 
     #[test]
+    fn a_running_recovery_point_is_disk_only_and_imports_cold() {
+        let mut runtime = fixture();
+        let disk = runtime.machine_dir("legacy").join("disk.ext4");
+        fs::write(&disk, b"guest disk").unwrap();
+        fs::create_dir(runtime.root.join("recovery")).unwrap();
+        // The fixture fails the test on any /snapshot/create: only pause, reflink, resume.
+        let (machine, server) = vm::disk_capture_fixture(&runtime.machine_dir("legacy"));
+        runtime.machines.insert("legacy".into(), machine);
+        runtime.state.workspaces.get_mut("legacy").unwrap().state = "running".into();
+        let store = "a".repeat(64);
+        let point = runtime
+            .request(&json!({"op":"recovery-prepare","id":"legacy","store":store}))
+            .unwrap();
+        server.join().unwrap();
+        runtime.machines.clear();
+        let name = point["snapshot"].as_str().unwrap().to_owned();
+        let directory = runtime.snapshot_dir(&name);
+        let manifest: Snapshot =
+            serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap()).unwrap();
+        assert!(manifest.disk_only && manifest.managed_recovery);
+        for file in ["state", "memory"] {
+            assert_eq!(fs::metadata(directory.join(file)).unwrap().len(), 0);
+        }
+        assert_eq!(
+            fs::read(directory.join("disk.ext4")).unwrap(),
+            b"guest disk"
+        );
+        // Its disk verifies; there is no RAM to resume, here or on a worker without the flag.
+        runtime.verified.clear();
+        runtime.verify_snapshot(&name, false).unwrap();
+        assert!(runtime.verify_snapshot(&name, true).is_err());
+        let mut legacy = serde_json::to_value(&manifest).unwrap();
+        legacy.as_object_mut().unwrap().remove("disk_only");
+        let legacy: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.resumable(&runtime.cpu, &runtime.kernel_hash));
+        assert!(!legacy.resumable("any host", &runtime.kernel_hash));
+
+        // Restored on another runner without --cold, it is registered stopped (a cold boot),
+        // never as a hibernation to resume. No VMM runs here, so the boot itself fails.
+        let mut other = fixture();
+        other.state.workspaces.clear();
+        fs::remove_dir_all(other.root.join("machines/legacy")).unwrap();
+        let copy = other.snapshot_dir(&name);
+        fs::create_dir(&copy).unwrap();
+        for file in [
+            "state",
+            "memory",
+            "disk.ext4",
+            "manifest.json",
+            "chunks.json",
+        ] {
+            if directory.join(file).exists() {
+                fs::copy(directory.join(file), copy.join(file)).unwrap();
+            }
+        }
+        assert!(
+            other
+                .request(&json!({"op":"import","snapshot":name,"cold":false}))
+                .is_err()
+        );
+        let restored = &other.state.workspaces["legacy"];
+        assert_eq!(restored.state, "stopped");
+        assert!(restored.hibernation.is_none());
+        fs::remove_dir_all(&other.root).unwrap();
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
     fn a_box_deleted_while_its_capture_is_hashed_leaves_no_snapshot() {
         let (mut runtime, server) = small_running();
         let Step::Seal(staged) =
@@ -2714,6 +2813,7 @@ mod disk_tests {
             files,
             digest: None,
             fork: None,
+            disk_only: false,
         };
         atomic_json(&sleep.join("manifest.json"), &snapshot).unwrap();
         let workspace = runtime.state.workspaces.get_mut("legacy").unwrap();
@@ -2848,6 +2948,7 @@ mod disk_tests {
                 .into(),
                 digest: None,
                 fork: None,
+                disk_only: false,
             };
             atomic_json(&directory.join("manifest.json"), &snapshot).unwrap();
         };
@@ -3000,6 +3101,7 @@ mod disk_tests {
             files: BTreeMap::new(),
             digest: None,
             fork: None,
+            disk_only: false,
         };
         let directory = runtime.snapshot_dir("saved");
         fs::create_dir(&directory).unwrap();
@@ -3219,6 +3321,7 @@ mod disk_tests {
             .into(),
             digest: None,
             fork: None,
+            disk_only: false,
         };
         atomic_json(&saved.join("manifest.json"), &snapshot).unwrap();
         runtime

@@ -125,11 +125,11 @@ pub(crate) fn park(shared: Shared, identity: &Identity, request: &Value) -> Resu
     };
     {
         let c = shared.lock().unwrap();
-        let caps: String=c.db.query_row("SELECT capabilities FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15",[&node],|r|r.get(0))?;
+        let caps: String=c.db.query_row("SELECT capabilities FROM live_nodes WHERE id=?1 AND revoked=0 AND heartbeat>CAST(strftime('%s','now') AS INTEGER)-15",[&node],|r|r.get(0))?;
         common::placement_capable(&serde_json::from_str(&caps)?)?;
         ensure!(
             c.db.query_row(
-                "SELECT json_extract(capabilities,'$.park_wake_v1')=1 FROM nodes WHERE id=?1",
+                "SELECT json_extract(capabilities,'$.park_wake_v1')=1 FROM live_nodes WHERE id=?1",
                 [&node],
                 |r| r.get::<_, Option<bool>>(0)
             )?
@@ -408,7 +408,7 @@ pub(super) fn reserve_wake(shared: &Shared, t: &Transfer) -> Result<bool> {
         c.db.execute("UPDATE operations SET response=json_set(COALESCE(response,'{}'),'$.capture_manifest',json(?1)) WHERE id=?2",params![serde_json::to_string(&manifest)?,t.operation])?;
     }
     let nodes: Vec<(String, String)> =
-        c.db.prepare("SELECT id,capabilities FROM nodes WHERE revoked=0 ORDER BY id")?
+        c.db.prepare("SELECT id,capabilities FROM live_nodes WHERE revoked=0 ORDER BY id")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
     let mut compatible_runner = false;

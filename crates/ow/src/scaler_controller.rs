@@ -134,15 +134,16 @@ fn inputs_on(
     }
     // Missing/expired/revoked enrollment can still incur costs. Coverage is explicit.
     let nodes: Vec<String> = db
-        .prepare("SELECT id FROM nodes ORDER BY rowid")?
+        .prepare("SELECT id FROM live_nodes ORDER BY rowid")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for retired in retired_nodes {
         ensure!(
-            db.query_row("SELECT revoked FROM nodes WHERE id=?1", [retired], |r| r
-                .get::<_, bool>(
-                0
-            ))?,
+            db.query_row(
+                "SELECT revoked FROM live_nodes WHERE id=?1",
+                [retired],
+                |r| r.get::<_, bool>(0)
+            )?,
             "retired pool node must first be revoked"
         );
     }
@@ -160,7 +161,7 @@ fn inputs_on(
             if !matches!(instance.state, InstanceState::Ready) {
                 continue;
             }
-            let row = db.query_row("SELECT heartbeat,capabilities,memory_mib,slots,rowid,revoked FROM nodes WHERE id=?1",[id],|r|Ok((uint(r,0)?,r.get::<_,String>(1)?,uint(r,2)?,uint(r,3)?,uint(r,4)?,r.get::<_,bool>(5)?))).optional()?;
+            let row = db.query_row("SELECT heartbeat,capabilities,memory_mib,slots,rowid,revoked FROM live_nodes WHERE id=?1",[id],|r|Ok((uint(r,0)?,r.get::<_,String>(1)?,uint(r,2)?,uint(r,3)?,uint(r,4)?,r.get::<_,bool>(5)?))).optional()?;
             let Some((heartbeat, raw, memory, slots, joined, revoked)) = row else {
                 durability_healthy = false;
                 continue;
@@ -415,7 +416,7 @@ pub(crate) fn command(root: &Path, tick_now: bool) -> Result<Value> {
 }
 /// Read-only worker inventory, outside the gateway mutex and every writer transaction.
 fn refresh(db: &Connection, now: u64, call: &impl Fn(&str) -> Result<Value>) -> Result<()> {
-    let nodes:Vec<(String,String)> = db.prepare("SELECT id,session FROM nodes WHERE revoked=0 AND heartbeat>=?1 AND heartbeat<=?2 AND session IS NOT NULL AND EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND node=nodes.id) ORDER BY id LIMIT 17")?
+    let nodes:Vec<(String,String)> = db.prepare("SELECT id,session FROM live_nodes WHERE revoked=0 AND heartbeat>=?1 AND heartbeat<=?2 AND session IS NOT NULL AND EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND node=live_nodes.id) ORDER BY id LIMIT 17")?
         .query_map(params![now.saturating_sub(15) as i64,now as i64],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     ensure!(
         nodes.len() <= 16,
@@ -461,7 +462,7 @@ fn refresh(db: &Connection, now: u64, call: &impl Fn(&str) -> Result<Value>) -> 
                 continue;
             }
             // Preserve catalog shape, pins and policy. A concurrent move/session/reconcile wins.
-            tx.execute("UPDATE resources SET metadata=json_set(metadata,'$.state',json_extract(?1,'$.state'),'$.durability',json_extract(?1,'$.durability'),'$.vmm_running',json_extract(?1,'$.vmm_running')),updated_at=datetime(?2,'unixepoch') WHERE kind='machine' AND physical=?3 AND node=?4 AND placement_epoch=?5 AND placement_managed=?6 AND metadata=?7 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical) AND EXISTS(SELECT 1 FROM nodes WHERE id=?4 AND revoked=0 AND session=?8 AND heartbeat>=?2-15 AND heartbeat<=?2)",params![m.to_string(),now as i64,physical,node,epoch,managed,metadata,session])?;
+            tx.execute("UPDATE resources SET metadata=json_set(metadata,'$.state',json_extract(?1,'$.state'),'$.durability',json_extract(?1,'$.durability'),'$.vmm_running',json_extract(?1,'$.vmm_running')),updated_at=datetime(?2,'unixepoch') WHERE kind='machine' AND physical=?3 AND node=?4 AND placement_epoch=?5 AND placement_managed=?6 AND metadata=?7 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical) AND EXISTS(SELECT 1 FROM live_nodes WHERE id=?4 AND revoked=0 AND session=?8 AND heartbeat>=?2-15 AND heartbeat<=?2)",params![m.to_string(),now as i64,physical,node,epoch,managed,metadata,session])?;
         }
         tx.commit()?;
     }

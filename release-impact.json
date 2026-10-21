@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.40",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Automatic recovery points of running boxes are disk-only: the guest is paused only while its disk is reflinked and no RAM is written, removing the full-RAM write from that pause (real-runner pause duration remains unmeasured); such a point restores as a cold boot (its manifest says disk_only and names no CPU, so an older worker refuses to resume it). The controller runs every catalog/health call off its async threads over reused connections and never holds the session lock across one; each runner writes transient health in its own private SQLite WAL file, while the live_nodes view preserves durable catalog policy and revocation. Upgrade controller and gateway together, since older gateways read only catalog heartbeats; a session whose mark or heartbeat cannot be recorded (an error, or no matching row) ends with a log line so the agent reconnects, and a controller stall no longer drops every session. The agent reconnects after 20 s without a frame from the controller, skips DNS for IP literals and reuses the last resolved addresses while lookups hang. Runners whose worker and agent have this advertise recovery_disk_only_v1."
+    },
+    {
       "version": "0.9.39",
       "class": 2,
       "changes": [

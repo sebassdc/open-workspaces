@@ -406,6 +406,7 @@ mod tests {
                 files,
                 digest: None,
                 fork: None,
+                disk_only: false,
             };
             atomic_json(&sleep.join("manifest.json"), &snapshot).unwrap();
             if sealed {
