@@ -89,6 +89,14 @@ fn answer(
     );
     let phase = m["lifecycle"]["phase"].clone();
     let deleted = m["state"] == "deleted";
+    if op == "export-cleanup" {
+        ensure!(
+            phase == "exported" && request["transfer"] == m["lifecycle"]["intent"]["transfer"],
+            "source has not completed export"
+        );
+        m["lifecycle"]["phase"] = json!("cleaned");
+        return Ok(m.clone());
+    }
     if op == "snapshot-delete" {
         let name = request["name"].as_str().unwrap();
         let existed = snapshots.remove(name).is_some();
@@ -99,7 +107,7 @@ fn answer(
     }
     // Like the worker: an old fenced source may still be deleted, nothing else runs on it.
     ensure!(
-        phase == "active" || op == "delete" && (phase == "exported" || phase == "cleaned"),
+        phase == "active" || op == "delete" && phase == "cleaned",
         "managed workspace is fenced or not activated"
     );
     Ok(match op {
@@ -700,7 +708,8 @@ fn parked() -> (Fixture, RefCell<Peers>) {
     c.db.execute("UPDATE resources SET node='',reserved_mib=0,reserved_cpus=0,current_capture='capture' WHERE physical='physical'",[]).unwrap();
     c.db.execute("UPDATE nodes SET heartbeat=?1,capabilities=json_set(capabilities,'$.managed_lifecycle_v1',json('true'))",[now()]).unwrap();
     drop(c);
-    peers.borrow_mut().source.as_mut().unwrap()["lifecycle"]["phase"] = json!("exported");
+    peers.borrow_mut().source.as_mut().unwrap()["lifecycle"] =
+        json!({"phase":"exported","intent":{"transfer":"transfer-park","capture":"parked"}});
     (f, peers)
 }
 
@@ -715,7 +724,14 @@ fn a_parked_box_deletes_its_parking_runners_fenced_copy_and_releases_its_capture
     )
     .unwrap();
     assert_eq!(deleted["deleted"], "box");
-    assert_eq!(source.last("delete")["placement"], copy["placement"]);
+    // Its uncleaned export is cleaned first, then deleted, both under its own placement.
+    let ops: Vec<String> = source
+        .ops()
+        .iter()
+        .filter(|r| r["placement"] == copy["placement"])
+        .map(|r| r["op"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ops, ["export-cleanup", "delete"]);
     assert_eq!(rows(&f, "SELECT COUNT(*) FROM resources"), 0);
     // Its stored capture is no longer a store root; the history row stays for collection.
     assert_eq!(

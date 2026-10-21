@@ -128,13 +128,14 @@ impl Runtime {
             .get(id)
             .is_some_and(|m| m.phase == Phase::Cleaned && m.intent.is_none())
     }
-    /// An activated copy that is not running, or a fenced source left by a move or park.
+    /// An activated copy that is not running, or a cleaned source left by a move or park.
+    /// An export not yet cleaned may still be a transfer's fallback, so it is cleaned first.
     pub(super) fn require_deletable(&self, id: &str) -> Result<()> {
         if let Some(m) = self.state.placements.get(id) {
             ensure!(
                 match m.phase {
                     Phase::Active => m.intent.is_none(),
-                    Phase::Exported | Phase::Cleaned => true,
+                    Phase::Cleaned => true,
                     _ => false,
                 },
                 "managed workspace is fenced or not activated"
@@ -956,13 +957,8 @@ mod tests {
             "recovery-result",
             "recovery-seal",
         ] {
-            // A completed export may still be deleted with its exact authority (a deleted box).
-            if op == "delete"
-                && matches!(
-                    runtime.state.placements["legacy"].phase,
-                    Phase::Exported | Phase::Cleaned
-                )
-            {
+            // A cleaned export may still be deleted with its exact authority (a deleted box).
+            if op == "delete" && runtime.state.placements["legacy"].phase == Phase::Cleaned {
                 continue;
             }
             let e = runtime.request(&request(op)).unwrap_err();
@@ -2007,6 +2003,9 @@ mod managed_lifecycle_tests {
         runtime
             .request(&json!({"op":"activate","id":"child","placement":child,"committed":true}))
             .unwrap();
+        // An export not yet cleaned may still be a transfer's fallback: clean it first.
+        let error = runtime.request(&delete).unwrap_err();
+        assert!(format!("{error:#}").contains("fenced"), "{error:#}");
         let mut cleanup = export.clone();
         cleanup["op"] = json!("export-cleanup");
         runtime.request(&cleanup).unwrap();
@@ -2018,7 +2017,9 @@ mod managed_lifecycle_tests {
                 .snapshot_dir("onward-capture/manifest.json")
                 .exists()
         );
-        // Deleting the child releases that reservation; its parent's capture is not its own.
+        // Deleting the child releases that reservation. The capture names its parent, and the
+        // worker cannot tell a generated fork capture from the parent's own named snapshot
+        // (a same-runner fork imports that directly), so it is left for the parent's owner.
         runtime
             .request(&json!({"op":"delete","id":"child","placement":child}))
             .unwrap();

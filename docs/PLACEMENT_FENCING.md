@@ -99,8 +99,9 @@ authority by itself.
 ## Managed delete and named snapshots
 
 Workers advertising `managed_lifecycle_v1` accept `delete` for a managed copy with
-its exact authority: an activated copy that is not running, or a completed export
-(`exported` or `cleaned`) left on a runner the box moved or was parked from. A copy
+its exact authority: an activated copy that is not running, or a cleaned export left
+on a runner the box moved or was parked from. An export not yet cleaned may still be
+a transfer's fallback, so the controller sends `export-cleanup` first; a copy
 mid-export or mid-import is refused. The machine directory, recovery journal and the
 box's local snapshots go, export and hibernation captures included, except a capture
 another managed copy still imports from. The fence stays as a **tombstone**: phase

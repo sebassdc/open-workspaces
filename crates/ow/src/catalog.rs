@@ -2066,7 +2066,7 @@ impl Catalog {
         ensure!(
             nodes::online(&self.root, node).is_ok(),
             limits::Rejection(format!(
-                "Runner {node} still holds a copy of this box or its snapshots and is offline; retry when it is back."
+                "Runner {node} still holds a copy of this box or its snapshots and is offline; retry when it is back, or revoke that runner if it is gone."
             ))
         );
         nodes::managed_lifecycle_capable(&self.root, node)?;
@@ -2114,7 +2114,15 @@ impl Catalog {
                 "runner {node} holds an unmanaged copy of this box; reconcile it first"
             );
             match seen["lifecycle"]["phase"].as_str() {
-                Some("exported" | "cleaned") => {
+                Some(phase @ ("exported" | "cleaned")) => {
+                    if phase == "exported" {
+                        // Every transfer of the box is finished: its source copy is no fallback.
+                        let intent = &seen["lifecycle"]["intent"];
+                        wire::request(
+                            &route,
+                            json!({"op":"export-cleanup","id":physical,"placement":seen["placement"],"transfer":intent["transfer"],"capture":intent["capture"]}),
+                        )?;
+                    }
                     let result = wire::request(
                         &route,
                         json!({"op":"delete","id":physical,"placement":seen["placement"]}),

@@ -152,7 +152,6 @@ pub(super) fn publish_named(
         // Already published transfer captures keep their original artifact/root; do not duplicate
         // them for drain. A named snapshot is published as one, so it forks and rehomes.
         if expected.is_some() && c.db.query_row("SELECT EXISTS(SELECT 1 FROM artifacts a JOIN transfers t ON t.capture=a.id JOIN operations o ON o.id=t.operation WHERE a.local_name=?1 AND a.machine=?2 AND a.state='stored' AND t.step='succeeded' AND json_extract(o.response,'$.capture_manifest.metadata.native_manifest') IS NOT NULL)",params![snapshot,machine],|r|r.get::<_,bool>(0))? {return Ok(());}
-        let owner:i64=c.db.query_row("SELECT owner FROM resources WHERE (kind='snapshot' AND physical=?1 AND json_extract(metadata,'$.workspace')=?2) OR (kind='machine' AND physical=?2 AND ?1 LIKE 'sleep-%')",params![snapshot,machine],|r|r.get(0)).context("unmanaged or incomplete local capture; retained")?;
         let mut id = format!(
             "drain-{}",
             &store::sha256(format!("{node}:{snapshot}").as_bytes())[..26]
@@ -165,6 +164,10 @@ pub(super) fn publish_named(
         let url = crate::image_store::configured_url(&c.root)?;
         let tx =
             rusqlite::Transaction::new_unchecked(&c.db, rusqlite::TransactionBehavior::Immediate)?;
+        // An existing record stands even after its snapshot or box is gone from the catalog.
+        let owner = || -> Result<i64> {
+            tx.query_row("SELECT owner FROM resources WHERE (kind='snapshot' AND physical=?1 AND json_extract(metadata,'$.workspace')=?2) OR (kind='machine' AND physical=?2 AND ?1 LIKE 'sleep-%')",params![snapshot,machine],|r|r.get(0)).context("unmanaged or incomplete local capture; retained")
+        };
         if let Some((raw, artifact)) = tx
             .query_row(
                 "SELECT manifest,artifact FROM drain_publications WHERE node=?1 AND name=?2",
@@ -194,6 +197,7 @@ pub(super) fn publish_named(
             tx.commit()?;
             return Ok(());
         }
+        let owner = owner()?;
         tx.execute("INSERT OR IGNORE INTO artifacts(id,kind,owner,machine,local_name,state,attempt,store_url) VALUES(?1,'snapshot',?2,?3,?4,'uploading',?5,?6)",params![id,owner,machine,snapshot,store::token()?,url])?;
         let (mut token,old_url):(String,String)=tx.query_row("SELECT attempt,store_url FROM artifacts WHERE id=?1 AND owner=?2 AND machine=?3 AND local_name=?4 AND state='uploading'",params![id,owner,machine,snapshot],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!(old_url == url, "publication store changed");
