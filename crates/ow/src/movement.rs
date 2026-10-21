@@ -3,10 +3,11 @@ use super::*;
 
 fn capable_move(c: &Catalog, node: &str, disk: u64) -> Result<()> {
     capable(c, node, disk)?;
-    let caps: String =
-        c.db.query_row("SELECT capabilities FROM nodes WHERE id=?1", [node], |r| {
-            r.get(0)
-        })?;
+    let caps: String = c.db.query_row(
+        "SELECT capabilities FROM live_nodes WHERE id=?1",
+        [node],
+        |r| r.get(0),
+    )?;
     ensure!(
         serde_json::from_str::<Value>(&caps)?["move_fork_v1"] == true,
         refuse(

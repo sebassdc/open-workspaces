@@ -1690,6 +1690,67 @@ fn controller_placement_policy_survives_runner_drain_changes() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn live_health_preserves_catalog_policy_revocation_and_restart_fences() {
+    let root = root();
+    let c = crate::catalog::Catalog::open(&root, "fixture", None).unwrap();
+    let credential = enrollment(&root, "alpha");
+    assert!(online(&root, "alpha").is_err());
+    let health = liveness_db(&root, "alpha").unwrap();
+    health
+        .execute(
+            "UPDATE health SET session='generation',heartbeat=?1,capabilities=?2",
+            params![
+                now(),
+                json!({"memory_mib":9999,"slots":99,"vcpus":99,"managed_lifecycle_v1":true})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+    // A catalog connection opened before the health file must discover it too.
+    let generation: String =
+        c.db.query_row("SELECT session FROM live_nodes WHERE id='alpha'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(generation, "generation");
+    assert!(online(&root, "alpha").is_ok());
+    assert!(managed_lifecycle_capable(&root, "alpha").is_ok());
+    c.db.execute(
+        "UPDATE nodes SET memory_mib=256,slots=1 WHERE id='alpha'",
+        [],
+    )
+    .unwrap();
+    c.db.execute(
+        "UPDATE node_capacity_limits SET vcpu_cap=1 WHERE node='alpha'",
+        [],
+    )
+    .unwrap();
+    let inventory = inventory(&root).unwrap();
+    for (key, expected) in [("memory_mib", 256), ("slots", 1), ("vcpus", 1)] {
+        assert_eq!(inventory[0]["capabilities"][key], expected);
+    }
+    assert!(authorized(&c.db, "alpha", credential["credential"].as_str().unwrap()).unwrap());
+    reset_health(&root).unwrap();
+    assert!(online(&root, "alpha").is_err());
+    let generation: Option<String> =
+        c.db.query_row("SELECT session FROM live_nodes WHERE id='alpha'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(generation.is_none());
+    // Even a fresh health record cannot undo durable revocation.
+    health
+        .execute("UPDATE health SET session='later',heartbeat=?1", [now()])
+        .unwrap();
+    revoke(&root, "alpha").unwrap();
+    assert!(online(&root, "alpha").is_err());
+    assert!(!authorized(&c.db, "alpha", credential["credential"].as_str().unwrap()).unwrap());
+    drop(health);
+    drop(c);
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Keep a genuinely issued old job present on the restored authority: an unknown
 /// ID would test only lookup failure and could miss a broken generation fence.
 #[test]
@@ -1814,9 +1875,11 @@ fn restored_controller_rejects_previously_issued_job_and_old_session_results() {
     let since = std::time::Instant::now();
     while db(&old_root)
         .unwrap()
-        .query_row("SELECT heartbeat FROM nodes WHERE id='alpha'", [], |r| {
-            r.get::<_, i64>(0)
-        })
+        .query_row(
+            "SELECT heartbeat FROM live_nodes WHERE id='alpha'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
         .unwrap()
         != 0
     {
@@ -2035,7 +2098,7 @@ fn serve_controller(c: &Controller) -> (String, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stalled_catalog_write_neither_stops_the_controller_nor_strands_a_runner() {
+async fn a_stalled_health_write_neither_stops_the_controller_nor_strands_a_runner() {
     let root = root();
     let alpha = enrollment(&root, "alpha");
     let c = Controller::new(&root).unwrap();
@@ -2053,9 +2116,9 @@ async fn a_stalled_catalog_write_neither_stops_the_controller_nor_strands_a_runn
 
         // The catalog lost this session's mark (as a write lost in a storm would): its
         // heartbeats match no row, so the controller ends it and the runner reconnects.
-        db(&root)
+        liveness_db(&root, "alpha")
             .unwrap()
-            .execute("UPDATE nodes SET session='lost' WHERE id='alpha'", [])
+            .execute("UPDATE health SET session='lost'", [])
             .unwrap();
         assert!(
             drive(&mut ws, Duration::from_secs(8)).1,
@@ -2064,11 +2127,11 @@ async fn a_stalled_catalog_write_neither_stops_the_controller_nor_strands_a_runn
         let mut ws = connect();
         assert!(!drive(&mut ws, Duration::from_secs(4)).1 && online());
 
-        // A capture's writeback holds the catalog's writes (here: its write lock, 8 s).
+        // A capture's writeback holds this runner's health writes (its real writer lock, 8 s).
         let held = {
             let root = root.clone();
             std::thread::spawn(move || {
-                let db = db(&root).unwrap();
+                let db = liveness_db(&root, "alpha").unwrap();
                 db.execute_batch("BEGIN IMMEDIATE").unwrap();
                 std::thread::sleep(Duration::from_secs(8));
                 db.execute_batch("COMMIT").unwrap();
@@ -2159,9 +2222,10 @@ async fn one_blocked_heartbeat_write_leaves_other_runners_online() {
                 let token = credential["credential"].as_str().unwrap();
                 let mut ws = socket(&origin, &format!("/node/{name}"), token, None).unwrap();
                 timeout_socket(&ws).unwrap();
-                drive(&mut ws, Duration::from_secs(36))
+                drive(&mut ws, Duration::from_secs(40))
             })
         };
+        let healthy_token = healthy["credential"].as_str().unwrap().to_owned();
         let (omega, sigma) = (runner("omega", stalled), runner("sigma", healthy));
         let started = std::time::Instant::now();
         while online(&root, "omega").is_err() || online(&root, "sigma").is_err() {
@@ -2176,16 +2240,100 @@ async fn one_blocked_heartbeat_write_leaves_other_runners_online() {
             }
         }
         let release = Release;
-        *STALLED.lock().unwrap() = Some("omega".into());
+        if let Ok(arm) = std::env::var("OW_TEST_WAL_STALL") {
+            fs::write(arm, b"armed").unwrap();
+        } else {
+            *STALLED.lock().unwrap() = Some("omega".into());
+        }
+        // Prove the fault holds SQLite's real writer lock, rather than a Rust mutex.
+        let locked = Connection::open(root.join("nodes/omega/liveness.sqlite3")).unwrap();
+        locked.busy_timeout(Duration::ZERO).unwrap();
+        let waiting = std::time::Instant::now();
+        loop {
+            match locked.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => locked.execute_batch("ROLLBACK").unwrap(),
+                Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => break,
+                Err(e) => panic!("unexpected lock error: {e}"),
+            }
+            assert!(
+                waiting.elapsed() < Duration::from_secs(5),
+                "the fault never held the WAL writer lock"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // A catalog writer held too: health/session writes must not need that lock either.
+        let catalog = db(&root).unwrap();
+        catalog.execute_batch("BEGIN IMMEDIATE").unwrap();
         let stalled_at = std::time::Instant::now();
+        let mut dispatched = false;
         while stalled_at.elapsed() < Duration::from_secs(23) {
             assert!(
                 online(&root, "sigma").is_ok(),
                 "a healthy runner went offline {:?} into another runner's stalled write",
                 stalled_at.elapsed()
             );
+            if !dispatched && stalled_at.elapsed() > Duration::from_secs(16) {
+                let pool = inventory(&root).unwrap();
+                assert_eq!(
+                    pool.as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|n| n["id"] == "sigma")
+                        .unwrap()["online"],
+                    true
+                );
+                let asked = std::time::Instant::now();
+                assert!(socket(&origin, "/node/sigma", &"0".repeat(64), None).is_err());
+                assert!(
+                    asked.elapsed() < Duration::from_secs(2),
+                    "controller stopped answering"
+                );
+                // The real proxy must admit and finish a new job, past the old offline cut-off.
+                let (mut local, upstream) = std::os::unix::net::UnixStream::pair().unwrap();
+                local
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                upstream.set_nonblocking(true).unwrap();
+                let task = tokio::spawn(proxy(
+                    c.clone(),
+                    "sigma".into(),
+                    tokio::net::UnixStream::from_std(upstream).unwrap(),
+                ));
+                local.write_all(b"probe\n").unwrap();
+                let asked = std::time::Instant::now();
+                let id = loop {
+                    if let Some(id) = c
+                        .jobs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(_, j)| j.node == "sigma")
+                        .map(|(id, _)| id.clone())
+                    {
+                        break id;
+                    }
+                    assert!(
+                        asked.elapsed() < Duration::from_secs(3),
+                        "healthy runner refused a new job"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let mut job =
+                    socket(&origin, &format!("/job/sigma/{id}"), &healthy_token, None).unwrap();
+                timeout_socket(&job).unwrap();
+                assert_eq!(job.read().unwrap().into_data().as_ref(), b"probe\n");
+                job.send(tungstenite::Message::Binary(b"ok\n".to_vec().into()))
+                    .unwrap();
+                let mut reply = [0; 3];
+                local.read_exact(&mut reply).unwrap();
+                assert_eq!(&reply, b"ok\n");
+                task.abort();
+                dispatched = true;
+            }
             std::thread::sleep(Duration::from_millis(250));
         }
+        assert!(dispatched);
+        catalog.execute_batch("ROLLBACK").unwrap();
         drop(release);
         let released = std::time::Instant::now();
         while online(&root, "omega").is_err() {

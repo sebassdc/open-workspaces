@@ -168,3 +168,13 @@ against a mock STS (see [per-box AWS access](AWS_ACCESS.md)).
 | Gateway error on an operation asks to try again | works | v0.9.33 | `dialogs.spec.mjs › a gateway error on an operation asks to try again, since an open dialog does not poll` |
 | Unexpected HTML without an auth redirect does not claim the login expired | works | v0.9.33 | `dialogs.spec.mjs › an unexpected HTML response without an auth redirect does not ask to sign in` |
 | Host node label rejects invalid characters and names the 64-character limit | works | v0.9.33 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` |
+
+## Recovery transport isolation
+
+| Feature | Status | Last passed | Test |
+| --- | --- | --- | --- |
+| Runner health remains online and accepts a proxy job during another runner's 23 s WAL writer stall and a held catalog writer | partial | v0.9.40 | `nodes::tests::one_blocked_heartbeat_write_leaves_other_runners_online` |
+
+This row covers a transport fixture, not a browser acceptance test.
+Real Firecracker pause timing and deployed fleet acceptance remain separate;
+see [recovery semantics](RECOVERY.md) and [transport isolation](MULTINODE.md#staying-up-while-the-disk-is-slow).

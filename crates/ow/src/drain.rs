@@ -138,7 +138,7 @@ pub(crate) fn command(
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(
             tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND revoked=0)",
+                "SELECT EXISTS(SELECT 1 FROM live_nodes WHERE id=?1 AND revoked=0)",
                 [node],
                 |r| r.get::<_, bool>(0)
             )?,
@@ -153,7 +153,7 @@ pub(crate) fn command(
                 ensure!(
                     node != "local"
                         && !tx.query_row(
-                            "SELECT id=?1 FROM nodes ORDER BY rowid LIMIT 1",
+                            "SELECT id=?1 FROM live_nodes ORDER BY rowid LIMIT 1",
                             [node],
                             |r| r.get::<_, bool>(0)
                         )?,
@@ -181,7 +181,7 @@ pub(crate) fn command(
     status(&db, node)
 }
 fn session(db: &Connection, node: &str) -> Result<String> {
-    Ok(db.query_row("SELECT session FROM nodes WHERE id=?1 AND revoked=0 AND heartbeat>unixepoch()-15 AND heartbeat<=unixepoch()",[node],|r|r.get(0)).context("fresh runner generation required")?)
+    Ok(db.query_row("SELECT session FROM live_nodes WHERE id=?1 AND revoked=0 AND heartbeat>unixepoch()-15 AND heartbeat<=unixepoch()",[node],|r|r.get(0)).context("fresh runner generation required")?)
 }
 fn catalog_empty(db: &Connection, node: &str) -> Result<()> {
     for (sql, why) in [
@@ -441,10 +441,11 @@ pub(crate) fn pass(
     };
     {
         let c = shared.lock().unwrap();
-        let caps: String =
-            c.db.query_row("SELECT capabilities FROM nodes WHERE id=?1", [node], |r| {
-                r.get(0)
-            })?;
+        let caps: String = c.db.query_row(
+            "SELECT capabilities FROM live_nodes WHERE id=?1",
+            [node],
+            |r| r.get(0),
+        )?;
         ensure!(
             serde_json::from_str::<Value>(&caps)?["drain_inventory_v1"] == true,
             "runner lacks bounded drain inventory"

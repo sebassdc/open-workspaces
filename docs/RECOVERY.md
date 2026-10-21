@@ -57,7 +57,7 @@ per-box error updates; monitor timer/service failure as well as box timestamps.
 ## Capture and retry
 
 A running box is due immediately on first participation, then 30 minutes after
-its last durable capture started. From 0.9.39 a running box's recovery point is
+its last durable capture started. From 0.9.40 a running box's recovery point is
 **disk-only**: the worker syncs the guest, pauses it only while it reflinks the
 disk (a metadata copy on Btrfs/XFS, after the disk file was flushed with the guest
 running; the clone is flushed after it runs again), and writes no RAM. The pause
@@ -243,7 +243,7 @@ ow --local --data-dir /path/to/other-runner exec PHYSICAL_ID -- 'cat /path/to/ma
 
 Start the destination worker first. `--cold` boots the captured disk and loses
 RAM processes; without it, runtime, CPU/host kernel and guest kernel must match.
-A disk-only point always boots cold on a 0.9.39 worker, with or without `--cold`.
+A disk-only point always boots cold on a 0.9.40 worker, with or without `--cold`.
 Its manifest names no CPU (`"cpu": "none: disk-only recovery point"`), so an older
 worker refuses to resume it and asks for `--cold`, which works there too.
 Import refuses an existing workspace ID. Download verifies bytes before import
