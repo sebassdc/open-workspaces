@@ -128,8 +128,26 @@ impl Runtime {
             .get(id)
             .is_some_and(|m| m.phase == Phase::Cleaned && m.intent.is_none())
     }
+    /// An activated copy that is not running, or a fenced source left by a move or park.
+    pub(super) fn require_deletable(&self, id: &str) -> Result<()> {
+        if let Some(m) = self.state.placements.get(id) {
+            ensure!(
+                match m.phase {
+                    Phase::Active => m.intent.is_none(),
+                    Phase::Exported | Phase::Cleaned => true,
+                    _ => false,
+                },
+                "managed workspace is fenced or not activated"
+            );
+        }
+        Ok(())
+    }
     pub(super) fn mark_deleted(&mut self, id: &str) {
-        self.state.placements.get_mut(id).unwrap().phase = Phase::Cleaned;
+        let managed = self.state.placements.get_mut(id).unwrap();
+        managed.phase = Phase::Cleaned;
+        // Its export and import captures are released: nothing may resume this copy.
+        managed.intent = None;
+        managed.import = None;
         self.state.workspaces.get_mut(id).unwrap().state = "deleted".into();
     }
 
@@ -938,6 +956,15 @@ mod tests {
             "recovery-result",
             "recovery-seal",
         ] {
+            // A completed export may still be deleted with its exact authority (a deleted box).
+            if op == "delete"
+                && matches!(
+                    runtime.state.placements["legacy"].phase,
+                    Phase::Exported | Phase::Cleaned
+                )
+            {
+                continue;
+            }
             let e = runtime.request(&request(op)).unwrap_err();
             assert!(e.to_string().contains("fenced"), "{op}: {e:#}");
         }
@@ -1896,6 +1923,13 @@ mod managed_lifecycle_tests {
     fn managed_delete_needs_exact_authority_and_leaves_a_replayable_tombstone() {
         let (mut runtime, placement) = runtime();
         named(&mut runtime, &placement, "kept-by-name");
+        named(&mut runtime, &placement, "probe");
+        // Kept aside: a valid capture of this box, to try to bring it back after the delete.
+        fs::rename(
+            runtime.snapshot_dir("probe"),
+            runtime.root.join("probe-aside"),
+        )
+        .unwrap();
         let delete = json!({"op":"delete","id":"legacy","placement":placement});
         for wrong in [
             json!({"op":"delete","id":"legacy"}),
@@ -1928,13 +1962,73 @@ mod managed_lifecycle_tests {
             late["op"] = json!(op);
             assert!(runtime.request(&late).is_err(), "{op}");
         }
-        // The tombstone is permanent, even for a later epoch.
-        fs::create_dir(runtime.snapshot_dir("capture")).unwrap();
-        let mut import = json!({"op":"import-prepare","id":"legacy","snapshot":"capture","manifest_sha256":"0".repeat(64),
-            "placement":{"epoch":9,"node":"alpha","transfer":"back"}});
-        assert!(runtime.request(&import).is_err());
-        import["op"] = json!("export-cleanup");
-        assert!(runtime.request(&import).is_err());
+        // The tombstone is permanent: a valid capture of this box cannot bring it back, even
+        // at a later epoch, and no export of it can be cleaned again.
+        fs::rename(
+            runtime.root.join("probe-aside"),
+            runtime.snapshot_dir("probe"),
+        )
+        .unwrap();
+        let import = json!({"op":"import-prepare","id":"legacy","snapshot":"probe",
+            "manifest_sha256":hash(&runtime.snapshot_dir("probe/manifest.json")).unwrap(),
+            "placement":{"epoch":9,"node":"alpha","transfer":"back"},"cold":true});
+        let error = runtime.request(&import).unwrap_err();
+        // (A cleaned export fence would accept this newer epoch; a tombstone never does.)
+        assert!(
+            format!("{error:#}").contains("different import placement"),
+            "{error:#}"
+        );
+        let cleanup = json!({"op":"export-cleanup","id":"legacy","placement":placement,"transfer":"move","capture":"probe"});
+        let error = runtime.request(&cleanup).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("missing export intent"),
+            "{error:#}"
+        );
+        assert!(!runtime.machine_dir("legacy").exists());
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
+    fn an_old_fenced_copy_deletes_with_its_own_authority_and_releases_its_captures() {
+        let (mut runtime, placement) = runtime();
+        let export = json!({"op":"export","id":"legacy","placement":placement,"transfer":"onward","capture":"onward-capture"});
+        runtime.crash = Some("capture");
+        assert!(runtime.request(&export).is_err());
+        // Mid-export the copy cannot be deleted.
+        let delete = json!({"op":"delete","id":"legacy","placement":placement});
+        let error = runtime.request(&delete).unwrap_err();
+        assert!(format!("{error:#}").contains("fenced"), "{error:#}");
+        runtime.crash = None;
+        runtime.request(&export).unwrap();
+        let digest = hash(&runtime.snapshot_dir("onward-capture/manifest.json")).unwrap();
+        // A fork child on this runner imports the export capture and keeps it reserved.
+        let child = json!({"epoch":8,"node":"alpha","transfer":"fork"});
+        runtime.request(&json!({"op":"fork-prepare","id":"child","fork_source":"legacy","placement":child,"snapshot":"onward-capture","manifest_sha256":digest})).unwrap();
+        runtime
+            .request(&json!({"op":"activate","id":"child","placement":child,"committed":true}))
+            .unwrap();
+        let mut cleanup = export.clone();
+        cleanup["op"] = json!("export-cleanup");
+        runtime.request(&cleanup).unwrap();
+        // The old source goes; the capture the child imported stays while it is reserved.
+        assert_eq!(runtime.request(&delete).unwrap()["snapshots"], json!([]));
+        assert!(runtime.deleted("legacy"));
+        assert!(
+            runtime
+                .snapshot_dir("onward-capture/manifest.json")
+                .exists()
+        );
+        // Deleting the child releases that reservation; its parent's capture is not its own.
+        runtime
+            .request(&json!({"op":"delete","id":"child","placement":child}))
+            .unwrap();
+        assert!(runtime.deleted("child"));
+        assert!(!runtime.lifecycle_capture("onward-capture"));
+        assert!(
+            runtime
+                .snapshot_dir("onward-capture/manifest.json")
+                .exists()
+        );
         fs::remove_dir_all(runtime.root).unwrap();
     }
 

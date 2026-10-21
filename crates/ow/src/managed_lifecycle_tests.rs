@@ -97,8 +97,9 @@ fn answer(
     if op == "delete" && deleted {
         return Ok(json!({"deleted":id,"snapshots":[]}));
     }
+    // Like the worker: an old fenced source may still be deleted, nothing else runs on it.
     ensure!(
-        phase == "active",
+        phase == "active" || op == "delete" && (phase == "exported" || phase == "cleaned"),
         "managed workspace is fenced or not activated"
     );
     Ok(match op {
@@ -303,6 +304,9 @@ fn a_running_moved_box_refuses_resize_and_a_transfer_lock_refuses_every_mutation
     let error = operate(&f, json!({"op":"resize","id":"box","memory_mib":512})).unwrap_err();
     assert!(format!("{error:#}").contains("stopped"), "{error:#}");
     assert!(target.ops().iter().all(|r| r["op"] != "resize"));
+    // Each of these succeeds on this stopped box with its snapshot, until a transfer holds it.
+    operate(&f, json!({"op":"snapshot","id":"box","name":"held"})).unwrap();
+    operate(&f, json!({"op":"stop","id":"box"})).unwrap();
     let c = f.shared.lock().unwrap();
     c.db.execute(
         "INSERT INTO transfer_locks(machine,transfer) VALUES('physical',?1)",
@@ -310,21 +314,22 @@ fn a_running_moved_box_refuses_resize_and_a_transfer_lock_refuses_every_mutation
     )
     .unwrap();
     drop(c);
+    let before = target.ops().len();
     for request in [
         json!({"op":"delete","id":"box"}),
         json!({"op":"resize","id":"box","memory_mib":512}),
         json!({"op":"snapshot","id":"box","name":"locked"}),
-        json!({"op":"snapshot-delete","id":"box","name":"locked"}),
+        json!({"op":"snapshot-delete","id":"box","name":"held"}),
         json!({"op":"ssh-keys","id":"box","keys":[]}),
     ] {
-        assert!(operate(&f, request.clone()).is_err(), "{request}");
+        let error = operate(&f, request.clone()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("transfer-aware routing"),
+            "{request}: {error:#}"
+        );
     }
-    assert!(
-        target
-            .ops()
-            .iter()
-            .all(|r| !matches!(r["op"].as_str(), Some("delete" | "snapshot" | "ssh-keys")))
-    );
+    // Refused before any runner contact, inventory refresh included.
+    assert_eq!(target.ops().len(), before);
 }
 
 #[test]
@@ -523,7 +528,11 @@ fn a_moved_box_deletes_on_its_runner_and_releases_rows_reservations_and_roots() 
     .unwrap();
     assert_eq!(deleted["deleted"], "box");
     assert_eq!(target.last("delete")["placement"], placement);
-    assert!(source.ops().iter().all(|r| r["op"] != "delete"));
+    // The old runner's fenced copy goes too, under that copy's own placement.
+    assert_eq!(
+        source.last("delete")["placement"],
+        peers.borrow().source.as_ref().unwrap()["placement"]
+    );
     assert_eq!(rows(&f, "SELECT COUNT(*) FROM resources"), 0);
     assert_eq!(
         rows(
@@ -681,25 +690,191 @@ fn a_cross_runner_fork_child_resizes_snapshots_rekeys_and_deletes_on_its_runner(
     assert!(placement_of(&f, "physical")["node"] == "source");
 }
 
-#[test]
-fn a_parked_box_deletes_without_runner_contact() {
-    let (f, _peers) = parked_fixture("stopped");
+/// A box parked from runner "source": no runner runs it, that runner keeps its fenced export.
+fn parked() -> (Fixture, RefCell<Peers>) {
+    let (f, peers) = parked_fixture("stopped");
     let c = f.shared.lock().unwrap();
     let t = c.transfer(f.transfer.id).unwrap();
     c.advance_transfer(t.id, t.epoch, t.step, Step::Aborted, &Evidence::default())
         .unwrap();
     c.db.execute("UPDATE resources SET node='',reserved_mib=0,reserved_cpus=0,current_capture='capture' WHERE physical='physical'",[]).unwrap();
+    c.db.execute("UPDATE nodes SET heartbeat=?1,capabilities=json_set(capabilities,'$.managed_lifecycle_v1',json('true'))",[now()]).unwrap();
     drop(c);
+    peers.borrow_mut().source.as_mut().unwrap()["lifecycle"]["phase"] = json!("exported");
+    (f, peers)
+}
+
+#[test]
+fn a_parked_box_deletes_its_parking_runners_fenced_copy_and_releases_its_capture() {
+    let (f, peers) = parked();
+    let copy = peers.borrow().source.clone().unwrap();
+    let source = Runner::serve(&f.root, "source", vec![copy.clone()]);
     let deleted = operate(
         &f,
         json!({"op":"delete","id":"box","operation_key":"parked"}),
     )
     .unwrap();
     assert_eq!(deleted["deleted"], "box");
+    assert_eq!(source.last("delete")["placement"], copy["placement"]);
     assert_eq!(rows(&f, "SELECT COUNT(*) FROM resources"), 0);
-    // Its stored capture is no longer rooted; the history row stays for collection.
+    // Its stored capture is no longer a store root; the history row stays for collection.
     assert_eq!(
         rows(&f, "SELECT COUNT(*) FROM artifacts WHERE id='capture'"),
+        1
+    );
+    assert_eq!(
+        rows(
+            &f,
+            "SELECT COUNT(*) FROM resources WHERE current_capture='capture'"
+        ) + rows(
+            &f,
+            "SELECT COUNT(*) FROM transfers WHERE capture='capture' AND step NOT IN ('succeeded','aborted','failed')"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_parked_box_deletes_its_stored_snapshot_from_the_catalog_alone() {
+    let (f, _peers) = parked();
+    let c = f.shared.lock().unwrap();
+    c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'snapshot','kept','s-kept',?2,'')",params![f.user,json!({"name":"s-kept","workspace":"physical","memory_mib":256,"vcpu_count":1,"disk_bytes":4,"state":"ready"}).to_string()]).unwrap();
+    c.db.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,attempt,digest,store_url) VALUES('kept-artifact','snapshot',?1,'physical','s-kept','stored',?2,?3,'s3://bucket/root')",params![f.user,"c".repeat(32),"d".repeat(64)]).unwrap();
+    drop(c);
+    // No runner socket exists: any runner contact would fail this delete.
+    operate(&f, json!({"op":"snapshot-delete","id":"box","name":"kept"})).unwrap();
+    assert_eq!(
+        rows(&f, "SELECT COUNT(*) FROM resources WHERE kind='snapshot'"),
+        0
+    );
+}
+
+#[test]
+fn an_unstored_snapshot_on_the_old_runner_is_removed_there_by_snapshot_delete_and_delete() {
+    let (f, peers) = completed(Kind::Move, true);
+    let c = f.shared.lock().unwrap();
+    // Taken before the box was managed: no disk size, so it can never be published.
+    for (name, physical) in [("first", "s-first"), ("second", "s-second")] {
+        c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'snapshot',?2,?3,?4,'source')",params![f.user,name,physical,json!({"name":physical,"workspace":"physical","memory_mib":256,"vcpu_count":1,"state":"ready"}).to_string()]).unwrap();
+    }
+    drop(c);
+    let old = peers.borrow().source.as_ref().unwrap()["placement"].clone();
+    let (source, target) = runners(&f, &peers);
+    // The old runner is offline: nothing is forgotten while its copy may remain.
+    let offline = |down: bool| {
+        f.shared
+            .lock()
+            .unwrap()
+            .db
+            .execute(
+                "UPDATE nodes SET heartbeat=?1 WHERE id='source'",
+                [if down { 0 } else { now() }],
+            )
+            .unwrap();
+    };
+    offline(true);
+    let error = operate(
+        &f,
+        json!({"op":"snapshot-delete","id":"box","name":"first"}),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("offline"), "{error:#}");
+    assert_eq!(
+        rows(&f, "SELECT COUNT(*) FROM resources WHERE kind='snapshot'"),
+        2
+    );
+    offline(false);
+    operate(
+        &f,
+        json!({"op":"snapshot-delete","id":"box","name":"first"}),
+    )
+    .unwrap();
+    let removed = source.last("snapshot-delete");
+    assert_eq!(
+        (removed["name"].clone(), removed["placement"].clone()),
+        (json!("s-first"), old.clone())
+    );
+    assert!(target.ops().iter().all(|r| r["op"] != "snapshot-delete"));
+    // Deleting the box removes its old fenced copy too, which takes that runner's snapshots.
+    let placement = placement_of(&f, "physical");
+    offline(true);
+    let error = operate(&f, json!({"op":"delete","id":"box","operation_key":"gone"})).unwrap_err();
+    assert!(format!("{error:#}").contains("offline"), "{error:#}");
+    // Its own runner holds the tombstone already; the catalog keeps the box until the old copy goes.
+    assert_eq!(target.last("delete")["placement"], placement);
+    assert_eq!(
+        rows(&f, "SELECT COUNT(*) FROM resources WHERE kind='machine'"),
+        1
+    );
+    offline(false);
+    operate(&f, json!({"op":"delete","id":"box","operation_key":"gone"})).unwrap();
+    assert_eq!(source.last("delete")["placement"], old);
+    assert_eq!(rows(&f, "SELECT COUNT(*) FROM resources"), 0);
+}
+
+#[test]
+fn a_runner_copy_with_no_box_record_keeps_its_publication_while_listed() {
+    let (f, _peers) = completed(Kind::Move, false);
+    let c = f.shared.lock().unwrap();
+    c.db.execute("INSERT INTO artifacts(id,kind,owner,machine,local_name,state,attempt,digest,store_url) VALUES('pulled','snapshot',?1,'physical','s-pulled','stored',?2,?3,'s3://bucket/root')",params![f.user,"c".repeat(32),"d".repeat(64)]).unwrap();
+    c.db.execute("INSERT INTO drain_publications(node,name,artifact,manifest) VALUES('target','s-pulled','pulled','{}')",[]).unwrap();
+    drop(c);
+    let listed = std::cell::Cell::new(true);
+    let call = |_: &str, r: Value| -> Result<Value> {
+        match r["op"].as_str().unwrap() {
+            "inspect" => anyhow::bail!("workspace not found"),
+            "snapshots" => Ok(if listed.get() {
+                json!([{"name":"s-pulled"}])
+            } else {
+                json!([])
+            }),
+            other => panic!("unexpected {other}"),
+        }
+    };
+    for (item, result) in publication::pass(&f.shared, &call) {
+        result.unwrap_or_else(|e| panic!("{item}: {e:#}"));
+    }
+    assert_eq!(rows(&f, "SELECT COUNT(*) FROM drain_publications"), 1);
+    listed.set(false);
+    for (item, result) in publication::pass(&f.shared, &call) {
+        result.unwrap_or_else(|e| panic!("{item}: {e:#}"));
+    }
+    assert_eq!(rows(&f, "SELECT COUNT(*) FROM drain_publications"), 0);
+}
+
+#[test]
+fn a_snapshot_a_fork_already_uploaded_is_still_published_as_a_snapshot() {
+    let (f, peers) = completed(Kind::Fork, false);
+    // The fork's own capture was published as its transfer capture; name it as a snapshot.
+    let capture: String = f
+        .shared
+        .lock()
+        .unwrap()
+        .db
+        .query_row(
+            "SELECT a.local_name FROM artifacts a JOIN transfers t ON t.capture=a.id WHERE t.id=?1",
+            [f.transfer.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    f.shared.lock().unwrap().db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'snapshot','forked-from',?2,?3,'source')",params![f.user,capture,json!({"name":capture,"workspace":"physical","memory_mib":256,"vcpu_count":1,"disk_bytes":4,"state":"ready"}).to_string()]).unwrap();
+    let call = |node: &str, r: Value| -> Result<Value> {
+        match r["op"].as_str().unwrap() {
+            "capture-published" => Ok(json!({"present":false})),
+            "capture-push" => Ok(publication(&r, true)),
+            _ => moving_call(&f, &peers, node, r),
+        }
+    };
+    for (item, result) in publication::pass(&f.shared, &call) {
+        result.unwrap_or_else(|e| panic!("{item}: {e:#}"));
+    }
+    assert_eq!(
+        rows(
+            &f,
+            &format!(
+                "SELECT COUNT(*) FROM artifacts WHERE kind='snapshot' AND state='stored' AND local_name='{capture}'"
+            )
+        ),
         1
     );
 }

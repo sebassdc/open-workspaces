@@ -386,8 +386,8 @@ refused while a transfer lock is held.
 | `ssh-authorize`, `ssh-revoke` | Key replacement on the current runner, then the catalog stores the new public policy and advances its generation, which invalidates any transfer admitted against the old one. |
 | `resize` | Stopped boxes only, as for any box: CPU, RAM and disk growth. The worker reply has no placement, so the catalog saves its own post-effect `inspect`, which must name the committed placement. A later move or park takes the new shape. |
 | `snapshot` | A named capture on the current runner, sealed `managed` like every capture of a managed box. The catalog records the box's disk size with it, for publication and forks. |
-| `snapshot-delete` | On the snapshot's runner while the box is there. A snapshot already in the artifact store and no longer on the box's runner is removed from the catalog alone. |
-| `delete` | Stopped or hibernated boxes only. The worker removes the disk, recovery journal and the box's local snapshots, and keeps its fence as a **tombstone** (`cleaned`, no export intent, state `deleted`): any later request, including an import at a newer epoch, is refused. A repeated delete answers from the tombstone, so a lost reply is safe to retry. The catalog then drops the box, its grants, quota allocation and snapshot rows. A **parked** box deletes in the catalog alone; its stored capture and any fenced source export stay until store collection and runner drain, as after every park. |
+| `snapshot-delete` | On the snapshot's runner while the box is there. A snapshot already in the artifact store and no longer on the box's runner is removed from the catalog alone. One not yet stored on a runner the box left is first removed there, under that copy's own fenced placement. |
+| `delete` | Stopped or hibernated boxes only. The worker removes the disk, recovery journal and the box's local snapshots, and keeps its fence as a **tombstone** (`cleaned`, no export or import intent, state `deleted`): any later request, including an import at a newer epoch, is refused. A repeated delete answers from the tombstone, so a lost reply is safe to retry. Then every runner the box was moved or parked from deletes its fenced copy the same way, under that copy's own placement, which takes the snapshots and hibernation captures left there. Only then does the catalog drop the box, its grants, quota allocation and snapshot rows. An offline old runner refuses the delete with its name; the box stays listed (its own runner already holds the tombstone) and the retry finishes. A **parked** box has no runner copy to delete first. Retired runners are skipped. |
 
 Delete and named-snapshot deletion need `managed_lifecycle_v1` from the runner's
 actual worker (`ow nodes` shows it under each runner's capabilities); the controller
@@ -414,10 +414,15 @@ Snapshot listings show the stored `artifact` ID, which the owner can restore wit
 runner than the box's own). A deleted snapshot or box stops rooting its artifact;
 the [collector](STORE_GC.md) removes it after its grace period.
 
-Limits: snapshots taken before this release without a recorded disk size are not
-published; a shared user's own snapshot of a box is published and rehomed, but forks
-from the store only for the box owner; snapshots of boxes that were never managed
-keep their runner-bound behavior.
+A runner copy whose box that runner no longer knows (a capture a fork pulled, say)
+keeps its publication record, and so its store root, for as long as the runner lists it.
+
+Limits: snapshots taken before this release have no recorded disk size and are not
+published (they stay on their runner, are deleted there, and fork only there); every
+capture now records it. A shared user's own snapshot of a box is published and
+rehomed, but forks from the store only for the box owner. A fork child's imported
+capture stays on its runner after the child is deleted. Snapshots of boxes that were
+never managed keep their runner-bound behavior.
 
 The focused tests run real move and fork transfers, then each operation against
 runner sockets that refuse any other placement, including after the move's source

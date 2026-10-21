@@ -149,21 +149,27 @@ pub(super) fn publish_named(
 ) -> Result<()> {
     let (a, expires) = {
         let c = shared.lock().unwrap();
-        // Already published transfer captures keep their original artifact/root; do not duplicate them.
-        if c.db.query_row("SELECT EXISTS(SELECT 1 FROM artifacts a JOIN transfers t ON t.capture=a.id JOIN operations o ON o.id=t.operation WHERE a.local_name=?1 AND a.machine=?2 AND a.state='stored' AND t.step='succeeded' AND json_extract(o.response,'$.capture_manifest.metadata.native_manifest') IS NOT NULL)",params![snapshot,machine],|r|r.get::<_,bool>(0))? {return Ok(());}
+        // Already published transfer captures keep their original artifact/root; do not duplicate
+        // them for drain. A named snapshot is published as one, so it forks and rehomes.
+        if expected.is_some() && c.db.query_row("SELECT EXISTS(SELECT 1 FROM artifacts a JOIN transfers t ON t.capture=a.id JOIN operations o ON o.id=t.operation WHERE a.local_name=?1 AND a.machine=?2 AND a.state='stored' AND t.step='succeeded' AND json_extract(o.response,'$.capture_manifest.metadata.native_manifest') IS NOT NULL)",params![snapshot,machine],|r|r.get::<_,bool>(0))? {return Ok(());}
         let owner:i64=c.db.query_row("SELECT owner FROM resources WHERE (kind='snapshot' AND physical=?1 AND json_extract(metadata,'$.workspace')=?2) OR (kind='machine' AND physical=?2 AND ?1 LIKE 'sleep-%')",params![snapshot,machine],|r|r.get(0)).context("unmanaged or incomplete local capture; retained")?;
-        let id = format!(
+        let mut id = format!(
             "drain-{}",
             &store::sha256(format!("{node}:{snapshot}").as_bytes())[..26]
         );
+        // A copy published before, then removed and since pulled back onto this runner, has a
+        // stored artifact but no record here; its new record gets the next ID in this chain.
+        while c.db.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE id=?1 AND state<>'uploading') AND NOT EXISTS(SELECT 1 FROM drain_publications WHERE node=?2 AND name=?3)",params![id,node,snapshot],|r|r.get::<_,bool>(0))? {
+            id = format!("drain-{}", &store::sha256(id.as_bytes())[..26]);
+        }
         let url = crate::image_store::configured_url(&c.root)?;
         let tx =
             rusqlite::Transaction::new_unchecked(&c.db, rusqlite::TransactionBehavior::Immediate)?;
-        if let Some(raw) = tx
+        if let Some((raw, artifact)) = tx
             .query_row(
-                "SELECT manifest FROM drain_publications WHERE node=?1 AND name=?2",
+                "SELECT manifest,artifact FROM drain_publications WHERE node=?1 AND name=?2",
                 params![node, snapshot],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?
         {
@@ -180,7 +186,7 @@ pub(super) fn publish_named(
             ensure!(
                 tx.query_row(
                     "SELECT state='stored' AND digest=?2 FROM artifacts WHERE id=?1",
-                    params![id, store::sha256(&manifest.bytes()?)],
+                    params![artifact, store::sha256(&manifest.bytes()?)],
                     |r| r.get::<_, bool>(0)
                 )?,
                 "named capture is no longer stored"

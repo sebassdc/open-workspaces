@@ -139,8 +139,17 @@ fn remove_copy(
                 request["placement"] = seen["placement"].clone();
             }
         }
-        // That runner no longer knows the box, so it holds none of its snapshots.
-        Err(error) if format!("{error:#}").contains("workspace not found") => return forget(),
+        // That runner no longer knows the box. A copy there (one a fork pulled, say) has no
+        // owner to delete it through, so its record stays as long as the runner lists it.
+        Err(error) if format!("{error:#}").contains("workspace not found") => {
+            let listed = call(node, json!({"op":"snapshots"}))?;
+            let held = listed
+                .as_array()
+                .context("invalid snapshot inventory")?
+                .iter()
+                .any(|s| s["name"] == snapshot);
+            return if held { Ok(()) } else { forget() };
+        }
         Err(error) => return Err(error),
     }
     let result = call(node, request)?;

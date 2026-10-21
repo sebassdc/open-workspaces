@@ -1156,6 +1156,7 @@ impl Runtime {
         if self.deleted(id) {
             return Ok(json!({"deleted":id,"snapshots":[]}));
         }
+        self.require_deletable(id)?;
         ensure!(
             !self.machines.contains_key(id),
             "workspace is running; stop or hibernate it first"
@@ -1869,10 +1870,9 @@ impl Runtime {
             return self.lifecycle_request(request);
         }
         if !id.is_empty() && !matches!(op, "inspect" | "placement-check") {
-            // Deleting a named snapshot never runs the copy, so a fenced source may do it;
-            // a repeated managed delete answers from its own tombstone.
-            let active = !(op == "snapshot-delete" || op == "delete" && self.deleted(id));
-            self.authorize(request, active)?;
+            // Deleting a named snapshot never runs the copy, so a fenced source may do it; a
+            // managed delete checks the copy's phase itself (an old fenced copy may go too).
+            self.authorize(request, !matches!(op, "snapshot-delete" | "delete"))?;
             ensure!(
                 !self.state.placements.contains_key(id)
                     || !matches!(op, "restore" | "fork" | "image-save"),
