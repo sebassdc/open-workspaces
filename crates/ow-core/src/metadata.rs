@@ -351,7 +351,7 @@ pub fn peer_index(peer: SocketAddr, local: SocketAddr) -> Option<u32> {
         .then(|| u32::from(c) * 64 + u32::from(d) / 4)
 }
 
-type Resolve = Arc<dyn Fn(SocketAddr, SocketAddr) -> Option<u32> + Send + Sync>;
+pub(crate) type Resolve = Arc<dyn Fn(SocketAddr, SocketAddr) -> Option<u32> + Send + Sync>;
 
 /// Listen on [`PORT`] in this (the worker's) network namespace.
 pub fn start() -> Result<()> {
@@ -361,7 +361,7 @@ pub fn start() -> Result<()> {
 }
 
 /// Answer connections on their own threads; `resolve` names the box of a connection.
-fn serve(listener: TcpListener, resolve: Resolve) {
+pub(crate) fn serve(listener: TcpListener, resolve: Resolve) {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };

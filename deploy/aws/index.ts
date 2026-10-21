@@ -86,6 +86,12 @@ export interface HostArgs {
     storeUrl?: pulumi.Input<string>;
     /** Controller-only GC rights. Default false; never enables a timer or deletion. Needs storeUrl. */
     storeGc?: boolean;
+    /**
+     * Per-box AWS roles in metadata mode: the host role may assume, tag and name the source
+     * identity of roles under the IAM path `/ow-box/` in this account, nothing else. Only IAM:
+     * the mode itself is switched on the controller (`aws-identity.json`). Default false.
+     */
+    boxRoles?: boolean;
     /** Digest-pinned base images to pull instead of building developerImages locally. */
     imageArtifacts?: pulumi.Input<{ [profile: string]: pulumi.Input<ImageArtifact> }>;
     /**
@@ -110,7 +116,7 @@ export interface HostArgs {
 }
 
 /** A runner host: Host inputs except dashboard, role and GC rights, plus the controller it joins. */
-export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability" | "poolAdmins" | "role" | "storeGc"> {
+export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability" | "poolAdmins" | "role" | "storeGc" | "boxRoles"> {
     // The package analyzer loses optional types inherited through Omit.
     vcpuOvercommit?: pulumi.Input<number>;
     hostReserveCpuMillis?: pulumi.Input<number>;
@@ -340,6 +346,19 @@ export function nodeId(name: string): string {
     return name;
 }
 
+/** The controller's per-box AWS roles: only roles under `/ow-box/` of its own account. */
+export function boxRolesPolicy(partition: string, account: string): string {
+    if (!/^\d{12}$/.test(account)) throw new Error("invalid AWS account");
+    return JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Action: ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"],
+            Resource: `arn:${partition}:iam::${account}:role/ow-box/*`,
+        }],
+    });
+}
+
 /** Own backup writes; controllers also read runner snapshots. Never grants store access or deletion. */
 export function backupPolicy(partition: string, url: string, includeRunnerSnapshots = true): string {
     const { bucket, prefix } = backupLocation(url);
@@ -469,6 +488,12 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
             if (controller || !args.storeUrl) throw new Error("storeGc needs a controller host and storeUrl");
             new aws.iam.RolePolicy(`${name}-store-gc`, { role: role.id,
                 policy: pulumi.all([partition, args.storeUrl]).apply(([p, url]) => storeGcPolicy(p, url)) }, parent);
+        }
+        if (args.boxRoles) {
+            if (controller) throw new Error("boxRoles is for the controller host, not a runner");
+            const account = aws.getCallerIdentityOutput({}, parent).accountId;
+            new aws.iam.RolePolicy(`${name}-box-roles`, { role: role.id,
+                policy: pulumi.all([partition, account]).apply(([p, a]) => boxRolesPolicy(p, a)) }, parent);
         }
         if (args.storeUrl) {
             new aws.iam.RolePolicy(`${name}-store`, { role: role.id,

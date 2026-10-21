@@ -2928,6 +2928,91 @@ mod disk_tests {
     }
 
     #[test]
+    fn aws_creds_stay_in_memory_and_are_served_while_the_runtime_is_busy() {
+        use std::io::{Read, Write};
+        let mut runtime = fixture();
+        // Its own box ID: the credential store is the process's, shared by parallel tests.
+        let mut workspace = runtime.state.workspaces["legacy"].clone();
+        workspace.id = "aws-meta".into();
+        workspace.state = "hibernated".into();
+        workspace.hibernation = Some("sleep-fixture".into());
+        runtime
+            .state
+            .workspaces
+            .insert("aws-meta".into(), workspace);
+        let expiration = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let creds = json!({"op":"aws-creds","id":"aws-meta","role_arn":"arn:aws:iam::111122223333:role/ow-box/reader","generation":1,"hop_limit":1,
+            "access_key_id":"ASIARUNTIME","secret_access_key":"runtimeSecret","session_token":"runtimeToken","expiration":expiration,"region":"us-east-1"});
+        // A hibernated box keeps them for its wake, and is neither woken nor kept awake.
+        assert_eq!(runtime.request(&creds).unwrap(), json!({"stored":true}));
+        assert_eq!(runtime.state.workspaces["aws-meta"].state, "hibernated");
+        assert!(!runtime.machines.contains_key("aws-meta"));
+        let check = json!({"op":"aws-creds","id":"aws-meta","check":true,"generation":1});
+        assert_eq!(runtime.request(&check).unwrap(), json!({"present":true}));
+        // Only for a box this worker hosts; never written to disk.
+        let mut elsewhere = creds.clone();
+        elsewhere["id"] = json!("not-here");
+        assert!(runtime.request(&elsewhere).is_err());
+        let mut files = vec![runtime.root.clone()];
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            } else if path.metadata().unwrap().len() < 1 << 20 {
+                let text = String::from_utf8_lossy(&fs::read(&path).unwrap()).to_string();
+                assert!(!text.contains("runtimeSecret"), "{}", path.display());
+            }
+        }
+        // Answers while the worker's runtime lock is held, as during a fork or restore.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        crate::metadata::serve(listener, std::sync::Arc::new(|_, _| Some(9100)));
+        crate::metadata::attach(9100, "aws-meta").unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let busy = shared.lock().unwrap();
+        let ask = |request: String| {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            reply.split_once("\r\n\r\n").unwrap().1.to_owned()
+        };
+        let token = ask("PUT /latest/api/token HTTP/1.1\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\nConnection: close\r\n\r\n".into());
+        let answer = ask(format!(
+            "GET /latest/meta-data/iam/security-credentials/reader HTTP/1.1\r\nX-aws-ec2-metadata-token: {token}\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(answer.contains("ASIARUNTIME"), "{answer}");
+        drop(busy);
+        let mut runtime = std::sync::Arc::into_inner(shared)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        crate::metadata::detach(9100);
+        // A stop drops them; deleting the box forgets its role.
+        runtime
+            .request(&json!({"op":"stop","id":"aws-meta"}))
+            .unwrap();
+        assert_eq!(runtime.request(&check).unwrap(), json!({"present":false}));
+        assert_eq!(
+            runtime
+                .request(&json!({"op":"aws-creds","id":"aws-meta"}))
+                .unwrap(),
+            json!({"cleared":true})
+        );
+        assert_eq!(
+            runtime.request(&json!({"op":"status"})).unwrap()["aws_metadata_v1"],
+            true
+        );
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
     fn recovery_replaces_an_unpinned_sleep_source_after_wake() {
         use crate::recovery::{Point, Recovery};
         let mut runtime = fixture();

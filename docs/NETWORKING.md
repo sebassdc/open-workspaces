@@ -25,6 +25,13 @@ assigned to another TAP. Management can still connect to the guest. A temporary
 asset listener binds only the requesting guest's host TAP address and verifies
 its peer address; it serves a fixed hash-verified project asset.
 
+The runner's own instance metadata (`169.254.169.254`) stays unreachable from
+guests: only TCP port 80 to that address arriving on a box TAP is redirected (nft
+`prerouting`) to the worker's per-box AWS metadata listener on the TAP's own host
+address, which answers as EC2 does for boxes with an attached role and with `404`
+otherwise, and never forwards anything ([per-box AWS access](AWS_ACCESS.md#metadata-mode)).
+That listener's port is closed on every interface but the TAPs.
+
 The supervisor owns both child processes and cleans them up together. An uplink
 exit causes worker shutdown; disks and existing checkpoints remain recoverable.
 Restart the worker to refresh the host-interface deny list after address changes.

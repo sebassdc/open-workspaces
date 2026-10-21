@@ -684,3 +684,6 @@ fn configured_pool_admin_and_transfer_reset_follow_aws_authority() {
 
 #[path = "aws_metadata_tests.rs"]
 mod metadata;
+
+#[path = "aws_metadata_e2e.rs"]
+mod e2e;

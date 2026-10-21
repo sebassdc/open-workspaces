@@ -129,7 +129,10 @@ dashboard.
 
 The fake worker accepts the token delivery call; that a guest's AWS SDK turns
 the token into credentials is checked by `crates/ow-core/tests/web_identity_chain.rs`
-against a mock STS (see [per-box AWS access](AWS_ACCESS.md)).
+against a mock STS (see [per-box AWS access](AWS_ACCESS.md)). The dialog is the same
+in metadata mode, where the details say "credentials" instead of "token"; the
+metadata endpoint, STS and withdrawal paths are covered by Rust tests and the
+isolated-network end-to-end test listed there.
 
 ## Host pool
 

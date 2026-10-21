@@ -1,6 +1,9 @@
 # ADR 0008: per-box AWS access through controller-issued web identity
 
-Status: implemented (release 0.9.37), off by default. Live AWS acceptance with a real
+Status: implemented (release 0.9.37), off by default. Superseded for controllers on
+EC2 with an instance role by [ADR 0009](0009-per-box-aws-metadata-endpoint.md)
+(metadata mode, 0.9.40); still the default mode and the choice for controllers
+outside AWS. Live AWS acceptance with a real
 IAM OIDC provider and role is pending; see [per-box AWS access](../AWS_ACCESS.md).
 Pattern: the [CredentialBroker](../CREDENTIAL_BROKER.md) workload identity (host-resolved
 box ID plus generation, hashed session identity, exact role ARNs, no fallback grant),

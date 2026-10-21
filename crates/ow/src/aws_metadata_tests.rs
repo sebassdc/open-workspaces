@@ -5,10 +5,10 @@ use crate::aws_metadata::Assume;
 use ow_core::sts;
 use std::sync::Weak;
 
-const READER: &str = "arn:aws:iam::111122223333:role/ow-box/reader";
+pub(super) const READER: &str = "arn:aws:iam::111122223333:role/ow-box/reader";
 const ADMIN_ONLY: &str = "arn:aws:iam::111122223333:role/ow-box/a-only";
 
-fn metadata_config() -> Value {
+pub(super) fn metadata_config() -> Value {
     json!({"mode":"metadata","allowed_roles":[
         {"role_arn":READER,"owners":["a@example.test","B@example.test"]},
         {"role_arn":ADMIN_ONLY,"owners":["a@example.test"]}]})
@@ -17,7 +17,7 @@ fn metadata_config() -> Value {
 type During = Box<dyn FnMut(&Arc<Mutex<Catalog>>)>;
 
 /// STS stand-in: checks it is called with the catalog unlocked and records each request.
-struct FakeSts {
+pub(super) struct FakeSts {
     catalog: Weak<Mutex<Catalog>>,
     calls: Vec<(String, String, String, String)>,
     fail: bool,
@@ -26,7 +26,7 @@ struct FakeSts {
 }
 
 impl FakeSts {
-    fn new(catalog: &Arc<Mutex<Catalog>>) -> Self {
+    pub(super) fn new(catalog: &Arc<Mutex<Catalog>>) -> Self {
         Self {
             catalog: Arc::downgrade(catalog),
             calls: Vec::new(),

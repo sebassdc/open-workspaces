@@ -552,6 +552,9 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
     }
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     let mut last = tokio::time::Instant::now();
+    // A new worker process holds no per-box AWS credentials: deliver them now.
+    #[cfg(target_os = "linux")]
+    let mut worker_pid = None;
     loop {
         tokio::select! {
             _=tick.tick()=>{
@@ -578,6 +581,10 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
                             cap["vcpus"]=json!(v["vcpus"].as_u64().unwrap().min(cpus));
                             if let Some(o)=cap.as_object_mut(){o.remove("type");o.remove("ready_ack");}
                             if db.execute("UPDATE nodes SET heartbeat=?1,capabilities=?2 WHERE id=?3 AND session=?4 AND revoked=0",params![now(),cap.to_string(),node,generation]).is_ok_and(|n|n==1) {
+                                #[cfg(target_os="linux")]
+                                if v["aws_metadata_v1"]==true && worker_pid.replace(v["worker_pid"].clone())!=Some(v["worker_pid"].clone()) {
+                                    crate::aws_identity::notify();
+                                }
                                 #[cfg(target_os="linux")]
                                 if v["image_store_v1"]==true {
                                     let (root,node,images)=(c.root.clone(),node.clone(),v["image_digests"].clone());
@@ -1138,6 +1145,7 @@ fn build_beat(
     beat["placement_fencing_v1"] = json!(common::placement_capable(status).is_ok());
     for field in [
         "compat",
+        "worker_pid",
         "max_disk_gib",
         "reserved_disk_bytes",
         "unwritten_disk_bytes",

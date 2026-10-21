@@ -83,6 +83,7 @@ export const instanceId = host.instanceId;
 | `tailscaleSsh` | `false` | Tailscale SSH, authorized by your tailnet policy. |
 | `dashboardLogins` | none | Tailnet logins allowed into the web dashboard. Needs `tailscaleAuthKeySecretArn`; see below. |
 | `poolAdmins` | none | Host only. Login emails that may transfer and fork any box and create boxes for others (the dashboard config's `pool_admins`; see [pool admins](../../docs/USERS.md#pool-admins-and-transfers)). Admits nobody by itself; needs `dashboardLogins` or `dashboardCapability`. A change restarts only the dashboard. |
+| `boxRoles` | `false` | Host only. Lets the host role assume roles under the IAM path `/ow-box/` of this account (with session tags and source identity), for [per-box AWS roles in metadata mode](../../docs/AWS_ACCESS.md). IAM only: the mode is switched on the controller in `aws-identity.json`. |
 | `dashboardCapability` | none | Application capability (`example.com/cap/open-workspaces`) admitting tailnet users without a login list. Needs `tailscaleAuthKeySecretArn`. Either this or `dashboardLogins` enables the dashboard; if both are set, either admits. |
 | `developerImages` | none | `["ubuntu"]`: build the [developer image](../../docs/GUEST_IMAGES.md) (user `dev`, SSH server, toolchains) after boot. SSH into boxes and golden-image recipes need it. |
 | `role` | `host` | `controller` opts a new host into remote-only capacity: no local worker, agent, images or KVM. In-place role conversion is refused. |

@@ -25,6 +25,7 @@ pulumi.runtime.setMocks({
         "aws:ec2/getSubnets:getSubnets": { ids: ["subnet-1"] },
         "aws:ec2/getSubnet:getSubnet": { id: "subnet-1", vpcId: "vpc-1", availabilityZone: "us-east-1a" },
         "aws:index/getPartition:getPartition": { partition: "aws" },
+        "aws:index/getCallerIdentity:getCallerIdentity": { accountId: "111122223333" },
         "aws:index/getRegion:getRegion": { region: "us-east-1", name: "us-east-1" },
         "aws:ssm/getParameter:getParameter": { value: "ami-1" },
     })[args.token] ?? {},
@@ -338,6 +339,19 @@ test("recovery opt-in preserves dashboard, CPU and artifact store configuration"
         images: { alpine: { version: 1, attempt: "a".repeat(32), digest: "b".repeat(64) } } });
     assert.equal(result.config.dashboard.capability, "example.test/cap/open-workspaces");
     assert.equal(result.config.backup.recovery, true);
+});
+
+test("box roles IAM is opt in and limited to /ow-box/ roles of this account", async () => {
+    const plain = await deploy({});
+    assert.ok(!created.some(r => r.name === "ow-test-box-roles"));
+    const enabled = await deploy({ boxRoles: true });
+    assert.equal(enabled.userData, plain.userData, "IAM only: nothing on the host changes");
+    assert.deepEqual(enabled.config, plain.config);
+    const policy = created.find(r => r.name === "ow-test-box-roles");
+    assert.equal(policy.type, "aws:iam/rolePolicy:RolePolicy");
+    assert.deepEqual(JSON.parse(policy.inputs.policy).Statement, [{ Effect: "Allow",
+        Action: ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"],
+        Resource: "arn:aws:iam::111122223333:role/ow-box/*" }]);
 });
 
 test("GC IAM is opt in, preserves host inputs and creates no bucket or endpoint", async () => {

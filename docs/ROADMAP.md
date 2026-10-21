@@ -175,6 +175,9 @@ Gate: reproducible evidence and runtime decision, per HANDOFF.md.
   Its web-identity mode is implemented: [per-box AWS access](AWS_ACCESS.md) issues
   controller-signed OIDC tokens to boxes with an operator-allowed role; the
   real-AWS acceptance (OIDC provider and a test role) is the consumer's next step.
+  Its metadata mode (0.9.40) serves controller-assumed role credentials at the box's
+  instance metadata address for AWS-hosted controllers; live acceptance with a
+  throwaway `ow-box/` role is pending.
 - Persistent disk, initial immutable base images, protected HTTP publishing and explicit public routes.
 - Off-worker disk backup and restore onto a replacement worker; basic logs and operational metrics.
 
