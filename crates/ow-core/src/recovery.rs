@@ -86,7 +86,7 @@ impl Recovery {
             "failures": self.failures,
             "retry_at": if self.attempted_at == 0 { None } else { Some(self.retry_at()) },
             "retention": "latest local point plus pending; off-host points kept until explicit GC",
-            "semantics": "disk recovery; RAM resume requires compatible runtime, CPU and kernel"
+            "semantics": "disk recovery: a running box's point is its disk alone and restores as a cold boot; a hibernated box's point keeps RAM, which resumes only on a compatible runtime, CPU and kernel"
         })
     }
 }

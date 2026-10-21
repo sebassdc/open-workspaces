@@ -81,6 +81,12 @@ fn as_guest() -> std::io::Result<()> {
 }
 
 pub fn reflink(source: &Path, destination: &Path) -> Result<()> {
+    clone_file(source, destination)?.sync_all()?;
+    Ok(())
+}
+
+/// A reflink not yet flushed: the caller syncs it, for example after the guest runs again.
+fn clone_file(source: &Path, destination: &Path) -> Result<File> {
     let src = File::open(source)?;
     let dst = OpenOptions::new()
         .write(true)
@@ -94,14 +100,12 @@ pub fn reflink(source: &Path, destination: &Path) -> Result<()> {
         let mut src = src;
         let mut dst = dst;
         std::io::copy(&mut src, &mut dst)?;
-        dst.sync_all()?;
-        return Ok(());
+        return Ok(dst);
     }
     if rc < 0 {
         return Err(std::io::Error::last_os_error()).context("disk reflink failed");
     }
-    dst.sync_all()?;
-    Ok(())
+    Ok(dst)
 }
 
 /// Reflinks an open file (which may already be unlinked) to a new `destination`.
@@ -582,6 +586,23 @@ impl Vm {
         }
     }
 
+    /// A crash-consistent copy of the disk alone (an automatic recovery point): the guest
+    /// is paused only while the disk is reflinked, and no RAM is written. The clone is
+    /// flushed after the guest runs again, and the dirty-page base of the next RAM capture
+    /// is left as it was. Returns how long the guest was paused.
+    pub fn capture_disk(&mut self, directory: &Path, disk: &Path) -> Result<Duration> {
+        self.checked("sync")?;
+        let paused = Instant::now();
+        self.api("PATCH", "/vm", json!({"state":"Paused"}))?;
+        let cloned = clone_file(disk, &directory.join("disk.ext4"));
+        let resumed = self.resume();
+        let paused_for = paused.elapsed();
+        let cloned = cloned?;
+        resumed?;
+        cloned.sync_all()?;
+        Ok(paused_for)
+    }
+
     pub fn alive(&mut self) -> bool {
         self.child.try_wait().ok().flatten().is_none()
     }
@@ -960,12 +981,27 @@ pub(crate) fn capture_fixture(directory: &Path, resume: bool) -> (Vm, std::threa
     capture_fixture_steps(directory, resume, vec![CaptureStep::default()])
 }
 
+/// As [`capture_fixture`], for one disk-only recovery point.
+#[cfg(test)]
+pub(crate) fn disk_capture_fixture(directory: &Path) -> (Vm, std::thread::JoinHandle<()>) {
+    capture_fixture_steps(
+        directory,
+        true,
+        vec![CaptureStep {
+            disk_only: true,
+            ..CaptureStep::default()
+        }],
+    )
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct CaptureStep {
     snapshot_type: Option<&'static str>,
     resume_fails: bool,
     clock_exit: i32,
+    /// A disk-only recovery point: pause and resume, no `/snapshot/create`.
+    disk_only: bool,
 }
 
 #[cfg(test)]
@@ -1010,7 +1046,9 @@ fn capture_fixture_steps(
             if !reply("sync", 0) {
                 return;
             }
-            let endpoints = if resume {
+            let endpoints = if capture.disk_only {
+                vec!["/vm", "/vm"]
+            } else if resume {
                 vec!["/vm", "/snapshot/create", "/vm"]
             } else {
                 vec!["/vm", "/snapshot/create"]
@@ -1068,7 +1106,7 @@ fn capture_fixture_steps(
                 } else {
                     assert_eq!(body["state"], if step == 0 { "Paused" } else { "Resumed" });
                 }
-                let status = if step == 2 && capture.resume_fails {
+                let status = if step > 0 && endpoint == "/vm" && capture.resume_fails {
                     500
                 } else {
                     204
@@ -1079,7 +1117,7 @@ fn capture_fixture_steps(
                 )
                 .unwrap();
             }
-            if resume && !capture.resume_fails {
+            if (resume || capture.disk_only) && !capture.resume_fails {
                 assert!(reply("date -u -s ", capture.clock_exit));
             }
         }
@@ -1146,6 +1184,7 @@ mod memory_tests {
                     snapshot_type: Some("Diff"),
                     resume_fails: failure == "resume",
                     clock_exit: if failure == "clock" { 1 } else { 0 },
+                    ..Default::default()
                 },
                 CaptureStep {
                     snapshot_type: Some("Full"),
@@ -1209,6 +1248,40 @@ mod memory_tests {
     #[test]
     fn failed_resume_clock_update_forces_a_full_ram_retry() {
         capture_failure_forces_a_full_retry("clock");
+    }
+
+    #[test]
+    fn a_disk_only_point_writes_no_ram_and_keeps_the_next_capture_a_diff() {
+        let root = scratch();
+        let disk = root.join("disk.ext4");
+        std::fs::write(&disk, b"disk").unwrap();
+        let (mut vm, server) = disk_capture_fixture(&root);
+        let base = root.join("base");
+        std::fs::write(&base, b"old pages").unwrap();
+        vm.memory_base = MemoryBase::Image(File::open(&base).unwrap());
+        let staging = root.join("point");
+        std::fs::create_dir(&staging).unwrap();
+        // The fixture asserts the API calls: Paused then Resumed, never /snapshot/create.
+        let paused = vm.capture_disk(&staging, &disk).unwrap();
+        server.join().unwrap();
+        assert!(paused < Duration::from_secs(5));
+        assert_eq!(std::fs::read(staging.join("disk.ext4")).unwrap(), b"disk");
+        assert!(!staging.join("memory").exists() && !staging.join("state").exists());
+        // The dirty log was not reset, so the next RAM capture may still save a diff.
+        assert!(matches!(vm.memory_base, MemoryBase::Image(_)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_disk_only_point_resumes_the_guest_when_the_reflink_fails() {
+        let root = scratch();
+        let (mut vm, server) = disk_capture_fixture(&root);
+        let staging = root.join("point");
+        std::fs::create_dir(&staging).unwrap();
+        // The fixture only finishes after it saw Resumed and the clock resync.
+        assert!(vm.capture_disk(&staging, &root.join("missing")).is_err());
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

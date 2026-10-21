@@ -57,11 +57,24 @@ per-box error updates; monitor timer/service failure as well as box timestamps.
 ## Capture and retry
 
 A running box is due immediately on first participation, then 30 minutes after
-its last durable capture started. The existing capture syncs the guest, pauses
-it, takes paired RAM/disk state and resumes it before hashing the sealed files.
-Disk-only recovery is filesystem/crash recovery: applications may replay their
-journals, and writes still in RAM require compatible RAM restore to continue.
-Application-specific quiescing is not provided.
+its last durable capture started. From 0.9.39 a running box's recovery point is
+**disk-only**: the worker syncs the guest, pauses it only while it reflinks the
+disk (milliseconds on Btrfs/XFS; the clone is flushed after the guest runs again),
+and writes no RAM. The point keeps the usual three files with empty `state` and
+`memory`, and its manifest says `"disk_only": true`. Earlier releases also saved the
+whole guest RAM inside the pause: 15-52 s guest freezes for large boxes, and a
+multi-GB writeback burst that stalled every fsync on the data volume, including the
+controller's catalog, for minutes. Explicit snapshots, hibernation, moves and forks
+still capture RAM.
+
+A disk-only point is crash-consistent: it is what the disk held at the pause, as
+after a power cut. Restoring it is always a **cold boot**: applications replay their
+journals, and processes and writes still in RAM are lost. Application-specific
+quiescing is not provided. A hibernated box's point is its sealed sleep capture,
+which keeps RAM for a compatible resume (below). `ow list`'s `durability.semantics`
+states this. A worker with disk-only points advertises `recovery_disk_only_v1` in
+`status`; its node agent forwards it, so `ow nodes` shows it under each runner's
+capabilities (check every runner has it after upgrading).
 
 After ten minutes from the first observation of a sealed hibernation, the worker pins that sealed sleep capture under a
 unique managed name. That observation is journaled, so worker restarts preserve
@@ -129,7 +142,7 @@ extent map until then) a disk chunk is not read when:
 
 The memory file is matched the same way from 0.9.22: a capture lays its changed
 pages over a reflink of the previous image, so unchanged RAM shares extents with
-it. Anything else is read and hashed in parallel: changed disk and RAM ranges, the
+it (a disk-only point's memory file is empty). Anything else is read and hashed in parallel: changed disk and RAM ranges, the
 device state file (written whole by every capture), and every range whose
 mapping is unknown, delayed, compressed, encrypted or inline. Without an earlier
 seal (first point, a changed destination, or a durable point from an older
@@ -229,6 +242,9 @@ ow --local --data-dir /path/to/other-runner exec PHYSICAL_ID -- 'cat /path/to/ma
 
 Start the destination worker first. `--cold` boots the captured disk and loses
 RAM processes; without it, runtime, CPU/host kernel and guest kernel must match.
+A disk-only point always boots cold on a 0.9.39 worker, with or without `--cold`.
+Its manifest names no CPU (`"cpu": "none: disk-only recovery point"`), so an older
+worker refuses to resume it and asks for `--cold`, which works there too.
 Import refuses an existing workspace ID. Download verifies bytes before import
 and removes a failed destination. Controller catalog adoption and placement
 fencing belong to the separate fleet workstream: never start a second copy of a

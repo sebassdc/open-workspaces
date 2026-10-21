@@ -189,6 +189,7 @@ fn incremental_retry_integrity_and_legacy_restore() {
     failed_runs_resume_and_lost_indexes_reconcile(&root, &store);
     chunk_seals_transfer_without_rereading(&root, &store);
     abruptly_killed_upload_resumes(&root);
+    disk_only_points_round_trip(&root, &store);
     println!(
         "Observed: first capture 4 nonzero chunks; one changed disk chunk added 1; interrupted commit + replay added 0; no chunk HEAD requests; second-runner bytes and legacy reads verified."
     );
@@ -387,4 +388,35 @@ fn abruptly_killed_upload_resumes(root: &Path) {
             fs::read(root.join("abrupt").join(file)).unwrap()
         );
     }
+}
+
+/// An automatic recovery point holds its disk and empty RAM files: sealed while sent,
+/// committed, and restored with the empty files intact.
+fn disk_only_points_round_trip(root: &Path, store: &S3Store) {
+    let directory = root.join("disk-only");
+    fs::create_dir(&directory).unwrap();
+    let disk = distinct(2, 23);
+    for (file, data) in [
+        ("state", &b""[..]),
+        ("memory", &b""[..]),
+        ("disk.ext4", &disk[..]),
+    ] {
+        fs::write(directory.join(file), data).unwrap();
+    }
+    let (sealed, _) = store.upload_unsealed(&directory, None).unwrap().unwrap();
+    assert_eq!(sealed.len(), 3, "every file is sealed, the empty ones too");
+    ow_core::snapshot_digest::write_sidecar(&directory, &sealed).unwrap();
+    let manifest = json!({"name":"disk-only","workspace":"box","disk_only":true,
+        "files":ow_core::snapshot_digest::roots(&sealed),
+        "digest":ow_core::snapshot_digest::CHUNKS_V2});
+    fs::write(directory.join("manifest.json"), manifest.to_string()).unwrap();
+    store.push("disk-only", &directory).unwrap();
+    let restored = root.join("disk-only-restored");
+    store.pull("disk-only", &restored).unwrap();
+    assert_eq!(fs::read(restored.join("disk.ext4")).unwrap(), disk);
+    for file in ["state", "memory"] {
+        assert_eq!(fs::metadata(restored.join(file)).unwrap().len(), 0);
+    }
+    let public: Value = serde_json::from_slice(&store.manifest("disk-only").unwrap()).unwrap();
+    assert_eq!(public["disk_only"], true);
 }

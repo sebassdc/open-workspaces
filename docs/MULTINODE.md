@@ -196,10 +196,38 @@ undone. Terminals never switch to a replacement stream automatically.
 | Node initial job request / dispatch wait | 10 seconds |
 | DNS / TCP connect / TLS+upgrade agent deadline | 5 / 5 / 10 seconds |
 | Reconnect / heartbeat / offline | 2 / 3 / 15 seconds |
+| Agent with no frame from the controller (pings every 3 s) | reconnects after 20 seconds |
 | Job write / guest RPC read / terminal idle | 5 / existing 120 / 90 seconds |
 | Human guest file / PTY frame | 256 KiB / 4096 bytes |
 | Human non-file / file request body | 16 KiB / 384 KiB |
-| Runtime free storage reserve | 128 MiB; capture also reserves RAM-sized free space |
+| Runtime free storage reserve | 128 MiB; a RAM capture also reserves RAM-sized free space (a disk-only recovery point does not) |
+
+### Staying up while the disk is slow
+
+A capture's writeback can make every fsync on the data filesystem wait for minutes.
+The controller therefore runs no catalog call on its two async threads: auth checks,
+heartbeats, session marks, enrollment and the node inventory run on blocking threads,
+over one reused reader and one writer connection (the writer commits heartbeats with
+`synchronous=NORMAL`; they are rewritten every few seconds and cleared at start). No
+lock on live sessions is held across a catalog call. Each session records its beats
+through its own task, latest beat first, so a slow write delays only that runner's
+recorded heartbeat while pings, other runners and the proxies carry on.
+
+A session ends, with a `node NAME: session ended (REASON)` line in the controller log,
+when its session mark or a heartbeat cannot be recorded (an error, or a heartbeat that
+matches no row because the catalog no longer holds this session), when its credential
+is revoked, or after 15 seconds without a heartbeat. The agent then reconnects by
+itself; a runner is never left connected in the agent's view and offline in the
+catalog without either side saying so. A tick that arrives far behind schedule means
+the controller itself stalled, so that silence is not held against the runner. The
+agent in turn reconnects after 20 seconds without any frame from the controller, so a
+lost controller or network path is noticed in seconds rather than when TCP gives up.
+Controller and agent from 0.9.39 behave this way; a runner whose worker and agent
+both have it advertises `recovery_disk_only_v1` (see [recovery](RECOVERY.md)).
+
+An IP-literal controller address needs no DNS lookup. Lookups run on at most four
+threads with a 5-second wait; while they fail, time out or are all busy, the agent
+reuses the addresses that last resolved for the controller (TLS still verifies it).
 
 Authenticated WebSocket redirects are never followed; custom CA trust applies to
 the first and only TLS handshake. No bearer secret is sent in a URL/query or

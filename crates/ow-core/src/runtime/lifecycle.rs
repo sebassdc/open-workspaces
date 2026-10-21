@@ -532,6 +532,7 @@ impl Runtime {
                 files,
                 digest: None,
                 fork: None,
+                disk_only: false,
             };
             // RAM copied from hibernation keeps the original compatibility tuple.
             let snapshot = if let Some(name) = &workspace.hibernation {
