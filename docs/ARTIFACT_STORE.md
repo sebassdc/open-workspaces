@@ -66,6 +66,11 @@ These byte transfers and hashes run in the agent, outside the serial worker. Nat
 This adapter does not index or convert legacy `SnapshotStore` backups; their existing
 publication and retention stay separate. See [restore lifecycle](LIFECYCLE.md).
 
+Named snapshots of managed (moved, forked, woken or restored) boxes are published
+as `snapshot` artifacts by the controller, once per runner and name, with the same
+`capture-push` job and checks; the runner keeps a verified copy. A fork from one
+imports it on any runner; see [named snapshots](LIFECYCLE.md#named-snapshots-outlast-their-runner).
+
 ## Publish once, pull by digest
 
 These are trusted Linux operator commands on an initialized ownership controller.

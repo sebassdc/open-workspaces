@@ -52,11 +52,14 @@ local captures, which pass the same publication checks as other captures. This
 conservative refusal is inspectable in `error`.
 
 Cleanup is only `export-cleanup` of a positively fenced, durably published,
-completed transfer whose source no longer owns placement. It never invokes
-ordinary `delete`, and preserves named snapshots and exported captures. Drain
-publication records remain explicit GC roots. Retiring a named snapshot's old
-runner does not add automatic cross-node named-snapshot restore; the committed
-artifact is available to the existing managed artifact restore path.
+completed transfer whose source no longer owns placement (a deleted box owns
+none). It never invokes ordinary `delete`, and preserves named snapshots and
+exported captures. Publication records, which the controller also writes when it
+[publishes a managed box's named snapshots](LIFECYCLE.md#named-snapshots-outlast-their-runner),
+remain explicit GC roots until that runner's copy is removed. Once a parked box's
+snapshot is rehomed to the store it forks from its artifact on any runner, and the
+artifact is available to managed restore. A managed delete's tombstone (`deleted`)
+counts as cleaned for retirement.
 
 ## Empty certificate and retained disk
 

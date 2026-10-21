@@ -350,8 +350,10 @@ different persisted policy generation. Subsequent managed key replacement update
 the catalog generation before another transfer can be admitted. Legacy key changes
 also advance that generation and invalidate cached policy, so an admission read
 cannot survive a concurrent revocation. Export replay rechecks the source policy
-before reusing an acknowledged fence. Managed delete,
-resize and ordinary restore remain unsupported; cold resize is a later slice.
+before reusing an acknowledged fence. Once no transfer lock is held, a managed box
+deletes, resizes, snapshots and changes keys under its committed placement (see
+[Lifecycle of a moved box](#lifecycle-of-a-moved-box)). Ordinary named restore stays
+refused for it: restore from the snapshot's artifact with `restore --artifact`.
 Managed fork uses its own locked snapshot path.
 
 This slice is **class 2**: worker interface 3 adds fork preparation, durable target
@@ -371,6 +373,58 @@ It checks real process/boot continuity, strict pinned-host-key OpenSSH, grants, 
 ownership, separate enrollment and independent disk writes on two disposable workers.
 Its execution record, rather than its presence or a successful API call, establishes
 hardware acceptance. Live cloud-store IAM/policy and fleet rollout remain separate.
+
+## Lifecycle of a moved box
+
+A box that a move, cross-runner fork, wake or managed restore placed (a *managed* box)
+keeps its ordinary lifecycle. Every request below carries the exact committed
+`placement` (epoch, runner, transfer); the worker refuses any other, and every one is
+refused while a transfer lock is held.
+
+| Operation | Managed behavior |
+| --- | --- |
+| `ssh-authorize`, `ssh-revoke` | Key replacement on the current runner, then the catalog stores the new public policy and advances its generation, which invalidates any transfer admitted against the old one. |
+| `resize` | Stopped boxes only, as for any box: CPU, RAM and disk growth. The worker reply has no placement, so the catalog saves its own post-effect `inspect`, which must name the committed placement. A later move or park takes the new shape. |
+| `snapshot` | A named capture on the current runner, sealed `managed` like every capture of a managed box. The catalog records the box's disk size with it, for publication and forks. |
+| `snapshot-delete` | On the snapshot's runner while the box is there. A snapshot already in the artifact store and no longer on the box's runner is removed from the catalog alone. |
+| `delete` | Stopped or hibernated boxes only. The worker removes the disk, recovery journal and the box's local snapshots, and keeps its fence as a **tombstone** (`cleaned`, no export intent, state `deleted`): any later request, including an import at a newer epoch, is refused. A repeated delete answers from the tombstone, so a lost reply is safe to retry. The catalog then drops the box, its grants, quota allocation and snapshot rows. A **parked** box deletes in the catalog alone; its stored capture and any fenced source export stay until store collection and runner drain, as after every park. |
+
+Delete and named-snapshot deletion need `managed_lifecycle_v1` from the runner's
+actual worker; the controller refuses them, naming the runner, until that worker is
+upgraded. Resize, snapshot and key changes use existing worker primitives.
+
+### Named snapshots outlast their runner
+
+The controller's recovery loop (every five seconds) publishes each ready named
+snapshot of a managed box, once, from the runner holding it, to the configured
+artifact store. It reuses the drain publication path: a per-attempt token,
+manifest-last upload, read-back by digest and native lineage, shape and hash
+checks, recorded per runner and name. Once published and once its box has left
+that runner (and holds no transfer lock), the snapshot is **rehomed**: its catalog
+row no longer names a runner, and the old runner's copy is removed under that
+runner's own fenced placement for the box. A copy is also removed after its
+snapshot or box is deleted; a retired runner's record is released without contact.
+Failures are logged once and retried.
+
+A fork from a stored snapshot imports its artifact on any eligible runner (pulling
+it, or using the verified copy the publishing runner kept) without a new capture or
+upload. A snapshot not yet stored still forks only on the box's current runner.
+Snapshot listings show the stored `artifact` ID, which the owner can restore with
+`ow restore BOX --artifact ID --node RUNNER` (managed restore, which needs another
+runner than the box's own). A deleted snapshot or box stops rooting its artifact;
+the [collector](STORE_GC.md) removes it after its grace period.
+
+Limits: snapshots taken before this release without a recorded disk size are not
+published; a shared user's own snapshot of a box is published and rehomed, but forks
+from the store only for the box owner; snapshots of boxes that were never managed
+keep their runner-bound behavior.
+
+The focused tests run real move and fork transfers, then each operation against
+runner sockets that refuse any other placement, including after the move's source
+is cleaned and for a cross-runner fork child; worker tests cover the tombstone, its
+replay and restart, and named-snapshot removal on an active and a fenced copy. The
+dashboard suite drives a moved box's snapshot, stop, resize and delete. Real-VM and
+live-store acceptance on a pool remain separate.
 
 ## Explicit runner retirement
 

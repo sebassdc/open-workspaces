@@ -46,6 +46,12 @@ export async function api(page, body) {
   }, body);
 }
 
+// Gives a machine a committed placement, as a move between runners does (test harness only).
+export async function manage(page, id) {
+  const status = await page.evaluate(async name => (await fetch('/__e2e/manage', {method: 'POST', body: JSON.stringify({name})})).status, id);
+  if (status !== 204) throw Error(`manage ${id}: ${status}`);
+}
+
 // Creates machines through the API, then reloads so the page lists them.
 export async function machines(page, ...ids) {
   for (const id of ids) await api(page, {op: 'create', id});

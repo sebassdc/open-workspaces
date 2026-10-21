@@ -8,6 +8,7 @@ import https from 'node:https';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import {fileURLToPath} from 'node:url';
 import {fakeWorker} from './fake-worker.mjs';
 
@@ -50,7 +51,33 @@ function peer(name) {
 peer('owner');
 
 const verbose = process.env.OW_E2E_VERBOSE;
-await fakeWorker(path.join(data, 'control.sock'), request => verbose && console.log('worker', JSON.stringify(request)));
+const worker = await fakeWorker(path.join(data, 'control.sock'), request => verbose && console.log('worker', JSON.stringify(request)));
+
+// Test-only: commit a placement for one of a user's machines in the real catalog, as a move
+// between runners leaves it (managed, at a fresh epoch), so tests can drive a moved machine.
+function manage(login, name) {
+  const db = new DatabaseSync(path.join(data, 'catalog.sqlite3'));
+  try {
+    db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; BEGIN IMMEDIATE');
+    const box = db.prepare("SELECT r.owner,r.physical,r.metadata FROM resources r JOIN users u ON u.id=r.owner WHERE u.email=? AND r.kind='machine' AND r.name=?").get(login, name);
+    if (!box) throw Error(`no machine ${name}`);
+    db.prepare("INSERT INTO settings(key,value) VALUES('transfer_epoch','0') ON CONFLICT(key) DO NOTHING").run();
+    const epoch = Number(db.prepare("SELECT value FROM settings WHERE key='transfer_epoch'").get().value) + 1;
+    db.prepare("UPDATE settings SET value=? WHERE key='transfer_epoch'").run(String(epoch));
+    const meta = JSON.parse(box.metadata);
+    const intent = {kind: 'move', machine: name, target: 'local', capture: null, child: null, snapshot: null, memory_mib: meta.memory_mib, cpus: meta.vcpu_count, disk_bytes: meta.disk_bytes, accept_cold: false};
+    const operation = db.prepare("INSERT INTO operations(owner,op,resource,state,node,retry_key,request,finished_at) VALUES(?,'move',?,'succeeded','local',?,?,CURRENT_TIMESTAMP)").run(box.owner, name, `e2e-move-${epoch}`, JSON.stringify({transfer: intent})).lastInsertRowid;
+    const transfer = db.prepare("INSERT INTO transfers(operation,kind,source,machine,source_node,source_epoch,source_policy_generation,target,epoch,step) VALUES(?,'move',?,?,'local',0,0,'local',?,'succeeded')").run(operation, box.physical, box.physical, epoch).lastInsertRowid;
+    db.prepare("UPDATE resources SET placement_managed=1,placement_epoch=?,ssh_policy='\"disabled\"' WHERE kind='machine' AND physical=?").run(epoch, box.physical);
+    db.exec('COMMIT');
+    worker.manage(box.physical, {epoch, node: 'local', transfer: `transfer-${transfer}`});
+  } catch (error) {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    throw error;
+  } finally {
+    db.close();
+  }
+}
 const dashboard = spawn(ow, ['--data-dir', data, 'dashboard', '--config', config, '--listen', `127.0.0.1:${dashboardPort}`], {
   env: {...process.env, PATH: `${bin}:${process.env.PATH}`, OW_E2E_WHOIS: whois},
   stdio: ['ignore', 'pipe', 'inherit'],
@@ -69,6 +96,17 @@ function identity(headers) {
   return {...clean, 'tailscale-user-login': user.login, 'x-forwarded-for': user.ip};
 }
 const proxy = https.createServer({key: fs.readFileSync(path.join(root, 'tls.key')), cert: fs.readFileSync(path.join(root, 'tls.crt'))}, (request, response) => {
+  if (request.method === 'POST' && request.url === '/__e2e/manage') {
+    let body = '';
+    request.on('data', chunk => body += chunk);
+    request.on('end', () => {
+      try {
+        manage(identity(request.headers)['tailscale-user-login'], JSON.parse(body).name);
+        response.writeHead(204).end();
+      } catch (error) { response.writeHead(400).end(error.message); }
+    });
+    return;
+  }
   const upstream = http.request({host: '127.0.0.1', port: dashboardPort, method: request.method, path: request.url, headers: identity(request.headers)}, reply => {
     if (reply.statusCode >= 500) console.error(`proxy: ${request.method} ${request.url} -> ${reply.statusCode}`);
     response.writeHead(reply.statusCode, reply.headers);

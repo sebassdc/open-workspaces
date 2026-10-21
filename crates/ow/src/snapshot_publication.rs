@@ -46,7 +46,7 @@ pub(super) fn pass(
     let mut results = Vec::new();
     let unpublished = (|| -> Result<Vec<(String, String, String, (u32, u32, u64))>> {
         let c = shared.lock().unwrap();
-        let mut stmt = c.db.prepare("SELECT s.node,s.physical,m.physical,json_extract(s.metadata,'$.memory_mib'),json_extract(s.metadata,'$.vcpu_count'),json_extract(s.metadata,'$.disk_bytes') FROM resources s JOIN resources m ON m.kind='machine' AND m.physical=json_extract(s.metadata,'$.workspace') AND m.owner=s.owner JOIN nodes n ON n.id=s.node WHERE s.kind='snapshot' AND s.node<>'' AND json_extract(s.metadata,'$.state')='ready' AND m.placement_managed=1 AND json_extract(s.metadata,'$.disk_bytes') IS NOT NULL AND json_extract(n.capabilities,'$.managed_restore_v1')=1 AND NOT EXISTS(SELECT 1 FROM drain_publications p WHERE p.node=s.node AND p.name=s.physical) ORDER BY s.created_at")?;
+        let mut stmt = c.db.prepare("SELECT s.node,s.physical,m.physical,json_extract(s.metadata,'$.memory_mib'),json_extract(s.metadata,'$.vcpu_count'),json_extract(s.metadata,'$.disk_bytes') FROM resources s JOIN resources m ON m.kind='machine' AND m.physical=json_extract(s.metadata,'$.workspace') JOIN nodes n ON n.id=s.node WHERE s.kind='snapshot' AND s.node<>'' AND json_extract(s.metadata,'$.state')='ready' AND m.placement_managed=1 AND json_extract(s.metadata,'$.disk_bytes') IS NOT NULL AND json_extract(n.capabilities,'$.managed_restore_v1')=1 AND NOT EXISTS(SELECT 1 FROM drain_publications p WHERE p.node=s.node AND p.name=s.physical) ORDER BY s.created_at")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((

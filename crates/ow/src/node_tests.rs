@@ -1442,10 +1442,11 @@ fn pool_spend_concurrent_invitations_have_one_winner_and_overflow_refuses() {
 #[test]
 fn placement_steps_reconcile_effect_before_reply_and_recheck_cached_authority() {
     use std::os::unix::net::UnixListener;
-    for op in common::PLACEMENT_OPERATIONS
-        .iter()
-        .copied()
-        .chain(std::iter::once("start"))
+    for op in
+        common::PLACEMENT_OPERATIONS
+            .iter()
+            .copied()
+            .chain(["start", "delete", "snapshot-delete"])
     {
         let root = root();
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();

@@ -41,6 +41,7 @@ browser test that guards it are listed in the [UI feature matrix](docs/UI_FEATUR
 | Recovery points | Upload periodic running captures and hibernation state; report last durable capture and failures. | Opt-in | v0.9.2; parallel SDK transfers v0.9.35 | [Recovery](docs/RECOVERY.md) |
 | Managed restore | Adopt an existing catalog-authorized capture through durable transfer and worker fencing. | Not yet live | v0.9.5 | [Transfer lifecycle](docs/LIFECYCLE.md) |
 | Park, wake and move across runners | Store a box without placement, wake on an eligible runner, or explicitly move/fork to a compatible target. | Not yet live | v0.9.11; move/fork v0.9.12; parallel SDK transfers v0.9.35 | [Transfer lifecycle](docs/LIFECYCLE.md), [artifact store](docs/ARTIFACT_STORE.md) |
+| Lifecycle of moved boxes | Delete, resize, snapshot and change SSH keys of a moved, forked or woken box under its placement epoch; its named snapshots go to the artifact store and fork on any runner. | Opt-in | v0.9.39 | [Transfer lifecycle](docs/LIFECYCLE.md#lifecycle-of-a-moved-box) |
 
 ### Storage and images
 
