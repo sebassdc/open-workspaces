@@ -1130,7 +1130,9 @@ pub fn run(cli: Cli) -> Result<i32> {
             )?;
             return Ok(0);
         }
-        Action::Down { hibernate: true } => {
+        Action::Down {
+            hibernate: true, ..
+        } => {
             bail!("down --hibernate is not supported on the Mac backend")
         }
         Action::Down { .. } => json!({"op":"shutdown"}),

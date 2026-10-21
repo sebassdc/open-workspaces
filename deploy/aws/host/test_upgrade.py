@@ -227,7 +227,10 @@ class Fake:
         self.up["worker"] = False
 
     def quiesce_off(self):
+        if "lift" in self.fail:
+            return False
         self.quiesced = False
+        return True
 
     def start_box(self, box):
         self._hit(f"resume:{box}")
@@ -256,6 +259,7 @@ class Fake:
             assert self.up[name], name
 
     def canary(self):
+        assert not self.quiesced, "the canary needs an open worker"
         self.calls.append("canary")
 
 
@@ -332,6 +336,30 @@ class Machine(unittest.TestCase):
                 self.run_plan(ops, ["worker"], 2, ["worker"], plan=plan)
                 self.assertEqual((self.journal()["step"], self.journal()["cold"]), ("done", ["late"]))
 
+    def test_the_new_worker_takes_no_wake_until_it_is_verified(self):
+        ops = Fake({"a": "running", "b": "stopped"})
+        real, seen = ops.verify, []
+
+        def verify(expected):  # a connection tries to wake b while the new worker is checked
+            seen.append(ops.quiesced)
+            real(expected)
+
+        ops.verify = verify
+        self.run_plan(ops, ["worker", "agent"], 2, ["agent", "worker"])
+        self.assertEqual(seen, [True], "wakes are refused during verify")
+        self.assertLess(ops.calls.index("start:worker"), len(ops.calls) - ops.calls[::-1].index("quiesce") - 1)
+        self.assertLess(len(ops.calls) - ops.calls[::-1].index("quiesce") - 1, ops.calls.index("start:agent"))
+        self.assertEqual((ops.box, ops.quiesced, self.journal()["step"]), ({"a": "running", "b": "stopped"}, False, "done"))
+
+    def test_a_lift_that_fails_leaves_the_journal_for_recover(self):
+        ops = Fake({"a": "running"}, fail={"lift"})
+        with self.assertRaisesRegex(RuntimeError, "did not lift"):
+            self.run_plan(ops, ["worker"], 2, ["worker"])
+        self.assertEqual((self.journal()["step"], ops.box["a"]), ("resume", "hibernated"))
+        ops.fail.clear()
+        u.recover(ops)
+        self.assertEqual((self.journal()["step"], ops.box["a"], ops.quiesced), ("done", "running", False))
+
     def test_runner_upgrade_without_boxes_runs_a_canary(self):
         ops = Fake({})
         self.run_plan(ops, ["worker"], 2, ["worker"])
@@ -362,14 +390,18 @@ class Machine(unittest.TestCase):
         real = ops.verify
 
         def verify_once(expected):  # the new release fails its checks; the old one passes
+            seen.append(ops.quiesced)
             if expected["worker"] == "0.5.0":
                 ops.fail.discard("verify")
             real(expected)
 
+        seen = []
         ops.verify = verify_once
         with self.assertRaisesRegex(RuntimeError, "injected failure at verify"):
             self.run_plan(ops, ["worker", "agent"], 2, ["agent", "worker"])
         self.assertEqual(self.journal()["step"], "rolled-back")
+        self.assertEqual(seen, [True, True], "both workers take no wake while verified")
+        self.assertFalse(ops.quiesced)
         self.assertEqual(h.pins(), self.frm)
         self.assertEqual(ops.box, {"a": "running"})
         self.assertTrue(all(ops.up.values()))

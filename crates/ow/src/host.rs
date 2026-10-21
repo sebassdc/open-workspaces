@@ -466,12 +466,35 @@ fn unpublish(root: &Path, id: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// A service stop: whatever stays running after the stop command is killed, so retry
+/// until every machine is hibernated (a busy machine, e.g. one still resuming, frees
+/// its lock; a failed capture is tried again) instead of giving up. Starts stay refused.
+fn hibernate_all_waiting(root: &Path) {
+    loop {
+        match hibernate_round(root, Duration::from_secs(24 * 3600)) {
+            Ok(()) => return,
+            Err(e) => eprintln!("{e:#}; retrying in 5 s, starts stay refused"),
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
 /// Refuses new starts and wakes, then hibernates every running machine. If one
 /// stays running (its capture failed), starts are allowed again and this fails, so
 /// the caller does not shut the worker down under it.
 fn hibernate_all(root: &Path) -> Result<()> {
-    // The AWS unit allows 900 s to stop; the worker captures one machine at a time.
-    let deadline = Instant::now() + Duration::from_secs(840);
+    // Callers run this under 900-1800 s caps (SSM, the upgrader); one machine at a time.
+    let result = hibernate_round(root, Duration::from_secs(840));
+    if result.is_err() {
+        // Called off: the worker keeps running, so it must accept starts and wakes again.
+        // Sent even when the quiesce itself failed: a timed-out one may still be applied.
+        let _ = wire::request(root, json!({"op":"quiesce","closing":false}));
+    }
+    result
+}
+
+fn hibernate_round(root: &Path, limit: Duration) -> Result<()> {
+    let deadline = Instant::now() + limit;
     // Any request can queue behind a capture already running, so each waits as long as one.
     let request = |value: Value| {
         wire::connect_waiting(root, &value, wire::reply_wait(&json!({"op":"hibernate"})))
@@ -520,11 +543,6 @@ fn hibernate_all(root: &Path) -> Result<()> {
         );
         Ok(())
     })();
-    if result.is_err() {
-        // Called off: the worker keeps running, so it must accept starts and wakes again.
-        // Sent even when the quiesce itself failed: a timed-out one may still be applied.
-        let _ = request(json!({"op":"quiesce","closing":false}));
-    }
     result
 }
 
@@ -882,13 +900,22 @@ pub fn run(cli: Cli) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&up(&root)?)?);
             return Ok(0);
         }
-        Action::Down { hibernate } => {
+        Action::Down { hibernate, wait } => {
             if hibernate && root.join("control.sock").exists() {
-                hibernate_all(&root)?;
+                if wait {
+                    hibernate_all_waiting(&root);
+                } else {
+                    hibernate_all(&root)?;
+                }
                 if let Err(e) = unpublish_all(&root, None) {
-                    // Called off after the hibernation: the worker keeps running and accepts starts.
-                    let _ = wire::request(&root, json!({"op":"quiesce","closing":false}));
-                    return Err(e);
+                    if wait {
+                        // A service stop goes on: nothing runs, and the gateways stop with the worker.
+                        eprintln!("unpublishing before the stop: {e:#}");
+                    } else {
+                        // Called off after the hibernation: the worker keeps running and accepts starts.
+                        let _ = wire::request(&root, json!({"op":"quiesce","closing":false}));
+                        return Err(e);
+                    }
                 }
             } else {
                 unpublish_all(&root, None)?;
@@ -1152,6 +1179,59 @@ mod down_tests {
             .iter()
             .map(|r| r["op"].as_str().unwrap().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn a_service_stop_retries_until_every_machine_is_hibernated() {
+        // Box a's first hibernation fails (e.g. busy while it resumes); a stop retries
+        // with starts still refused instead of letting systemd kill the running VMs.
+        let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            let (mut tries, mut slept) = (0, false);
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let request = wire::line(&mut stream).unwrap();
+                log.lock().unwrap().push(request.clone());
+                let state = if slept { "hibernated" } else { "running" };
+                let response = match request["op"].as_str().unwrap() {
+                    "list" => json!({"ok":true,"result":[{"id":"a","state":state}]}),
+                    "hibernate" => {
+                        tries += 1;
+                        slept = tries > 1;
+                        if slept {
+                            json!({"ok":true,"result":{}})
+                        } else {
+                            json!({"ok":false,"error":"Resource temporarily unavailable (os error 11)"})
+                        }
+                    }
+                    _ => json!({"ok":true,"result":{}}),
+                };
+                wire::send(&mut stream, &response).unwrap();
+            }
+        });
+        hibernate_all_waiting(&root);
+        assert_eq!(
+            ops(&seen),
+            [
+                "quiesce",
+                "list",
+                "hibernate",
+                "list",
+                "quiesce",
+                "list",
+                "hibernate",
+                "list"
+            ]
+        );
+        assert!(
+            seen.lock().unwrap().iter().all(|r| r["closing"] != false),
+            "starts are never allowed again during a stop"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
