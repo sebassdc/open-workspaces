@@ -59,7 +59,11 @@ allow-list; the machine details then show it with its token expiry and a
 machines**. The designated host pool owner also sees a list of box AWS settings
 in the host controls. These attach/detach actions need no share grant; their role
 choices still follow each box owner's allow-list.
-These settings grant no terminal or disk access. The API does not delete snapshots on their own, change host configuration, grant Cloudflare permissions, or serve
+These settings grant no terminal or disk access. The host pool owner also sees
+fleet health: a banner for each active alert (a runner offline, a data volume
+low on space) and, under each host, its latest CPU, memory, load, free disk,
+agent memory, channel connects and last event ([node telemetry](TELEMETRY.md)).
+The API does not delete snapshots on their own, change host configuration, grant Cloudflare permissions, or serve
 arbitrary guest HTML on the dashboard origin. Public guest-app publishing remains
 a subsequent slice.
 

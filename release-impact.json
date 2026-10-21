@@ -2,6 +2,46 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.41",
+      "class": 1,
+      "changes": [
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Node telemetry over OpenTelemetry (docs/TELEMETRY.md). Node agents advertise telemetry_v1 and, once the controller's acknowledgement offers the telemetry-v1 extension, send OTLP/HTTP JSON metrics (host CPU, memory, load, data-volume space, agent and worker memory, per-box memory of at most 32 boxes under opaque IDs, channel connects and disconnects, capture and restore timings) and events (channel disconnected/reconnected with a reason class, agent start, operations) over the existing node channel, at most 28 KiB per frame, from a bounded 64-payload queue that drops the oldest and counts it. The controller validates each frame, stamps the authenticated node, keeps the latest summary and a 200-event ring per node in additive tables (settings, config_changes, node_telemetry, node_events; no schema bump), raises node_offline and disk_low alerts (journal line and event on each transition), and forwards everything to telemetry.forward_endpoint when set. Settings live on the controller only: ow config list|get|set (telemetry.enabled, telemetry.interval_s, telemetry.forward_endpoint, alerts.offline_after_s, alerts.disk_low_gib), versioned and recorded, carried on every acknowledgement so runners apply a change within about 3 s. ow health prints fleet health and exits 1 on an alert; ow nodes adds alerts and telemetry; the dashboard shows an alert banner and a health line per host to the pool owner. Old agents ignore the extra acknowledgement field and send nothing; new agents send nothing to an old controller. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel, host layout 2 and stage 0 are unchanged; the worker is untouched.",
+      "waivers": {
+        "worker": "crates/ow/src/host.rs adds only the local ow health and ow config CLI arms and annotates ow nodes output; no worker code, operation, runtime or service changes."
+      }
+    },
+    {
       "version": "0.9.40",
       "class": 2,
       "changes": [

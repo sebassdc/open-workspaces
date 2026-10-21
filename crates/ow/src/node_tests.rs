@@ -715,6 +715,7 @@ fn an_agent_whose_worker_leaves_its_protocol_window_drives_it_no_more() {
             None,
             Busy::new(),
             &Mutex::new(checked),
+            None,
         )
         .unwrap();
         until("the refusal", &|| {
@@ -1258,6 +1259,7 @@ fn outbound_runner_relays_snapshot_delete_only_to_a_capable_worker() {
                     json!({"worker_protocol":1,"worker_pid":std::process::id(),
                     "snapshot_delete_v1":capable}),
                 )),
+                None,
             )
         });
         let (tcp, _) = controller.accept().unwrap();
@@ -1325,6 +1327,7 @@ fn preview_tunnel_job_uses_the_existing_worker_stream() {
                 &Mutex::new(Some(
                     json!({"worker_protocol":1,"worker_pid":std::process::id()}),
                 )),
+                None,
             )
         });
         let (tcp, _) = controller.accept().unwrap();
@@ -1556,6 +1559,7 @@ fn managed_stream_envelopes_reach_only_the_named_capable_worker() {
                     &Mutex::new(Some(
                         json!({"worker_protocol":2,"placement_fencing_v1":true,"worker_pid":std::process::id()}),
                     )),
+                    None,
                 )
             });
             let (tcp, _) = listener.accept().unwrap();
@@ -2353,4 +2357,288 @@ async fn one_blocked_heartbeat_write_leaves_other_runners_online() {
     .await
     .unwrap();
     server.abort();
+}
+
+/// Reads frames until a `ready` acknowledgement, answering pings.
+fn read_ack(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) -> Value {
+    let deadline = std::time::Instant::now();
+    loop {
+        match ws.read() {
+            Ok(tungstenite::Message::Text(t)) => {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "ready" {
+                    return v;
+                }
+            }
+            Ok(tungstenite::Message::Ping(v)) => {
+                let _ = ws.send(tungstenite::Message::Pong(v));
+            }
+            Err(e) if timed_out(&e) => assert!(
+                deadline.elapsed() < Duration::from_secs(5),
+                "no acknowledgement"
+            ),
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telemetry_is_negotiated_stored_stamped_and_configured_from_the_controller() {
+    let root = root();
+    let credentials = enrollment(&root, "alpha");
+    let c = Controller::new(&root).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let proxy_loop = tokio::spawn(proxies(c.clone()));
+    let app = routes(c.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let token = credentials["credential"].as_str().unwrap().to_owned();
+    let root1 = root.clone();
+    tokio::task::spawn_blocking(move || {
+        let beat = |telemetry: bool| json!({"type":"heartbeat","ready_ack":true,"protocol":1,"backend":"firecracker","arch":"x86_64","runtime":common::RUNTIME,"memory_mib":512,"slots":2,"vcpus":2,"images":["alpine"],"telemetry_v1":telemetry}).to_string();
+        let agent = crate::telemetry::Agent::new("forged", "s".repeat(64));
+        let (frames, _) = crate::telemetry::encode_metrics(
+            "forged",
+            &crate::telemetry::box_metrics(&json!({"running":{}}), "salt"),
+            1,
+            2,
+        );
+        // An old agent (no telemetry_v1) gets the offer but may not send telemetry.
+        let mut ws = socket(&origin, "/node/alpha", &token, None).unwrap();
+        timeout_socket(&ws).unwrap();
+        ws.send(tungstenite::Message::Text(beat(false).into())).unwrap();
+        let ack = read_ack(&mut ws);
+        assert!(ack["extensions"].as_array().unwrap().iter().any(|x| x == "telemetry-v1"));
+        assert_eq!(ack["telemetry"]["enabled"], true);
+        assert_eq!(ack["telemetry"]["interval_s"], 15);
+        ws.send(tungstenite::Message::Text(frames[0].clone().into())).unwrap();
+        let deadline = std::time::Instant::now();
+        loop {
+            match ws.read() {
+                Ok(tungstenite::Message::Ping(v)) => { let _ = ws.send(tungstenite::Message::Pong(v)); }
+                Ok(tungstenite::Message::Text(_)) => {}
+                Err(e) if timed_out(&e) => assert!(deadline.elapsed() < Duration::from_secs(5), "unnegotiated telemetry kept the session"),
+                _ => break,
+            }
+        }
+        // A telemetry agent: its frames are stored under the authenticated node.
+        let mut ws = socket(&origin, "/node/alpha", &token, None).unwrap();
+        timeout_socket(&ws).unwrap();
+        ws.send(tungstenite::Message::Text(beat(true).into())).unwrap();
+        read_ack(&mut ws);
+        ws.send(tungstenite::Message::Text(frames[0].clone().into())).unwrap();
+        let mut events = 0;
+        while let Some(frame) = { agent.negotiated.store(true, std::sync::atomic::Ordering::SeqCst); agent.next() } {
+            ws.send(tungstenite::Message::Text(frame.into())).unwrap();
+            events += 1;
+        }
+        assert_eq!(events, 1, "the agent.started event");
+        let deadline = std::time::Instant::now();
+        let health = loop {
+            let health = crate::telemetry::health(&root1).unwrap();
+            let node = &health["nodes"][0];
+            if node["telemetry"]["metrics"]["ow.box.running"] == 0.0
+                && node["events"].as_array().unwrap().iter().any(|e| e["name"] == "ow.node.agent.started")
+            {
+                break health;
+            }
+            assert!(deadline.elapsed() < Duration::from_secs(5), "telemetry not stored: {health}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(health["nodes"][0]["id"], "alpha");
+        assert_eq!(health["nodes"][0]["telemetry_v1"], true);
+        assert!(health["alerts"].as_array().unwrap().is_empty(), "{health}");
+        let events = health["nodes"][0]["events"].as_array().unwrap();
+        assert!(events.iter().any(|e| e["name"] == "ow.node.session.closed" && e["attributes"]["reason"] == "invalid"), "{events:?}");
+        // One command on the controller reaches the runner with the next acknowledgement.
+        crate::telemetry::set(&root1, "telemetry.enabled", "false", "test").unwrap();
+        crate::telemetry::set(&root1, "telemetry.interval_s", "30", "test").unwrap();
+        ws.send(tungstenite::Message::Text(beat(true).into())).unwrap();
+        let ack = read_ack(&mut ws);
+        assert_eq!(ack["telemetry"]["enabled"], false);
+        assert_eq!(ack["telemetry"]["interval_s"], 30);
+        assert_eq!(ack["telemetry"]["version"], 2);
+    })
+    .await
+    .unwrap();
+    server.abort();
+    proxy_loop.abort();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_sends_host_box_and_channel_telemetry_once_offered() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let worker = root();
+    let listener = std::os::unix::net::UnixListener::bind(worker.join("control.sock")).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let Ok(req) = wire::line(&mut stream) else {
+                continue;
+            };
+            let value = match req["op"].as_str().unwrap() {
+                "status" => {
+                    json!({"max_memory_mib":512,"max_running":2,"max_vcpus":2,"max_guest_memory_mib":512,"max_guest_vcpus":2,
+                    "guest_ssh_v1":true,"internet":true,"images":[],"version":"0.5.0","worker_pid":std::process::id(),
+                    "worker_protocol":common::WORKER_PROTOCOL,"free_disk_bytes":1u64<<40})
+                }
+                "stats" => {
+                    json!({"running":{"m-0123456789abcdef01234567":{"rss_kib":2048,"pss_kib":1024},"legacy-name":{"rss_kib":10,"pss_kib":5}}})
+                }
+                other => panic!("unexpected op {other}"),
+            };
+            let _ = wire::send(&mut stream, &json!({"ok":true,"result":value}));
+        }
+    });
+    // A stand-in controller that offers telemetry, keeps every telemetry frame and
+    // drops the first channel once metrics arrived, so the agent reconnects.
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", tcp.local_addr().unwrap());
+    let frames = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let dropped_once = Arc::new(AtomicBool::new(false));
+    {
+        let (frames, dropped_once) = (frames.clone(), dropped_once.clone());
+        std::thread::spawn(move || {
+            for stream in tcp.incoming() {
+                let (frames, dropped_once) = (frames.clone(), dropped_once.clone());
+                std::thread::spawn(move || {
+                    let Ok(mut ws) = tungstenite::accept(stream.unwrap()) else {
+                        return;
+                    };
+                    ws.get_ref()
+                        .set_read_timeout(Some(Duration::from_millis(50)))
+                        .unwrap();
+                    loop {
+                        match ws.read() {
+                            Ok(tungstenite::Message::Text(t)) => {
+                                let v: Value = serde_json::from_str(&t).unwrap();
+                                assert!(t.len() <= crate::telemetry::FRAME_LIMIT + 64);
+                                if v["type"] == "heartbeat" {
+                                    assert_eq!(v["telemetry_v1"], true);
+                                    let ack = json!({"type":"ready","node":"alpha","generation":"g1","extensions":["telemetry-v1"],"telemetry":{"enabled":true,"interval_s":5}});
+                                    let _ =
+                                        ws.send(tungstenite::Message::Text(ack.to_string().into()));
+                                } else {
+                                    assert_eq!(v["type"], "otlp");
+                                    let metrics = v["signal"] == "metrics";
+                                    frames.lock().unwrap().push(v);
+                                    if metrics && !dropped_once.swap(true, Ordering::SeqCst) {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(tungstenite::Message::Ping(v)) => {
+                                let _ = ws.send(tungstenite::Message::Pong(v));
+                            }
+                            Err(e) if timed_out(&e) => {}
+                            _ => return,
+                        }
+                    }
+                });
+            }
+        });
+    }
+    let credential = worker.join("node.json");
+    write_private(
+        &credential,
+        &json!({"node":"alpha","credential":"a".repeat(64)}),
+    )
+    .unwrap();
+    {
+        let (worker, origin, credential) = (worker.clone(), origin.clone(), credential.clone());
+        std::thread::spawn(move || agent(&worker, &origin, &credential, None, None, true));
+    }
+    let event_names = |frames: &[Value]| -> Vec<String> {
+        frames
+            .iter()
+            .filter(|f| f["signal"] == "logs")
+            .flat_map(|f| {
+                f["body"]["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            })
+            .filter_map(|r| {
+                r["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|a| a["key"] == "event.name")
+                    .map(|a| a["value"]["stringValue"].as_str().unwrap().to_owned())
+            })
+            .collect()
+    };
+    let started = std::time::Instant::now();
+    loop {
+        let frames = frames.lock().unwrap().clone();
+        if event_names(&frames).contains(&"ow.node.channel.reconnected".to_owned()) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(40),
+            "no reconnect event: {:?}",
+            event_names(&frames)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let frames = frames.lock().unwrap().clone();
+    let names = event_names(&frames);
+    assert_eq!(names[0], "ow.node.agent.started");
+    assert!(
+        names.contains(&"ow.node.channel.disconnected".to_owned()),
+        "{names:?}"
+    );
+    let metrics: Vec<Value> = frames
+        .iter()
+        .filter(|f| f["signal"] == "metrics")
+        .flat_map(|f| {
+            f["body"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    let named = |name: &str| {
+        metrics
+            .iter()
+            .find(|m| m["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    named("system.filesystem.usage");
+    named("ow.node.channel.connects");
+    named("ow.telemetry.dropped");
+    named("process.memory.usage");
+    named("system.memory.usage");
+    let rss = named("ow.box.memory.rss");
+    let ids: Vec<&str> = rss["gauge"]["dataPoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["attributes"][0]["value"]["stringValue"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids[0], "m-0123456789abcdef01234567");
+    assert!(
+        ids[1].starts_with("h-"),
+        "a legacy box name is never sent: {ids:?}"
+    );
+    assert!(
+        !serde_json::to_string(&frames)
+            .unwrap()
+            .contains("legacy-name")
+    );
+    let resource = &frames[0]["body"]["resourceLogs"][0]["resource"]["attributes"];
+    assert!(
+        resource
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["key"] == "ow.node.id" && a["value"]["stringValue"] == "alpha")
+    );
+    let _ = fs::remove_dir_all(worker);
 }

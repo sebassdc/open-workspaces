@@ -464,6 +464,8 @@ pub async fn handle(
             let host_controls = pool_owner == Some(user);
             if host_controls {
                 state["aws_boxes"] = json!(catalog.pool_aws_boxes(user)?);
+                // Fleet health for the pool owner; an unreadable telemetry store hides only this panel.
+                state["fleet"] = crate::telemetry::health(&catalog.root).unwrap_or(Value::Null);
             }
             state["host_controls"] = json!(host_controls);
             state["pool_policy"] = json!(crate::nodes::POOL_POLICY);

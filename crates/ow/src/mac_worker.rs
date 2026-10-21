@@ -1067,9 +1067,13 @@ pub fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Action::Nodes => {
-            println!("{}", nodes::inventory(&root)?);
+            let mut nodes = nodes::inventory(&root)?;
+            crate::telemetry::annotate(&mut nodes, &crate::telemetry::health(&root)?);
+            println!("{nodes}");
             return Ok(0);
         }
+        Action::Health => return crate::telemetry::health_command(&root),
+        Action::Config { action } => return crate::telemetry::config_command(&root, action),
         _ => {}
     }
     let r = match cli.command {
