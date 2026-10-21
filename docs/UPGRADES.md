@@ -178,6 +178,7 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   written last. A complete release is reused. See [Released binaries](#released-binaries)
   for where `ow` and the guest agent come from.
 - **gate**: again, with the staged kernel's hash and the boxes as they are now.
+  Disk-only recovery points hold no RAM state and are not gated.
   With `--accept-cold` and backups configured, `ow-backup` runs first.
 - **hibernate**: the worker is quiesced first (it then refuses starts and wakes),
   so the running boxes read next are exactly the ones the old worker's own

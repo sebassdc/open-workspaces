@@ -318,6 +318,14 @@ class Machine(unittest.TestCase):
         self.assertLess(ops.calls.index("quiesce"), ops.calls.index("hibernated:original"))
         self.assertEqual((self.journal()["step"], self.journal()["error"]), ("done", None))
 
+    def test_disk_only_recovery_points_never_meet_the_capture_gate(self):
+        for name, manifest in (("sleep-recovery-a", {"disk_only": True, "cpu": "none: disk-only recovery point"}),
+                               ("sleep-b", {"cpu": COMPAT["cpu"]})):
+            h.write_json(f"{h.RUNNER}/snapshots/{name}/manifest.json",
+                         {"workspace": "m-1", "name": name, "runtime": COMPAT["runtime"],
+                          "kernel_sha256": COMPAT["kernel_sha256"], **manifest})
+        self.assertEqual([c["name"] for c in u.captures(COMPAT)], ["m-1/sleep-b"])
+
     def test_a_box_started_after_the_last_plan_still_meets_the_capture_gate(self):
         # Planned with no box at all, for a release with another guest kernel.
         m = manifest(entry("0.5.1", ["guest-kernel"], 2, kernel="f" * 64))
