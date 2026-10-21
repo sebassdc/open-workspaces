@@ -794,9 +794,13 @@ pub fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Action::Nodes => {
-            println!("{}", crate::nodes::inventory(&root)?);
+            let mut nodes = crate::nodes::inventory(&root)?;
+            crate::telemetry::annotate(&mut nodes, &crate::telemetry::health(&root)?);
+            println!("{nodes}");
             return Ok(0);
         }
+        Action::Health => return crate::telemetry::health_command(&root),
+        Action::Config { action } => return crate::telemetry::config_command(&root, action),
         Action::NodeAgent {
             controller,
             credential,

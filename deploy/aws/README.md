@@ -363,6 +363,22 @@ controller runs, and the runner refuses an agent that controller would not
 accept (the controller accepts its own protocol and the one before, so runners
 may lag one protocol version). See [docs/UPGRADES.md](../../docs/UPGRADES.md#runners).
 
+### Fleet health
+
+Every runner reports health to its controller ([node telemetry](../../docs/TELEMETRY.md)),
+on by default, with no Pulumi input. On the controller host:
+
+```bash
+sudo /srv/ow/run/dashboard/bin/ow --local --data-dir /srv/ow/.ow/controller health   # exit 1 on an alert
+sudo /srv/ow/run/dashboard/bin/ow --local --data-dir /srv/ow/.ow/controller nodes    # alerts and telemetry per runner
+sudo /srv/ow/run/dashboard/bin/ow --local --data-dir /srv/ow/.ow/controller config set telemetry.forward_endpoint http://127.0.0.1:4318
+```
+
+Settings (`ow config list`) live in the controller's catalog and reach every
+runner within seconds; nothing is set per runner. Alert transitions are logged
+as `alert raised: …` lines in the controller unit's journal. `ow nodes` from a
+remote CLI shows `telemetry_v1` for each runner that supports it.
+
 ## Runner pool
 
 `RunnerPool` is an opt-in Auto Scaling group of runner hosts that the controller

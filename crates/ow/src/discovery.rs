@@ -48,7 +48,12 @@ pub fn node(inventory: &Value, reserved: Value, now: u64) -> Value {
         capabilities[key] = cap[key].clone();
     }
     capabilities["protocol"] = json!(cap["protocol"].as_u64());
-    for key in ["guest_ssh_v1", "disk_resize_v1", "managed_lifecycle_v1"] {
+    for key in [
+        "guest_ssh_v1",
+        "disk_resize_v1",
+        "managed_lifecycle_v1",
+        "telemetry_v1",
+    ] {
         capabilities[key] = json!(cap[key].as_bool());
     }
     if cap.get("operations").is_some() {

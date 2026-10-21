@@ -197,6 +197,7 @@ undone. Terminals never switch to a replacement stream automatically.
 | DNS / TCP connect / TLS+upgrade agent deadline | 5 / 5 / 10 seconds |
 | Reconnect / heartbeat / offline | 2 / 3 / 15 seconds |
 | Agent with no frame from the controller (pings every 3 s) | reconnects after 20 seconds |
+| Telemetry frame / frames per session tick / runner queue | 28 KiB / 20 per 3 s / 64 payloads ([telemetry](TELEMETRY.md)) |
 | Job write / guest RPC read / terminal idle | 5 / existing 120 / 90 seconds |
 | Human guest file / PTY frame | 256 KiB / 4096 bytes |
 | Human non-file / file request body | 16 KiB / 384 KiB |
