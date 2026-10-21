@@ -390,8 +390,8 @@ refused while a transfer lock is held.
 | `delete` | Stopped or hibernated boxes only. The worker removes the disk, recovery journal and the box's local snapshots, and keeps its fence as a **tombstone** (`cleaned`, no export intent, state `deleted`): any later request, including an import at a newer epoch, is refused. A repeated delete answers from the tombstone, so a lost reply is safe to retry. The catalog then drops the box, its grants, quota allocation and snapshot rows. A **parked** box deletes in the catalog alone; its stored capture and any fenced source export stay until store collection and runner drain, as after every park. |
 
 Delete and named-snapshot deletion need `managed_lifecycle_v1` from the runner's
-actual worker; the controller refuses them, naming the runner, until that worker is
-upgraded. Resize, snapshot and key changes use existing worker primitives.
+actual worker (`ow nodes` shows it under each runner's capabilities); the controller
+refuses them, naming the runner, until that worker is upgraded. Resize, snapshot and key changes use existing worker primitives.
 
 ### Named snapshots outlast their runner
 
