@@ -2,6 +2,41 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.43",
+      "class": 0,
+      "changes": [
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Upgrader: after the pin switch the new worker is quiesced as soon as it answers, before the agent and gateway start, and stays quiesced until verify passes; the resume step lifts it. Before, a wake on connection could reach the new worker during verify, and a large box's resume (its hibernation snapshot is hashed first) held the one-request worker past verify's deadline, so the upgrade rolled back while that resume still held the box and the rollback's stop timed out. Takes effect from the next upgrade, since an upgrade runs the installed upgrader. No unit restarts; protocol, catalog, runtime and host layout 2 unchanged."
+    },
+    {
       "version": "0.9.42",
       "class": 2,
       "changes": [

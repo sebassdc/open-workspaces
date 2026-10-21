@@ -648,6 +648,12 @@ def execute(plan_, ops, frm, to, target_name):
         for name in ("worker", "agent", "dashboard"):
             if name in restart:
                 ops.start(name)
+            if name == "worker" and worker:
+                # The new worker starts open to wakes: quiesce it before the agent and the
+                # gateway can wake a box, or a long resume (a large snapshot is hashed first)
+                # holds the one-request worker past verify's deadline. finish() lifts it.
+                wait_worker(ops)
+                ops.quiesce()
         j.step("verify")
         ops.verify({name: version_of(to[name]) for name in j["from"] if name != "current"})
     except Exception as e:
@@ -665,6 +671,8 @@ def finish(j, ops):
     """Resume and undrain; a box that does not resume stays hibernated (it wakes on its
     next connection) and is reported, never rolled back: its capture may be spent."""
     j.step("resume")
+    if "worker" in j["restart"]:
+        ops.quiesce_off()
     failed = resume(j, ops)
     if j["class"] == 2 and not j["resume"]:
         ops.canary()

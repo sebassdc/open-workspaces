@@ -332,6 +332,21 @@ class Machine(unittest.TestCase):
                 self.run_plan(ops, ["worker"], 2, ["worker"], plan=plan)
                 self.assertEqual((self.journal()["step"], self.journal()["cold"]), ("done", ["late"]))
 
+    def test_the_new_worker_takes_no_wake_until_it_is_verified(self):
+        ops = Fake({"a": "running", "b": "stopped"})
+        real, seen = ops.verify, []
+
+        def verify(expected):  # a connection tries to wake b while the new worker is checked
+            seen.append(ops.quiesced)
+            real(expected)
+
+        ops.verify = verify
+        self.run_plan(ops, ["worker", "agent"], 2, ["agent", "worker"])
+        self.assertEqual(seen, [True], "wakes are refused during verify")
+        self.assertLess(ops.calls.index("start:worker"), len(ops.calls) - ops.calls[::-1].index("quiesce") - 1)
+        self.assertLess(len(ops.calls) - ops.calls[::-1].index("quiesce") - 1, ops.calls.index("start:agent"))
+        self.assertEqual((ops.box, ops.quiesced, self.journal()["step"]), ({"a": "running", "b": "stopped"}, False, "done"))
+
     def test_runner_upgrade_without_boxes_runs_a_canary(self):
         ops = Fake({})
         self.run_plan(ops, ["worker"], 2, ["worker"])

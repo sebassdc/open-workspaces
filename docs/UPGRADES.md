@@ -185,6 +185,10 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   The capture gate runs a last time here, on every capture now present, so a
   box started after planning cannot lose its RAM state without `--accept-cold`;
   a refusal aborts (quiesce lifted, drain removed).
+- **start**: the new worker is quiesced as soon as it answers, before the agent
+  and the dashboard start, so no wake on connection reaches it until verify passes
+  (a large box's resume hashes its hibernation snapshot first and would hold the
+  one-request worker past verify's deadline). The resume step lifts the quiesce.
 - **verify** (each unit against its own pin): the unit is active and its
   `/proc/PID/exe` is its pin's `bin/ow`; the worker answers with its pin's
   version; the runner is online with the agent's and worker's versions; the
