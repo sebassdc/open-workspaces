@@ -888,8 +888,8 @@ fn attributes_json(attrs: &[(String, String)]) -> Value {
 pub(crate) enum Received {
     /// Latest values, keyed `name{attr=value,...}`.
     Metrics(BTreeMap<String, f64>),
-    /// (severity, name, attributes) per record.
-    Events(Vec<(String, String, Value)>),
+    /// (when it happened, severity, name, attributes) per record.
+    Events(Vec<(i64, String, String, Value)>),
 }
 /// Validates a node's telemetry frame. Returns what to store and the request to forward,
 /// rebuilt from the validated fields only, with the authenticated node ID.
@@ -992,7 +992,12 @@ pub(crate) fn receive(node: &str, frame: &Value) -> Result<(Received, &'static s
                             .filter(|(k, _)| k != "event.name")
                             .map(|(k, v)| (k, json!(v)))
                             .collect();
-                        events.push((severity.to_owned(), name, Value::Object(attrs)));
+                        events.push((
+                            event_time(time.as_str().unwrap_or_default(), now()),
+                            severity.to_owned(),
+                            name,
+                            Value::Object(attrs),
+                        ));
                     }
                 }
                 out_resources.push(json!({"resource":checked_resource(&r["resource"],node)?,
@@ -1008,7 +1013,18 @@ pub(crate) fn receive(node: &str, frame: &Value) -> Result<(Received, &'static s
     }
 }
 
-/// Appends an event to a node's capped ring.
+/// When a runner's event happened, in Unix seconds: its own timestamp, so an event
+/// queued during an outage keeps its time. A clock far off (over 5 min ahead or a week
+/// behind) falls back to the time it arrived.
+fn event_time(nanos: &str, now: i64) -> i64 {
+    nanos
+        .parse::<u128>()
+        .ok()
+        .map(|n| (n / 1_000_000_000) as i64)
+        .filter(|at| *at <= now + 300 && *at >= now - 7 * 86400)
+        .unwrap_or(now)
+}
+/// Appends an event that happens now to a node's capped ring.
 pub(crate) fn record_event(
     db: &Connection,
     node: &str,
@@ -1016,9 +1032,20 @@ pub(crate) fn record_event(
     name: &str,
     attrs: &Value,
 ) -> Result<()> {
+    record_event_at(db, node, now(), severity, name, attrs)
+}
+/// Appends an event to a node's capped ring (the newest EVENTS arrivals stay).
+fn record_event_at(
+    db: &Connection,
+    node: &str,
+    at: i64,
+    severity: &str,
+    name: &str,
+    attrs: &Value,
+) -> Result<()> {
     db.execute(
         "INSERT INTO node_events(node,unix_s,severity,name,attrs) VALUES(?1,?2,?3,?4,?5)",
-        params![node, now(), severity, name, attrs.to_string()],
+        params![node, at, severity, name, attrs.to_string()],
     )?;
     db.execute(
         "DELETE FROM node_events WHERE node=?1 AND id<=(SELECT id FROM node_events WHERE node=?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)",
@@ -1112,8 +1139,8 @@ pub(crate) fn store(root: &Path, node: &str, received: &Received) -> Result<()> 
             tx.commit()?;
         }
         Received::Events(events) => {
-            for (severity, name, attrs) in events {
-                record_event(&db, node, severity, name, attrs)?;
+            for (at, severity, name, attrs) in events {
+                record_event_at(&db, node, *at, severity, name, attrs)?;
             }
         }
     }
@@ -1132,6 +1159,8 @@ pub(crate) fn forward(signal: &'static str, body: Value) {
     }
 }
 
+/// Every alert kind `alerts` raises.
+const ALERTS: [&str; 2] = ["node_offline", "disk_low"];
 fn gib(n: u64) -> u64 {
     n * 1024 * 1024 * 1024
 }
@@ -1207,7 +1236,7 @@ pub fn health(root: &Path) -> Result<Value> {
             )
             .optional()?;
         let mut stmt = db.prepare_cached(
-            "SELECT unix_s,severity,name,attrs FROM node_events WHERE node=?1 ORDER BY id DESC LIMIT 10",
+            "SELECT unix_s,severity,name,attrs FROM node_events WHERE node=?1 ORDER BY unix_s DESC,id DESC LIMIT 10",
         )?;
         let events = stmt
             .query_map([&id], |r| {
@@ -1215,7 +1244,10 @@ pub fn health(root: &Path) -> Result<Value> {
                     "attributes":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or_default()}))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // The latest heartbeat the controller stored: live now, or before the last close.
+        let heard = n["last_seen_unix_s"].as_i64().unwrap_or(0).max(seen);
         nodes.push(json!({"id":id,"online":n["online"],"revoked":n["revoked"],"last_seen_unix_s":n["last_seen_unix_s"],
+            "last_heartbeat_unix_s":(heard>0).then_some(heard),
             "telemetry_v1":n["capabilities"]["telemetry_v1"]==true,
             "telemetry":telemetry.map(|(s,at)| json!({"unix_s":at,"metrics":serde_json::from_str::<Value>(&s).unwrap_or_default()})),
             "events":events}));
@@ -1304,28 +1336,52 @@ fn controller_metrics(health: &Value, start: u128) -> Value {
             })
             .collect(),
     };
+    // Every kind for every runner, 1 or 0: a cleared alert reports 0, so a latest-value
+    // backend sees it end instead of keeping the last 1 until the series goes stale.
+    let active = |node: &Value, kind: &str| {
+        health["alerts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|a| a["node"] == node["id"] && a["kind"] == kind)
+    };
     let alerts = Metric {
         name: "ow.alert.active",
         unit: "1",
         sum: false,
-        points: health["alerts"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|a| {
-                (
-                    vec![
-                        (
-                            "ow.node.id",
-                            a["node"].as_str().unwrap_or_default().to_owned(),
-                        ),
-                        (
-                            "ow.alert.kind",
-                            a["kind"].as_str().unwrap_or_default().to_owned(),
-                        ),
-                    ],
-                    Num::Int(1),
-                )
+        points: nodes
+            .iter()
+            .flat_map(|n| {
+                ALERTS.map(|kind| {
+                    (
+                        vec![
+                            (
+                                "ow.node.id",
+                                n["id"].as_str().unwrap_or_default().to_owned(),
+                            ),
+                            ("ow.alert.kind", kind.to_owned()),
+                        ],
+                        Num::Int(i64::from(active(n, kind))),
+                    )
+                })
+            })
+            .collect(),
+    };
+    let age = Metric {
+        name: "ow.node.heartbeat.age",
+        unit: "s",
+        sum: false,
+        points: nodes
+            .iter()
+            .filter_map(|n| {
+                let heard = n["last_heartbeat_unix_s"].as_i64()?;
+                Some((
+                    vec![(
+                        "ow.node.id",
+                        n["id"].as_str().unwrap_or_default().to_owned(),
+                    )],
+                    Num::Int((now / 1_000_000_000) as i64 - heard),
+                ))
             })
             .collect(),
     };
@@ -1335,7 +1391,7 @@ fn controller_metrics(health: &Value, start: u128) -> Value {
         true,
         Num::Int(FORWARD_DROPPED.load(Ordering::SeqCst) as i64),
     );
-    let metrics: Vec<Value> = [up, alerts, dropped]
+    let metrics: Vec<Value> = [up, alerts, age, dropped]
         .iter()
         .filter(|m| !m.points.is_empty())
         .map(|m| encode_metric(m, start, now))
@@ -1754,7 +1810,7 @@ mod tests {
         let Received::Events(events) = received else {
             panic!()
         };
-        assert_eq!(events[0].1, "ow.node.agent.started");
+        assert_eq!(events[0].2, "ow.node.agent.started");
 
         let mut bad = frame.clone();
         bad["body"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["name"] =
@@ -1872,6 +1928,130 @@ mod tests {
             .unwrap();
         assert_eq!(summary, r#"{"ow.c":2.0}"#);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delayed_events_keep_the_time_they_happened() {
+        let root = std::env::temp_dir().join(format!("ow-t-{}", crate::common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let agent = Agent::new("alpha", SALT.into());
+        agent.disconnected(&anyhow::anyhow!("no frame from the controller for 20 s"));
+        let frames: Vec<Value> = agent
+            .queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| serde_json::from_str(f).unwrap())
+            .collect();
+        // Queued during an hour-long outage: the records carry their own time.
+        let hour_ago = ((unix_nanos() / 1_000_000_000) as i64 - 3600) as u128 * 1_000_000_000;
+        for mut frame in frames {
+            let record = &mut frame["body"]["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
+            record["timeUnixNano"] = json!(hour_ago.to_string());
+            let (received, _, forwarded) = receive("alpha", &frame).unwrap();
+            assert_eq!(
+                forwarded["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["timeUnixNano"],
+                hour_ago.to_string()
+            );
+            store(&root, "alpha", &received).unwrap();
+        }
+        // A controller event that happens now.
+        record_event(
+            &crate::nodes::db(&root).unwrap(),
+            "alpha",
+            "WARN",
+            "ow.alert.raised",
+            &json!({"kind":"node_offline"}),
+        )
+        .unwrap();
+        let db = crate::nodes::db(&root).unwrap();
+        let stored: Vec<(String, i64)> = db
+            .prepare("SELECT name,unix_s FROM node_events WHERE node='alpha' ORDER BY unix_s DESC")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let at = |name: &str| stored.iter().find(|(n, _)| n == name).unwrap().1;
+        assert_eq!(
+            at("ow.node.channel.disconnected"),
+            (hour_ago / 1_000_000_000) as i64
+        );
+        assert_eq!(
+            at("ow.node.agent.started"),
+            (hour_ago / 1_000_000_000) as i64
+        );
+        assert!((at("ow.alert.raised") - now()).abs() <= 2);
+        assert_eq!(
+            stored[0].0, "ow.alert.raised",
+            "listed by when they happened"
+        );
+        // A clock far off falls back to the time of arrival.
+        assert_eq!(event_time("99999999999999999999", 1000), 1000);
+        assert_eq!(event_time("not a number", 1000), 1000);
+        assert_eq!(
+            event_time(&(900u128 * 1_000_000_000).to_string(), 1000),
+            900
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn forwarded_alert_series_report_zero_once_cleared() {
+        let series = |health: &Value| -> Vec<(String, String, String)> {
+            let body = controller_metrics(health, 1);
+            body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["name"] == "ow.alert.active")
+                .flat_map(|m| m["gauge"]["dataPoints"].as_array().unwrap().clone())
+                .map(|p| {
+                    let attr = |k: &str| {
+                        p["attributes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|a| a["key"] == k)
+                            .unwrap()["value"]["stringValue"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                    };
+                    (
+                        attr("ow.node.id"),
+                        attr("ow.alert.kind"),
+                        p["asInt"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect()
+        };
+        let node = |online: bool| json!({"id":"alpha","online":online,"revoked":false,"last_heartbeat_unix_s":now()-120});
+        let down = json!({"nodes":[node(false)],"alerts":[{"kind":"node_offline","node":"alpha"}]});
+        let up = json!({"nodes":[node(true)],"alerts":[]});
+        let entry = |kind: &str, v: &str| ("alpha".to_owned(), kind.to_owned(), v.to_owned());
+        assert_eq!(
+            series(&down),
+            [entry("node_offline", "1"), entry("disk_low", "0")]
+        );
+        assert_eq!(
+            series(&up),
+            [entry("node_offline", "0"), entry("disk_low", "0")]
+        );
+        let body = controller_metrics(&down, 1);
+        let age = body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "ow.node.heartbeat.age")
+            .unwrap()
+            .clone();
+        let age: i64 = age["gauge"]["dataPoints"][0]["asInt"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((119..=122).contains(&age), "{age}");
     }
 
     #[test]

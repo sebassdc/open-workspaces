@@ -179,6 +179,11 @@ Surfaces:
 | Stored per runner | latest summary (≤ 256 series) and 200 events |
 | Forwarder | 64 queued payloads, one attempt each, 5 s timeout, no redirects |
 
+Each event keeps the time it happened on the runner. A disconnect queued during
+an outage is stored and listed at its own time, not when it arrived. A
+timestamp more than 5 minutes ahead or a week behind the controller's clock
+falls back to the arrival time.
+
 While the channel is down, events and samples wait in the queue (a runner that
 reconnects reports why it went down). Then the oldest are dropped and counted
 in `ow.telemetry.dropped`. Collection reads `/proc` and `statvfs` once per
@@ -197,8 +202,9 @@ controller's own series:
 
 | Series | Value |
 | --- | --- |
-| `ow.node.up` | one per runner |
-| `ow.alert.active` | `ow.alert.kind` and `ow.node.id` |
+| `ow.node.up` | 1 or 0 per runner |
+| `ow.alert.active` | 1 or 0 for each runner and alert kind (`ow.alert.kind`, `ow.node.id`); a cleared alert reports 0 |
+| `ow.node.heartbeat.age` | seconds since each runner's last stored heartbeat |
 | `ow.telemetry.forward.dropped` | payloads the forwarder dropped |
 
 Any OpenTelemetry Collector with an `otlp` receiver on port 4318 accepts this.
