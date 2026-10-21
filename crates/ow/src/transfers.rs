@@ -438,6 +438,7 @@ pub(crate) fn recover(shared: &Shared) {
                 }
             }
             crate::drain::reconcile(&shared);
+            publication::reconcile_snapshots(&shared);
             drop(shared);
             std::thread::sleep(Duration::from_secs(5));
         }
@@ -1239,4 +1240,7 @@ mod vm_tests;
 
 #[path = "drain_transfer.rs"]
 mod draining;
+
+#[path = "snapshot_publication.rs"]
+mod publication;
 pub(crate) use draining::{drain_cleanup, drain_park, drain_publish};

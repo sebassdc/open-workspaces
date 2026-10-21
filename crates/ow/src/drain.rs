@@ -467,7 +467,14 @@ pub(crate) fn pass(
     ensure!(
         machines.iter().all(|m| matches!(
             m["state"].as_str(),
-            Some("stopped" | "hibernated" | "exported" | "exported-cleaned" | "discarded")
+            Some(
+                "stopped"
+                    | "hibernated"
+                    | "exported"
+                    | "exported-cleaned"
+                    | "deleted"
+                    | "discarded"
+            )
         )),
         "unknown VM state; retained"
     );

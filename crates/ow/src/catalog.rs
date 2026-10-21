@@ -927,7 +927,12 @@ impl Catalog {
                 common::identifier(snapshot)?;
                 // A pool admin forks the box owner's named snapshots; others their own.
                 let snapshots = c.snapshot_owner(user, &intent.machine)?;
-                Some(c.db.query_row("SELECT physical FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND node=?3 AND json_extract(metadata,'$.workspace')=?4 AND json_extract(metadata,'$.memory_mib')=?5 AND json_extract(metadata,'$.vcpu_count')=?6 AND json_extract(metadata,'$.disk_bytes')=?7",params![snapshots,snapshot,source_node,source,intent.memory_mib,intent.cpus,intent.disk_bytes as i64],|r|r.get::<_,String>(0)).context("snapshot identity or shape changed during admission")?)
+                // A stored snapshot forks from its artifact, wherever its runner copy is.
+                let physical = c.db.query_row("SELECT physical FROM resources WHERE owner=?1 AND kind='snapshot' AND name=?2 AND (node=?3 OR ?8 IS NOT NULL) AND json_extract(metadata,'$.workspace')=?4 AND json_extract(metadata,'$.memory_mib')=?5 AND json_extract(metadata,'$.vcpu_count')=?6 AND json_extract(metadata,'$.disk_bytes')=?7",params![snapshots,snapshot,source_node,source,intent.memory_mib,intent.cpus,intent.disk_bytes as i64,intent.capture],|r|r.get::<_,String>(0)).context("snapshot identity or shape changed during admission")?;
+                if let Some(capture) = &intent.capture {
+                    ensure!(c.db.query_row("SELECT local_name=?2 AND kind='snapshot' FROM artifacts WHERE id=?1",params![capture,physical],|r|r.get::<_,bool>(0))?,"stored capture is not this snapshot");
+                }
+                Some(physical)
             } else { None };
             // Global high-watermark survives aborts, deleted children and controller restarts.
             c.db.execute("INSERT INTO settings(key,value) VALUES('transfer_epoch','0') ON CONFLICT(key) DO NOTHING",[])?;
@@ -1618,7 +1623,13 @@ impl Catalog {
         let mut value: Value = serde_json::from_str(metadata)?;
         value[if kind == "machine" { "id" } else { "name" }] = json!(physical);
         value["node"] = json!(node);
-        let online = if node == "local" {
+        if kind == "snapshot" {
+            // A stored snapshot restores or forks from the artifact store on any runner.
+            value["artifact"] = json!(self.db.query_row("SELECT a.id FROM artifacts a JOIN resources s ON s.kind='snapshot' AND s.physical=?1 AND a.owner=s.owner WHERE a.kind='snapshot' AND a.local_name=?1 AND a.state='stored' AND a.digest IS NOT NULL ORDER BY a.stored_at DESC LIMIT 1",[physical],|r|r.get::<_,String>(0)).optional()?);
+        }
+        let online = if node.is_empty() && kind == "snapshot" {
+            true
+        } else if node == "local" {
             self.root.join("control.sock").exists()
         } else {
             nodes::online(&self.root, node).is_ok()
@@ -1988,9 +1999,67 @@ impl Catalog {
         physical: &str,
         input: &Value,
     ) -> Result<Value> {
+        self.without_runner(user, "delete", name, physical, input, |c| {
+            Ok(json!({"deleted":name,"snapshots":c.forget(user, physical)?}))
+        })
+    }
+    fn parked(&self, physical: &str) -> Result<bool> {
+        Ok(self.db.query_row("SELECT node='' AND placement_managed=1 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1) FROM resources WHERE kind='machine' AND physical=?1",[physical],|r|r.get(0))?)
+    }
+    /// A named snapshot kept in the artifact store and no longer on its box's runner (the box
+    /// moved or was parked): only the catalog row goes. A runner still holding a copy has it
+    /// removed by the publication janitor, which owns that runner's publication record.
+    fn delete_stored_snapshot(
+        &mut self,
+        user: i64,
+        name: &str,
+        physical: &str,
+        input: &Value,
+    ) -> Result<Option<Value>> {
+        let snapshot = input["name"].as_str().context("snapshot name")?;
+        let id = self.physical(user, "snapshot", snapshot)?;
+        self.snapshot_source(user, &id, physical)?;
+        let away: bool = self.db.query_row("SELECT s.node<>m.node AND EXISTS(SELECT 1 FROM artifacts a WHERE a.kind='snapshot' AND a.owner=s.owner AND a.local_name=s.physical AND a.state='stored') FROM resources s JOIN resources m ON m.kind='machine' AND m.physical=?2 WHERE s.kind='snapshot' AND s.physical=?1",params![id,physical],|r|r.get(0))?;
+        if !away {
+            return Ok(None);
+        }
+        let moving: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1)",
+            [physical],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            !moving,
+            limits::Rejection(
+                "snapshot is in use by a move or fork; retry when it finishes".into()
+            )
+        );
+        let value = self.without_runner(user, "snapshot-delete", snapshot, physical, input, |c| {
+            let tx = c.db.transaction()?;
+            tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND owner=?1 AND resource=?2",params![user,snapshot])?;
+            tx.execute(
+                "DELETE FROM resources WHERE kind='snapshot' AND physical=?1",
+                [&id],
+            )?;
+            tx.commit()?;
+            Ok(json!({"deleted":snapshot,"workspace":name}))
+        })?;
+        Ok(Some(value))
+    }
+    /// Record an operation that needs no runner under its key, with the fingerprint a
+    /// dispatched one would have, then apply its catalog effect.
+    fn without_runner(
+        &mut self,
+        user: i64,
+        op: &str,
+        resource: &str,
+        physical: &str,
+        input: &Value,
+        effect: impl FnOnce(&mut Self) -> Result<Value>,
+    ) -> Result<Value> {
         ensure!(
             !limits::unresolved(&self.db, physical)?,
-            "missing workspace has unresolved operations; reconcile their outcomes before deleting it"
+            "machine has unresolved operations; reconcile their outcomes first"
         );
         let node = self.placement("machine", physical)?;
         let mut request = input.clone();
@@ -2024,11 +2093,11 @@ impl Catalog {
                 id
             }
             None => {
-                self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,'delete',?2,'pending',?3,?4,?5)",params![user,name,node,key,fingerprint])?;
+                self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,?2,?3,'pending',?4,?5,?6)",params![user,op,resource,node,key,fingerprint])?;
                 self.db.last_insert_rowid()
             }
         };
-        let mut value = json!({"deleted":name,"snapshots":self.forget(user, physical)?});
+        let mut value = effect(self)?;
         value["operation"] = self.operation_info(user, operation)?;
         value["operation"]["state"] = json!("succeeded");
         value["operation_id"] = json!(operation);
@@ -2489,8 +2558,24 @@ impl Catalog {
                     };
                 }
             }
+            if op == "delete" && self.parked(&physical)? {
+                // No runner holds an executable copy. The stored capture and any fenced source
+                // export stay until store collection and runner drain, as for every park.
+                return self.delete_missing(user, &name, &physical, &input);
+            }
+            if op == "snapshot-delete"
+                && let Some(value) = self.delete_stored_snapshot(user, &name, &physical, &input)?
+            {
+                return Ok(value);
+            }
             self.legacy_access(&physical)?;
             if let Some(placement) = self.managed_placement(&physical)? {
+                if op == "restore" {
+                    return Err(limits::Rejection(format!(
+                        "machine '{name}' was moved between runners; restore it from its snapshot's artifact (ow restore {name} --artifact ID --node RUNNER, the ID is in ow snapshots)"
+                    ))
+                    .into());
+                }
                 ensure!(
                     matches!(
                         op.as_str(),
@@ -2502,9 +2587,16 @@ impl Catalog {
                             | "put"
                             | "get"
                             | "hibernate"
+                            | "resize"
+                            | "snapshot"
+                            | "snapshot-delete"
+                            | "delete"
                     ),
                     "managed mutation requires lifecycle coordination"
                 );
+                if matches!(op.as_str(), "delete" | "snapshot-delete") {
+                    nodes::managed_lifecycle_capable(&self.root, &placement.node)?;
+                }
                 request["placement"] = json!(placement);
             }
             // Confirmed gone from its runner: only the row is left. A runner that is online now
@@ -3009,7 +3101,7 @@ impl Catalog {
             return Err(self.outcome_error(owner, operation));
         }
         if request.get("placement").is_some()
-            && matches!(op.as_str(), "start" | "stop" | "hibernate")
+            && matches!(op.as_str(), "start" | "stop" | "hibernate" | "resize")
         {
             // Lifecycle replies predate placement fields; observe the actual current copy.
             let observed = (|| -> Result<Value> {
@@ -3049,6 +3141,10 @@ impl Catalog {
         ) {
         } else if op == "snapshot" {
             let id = request["name"].as_str().unwrap();
+            if request.get("placement").is_some() && value["disk_bytes"].is_null() {
+                // Its store publication and any fork from it are checked against this size.
+                value["disk_bytes"] = self.db.query_row("SELECT json_extract(metadata,'$.disk_bytes') FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|r.get::<_,Option<i64>>(0))?.map_or(Value::Null, |n| json!(n));
+            }
             self.save_node(&node, "snapshot", id, &value)?;
             value = self.public(user, "snapshot", &value)?;
         } else if op == "stop" {
@@ -3065,6 +3161,11 @@ impl Catalog {
             tx.execute(
                 "DELETE FROM resources WHERE kind='snapshot' AND physical=?1",
                 [id],
+            )?;
+            // This runner's copy is gone; its store publication is no longer a root.
+            tx.execute(
+                "DELETE FROM drain_publications WHERE node=?1 AND name=?2",
+                params![node, id],
             )?;
             tx.commit()?;
             value = json!({"deleted":snapshot,"workspace":name});

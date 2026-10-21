@@ -89,7 +89,8 @@ pub(crate) fn drain_cleanup(
             .unwrap_or(false)),
         "source capture not durable"
     );
-    ensure!(c.db.query_row("SELECT node<>?2 AND placement_epoch>=?3 FROM resources WHERE kind='machine' AND physical=?1",params![t.machine,node,t.epoch],|r|r.get::<_,bool>(0))?,"source still owns placement");
+    // A deleted box no longer owns any placement.
+    ensure!(c.db.query_row("SELECT node<>?2 AND placement_epoch>=?3 FROM resources WHERE kind='machine' AND physical=?1",params![t.machine,node,t.epoch],|r|r.get::<_,bool>(0)).optional()?.unwrap_or(true),"source still owns placement");
     drop(c);
     let result = call(
         node,
@@ -109,13 +110,43 @@ pub(crate) fn drain_publish(
     capture: &Value,
     call: &impl Fn(&str, Value) -> Result<Value>,
 ) -> Result<()> {
-    let native_value = &capture["native"];
-    let snapshot = native_value["name"]
-        .as_str()
-        .context("capture name missing")?;
-    let machine = native_value["workspace"]
-        .as_str()
-        .context("capture lineage missing")?;
+    let native = &capture["native"];
+    let shape = (
+        native["memory_mib"]
+            .as_u64()
+            .context("capture memory unknown")?
+            .try_into()?,
+        native["vcpu_count"]
+            .as_u64()
+            .context("capture CPU unknown")?
+            .try_into()?,
+        capture["disk_bytes"]
+            .as_u64()
+            .context("capture disk unknown")?,
+    );
+    publish_named(
+        shared,
+        node,
+        native["name"].as_str().context("capture name missing")?,
+        native["workspace"]
+            .as_str()
+            .context("capture lineage missing")?,
+        shape,
+        Some(native),
+        call,
+    )
+}
+/// Publishes a runner's named capture once, recorded per runner and name. `expected` pins the
+/// exact native manifest the runner reported; without it the catalog shape and hashes decide.
+pub(super) fn publish_named(
+    shared: &Shared,
+    node: &str,
+    snapshot: &str,
+    machine: &str,
+    (memory_mib, cpus, disk_bytes): (u32, u32, u64),
+    expected: Option<&Value>,
+    call: &impl Fn(&str, Value) -> Result<Value>,
+) -> Result<()> {
     let (a, expires) = {
         let c = shared.lock().unwrap();
         // Already published transfer captures keep their original artifact/root; do not duplicate them.
@@ -137,12 +168,13 @@ pub(crate) fn drain_publish(
             .optional()?
         {
             let manifest: store::Manifest = serde_json::from_str(&raw)?;
+            let stored: Value = serde_json::from_str(
+                manifest.metadata["native_manifest"]
+                    .as_str()
+                    .context("native manifest missing")?,
+            )?;
             ensure!(
-                serde_json::from_str::<Value>(
-                    manifest.metadata["native_manifest"]
-                        .as_str()
-                        .context("native manifest missing")?
-                )? == *native_value,
+                expected.is_none_or(|native| *native == stored),
                 "named capture changed"
             );
             ensure!(
@@ -186,17 +218,9 @@ pub(crate) fn drain_publish(
                 attempt: token,
                 digest: String::new(),
             },
-            memory_mib: native_value["memory_mib"]
-                .as_u64()
-                .context("capture memory unknown")?
-                .try_into()?,
-            cpus: native_value["vcpu_count"]
-                .as_u64()
-                .context("capture CPU unknown")?
-                .try_into()?,
-            disk_bytes: capture["disk_bytes"]
-                .as_u64()
-                .context("capture disk unknown")?,
+            memory_mib,
+            cpus,
+            disk_bytes,
         };
         tx.commit()?;
         (a, expires.unwrap())
@@ -214,7 +238,7 @@ pub(crate) fn drain_publish(
     pinned.reference = reference.clone();
     let (_, observed) = native(&manifest, &pinned)?;
     ensure!(
-        observed == *native_value
+        expected.is_none_or(|native| *native == observed)
             && reference.attempt == a.reference.attempt
             && store::sha256(&manifest.bytes()?) == reference.digest,
         "named snapshot publication differs"

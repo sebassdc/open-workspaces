@@ -2671,3 +2671,6 @@ fn wake_reserved_before_soft_drain_finishes_the_existing_transfer() {
         Some(target.as_str())
     );
 }
+
+#[path = "managed_lifecycle_tests.rs"]
+mod managed;

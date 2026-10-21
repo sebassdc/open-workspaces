@@ -401,6 +401,25 @@ pub fn operation_capable(root: &Path, node: &str, op: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Deleting a managed box or its named snapshots needs a worker that keeps a deletion tombstone.
+pub fn managed_lifecycle_capable(root: &Path, node: &str) -> Result<()> {
+    let caps: Value = if node == "local" {
+        crate::wire::request(root, json!({"op":"status"}))?
+    } else {
+        serde_json::from_str(&db(root)?.query_row(
+            "SELECT capabilities FROM nodes WHERE id=?1",
+            [node],
+            |r| r.get::<_, String>(0),
+        )?)?
+    };
+    ensure!(
+        caps["managed_lifecycle_v1"] == true,
+        crate::limits::Rejection(format!(
+            "Runner {node} runs a worker that cannot delete moved boxes or their snapshots; upgrade its worker first."
+        ))
+    );
+    Ok(())
+}
 pub fn ssh_capable(root: &Path, node: &str) -> Result<()> {
     online(root, node)?;
     if node != "local" {
@@ -1104,6 +1123,8 @@ fn build_beat(
     cache_extension(&mut beat, status, root, cache_negotiated)?;
     beat["disk_resize_v1"] = json!(status["disk_resize_v1"] == true);
     beat["snapshot_delete_v1"] = json!(status["snapshot_delete_v1"] == true);
+    beat["managed_lifecycle_v1"] =
+        json!(status["managed_lifecycle_v1"] == true && common::placement_capable(status).is_ok());
     beat["aws_identity_v1"] = json!(status["aws_identity_v1"] == true);
     #[cfg(target_os = "linux")]
     {
@@ -1748,8 +1769,12 @@ fn journal_request(root: &Path, request: &Value, fencing_worker: bool) -> Result
                 return Ok(v);
             }
         }
+        // A managed delete or snapshot delete repeats against its own epoch-checked tombstone.
         if !matches!(request["op"].as_str(), Some("create" | "fork" | "snapshot"))
-            && !(request["op"] == "start" && request.get("placement").is_some())
+            && !(matches!(
+                request["op"].as_str(),
+                Some("start" | "delete" | "snapshot-delete")
+            ) && request.get("placement").is_some())
             && !request["op"]
                 .as_str()
                 .is_some_and(|op| common::PLACEMENT_OPERATIONS.contains(&op))

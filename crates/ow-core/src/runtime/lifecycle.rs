@@ -61,6 +61,14 @@ impl Runtime {
         })
     }
 
+    pub(super) fn lifecycle_capture_of_another(&self, id: &str, name: &str) -> bool {
+        self.state.placements.iter().any(|(other, m)| {
+            other != id
+                && (m.intent.as_ref().is_some_and(|i| i.capture == name)
+                    || m.import.as_ref().is_some_and(|i| i.snapshot == name))
+        })
+    }
+
     pub(super) fn recover_state(state: &mut State) -> Result<()> {
         for (id, workspace) in &mut state.workspaces {
             ensure!(
@@ -81,6 +89,7 @@ impl Runtime {
                     Phase::Prepared => "prepared",
                     Phase::Exporting | Phase::Captured => "exporting",
                     Phase::Exported => "exported",
+                    Phase::Cleaned if managed.intent.is_none() => "deleted",
                     Phase::Cleaned => "exported-cleaned",
                     Phase::Discarded => "discarded",
                 }
@@ -94,6 +103,7 @@ impl Runtime {
                             | "exporting"
                             | "exported"
                             | "exported-cleaned"
+                            | "deleted"
                             | "discarded"
                     ),
                     "lifecycle state is missing managed placement: {id}"
@@ -109,6 +119,18 @@ impl Runtime {
             "orphan placement fence"
         );
         Ok(())
+    }
+
+    /// A managed delete leaves its fence cleaned with no export intent: a tombstone.
+    pub(super) fn deleted(&self, id: &str) -> bool {
+        self.state
+            .placements
+            .get(id)
+            .is_some_and(|m| m.phase == Phase::Cleaned && m.intent.is_none())
+    }
+    pub(super) fn mark_deleted(&mut self, id: &str) {
+        self.state.placements.get_mut(id).unwrap().phase = Phase::Cleaned;
+        self.state.workspaces.get_mut(id).unwrap().state = "deleted".into();
     }
 
     pub(super) fn require_unmanaged(&self, id: &str) -> Result<()> {
@@ -203,6 +225,9 @@ impl Runtime {
                 );
             }
             "activate" | "placement-register" => self.require_active(id)?,
+            "delete" => ensure!(self.deleted(id), "managed delete was not completed"),
+            // Removing a named snapshot never executes or changes the copy itself.
+            "snapshot-delete" => {}
             _ => self.require_active(id)?,
         }
         Ok(())
@@ -598,7 +623,7 @@ impl Runtime {
         let replacing_cleaned = self.state.placements.get(id).is_some_and(|m| {
             matches!(m.phase, Phase::Cleaned | Phase::Discarded)
                 && authority.epoch > m.authority.epoch
-        });
+        }) && !self.deleted(id);
         if let Some(managed) = self.state.placements.get(id).filter(|_| !replacing_cleaned) {
             ensure!(
                 managed.authority == authority && managed.import.as_ref() == Some(&intent),
@@ -1827,6 +1852,153 @@ mod revisit_tests {
         assert!(runtime.request(&cleanup).is_err());
         assert!(runtime.check_replay(&json!({"request":export})).is_err());
         assert!(runtime.snapshot_dir("capture/manifest.json").exists());
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod managed_lifecycle_tests {
+    use super::*;
+    fn runtime() -> (Runtime, Value) {
+        let mut runtime = super::super::disk_tests::fixture();
+        File::options()
+            .write(true)
+            .open(runtime.machine_dir("legacy").join("disk.ext4"))
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+        let placement = json!({"epoch":7,"node":"alpha","transfer":"move"});
+        runtime.request(&json!({"op":"placement-register","id":"legacy","committed":true,"placement":placement})).unwrap();
+        (runtime, placement)
+    }
+    fn named(runtime: &mut Runtime, placement: &Value, name: &str) {
+        let _ = fs::remove_file(runtime.machine_dir("legacy").join("fixture-api.sock"));
+        let (machine, server) = vm::capture_fixture(&runtime.machine_dir("legacy"), true);
+        runtime.machines.insert("legacy".into(), machine);
+        let result = runtime
+            .request(&json!({"op":"snapshot","id":"legacy","name":name,"placement":placement}))
+            .unwrap();
+        runtime.machines.clear();
+        server.join().unwrap();
+        assert_eq!(result["name"], name);
+        let manifest: Value = serde_json::from_slice(
+            &fs::read(runtime.snapshot_dir(name).join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["managed"], true);
+    }
+    fn restart(runtime: &mut Runtime) {
+        runtime.state = State::read(&fs::read(runtime.root.join("state.json")).unwrap()).unwrap();
+        Runtime::recover_state(&mut runtime.state).unwrap();
+    }
+
+    #[test]
+    fn managed_delete_needs_exact_authority_and_leaves_a_replayable_tombstone() {
+        let (mut runtime, placement) = runtime();
+        named(&mut runtime, &placement, "kept-by-name");
+        let delete = json!({"op":"delete","id":"legacy","placement":placement});
+        for wrong in [
+            json!({"op":"delete","id":"legacy"}),
+            json!({"op":"delete","id":"legacy","placement":{"epoch":6,"node":"alpha","transfer":"move"}}),
+            json!({"op":"delete","id":"legacy","placement":{"epoch":7,"node":"beta","transfer":"move"}}),
+        ] {
+            assert!(runtime.request(&wrong).is_err(), "{wrong}");
+        }
+        assert!(runtime.machine_dir("legacy").exists());
+        let first = runtime.request(&delete).unwrap();
+        assert_eq!(first["deleted"], "legacy");
+        assert_eq!(first["snapshots"], json!(["kept-by-name"]));
+        assert!(!runtime.machine_dir("legacy").exists());
+        assert!(!runtime.snapshot_dir("kept-by-name").exists());
+        assert!(runtime.deleted("legacy"));
+        assert_eq!(runtime.workspace_count(), 0);
+        // A lost reply: the repeat and the agent's cached-reply check both succeed.
+        assert_eq!(
+            runtime.request(&delete).unwrap(),
+            json!({"deleted":"legacy","snapshots":[]})
+        );
+        runtime
+            .request(&json!({"op":"placement-check","id":"legacy","request":delete}))
+            .unwrap();
+        restart(&mut runtime);
+        assert_eq!(runtime.state.workspaces["legacy"].state, "deleted");
+        assert!(runtime.deleted("legacy"));
+        for op in ["start", "exec", "resize", "snapshot", "ssh-keys"] {
+            let mut late = delete.clone();
+            late["op"] = json!(op);
+            assert!(runtime.request(&late).is_err(), "{op}");
+        }
+        // The tombstone is permanent, even for a later epoch.
+        fs::create_dir(runtime.snapshot_dir("capture")).unwrap();
+        let mut import = json!({"op":"import-prepare","id":"legacy","snapshot":"capture","manifest_sha256":"0".repeat(64),
+            "placement":{"epoch":9,"node":"alpha","transfer":"back"}});
+        assert!(runtime.request(&import).is_err());
+        import["op"] = json!("export-cleanup");
+        assert!(runtime.request(&import).is_err());
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
+    #[test]
+    fn managed_named_snapshot_delete_works_active_or_fenced_but_never_on_captures() {
+        let (mut runtime, placement) = runtime();
+        named(&mut runtime, &placement, "first");
+        named(&mut runtime, &placement, "second");
+        let delete = |name: &str, placement: &Value| json!({"op":"snapshot-delete","id":"legacy","name":name,"placement":placement});
+        assert!(
+            runtime
+                .request(&json!({"op":"snapshot-delete","id":"legacy","name":"first"}))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .request(&delete(
+                    "first",
+                    &json!({"epoch":6,"node":"alpha","transfer":"move"})
+                ))
+                .is_err()
+        );
+        assert_eq!(
+            runtime.request(&delete("first", &placement)).unwrap()["existed"],
+            true
+        );
+        assert!(!runtime.snapshot_dir("first").exists());
+        assert_eq!(
+            runtime.request(&delete("first", &placement)).unwrap()["existed"],
+            false
+        );
+        // Moved away: the fenced, cleaned source still removes its named snapshot copy.
+        let export = json!({"op":"export","id":"legacy","placement":placement,"transfer":"onward","capture":"onward-capture"});
+        runtime.request(&export).unwrap();
+        assert!(
+            runtime
+                .request(&delete("onward-capture", &placement))
+                .is_err()
+        );
+        let mut cleanup = export.clone();
+        cleanup["op"] = json!("export-cleanup");
+        runtime.request(&cleanup).unwrap();
+        assert!(
+            runtime
+                .request(&delete("onward-capture", &placement))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .request(&json!({"op":"start","id":"legacy","placement":placement}))
+                .is_err()
+        );
+        assert_eq!(
+            runtime.request(&delete("second", &placement)).unwrap()["existed"],
+            true
+        );
+        runtime
+            .request(&json!({"op":"placement-check","id":"legacy","request":delete("second", &placement)}))
+            .unwrap();
+        assert!(
+            runtime
+                .snapshot_dir("onward-capture/manifest.json")
+                .exists()
+        );
         fs::remove_dir_all(runtime.root).unwrap();
     }
 }
