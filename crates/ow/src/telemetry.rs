@@ -28,7 +28,25 @@ const EVENTS: i64 = 200;
 const SERIES: usize = 256;
 /// Telemetry frames a controller session accepts per 3 s tick; more are ignored.
 pub(crate) const FRAMES_PER_TICK: u32 = 20;
-/// Operations whose duration is reported (captures and restores).
+/// Agent jobs that are reads, streams or credential refreshes: no `ow.node.operation`
+/// event (every other job, box lifecycle and capture steps included, gets one).
+const QUIET: [&str; 14] = [
+    "status",
+    "list",
+    "stats",
+    "snapshots",
+    "inspect",
+    "ssh-info",
+    "cache-inventory",
+    "capture-progress",
+    "drain-inventory",
+    "aws-token",
+    "aws-creds",
+    "terminal",
+    "ssh",
+    "tunnel",
+];
+/// Operations whose duration is reported as a metric (captures and restores).
 const TIMED: [&str; 7] = [
     "snapshot",
     "hibernate",
@@ -53,10 +71,13 @@ fn now() -> i64 {
 // Controller-held settings (one source; read on every acknowledgement).
 
 /// Allowed keys and their defaults.
-pub const KEYS: [(&str, &str); 6] = [
+pub const KEYS: [(&str, &str); 8] = [
     ("telemetry.enabled", "true"),
     ("telemetry.interval_s", "15"),
     ("telemetry.forward_endpoint", ""),
+    // Whether events are forwarded as OTLP logs, and the lowest severity forwarded.
+    ("telemetry.logs", "true"),
+    ("telemetry.log_level", "info"),
     ("alerts.offline_after_s", "60"),
     ("alerts.disk_low_gib", "20"),
     // The dashboard UI bundle the controller serves (docs/DASHBOARD.md#ui-bundles).
@@ -75,6 +96,18 @@ fn typed(key: &str, value: &str) -> Result<Value> {
             "false" => Ok(json!(false)),
             _ => bail!("telemetry.enabled is true or false"),
         },
+        "telemetry.logs" => match value {
+            "true" => Ok(json!(true)),
+            "false" => Ok(json!(false)),
+            _ => bail!("telemetry.logs is true or false"),
+        },
+        "telemetry.log_level" => {
+            ensure!(
+                severity_number(&value.to_ascii_uppercase()).is_some(),
+                "telemetry.log_level is info, warn or error"
+            );
+            Ok(json!(value.to_ascii_lowercase()))
+        }
         "telemetry.interval_s" => number(5..=300),
         "alerts.offline_after_s" => number(15..=86400),
         "alerts.disk_low_gib" => number(0..=100_000),
@@ -259,20 +292,25 @@ pub(crate) fn encode_metrics(
     }
     (frames, dropped)
 }
-fn encode_event(node: &str, severity: &str, name: &str, attrs: &[(&str, String)]) -> String {
-    let number = match severity {
-        "ERROR" => 17,
-        "WARN" => 13,
-        _ => 9,
-    };
+fn severity_number(severity: &str) -> Option<u64> {
+    match severity {
+        "INFO" => Some(9),
+        "WARN" => Some(13),
+        "ERROR" => Some(17),
+        _ => None,
+    }
+}
+fn log_record(severity: &str, name: &str, attrs: &[(&str, String)]) -> Value {
     let mut attrs = attrs.to_vec();
     attrs.push(("event.name", name.to_owned()));
     let now = unix_nanos().to_string();
+    json!({"timeUnixNano":now,"observedTimeUnixNano":now,"severityNumber":severity_number(severity).unwrap_or(9),
+        "severityText":severity,"body":{"stringValue":name},"attributes":attributes(&attrs)})
+}
+fn encode_event(node: &str, severity: &str, name: &str, attrs: &[(&str, String)]) -> String {
     frame(
         "logs",
-        json!({"resourceLogs":[{"resource":resource(node),"scopeLogs":[{"scope":{"name":"ow"},"logRecords":[{
-            "timeUnixNano":now,"observedTimeUnixNano":now,"severityNumber":number,"severityText":severity,
-            "body":{"stringValue":name},"attributes":attributes(&attrs)}]}]}]}),
+        json!({"resourceLogs":[{"resource":resource(node),"scopeLogs":[{"scope":{"name":"ow"},"logRecords":[log_record(severity,name,attrs)]}]}]}),
     )
 }
 
@@ -303,6 +341,36 @@ pub(crate) struct Agent {
     channel: Mutex<Channel>,
     /// Per operation: last duration (ms), successes, failures.
     ops: Mutex<BTreeMap<String, (u64, u64, u64)>>,
+    /// The last worker process seen, and whether the worker stopped answering since.
+    worker: Mutex<(Option<u64>, bool)>,
+}
+
+/// Why a job failed, as a fixed class: worker errors can quote paths, names or commands.
+pub(crate) fn error_class(error: &str) -> &'static str {
+    let text = error.to_ascii_lowercase();
+    let classes = [
+        ("not found", "not_found"),
+        ("no such", "not_found"),
+        ("unknown", "not_found"),
+        ("already", "conflict"),
+        ("conflict", "conflict"),
+        ("timed out", "timeout"),
+        ("timeout", "timeout"),
+        ("capacity", "capacity"),
+        ("no space", "capacity"),
+        ("memory", "capacity"),
+        ("upgrade", "unsupported"),
+        ("unsupported", "unsupported"),
+        ("lacks", "unsupported"),
+        ("denied", "refused"),
+        ("refused", "refused"),
+        ("permission", "refused"),
+        ("worker", "worker"),
+    ];
+    classes
+        .iter()
+        .find(|(needle, _)| text.contains(needle))
+        .map_or("failed", |(_, class)| class)
 }
 
 /// Why a channel attempt ended, as a fixed class (never the raw error text).
@@ -340,6 +408,7 @@ impl Agent {
             interval_s: AtomicU64::new(15),
             channel: Mutex::new(Channel::default()),
             ops: Mutex::new(BTreeMap::new()),
+            worker: Mutex::new((None, false)),
         });
         agent.event(
             "INFO",
@@ -347,6 +416,49 @@ impl Agent {
             &[("ow.version", env!("CARGO_PKG_VERSION").into())],
         );
         agent
+    }
+    /// Reports an agent upgrade: the version this data directory last ran, when it differs.
+    pub fn version_change(&self, root: &Path) {
+        let path = root.join("telemetry-version");
+        let version = env!("CARGO_PKG_VERSION");
+        let previous = std::fs::read_to_string(&path).unwrap_or_default();
+        let previous = previous.trim();
+        if previous == version {
+            return;
+        }
+        if !previous.is_empty() {
+            let from = if valid_value(previous) {
+                previous
+            } else {
+                "unknown"
+            };
+            self.event(
+                "INFO",
+                "ow.node.agent.upgraded",
+                &[("from", from.into()), ("to", version.into())],
+            );
+        }
+        let _ = std::fs::write(path, version);
+    }
+    /// The worker's process from each status poll (None: it did not answer).
+    pub fn worker(&self, pid: Option<u64>) {
+        let mut worker = self.worker.lock().unwrap();
+        match pid {
+            None if !worker.1 => {
+                worker.1 = true;
+                drop(worker);
+                self.event("WARN", "ow.node.worker.unavailable", &[]);
+            }
+            None => {}
+            Some(pid) => {
+                let restarted = worker.0.is_some_and(|last| last != pid);
+                *worker = (Some(pid), false);
+                drop(worker);
+                if restarted {
+                    self.event("INFO", "ow.node.worker.restarted", &[]);
+                }
+            }
+        }
     }
     fn push(&self, frame: String) {
         if !self.enabled.load(Ordering::SeqCst) {
@@ -384,8 +496,16 @@ impl Agent {
             return;
         }
         channel.connects += 1;
-        channel.connect_ms = Some(connected_at.elapsed().as_millis() as u64);
-        if let Some((since, reason, attempts)) = channel.down.take() {
+        let ms = connected_at.elapsed().as_millis() as u64;
+        channel.connect_ms = Some(ms);
+        if channel.connects == 1 && channel.down.is_none() {
+            drop(channel);
+            self.event(
+                "INFO",
+                "ow.node.channel.connected",
+                &[("duration_ms", ms.to_string())],
+            );
+        } else if let Some((since, reason, attempts)) = channel.down.take() {
             drop(channel);
             self.event(
                 "INFO",
@@ -417,25 +537,39 @@ impl Agent {
             }
         }
     }
-    pub fn operation(&self, op: &str, elapsed: Duration, ok: bool) {
-        if !TIMED.contains(&op) {
-            return;
-        }
-        let ms = elapsed.as_millis() as u64;
-        {
+    /// One finished job: `machine` is the box it named, `error` the failure class.
+    pub fn operation(
+        &self,
+        op: &str,
+        machine: Option<&str>,
+        elapsed: Duration,
+        error: Option<&'static str>,
+    ) {
+        let (ok, ms) = (error.is_none(), elapsed.as_millis() as u64);
+        if TIMED.contains(&op) {
             let mut ops = self.ops.lock().unwrap();
             let entry = ops.entry(op.to_owned()).or_default();
             entry.0 = ms;
             if ok { entry.1 += 1 } else { entry.2 += 1 }
         }
+        if QUIET.contains(&op) || !valid_value(op) {
+            return;
+        }
+        let mut attrs = vec![
+            ("op", op.to_owned()),
+            ("outcome", if ok { "ok" } else { "error" }.to_owned()),
+            ("duration_ms", ms.to_string()),
+        ];
+        if let Some(machine) = machine {
+            attrs.push(("ow.box.id", box_id(machine, &self.salt)));
+        }
+        if let Some(error) = error {
+            attrs.push(("error", error.to_owned()));
+        }
         self.event(
             if ok { "INFO" } else { "WARN" },
             "ow.node.operation",
-            &[
-                ("op", op.into()),
-                ("outcome", if ok { "ok" } else { "error" }.into()),
-                ("duration_ms", ms.to_string()),
-            ],
+            &attrs,
         );
     }
     /// The next frame to send on this channel, if the controller takes telemetry.
@@ -447,12 +581,14 @@ impl Agent {
     }
     /// Times one job; reported when the timer drops, so a job that fails with an error
     /// counts as a failure too.
-    pub fn timer(&self, op: &str) -> OpTimer<'_> {
+    pub fn timer(&self, op: &str, request: &Value) -> OpTimer<'_> {
         OpTimer {
             agent: self,
             op: op.to_owned(),
+            machine: request["id"].as_str().map(str::to_owned),
             started: Instant::now(),
             ok: false,
+            error: "agent",
         }
     }
     fn agent_metrics(&self) -> Vec<Metric> {
@@ -522,13 +658,20 @@ impl Agent {
 pub(crate) struct OpTimer<'a> {
     agent: &'a Agent,
     op: String,
+    machine: Option<String>,
     started: Instant,
     pub ok: bool,
+    /// The failure class when not ok; "agent" when the job failed before an answer.
+    pub error: &'static str,
 }
 impl Drop for OpTimer<'_> {
     fn drop(&mut self) {
-        self.agent
-            .operation(&self.op, self.started.elapsed(), self.ok);
+        self.agent.operation(
+            &self.op,
+            self.machine.as_deref(),
+            self.started.elapsed(),
+            (!self.ok).then_some(self.error),
+        );
     }
 }
 
@@ -980,12 +1123,7 @@ pub(crate) fn receive(node: &str, frame: &Value) -> Result<(Received, &'static s
                     for record in records {
                         let attrs = checked_attributes(&record["attributes"])?;
                         let severity = record["severityText"].as_str().unwrap_or("INFO");
-                        let number = match severity {
-                            "INFO" => 9,
-                            "WARN" => 13,
-                            "ERROR" => 17,
-                            _ => bail!("severity"),
-                        };
+                        let number = severity_number(severity).context("severity")?;
                         let name = attrs
                             .iter()
                             .find(|(k, _)| k == "event.name")
@@ -1032,7 +1170,32 @@ fn event_time(nanos: &str, now: i64) -> i64 {
         .filter(|at| *at <= now + 300 && *at >= now - 7 * 86400)
         .unwrap_or(now)
 }
-/// Appends an event that happens now to a node's capped ring.
+fn controller_resource() -> Value {
+    json!({"attributes":attributes(&[("service.name","ow-controller".into()),("service.version",env!("CARGO_PKG_VERSION").into())])})
+}
+/// Forwards one controller event as an OTLP log record (ExportLogsServiceRequest). Its attributes are fixed classes
+/// and numbers the controller set itself; `ow.node.id` names the runner it concerns.
+pub(crate) fn controller_log(node: Option<&str>, severity: &str, name: &str, attrs: &Value) {
+    forward("logs", controller_logs(node, severity, name, attrs));
+}
+fn controller_logs(node: Option<&str>, severity: &str, name: &str, attrs: &Value) -> Value {
+    let mut list: Vec<(&str, String)> = attrs
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| match v {
+            Value::String(text) => Some((k.as_str(), text.clone())),
+            Value::Number(_) | Value::Bool(_) => Some((k.as_str(), v.to_string())),
+            _ => None,
+        })
+        .collect();
+    if let Some(node) = node {
+        list.push(("ow.node.id", node.to_owned()));
+    }
+    json!({"resourceLogs":[{"resource":controller_resource(),"scopeLogs":[{"scope":{"name":"ow","version":env!("CARGO_PKG_VERSION")},
+        "logRecords":[log_record(severity,name,&list)]}]}]})
+}
+/// Appends an event that happens now to a node's capped ring and forwards it.
 pub(crate) fn record_event(
     db: &Connection,
     node: &str,
@@ -1040,6 +1203,7 @@ pub(crate) fn record_event(
     name: &str,
     attrs: &Value,
 ) -> Result<()> {
+    controller_log(Some(node), severity, name, attrs);
     record_event_at(db, node, now(), severity, name, attrs)
 }
 /// Appends an event to a node's capped ring (the newest EVENTS arrivals stay).
@@ -1110,12 +1274,44 @@ pub(crate) fn session_reason(reason: &str) -> &'static str {
         .find(|(text, _)| reason.contains(text))
         .map_or("closed", |(_, class)| class)
 }
-/// Recorded at controller start: offline grace never starts before it.
+/// Recorded at controller start: offline grace never starts before it. Also forwards the
+/// start, and an upgrade when the catalog last ran under another version.
 pub(crate) fn controller_started(db: &Connection) -> Result<()> {
     db.execute(
         "INSERT INTO settings(key,value) VALUES('controller_started_unix_s',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [now().to_string()],
     )?;
+    let version = env!("CARGO_PKG_VERSION");
+    let previous: Option<String> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key='controller_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    db.execute(
+        "INSERT INTO settings(key,value) VALUES('controller_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [version],
+    )?;
+    controller_log(
+        None,
+        "INFO",
+        "ow.controller.started",
+        &json!({"ow.version":version}),
+    );
+    if let Some(from) = previous.filter(|p| p != version) {
+        let from = if valid_value(&from) {
+            from
+        } else {
+            "unknown".into()
+        };
+        controller_log(
+            None,
+            "INFO",
+            "ow.controller.upgraded",
+            &json!({"from":from,"to":version}),
+        );
+    }
     Ok(())
 }
 pub(crate) fn store(root: &Path, node: &str, received: &Received) -> Result<()> {
@@ -1155,16 +1351,42 @@ pub(crate) fn store(root: &Path, node: &str, received: &Received) -> Result<()> 
     Ok(())
 }
 
-/// Node payloads and controller metrics waiting for the forwarder.
-static FORWARD: std::sync::OnceLock<tokio::sync::mpsc::Sender<(&'static str, Value)>> =
-    std::sync::OnceLock::new();
+type Payload = (&'static str, Value);
+/// Node payloads, controller events and controller metrics waiting for the forwarder:
+/// bounded and in memory only. It exists before the forwarder starts, so events from
+/// controller start-up wait for it.
+#[allow(clippy::type_complexity)]
+static FORWARD: std::sync::OnceLock<(
+    tokio::sync::mpsc::Sender<Payload>,
+    Mutex<Option<tokio::sync::mpsc::Receiver<Payload>>>,
+)> = std::sync::OnceLock::new();
 static FORWARD_DROPPED: AtomicU64 = AtomicU64::new(0);
+fn forward_queue() -> &'static (
+    tokio::sync::mpsc::Sender<Payload>,
+    Mutex<Option<tokio::sync::mpsc::Receiver<Payload>>>,
+) {
+    FORWARD.get_or_init(|| {
+        let (tx, rx) = tokio::sync::mpsc::channel(QUEUE);
+        (tx, Mutex::new(Some(rx)))
+    })
+}
 pub(crate) fn forward(signal: &'static str, body: Value) {
-    if let Some(tx) = FORWARD.get()
-        && tx.try_send((signal, body)).is_err()
-    {
+    if forward_queue().0.try_send((signal, body)).is_err() {
         FORWARD_DROPPED.fetch_add(1, Ordering::SeqCst);
     }
+}
+/// Keeps the log records at or above `min` (an OTLP severity number); false when none is left.
+fn keep_logs(body: &mut Value, min: u64) -> bool {
+    let mut any = false;
+    for r in body["resourceLogs"].as_array_mut().into_iter().flatten() {
+        for s in r["scopeLogs"].as_array_mut().into_iter().flatten() {
+            if let Some(records) = s["logRecords"].as_array_mut() {
+                records.retain(|x| x["severityNumber"].as_u64().unwrap_or(0) >= min);
+                any |= !records.is_empty();
+            }
+        }
+    }
+    any
 }
 
 /// Every alert kind `alerts` raises.
@@ -1257,6 +1479,7 @@ pub fn health(root: &Path) -> Result<Value> {
         nodes.push(json!({"id":id,"online":n["online"],"revoked":n["revoked"],"last_seen_unix_s":n["last_seen_unix_s"],
             "last_heartbeat_unix_s":(heard>0).then_some(heard),
             "telemetry_v1":n["capabilities"]["telemetry_v1"]==true,
+            "telemetry_logs_v1":n["capabilities"]["telemetry_logs_v1"]==true,
             "telemetry":telemetry.map(|(s,at)| json!({"unix_s":at,"metrics":serde_json::from_str::<Value>(&s).unwrap_or_default()})),
             "events":events}));
     }
@@ -1407,7 +1630,7 @@ fn controller_metrics(health: &Value, start: u128) -> Value {
         .filter(|m| !m.points.is_empty())
         .map(|m| encode_metric(m, start, now))
         .collect();
-    json!({"resourceMetrics":[{"resource":{"attributes":attributes(&[("service.name","ow-controller".into()),("service.version",env!("CARGO_PKG_VERSION").into())])},
+    json!({"resourceMetrics":[{"resource":controller_resource(),
         "scopeMetrics":[{"scope":{"name":"ow","version":env!("CARGO_PKG_VERSION")},"metrics":metrics}]}]})
 }
 
@@ -1424,28 +1647,40 @@ pub(crate) async fn forwarder(
     else {
         return;
     };
-    let mut endpoint = (Instant::now() - Duration::from_secs(60), String::new());
-    while let Some((signal, body)) = rx.recv().await {
-        // The endpoint is re-read at most every 3 s, so a change applies within seconds.
+    // (read at, endpoint, logs forwarded, lowest log severity number)
+    let mut endpoint = (
+        Instant::now() - Duration::from_secs(60),
+        String::new(),
+        true,
+        9,
+    );
+    while let Some((signal, mut body)) = rx.recv().await {
+        // Settings are re-read at most every 3 s, so a change applies within seconds.
         if endpoint.0.elapsed() > Duration::from_secs(3) {
             let root = root.clone();
-            let url = tokio::task::spawn_blocking(move || {
-                crate::nodes::db(&root)
-                    .and_then(|db| settings(&db))
-                    .map(|s| {
-                        s["telemetry.forward_endpoint"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_owned()
-                    })
+            let current = tokio::task::spawn_blocking(move || {
+                crate::nodes::db(&root).and_then(|db| settings(&db))
             })
-            .await;
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
             endpoint = (
                 Instant::now(),
-                url.ok().and_then(Result::ok).unwrap_or_default(),
+                current["telemetry.forward_endpoint"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned(),
+                current["telemetry.logs"] != false,
+                current["telemetry.log_level"]
+                    .as_str()
+                    .and_then(|l| severity_number(&l.to_ascii_uppercase()))
+                    .unwrap_or(9),
             );
         }
-        if endpoint.1.is_empty() {
+        if endpoint.1.is_empty()
+            || signal == "logs" && !(endpoint.2 && keep_logs(&mut body, endpoint.3))
+        {
             continue;
         }
         let sent = client
@@ -1462,8 +1697,7 @@ pub(crate) async fn forwarder(
 /// The controller's telemetry tasks: the forwarder and a 15 s alert loop that logs and
 /// records alert transitions and forwards controller-side series.
 pub(crate) fn spawn_controller_tasks(root: std::path::PathBuf) {
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    if FORWARD.set(tx).is_ok() {
+    if let Some(rx) = forward_queue().1.lock().unwrap().take() {
         tokio::spawn(forwarder(root.clone(), rx));
     }
     let start = unix_nanos();
@@ -1666,6 +1900,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "ow.node.channel.connected",
                 "ow.node.channel.disconnected",
                 "ow.node.channel.reconnected"
             ]
@@ -2132,7 +2367,9 @@ mod tests {
         )
         .unwrap();
         tokio::time::sleep(Duration::from_secs(4)).await;
-        tx.send(("logs", json!({"resourceLogs":[]}))).await.unwrap();
+        tx.send(("logs", controller_logs(None, "INFO", "ow.test", &json!({}))))
+            .await
+            .unwrap();
         let request = tokio::time::timeout(Duration::from_secs(5), seen.recv())
             .await
             .unwrap()
@@ -2142,6 +2379,567 @@ mod tests {
             request
                 .to_ascii_lowercase()
                 .contains("content-type: application/json")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Checks a body against the OTLP/JSON `ExportLogsServiceRequest` schema
+    /// (opentelemetry-proto logs.proto, proto3 JSON mapping): known fields only, uint64
+    /// and int64 as decimal strings, enums as numbers, one AnyValue variant per value.
+    fn otlp_logs_errors(body: &Value) -> Vec<String> {
+        fn fields(v: &Value, allowed: &[&str], at: &str, errors: &mut Vec<String>) {
+            match v.as_object() {
+                Some(o) => errors.extend(
+                    o.keys()
+                        .filter(|k| !allowed.contains(&k.as_str()))
+                        .map(|k| format!("{at}: unknown field {k}")),
+                ),
+                None => errors.push(format!("{at}: not an object")),
+            }
+        }
+        fn uint64(v: &Value, at: &str, errors: &mut Vec<String>) {
+            if !v.as_str().is_some_and(|t| t.parse::<u64>().is_ok()) {
+                errors.push(format!("{at}: uint64 is a decimal string"));
+            }
+        }
+        fn any_value(v: &Value, at: &str, errors: &mut Vec<String>) {
+            let variants = [
+                "stringValue",
+                "boolValue",
+                "intValue",
+                "doubleValue",
+                "arrayValue",
+                "kvlistValue",
+                "bytesValue",
+            ];
+            fields(v, &variants, at, errors);
+            if v.as_object().map_or(0, |o| o.len()) != 1 {
+                errors.push(format!("{at}: one AnyValue variant"));
+            }
+            if v.get("stringValue").is_some_and(|s| !s.is_string()) {
+                errors.push(format!("{at}: stringValue is a string"));
+            }
+        }
+        fn key_values(v: &Value, at: &str, errors: &mut Vec<String>) {
+            for (i, kv) in v.as_array().into_iter().flatten().enumerate() {
+                let at = format!("{at}[{i}]");
+                fields(kv, &["key", "value"], &at, errors);
+                if !kv["key"].is_string() {
+                    errors.push(format!("{at}: key is a string"));
+                }
+                any_value(&kv["value"], &format!("{at}.value"), errors);
+            }
+            if !v.is_array() && !v.is_null() {
+                errors.push(format!("{at}: attributes are an array"));
+            }
+        }
+        let mut errors = vec![];
+        let errors_ = &mut errors;
+        fields(body, &["resourceLogs"], "request", errors_);
+        let Some(resources) = body["resourceLogs"].as_array() else {
+            errors.push("resourceLogs is an array".into());
+            return errors;
+        };
+        for (i, r) in resources.iter().enumerate() {
+            let at = format!("resourceLogs[{i}]");
+            fields(r, &["resource", "scopeLogs", "schemaUrl"], &at, &mut errors);
+            fields(
+                &r["resource"],
+                &["attributes", "droppedAttributesCount"],
+                &format!("{at}.resource"),
+                &mut errors,
+            );
+            key_values(
+                &r["resource"]["attributes"],
+                &format!("{at}.resource.attributes"),
+                &mut errors,
+            );
+            for (j, s) in r["scopeLogs"].as_array().into_iter().flatten().enumerate() {
+                let at = format!("{at}.scopeLogs[{j}]");
+                fields(s, &["scope", "logRecords", "schemaUrl"], &at, &mut errors);
+                fields(
+                    &s["scope"],
+                    &["name", "version", "attributes", "droppedAttributesCount"],
+                    &format!("{at}.scope"),
+                    &mut errors,
+                );
+                for (k, l) in s["logRecords"].as_array().into_iter().flatten().enumerate() {
+                    let at = format!("{at}.logRecords[{k}]");
+                    fields(
+                        l,
+                        &[
+                            "timeUnixNano",
+                            "observedTimeUnixNano",
+                            "severityNumber",
+                            "severityText",
+                            "body",
+                            "attributes",
+                            "droppedAttributesCount",
+                            "flags",
+                            "traceId",
+                            "spanId",
+                            "eventName",
+                        ],
+                        &at,
+                        &mut errors,
+                    );
+                    uint64(
+                        &l["timeUnixNano"],
+                        &format!("{at}.timeUnixNano"),
+                        &mut errors,
+                    );
+                    uint64(
+                        &l["observedTimeUnixNano"],
+                        &format!("{at}.observedTimeUnixNano"),
+                        &mut errors,
+                    );
+                    if !l["severityNumber"]
+                        .as_u64()
+                        .is_some_and(|n| (1..=24).contains(&n))
+                    {
+                        errors.push(format!("{at}: severityNumber is an enum number 1..24"));
+                    }
+                    any_value(&l["body"], &format!("{at}.body"), &mut errors);
+                    key_values(&l["attributes"], &format!("{at}.attributes"), &mut errors);
+                }
+            }
+        }
+        errors
+    }
+    fn record_attrs(body: &Value) -> BTreeMap<String, String> {
+        body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a["key"].as_str().unwrap().to_owned(),
+                    a["value"]["stringValue"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+    fn agent_bodies(agent: &Agent) -> Vec<Value> {
+        agent
+            .queue
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|f| serde_json::from_str::<Value>(&f).unwrap()["body"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn every_event_type_is_an_otlp_log_record_with_its_attributes() {
+        let root = std::env::temp_dir().join(format!("ow-t-{}", crate::common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let agent = Agent::new("alpha", SALT.into());
+        std::fs::write(root.join("telemetry-version"), "0.9.1").unwrap();
+        agent.version_change(&root);
+        agent.version_change(&root);
+        let up = json!({"type":"ready","extensions":["telemetry-v1"],"telemetry":{"enabled":true}});
+        agent.acknowledged(&up, Instant::now());
+        agent.disconnected(&anyhow::anyhow!("no frame from the controller for 20 s"));
+        agent.acknowledged(&up, Instant::now());
+        agent.worker(Some(10));
+        agent.worker(None);
+        agent.worker(None);
+        agent.worker(Some(11));
+        agent.operation(
+            "hibernate",
+            Some("m-0123456789abcdef01234567"),
+            Duration::from_millis(1500),
+            None,
+        );
+        agent.operation("status", None, Duration::from_millis(1), None);
+        // Agent records go to the controller, which validates and forwards them.
+        let mut seen = BTreeMap::new();
+        for body in agent_bodies(&agent) {
+            let (received, signal, forwarded) =
+                receive("alpha", &json!({"type":"otlp","signal":"logs","body":body})).unwrap();
+            assert!(matches!(received, Received::Events(_)));
+            assert_eq!(signal, "logs");
+            assert_eq!(otlp_logs_errors(&forwarded), Vec::<String>::new());
+            let attrs = record_attrs(&forwarded);
+            let resource = &forwarded["resourceLogs"][0]["resource"]["attributes"];
+            assert!(
+                resource
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["key"] == "service.version")
+            );
+            assert!(
+                resource
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["key"] == "ow.node.id" && a["value"]["stringValue"] == "alpha")
+            );
+            seen.insert(attrs["event.name"].clone(), attrs);
+        }
+        let names: Vec<&str> = seen.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "ow.node.agent.started",
+                "ow.node.agent.upgraded",
+                "ow.node.channel.connected",
+                "ow.node.channel.disconnected",
+                "ow.node.channel.reconnected",
+                "ow.node.operation",
+                "ow.node.worker.restarted",
+                "ow.node.worker.unavailable",
+            ],
+            "status is a quiet read; repeated upgrade and unavailable reports count once"
+        );
+        assert_eq!(seen["ow.node.agent.upgraded"]["from"], "0.9.1");
+        assert_eq!(
+            seen["ow.node.agent.upgraded"]["to"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(seen["ow.node.channel.reconnected"]["reason"], "silent");
+        let op = &seen["ow.node.operation"];
+        assert_eq!(
+            (
+                op["op"].as_str(),
+                op["outcome"].as_str(),
+                op["duration_ms"].as_str()
+            ),
+            ("hibernate", "ok", "1500")
+        );
+        assert_eq!(op["ow.box.id"], "m-0123456789abcdef01234567");
+
+        // Controller events: sessions, alerts, start and upgrade.
+        let db = crate::nodes::db(&root).unwrap();
+        db.execute(
+            "INSERT INTO settings(key,value) VALUES('controller_version','0.9.2')",
+            [],
+        )
+        .unwrap();
+        let bodies = [
+            controller_logs(Some("alpha"), "INFO", "ow.node.session.opened", &json!({})),
+            controller_logs(
+                Some("alpha"),
+                "WARN",
+                "ow.node.session.closed",
+                &json!({"reason":"timeout","last_seen_unix_s":1700000000}),
+            ),
+            controller_logs(
+                Some("alpha"),
+                "ERROR",
+                "ow.alert.raised",
+                &json!({"kind":"node_offline"}),
+            ),
+            controller_logs(
+                Some("alpha"),
+                "INFO",
+                "ow.alert.cleared",
+                &json!({"kind":"node_offline"}),
+            ),
+            controller_logs(
+                None,
+                "INFO",
+                "ow.controller.started",
+                &json!({"ow.version":"0.9.46"}),
+            ),
+        ];
+        for body in &bodies {
+            assert_eq!(otlp_logs_errors(body), Vec::<String>::new(), "{body}");
+            assert_eq!(
+                body["resourceLogs"][0]["resource"]["attributes"][0]["value"]["stringValue"],
+                "ow-controller"
+            );
+        }
+        let closed = record_attrs(&bodies[1]);
+        assert_eq!(
+            (
+                closed["reason"].as_str(),
+                closed["last_seen_unix_s"].as_str(),
+                closed["ow.node.id"].as_str()
+            ),
+            ("timeout", "1700000000", "alpha")
+        );
+        assert_eq!(
+            bodies[2]["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["severityNumber"],
+            17
+        );
+        controller_started(&db).unwrap();
+        let version: String = db
+            .query_row(
+                "SELECT value FROM settings WHERE key='controller_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        // The schema check itself refuses what a collector would.
+        let mut bad = bodies[0].clone();
+        bad["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["timeUnixNano"] = json!(1);
+        bad["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["severity"] = json!("INFO");
+        assert_eq!(otlp_logs_errors(&bad).len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operation_records_carry_classes_and_hashed_boxes_never_user_content() {
+        let agent = Agent::new("alpha", SALT.into());
+        agent.queue.lock().unwrap().clear();
+        let error = "exec failed: /home/alice/secret-project/run.sh not found (env TOKEN=hunter2)";
+        let mut timer = agent.timer(
+            "exec",
+            &json!({"op":"exec","id":"alice-secret-project","command":"cat /etc/shadow","env":{"TOKEN":"hunter2"}}),
+        );
+        timer.error = error_class(error);
+        drop(timer);
+        // A job that failed before the worker answered.
+        drop(agent.timer(
+            "create",
+            &json!({"op":"create","id":"m-0123456789abcdef01234567"}),
+        ));
+        let mut ok = agent.timer(
+            "put",
+            &json!({"op":"put","id":"alice-secret-project","data":"aGVsbG8="}),
+        );
+        ok.ok = true;
+        drop(ok);
+        drop(agent.timer("terminal", &json!({"op":"terminal","id":"x"})));
+        let frames: Vec<String> = agent.queue.lock().unwrap().iter().cloned().collect();
+        assert_eq!(frames.len(), 3, "streams are quiet");
+        for f in &frames {
+            for secret in [
+                "alice", "secret", "hunter2", "shadow", "home", "TOKEN", "aGVsbG8",
+            ] {
+                assert!(!f.contains(secret), "{secret} leaked: {f}");
+            }
+        }
+        let attrs: Vec<_> = agent_bodies(&agent).iter().map(record_attrs).collect();
+        assert_eq!(attrs[0]["error"], "not_found");
+        assert_eq!(attrs[0]["outcome"], "error");
+        assert!(attrs[0]["ow.box.id"].starts_with("h-"));
+        assert_eq!(attrs[1]["error"], "agent");
+        assert_eq!(attrs[1]["ow.box.id"], "m-0123456789abcdef01234567");
+        assert_eq!(attrs[2]["outcome"], "ok");
+        assert!(!attrs[2].contains_key("error"));
+        assert_eq!(error_class("worker unavailable"), "worker");
+        assert_eq!(error_class("box already exists"), "conflict");
+        assert_eq!(error_class("weird"), "failed");
+        // Controller records keep only scalar attributes.
+        let body = controller_logs(
+            Some("alpha"),
+            "INFO",
+            "ow.test",
+            &json!({"kind":"disk_low","nested":{"x":"y"}}),
+        );
+        assert!(!body.to_string().contains("nested"));
+    }
+
+    #[test]
+    fn log_settings_validate() {
+        let root = std::env::temp_dir().join(format!("ow-t-{}", crate::common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let s = settings(&crate::nodes::db(&root).unwrap()).unwrap();
+        assert_eq!(
+            (
+                s["telemetry.logs"].clone(),
+                s["telemetry.log_level"].clone()
+            ),
+            (json!(true), json!("info"))
+        );
+        assert!(set(&root, "telemetry.log_level", "debug", "t").is_err());
+        assert!(set(&root, "telemetry.logs", "yes", "t").is_err());
+        let s = set(&root, "telemetry.log_level", "WARN", "t").unwrap();
+        assert_eq!(s["telemetry.log_level"], "warn");
+        let mut body = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"severityNumber":9},{"severityNumber":13}]}]}]});
+        assert!(keep_logs(&mut body, 13));
+        assert_eq!(
+            body["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!keep_logs(&mut body, 17));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarded_logs_follow_the_switch_and_level_and_drops_are_counted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = std::env::temp_dir().join(format!("ow-t-{}", crate::common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        // An endpoint that is down: each payload is one failed attempt, counted.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let down = closed.local_addr().unwrap();
+        drop(closed);
+        set(
+            &root,
+            "telemetry.forward_endpoint",
+            &format!("http://{down}"),
+            "t",
+        )
+        .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(forwarder(root.clone(), rx));
+        let before = FORWARD_DROPPED.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            tx.send(("logs", controller_logs(None, "WARN", "ow.test", &json!({}))))
+                .await
+                .unwrap();
+        }
+        let deadline = Instant::now();
+        while FORWARD_DROPPED.load(Ordering::SeqCst) < before + 3 {
+            assert!(
+                deadline.elapsed() < Duration::from_secs(10),
+                "drops not counted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, mut seen) = tokio::sync::mpsc::channel::<String>(8);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 65536];
+                let n = s.read(&mut buf).await.unwrap();
+                let _ = seen_tx
+                    .send(String::from_utf8_lossy(&buf[..n]).into_owned())
+                    .await;
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            }
+        });
+        set(
+            &root,
+            "telemetry.forward_endpoint",
+            &format!("http://{address}"),
+            "t",
+        )
+        .unwrap();
+        set(&root, "telemetry.log_level", "warn", "t").unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        tx.send((
+            "logs",
+            controller_logs(None, "INFO", "ow.test.info", &json!({})),
+        ))
+        .await
+        .unwrap();
+        tx.send((
+            "logs",
+            controller_logs(None, "WARN", "ow.test.warn", &json!({})),
+        ))
+        .await
+        .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.starts_with("POST /v1/logs"), "{request}");
+        assert!(request.contains("ow.test.warn") && !request.contains("ow.test.info"));
+        // Off: logs stop within one settings refresh; metrics still go.
+        set(&root, "telemetry.logs", "false", "t").unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        tx.send((
+            "logs",
+            controller_logs(None, "ERROR", "ow.test.error", &json!({})),
+        ))
+        .await
+        .unwrap();
+        tx.send(("metrics", json!({"resourceMetrics":[]})))
+            .await
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.starts_with("POST /v1/metrics"), "{request}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Against a real collector: `OW_OTLP_ENDPOINT=http://127.0.0.1:4318 cargo test -p ow
+    /// --bin ow every_event_type_reaches_a_collector -- --ignored`. Sends every event
+    /// type, then turns logs off and sends `ow.test.after_off`, which must not arrive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn every_event_type_reaches_a_collector() {
+        let endpoint = std::env::var("OW_OTLP_ENDPOINT").expect("OW_OTLP_ENDPOINT");
+        let root = std::env::temp_dir().join(format!("ow-t-{}", crate::common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        set(&root, "telemetry.forward_endpoint", &endpoint, "t").unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(QUEUE);
+        tokio::spawn(forwarder(root.clone(), rx));
+        let agent = Agent::new("alpha", SALT.into());
+        std::fs::write(root.join("telemetry-version"), "0.9.1").unwrap();
+        agent.version_change(&root);
+        let up = json!({"type":"ready","extensions":["telemetry-v1"],"telemetry":{"enabled":true}});
+        agent.acknowledged(&up, Instant::now());
+        agent.disconnected(&anyhow::anyhow!("no frame from the controller for 20 s"));
+        agent.acknowledged(&up, Instant::now());
+        agent.worker(Some(10));
+        agent.worker(None);
+        agent.worker(Some(11));
+        let mut ok = agent.timer("hibernate", &json!({"id":"m-0123456789abcdef01234567"}));
+        ok.ok = true;
+        drop(ok);
+        let mut failed = agent.timer("seal-disk", &json!({"id":"legacy-name"}));
+        failed.error = error_class("capture timed out");
+        drop(failed);
+        for body in agent_bodies(&agent) {
+            let (_, signal, body) =
+                receive("alpha", &json!({"type":"otlp","signal":"logs","body":body})).unwrap();
+            tx.send((signal, body)).await.unwrap();
+        }
+        for (severity, name, attrs) in [
+            ("INFO", "ow.node.session.opened", json!({})),
+            (
+                "WARN",
+                "ow.node.session.closed",
+                json!({"reason":"timeout","last_seen_unix_s":1}),
+            ),
+            ("ERROR", "ow.alert.raised", json!({"kind":"node_offline"})),
+            ("INFO", "ow.alert.cleared", json!({"kind":"node_offline"})),
+        ] {
+            tx.send((
+                "logs",
+                controller_logs(Some("alpha"), severity, name, &attrs),
+            ))
+            .await
+            .unwrap();
+        }
+        for (name, attrs) in [
+            (
+                "ow.controller.started",
+                json!({"ow.version":env!("CARGO_PKG_VERSION")}),
+            ),
+            (
+                "ow.controller.upgraded",
+                json!({"from":"0.9.45","to":env!("CARGO_PKG_VERSION")}),
+            ),
+        ] {
+            tx.send(("logs", controller_logs(None, "INFO", name, &attrs)))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        set(&root, "telemetry.logs", "false", "t").unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let before = FORWARD_DROPPED.load(Ordering::SeqCst);
+        tx.send((
+            "logs",
+            controller_logs(None, "ERROR", "ow.test.after_off", &json!({})),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            FORWARD_DROPPED.load(Ordering::SeqCst),
+            before,
+            "the collector refused a payload"
         );
         let _ = std::fs::remove_dir_all(root);
     }
