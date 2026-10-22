@@ -161,17 +161,23 @@ pub fn connect_waiting(
     request: &Value,
     wait: Duration,
 ) -> Result<(UnixStream, Value)> {
-    let mut stream = open(root)?;
-    stream.set_read_timeout(Some(wait))?;
-    stream.set_write_timeout(Some(Duration::from_secs(120)))?;
-    send(&mut stream, request)?;
-    let response = line(&mut stream)?;
-    ensure!(
-        response["ok"] == true,
-        "{}",
-        response["error"].as_str().unwrap_or("worker error")
-    );
-    Ok((stream, response["result"].clone()))
+    let started = std::time::Instant::now();
+    let result = (|| {
+        let mut stream = open(root)?;
+        stream.set_read_timeout(Some(wait))?;
+        stream.set_write_timeout(Some(Duration::from_secs(120)))?;
+        send(&mut stream, request)?;
+        let response = line(&mut stream)?;
+        ensure!(
+            response["ok"] == true,
+            "{}",
+            response["error"].as_str().unwrap_or("worker error")
+        );
+        Ok((stream, response["result"].clone()))
+    })();
+    let error = result.as_ref().err().map(|e| format!("{e:#}"));
+    crate::telemetry::observed(root, request, started.elapsed(), error.as_deref());
+    result
 }
 
 pub fn request(root: &Path, value: Value) -> Result<Value> {
@@ -197,11 +203,26 @@ pub fn response(result: anyhow::Result<Value>) -> Value {
 
 /// Preserve the worker error envelope so callers can distinguish a rejection from transport loss.
 pub fn request_envelope(root: &Path, request: &Value) -> Result<Value> {
-    let mut stream = open(root)?;
-    stream.set_read_timeout(Some(reply_wait(request)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    send(&mut stream, request)?;
-    line(&mut stream)
+    let started = std::time::Instant::now();
+    let result = (|| {
+        let mut stream = open(root)?;
+        stream.set_read_timeout(Some(reply_wait(request)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        send(&mut stream, request)?;
+        line(&mut stream)
+    })();
+    let error = match &result {
+        Ok(envelope) if envelope["ok"] != true => Some(
+            envelope["error"]
+                .as_str()
+                .unwrap_or("worker error")
+                .to_owned(),
+        ),
+        Ok(_) => None,
+        Err(e) => Some(format!("{e:#}")),
+    };
+    crate::telemetry::observed(root, request, started.elapsed(), error.as_deref());
+    result
 }
 
 #[cfg(test)]

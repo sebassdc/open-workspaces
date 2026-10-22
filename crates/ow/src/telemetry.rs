@@ -7,8 +7,9 @@ use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
+    cell::Cell,
     collections::{BTreeMap, VecDeque},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -345,6 +346,18 @@ pub(crate) struct Agent {
     worker: Mutex<(Option<u64>, bool)>,
 }
 
+/// Every `error` class an operation record can carry.
+const ERRORS: [&str; 9] = [
+    "not_found",
+    "conflict",
+    "timeout",
+    "capacity",
+    "unsupported",
+    "refused",
+    "worker",
+    "failed",
+    "agent",
+];
 /// Why a job failed, as a fixed class: worker errors can quote paths, names or commands.
 pub(crate) fn error_class(error: &str) -> &'static str {
     let text = error.to_ascii_lowercase();
@@ -555,17 +568,7 @@ impl Agent {
         if QUIET.contains(&op) || !valid_value(op) {
             return;
         }
-        let mut attrs = vec![
-            ("op", op.to_owned()),
-            ("outcome", if ok { "ok" } else { "error" }.to_owned()),
-            ("duration_ms", ms.to_string()),
-        ];
-        if let Some(machine) = machine {
-            attrs.push(("ow.box.id", box_id(machine, &self.salt)));
-        }
-        if let Some(error) = error {
-            attrs.push(("error", error.to_owned()));
-        }
+        let attrs = operation_attrs(op, machine.map(|m| box_id(m, &self.salt)), ms, error);
         self.event(
             if ok { "INFO" } else { "WARN" },
             "ow.node.operation",
@@ -582,6 +585,8 @@ impl Agent {
     /// Times one job; reported when the timer drops, so a job that fails with an error
     /// counts as a failure too.
     pub fn timer(&self, op: &str, request: &Value) -> OpTimer<'_> {
+        // The job reports itself; its worker requests are not reported again.
+        IN_JOB.with(|j| j.set(true));
         OpTimer {
             agent: self,
             op: op.to_owned(),
@@ -655,6 +660,170 @@ impl Agent {
     }
 }
 
+/// An `ow.node.operation` record's attributes; `machine` is already an opaque box ID.
+fn operation_attrs(
+    op: &str,
+    machine: Option<String>,
+    ms: u64,
+    error: Option<&'static str>,
+) -> Vec<(&'static str, String)> {
+    let mut attrs = vec![
+        ("op", op.to_owned()),
+        (
+            "outcome",
+            if error.is_none() { "ok" } else { "error" }.to_owned(),
+        ),
+        ("duration_ms", ms.to_string()),
+    ];
+    if let Some(machine) = machine {
+        attrs.push(("ow.box.id", machine));
+    }
+    if let Some(error) = error {
+        attrs.push(("error", error.to_owned()));
+    }
+    attrs
+}
+
+// ---------------------------------------------------------------------------------------
+// Local intake: worker operations other `ow` processes on this host run (the dashboard's
+// catalog on the controller's own worker, the scheduled `ow backup recover`, host CLI
+// commands) reach the long-running process for that data directory (the node agent, or
+// the node controller for its `local` worker), which reports them like its own.
+
+/// Socket in a worker's data directory (owner-only) that takes one operation per line.
+pub(crate) const INTAKE: &str = "telemetry.sock";
+type Sink = Arc<dyn Fn(&str, Option<&str>, Duration, Option<&'static str>) + Send + Sync>;
+static SINKS: Mutex<Vec<(PathBuf, Sink)>> = Mutex::new(Vec::new());
+thread_local! {
+    /// This thread runs an agent job, which reports itself (`Agent::timer`).
+    static IN_JOB: Cell<bool> = const { Cell::new(false) };
+}
+fn canonical(root: &Path) -> PathBuf {
+    root.canonicalize().unwrap_or_else(|_| root.to_owned())
+}
+/// A worker request finished (`wire`). Reads, streams and agent jobs are not reported.
+pub(crate) fn observed(root: &Path, request: &Value, elapsed: Duration, error: Option<&str>) {
+    let Some(op) = request["op"].as_str() else {
+        return;
+    };
+    if QUIET.contains(&op) || !valid_value(op) || IN_JOB.with(Cell::get) {
+        return;
+    }
+    report(
+        root,
+        op,
+        request["id"].as_str(),
+        elapsed,
+        error.map(error_class),
+    );
+}
+/// Hands one operation to whoever reports for `root`: this process when it serves `root`,
+/// else the process listening on its intake. With nobody listening it is not reported.
+pub(crate) fn report(
+    root: &Path,
+    op: &str,
+    machine: Option<&str>,
+    elapsed: Duration,
+    error: Option<&'static str>,
+) {
+    let root = canonical(root);
+    let sink = SINKS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(r, _)| *r == root)
+        .map(|(_, sink)| sink.clone());
+    if let Some(sink) = sink {
+        return sink(op, machine, elapsed, error);
+    }
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(root.join(INTAKE)) else {
+        return;
+    };
+    use std::io::Write;
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    let record =
+        json!({"op":op,"machine":machine,"duration_ms":elapsed.as_millis() as u64,"error":error});
+    let _ = writeln!(stream, "{record}");
+}
+/// One intake line, validated: (op, raw box ID, duration in ms, error class).
+fn intake_record(line: &str) -> Option<(String, Option<String>, u64, Option<&'static str>)> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    let op = v["op"]
+        .as_str()
+        .filter(|op| valid_value(op) && !QUIET.contains(op))?;
+    let machine = match &v["machine"] {
+        Value::Null => None,
+        Value::String(m) if m.len() <= 128 => Some(m.clone()),
+        _ => return None,
+    };
+    let error = match &v["error"] {
+        Value::Null => None,
+        Value::String(e) => Some(*ERRORS.iter().find(|k| **k == e.as_str())?),
+        _ => return None,
+    };
+    Some((op.to_owned(), machine, v["duration_ms"].as_u64()?, error))
+}
+/// Reports operations for `root` from this process, and from others through its intake
+/// socket unless another live process already serves it.
+pub(crate) fn serve_intake(root: &Path, sink: Sink) {
+    use std::io::{BufRead, Read};
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener, net::UnixStream};
+    let root = canonical(root);
+    SINKS.lock().unwrap().push((root.clone(), sink.clone()));
+    let path = root.join(INTAKE);
+    if UnixStream::connect(&path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(e) => return eprintln!("telemetry intake unavailable: {e:#}"),
+    };
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+            let mut line = String::new();
+            if std::io::BufReader::new(stream.take(1024))
+                .read_line(&mut line)
+                .is_ok()
+                && let Some((op, machine, ms, error)) = intake_record(&line)
+            {
+                sink(&op, machine.as_deref(), Duration::from_millis(ms), error);
+            }
+        }
+    });
+}
+/// The node controller reports its own worker's operations as runner `local`: stored in
+/// its event log and forwarded.
+pub(crate) fn serve_controller_intake(root: &Path) {
+    let (db_root, salt) = (root.to_owned(), salt(root));
+    serve_intake(
+        root,
+        Arc::new(move |op, machine, elapsed, error| {
+            let attrs: serde_json::Map<String, Value> = operation_attrs(
+                op,
+                machine.map(|m| box_id(m, &salt)),
+                elapsed.as_millis() as u64,
+                error,
+            )
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), json!(v)))
+            .collect();
+            let severity = if error.is_none() { "INFO" } else { "WARN" };
+            let _ = crate::nodes::db(&db_root).and_then(|db| {
+                record_event(
+                    &db,
+                    "local",
+                    severity,
+                    "ow.node.operation",
+                    &Value::Object(attrs),
+                )
+            });
+        }),
+    );
+}
+
 pub(crate) struct OpTimer<'a> {
     agent: &'a Agent,
     op: String,
@@ -666,6 +835,7 @@ pub(crate) struct OpTimer<'a> {
 }
 impl Drop for OpTimer<'_> {
     fn drop(&mut self) {
+        IN_JOB.with(|j| j.set(false));
         self.agent.operation(
             &self.op,
             self.machine.as_deref(),
@@ -2858,6 +3028,85 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(request.starts_with("POST /v1/metrics"), "{request}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn other_processes_hand_operations_to_the_intake_and_bad_lines_are_refused() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("ow-t-{}", crate::common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        serve_intake(
+            &root,
+            Arc::new(move |op, machine, elapsed, error| {
+                let _ = tx.lock().unwrap().send((
+                    op.to_owned(),
+                    machine.map(str::to_owned),
+                    elapsed.as_millis() as u64,
+                    error,
+                ));
+            }),
+        );
+        // A socket path is limited to about 100 bytes; deploy paths are short, some test
+        // temporary directories are not.
+        if root.join(INTAKE).as_os_str().len() < 100 {
+            let mode = std::fs::metadata(root.join(INTAKE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "owner-only");
+            // What another process (a dashboard, the recovery timer) writes.
+            let send = |line: &str| {
+                let mut s = std::os::unix::net::UnixStream::connect(root.join(INTAKE)).unwrap();
+                writeln!(s, "{line}").unwrap();
+            };
+            for bad in [
+                r#"{"op":"status","duration_ms":1}"#,
+                r#"{"op":"rm -rf /","duration_ms":1}"#,
+                r#"{"op":"exec","duration_ms":1,"error":"/home/alice: not found"}"#,
+                r#"{"op":"exec"}"#,
+                "not json",
+            ] {
+                send(bad);
+            }
+            send(
+                r#"{"op":"hibernate","machine":"legacy-name","duration_ms":1500,"error":"timeout"}"#,
+            );
+            let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                got,
+                (
+                    "hibernate".into(),
+                    Some("legacy-name".into()),
+                    1500,
+                    Some("timeout")
+                ),
+                "the five bad lines were refused"
+            );
+        }
+        // In this process the registered sink is called directly; reads are never reported.
+        report(&root, "stop", None, Duration::from_millis(3), None);
+        observed(&root, &json!({"op":"list"}), Duration::ZERO, None);
+        observed(
+            &root,
+            &json!({"op":"start","id":"b"}),
+            Duration::ZERO,
+            Some("worker busy"),
+        );
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().0, "stop");
+        let start = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((start.0.as_str(), start.3), ("start", Some("worker")));
+        // An agent job reports itself; its worker requests are not reported twice.
+        let agent = Agent::new("alpha", SALT.into());
+        let timer = agent.timer("start", &json!({"id":"b"}));
+        observed(&root, &json!({"op":"start","id":"b"}), Duration::ZERO, None);
+        drop(timer);
+        observed(&root, &json!({"op":"stop","id":"b"}), Duration::ZERO, None);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().0, "stop");
+        assert!(rx.try_recv().is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 

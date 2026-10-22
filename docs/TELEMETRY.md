@@ -122,6 +122,26 @@ capacity, unsupported, refused, worker, failed, or agent (the job failed before
 the worker answered). The worker's error text, the command, file contents,
 environment values and box names never leave the runner.
 
+Worker operations that do not come through an agent job are reported too:
+- the controller's own worker (runner `local`), driven by the catalog in the
+  dashboard, the remote API or the CLI;
+- the scheduled recovery points (`ow backup recover`, the `ow-recovery` timer):
+  `recovery-prepare`, `recovery-seal` and `recovery-result` per box, plus one
+  `op=recovery` record per box for the whole point (capture, seal, upload and
+  result), with `error` when any step failed;
+- host CLI commands that drive the worker directly.
+
+These processes are short-lived or have no forwarder, so they hand each record
+over a local socket, `telemetry.sock` in the worker's data directory (mode
+0600), to the long-running process for that directory: the node agent for a
+runner, the node controller for `local`. That process reports it like its own:
+the agent queues an `ow.node.operation` record, the controller stores it in the
+`local` event log and forwards it. The socket takes one line per operation (op,
+box ID, duration, error class) and refuses anything else; the receiver hashes
+the box ID. Reads (`status`, `list` and the others above) are not handed over.
+When nothing listens (the agent or controller is down) the record is not
+reported.
+
 The controller writes its own events into the same per-runner log:
 - `ow.node.session.opened` and `ow.node.session.closed`, for sessions that stored
   at least one heartbeat. The close event carries `reason` = timeout, ping, auth,
@@ -310,6 +330,12 @@ Run with `cargo test -p ow --bin ow telemetry` (Linux for the protocol tests):
   against the OTLP/JSON `ExportLogsServiceRequest` schema with its documented
   attributes; an operation record carries only classes and a hashed box ID,
   never the command, file contents, environment or worker error text.
+- **Local operations:** the catalog's create, hibernate, start, stop and a
+  failed start on the controller's own worker each produce an operation record
+  in the `local` event log; a scheduled recovery run reports prepare, result and
+  the per-box `recovery` record, with the injected upload failure as an error;
+  the intake socket is owner-only, refuses malformed lines and quiet reads, and
+  an agent job's own worker requests are not reported twice.
 - **Real collector:** with an OpenTelemetry Collector on port 4318,
   `OW_OTLP_ENDPOINT=http://127.0.0.1:4318 cargo test -p ow --bin ow
   every_event_type_reaches_a_collector -- --ignored` sends every event type

@@ -33,7 +33,12 @@ impl Fake {
         }
     }
     fn worker(&mut self, node: &str) {
-        let path = self.root.join("nodes").join(node);
+        // `local`: the controller's own worker, in its data directory.
+        let path = if node == "local" {
+            self.root.clone()
+        } else {
+            self.root.join("nodes").join(node)
+        };
         std::fs::create_dir_all(&path).unwrap();
         let listener = UnixListener::bind(path.join("control.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -165,6 +170,9 @@ impl Fake {
                 wire::send(&mut stream, &json!({"ok":true,"result":result})).unwrap();
             }
         }));
+        if node == "local" {
+            return;
+        }
         nodes::db(&self.root).unwrap().execute("INSERT INTO nodes(id,credential_hash,memory_mib,slots,heartbeat,capabilities) VALUES(?1,'hash',512,2,?2,?3)",params![node,nodes_now(),json!({"memory_mib":512,"slots":2,"vcpus":2,"images":["alpine"]}).to_string()]).unwrap();
     }
 }
@@ -4696,4 +4704,60 @@ fn managed_fork_for_another_owner_charges_and_audits_them() {
         )
     );
     assert_eq!(c.state(user).unwrap()["audit"][0]["to"], "bob@example.test");
+}
+
+#[test]
+fn controller_local_box_lifecycle_is_reported_as_operation_events() {
+    let mut fake = Fake::new();
+    fake.worker("local");
+    // The node controller's intake: its catalog (or the dashboard's, over the socket)
+    // reports the local worker's operations to the event log, which forwards them.
+    crate::telemetry::serve_controller_intake(&fake.root);
+    // A box made on the controller's own worker (host CLI), adopted by the catalog.
+    wire::request(
+        &fake.root,
+        json!({"op":"create","id":"demo","memory_mib":256,"vcpu_count":1,"image":"alpine"}),
+    )
+    .unwrap();
+    let mut c = Catalog::open(&fake.root, "test", Some("alice@example.test")).unwrap();
+    let owner = c.user(&identity("alice")).unwrap();
+    for op in ["hibernate", "start", "stop"] {
+        let result = c.operation(owner, json!({"op":op,"id":"demo"})).unwrap();
+        assert_eq!(result["operation"]["state"], "succeeded", "{op}");
+    }
+    *fake.reject.lock().unwrap() = Some("start".into());
+    *fake.diagnostic.lock().unwrap() = "workspace /home/alice/demo not found".into();
+    assert!(
+        c.operation(owner, json!({"op":"start","id":"demo"}))
+            .is_err()
+    );
+    let events: Vec<Value> = nodes::db(&fake.root)
+        .unwrap()
+        .prepare("SELECT attrs FROM node_events WHERE node='local' AND name='ow.node.operation' ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|a| serde_json::from_str(&a.unwrap()).unwrap())
+        .collect();
+    let ops: Vec<(&str, &str)> = events
+        .iter()
+        .map(|e| (e["op"].as_str().unwrap(), e["outcome"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        ops,
+        [
+            ("create", "ok"),
+            ("hibernate", "ok"),
+            ("start", "ok"),
+            ("stop", "ok"),
+            ("start", "error")
+        ],
+        "{events:?}"
+    );
+    assert_eq!(events[4]["error"], "not_found");
+    for e in &events {
+        assert!(e["duration_ms"].as_str().unwrap().parse::<u64>().is_ok());
+        assert!(e["ow.box.id"].as_str().unwrap().starts_with(['m', 'h']));
+        assert!(!e.to_string().contains("alice") && !e.to_string().contains("demo"));
+    }
 }

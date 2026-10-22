@@ -131,7 +131,8 @@ See [wake on connect, snapshot store and golden images](DAILY_USE.md).
 - [x] 0.9.46, event logs ([TELEMETRY.md](TELEMETRY.md)): with a forward
   endpoint, every node and controller event (channel, sessions, restarts,
   upgrades, worker restarts, box lifecycle and capture operations with outcome,
-  duration and error class, alerts) is forwarded as an OTLP log record, so event
+  duration and error class, including the controller's own worker and the
+  scheduled recovery points, alerts) is forwarded as an OTLP log record, so event
   history outlives the 200-row table. `telemetry.logs` and `telemetry.log_level`
   are controller settings; runners advertise `telemetry_logs_v1`.
 

@@ -1236,6 +1236,7 @@ pub fn controller(
     rt.block_on(async move {
         let routes = routes(c.clone());
         crate::telemetry::spawn_controller_tasks(c.root.clone());
+        crate::telemetry::serve_controller_intake(&c.root);
         tokio::spawn(proxies(c.clone()));
         let slots = Arc::new(Semaphore::new(128));
         if let (Some(cert), Some(key)) = (cert, key) {
@@ -1721,6 +1722,15 @@ pub fn agent(
     ))));
     let telemetry = crate::telemetry::Agent::new(&node, crate::telemetry::salt(root));
     telemetry.version_change(root);
+    {
+        let telemetry = telemetry.clone();
+        crate::telemetry::serve_intake(
+            root,
+            Arc::new(move |op, machine, elapsed, error| {
+                telemetry.operation(op, machine, elapsed, error)
+            }),
+        );
+    }
     {
         let prepared = prepared.clone();
         crate::telemetry::collector(

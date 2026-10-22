@@ -156,6 +156,7 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
             continue;
         }
         let id = machine["id"].as_str().context("missing machine ID")?;
+        let started = std::time::Instant::now();
         let result = (|| -> Result<()> {
             let mut request = json!({"op":"recovery-prepare","id":id,"store":store_id});
             if let Some(placement) = machine.get("placement") {
@@ -226,6 +227,18 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
             );
             Ok(())
         })();
+        // One record per box for the whole point (capture, seal, upload, result); the
+        // worker requests inside it are reported too.
+        crate::telemetry::report(
+            runner,
+            "recovery",
+            Some(id),
+            started.elapsed(),
+            result
+                .as_ref()
+                .err()
+                .map(|e| crate::telemetry::error_class(&format!("{e:#}"))),
+        );
         if let Err(error) = result {
             eprintln!("recovery {id}: {error:#}");
             failed.push(id.to_owned());
@@ -786,8 +799,37 @@ mod tests {
                 self.0.push(name, directory)
             }
         }
+        // The runner's node agent reports what the scheduled recovery ran.
+        let reported = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let reported = reported.clone();
+            crate::telemetry::serve_intake(
+                &runner,
+                std::sync::Arc::new(move |op: &str, machine: Option<&str>, _, error| {
+                    reported.lock().unwrap().push((
+                        op.to_owned(),
+                        machine.map(str::to_owned),
+                        error,
+                    ))
+                }),
+            );
+        }
         let error = recover(&Failing(Dir(remote.clone())), &runner, &"a".repeat(64)).unwrap_err();
         worker.join().unwrap();
+        let reported = reported.lock().unwrap().clone();
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            reported,
+            [
+                ("recovery-prepare".to_owned(), some("a"), None),
+                ("recovery-result".to_owned(), some("a"), None),
+                ("recovery".to_owned(), some("a"), Some("failed")),
+                ("recovery-prepare".to_owned(), some("b"), None),
+                ("recovery-result".to_owned(), some("b"), None),
+                ("recovery".to_owned(), some("b"), None),
+            ],
+            "status and list are quiet reads"
+        );
         assert!(error.to_string().contains("failed for a"));
         let seen = seen.lock().unwrap();
         let results: Vec<_> = seen
