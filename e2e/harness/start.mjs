@@ -78,6 +78,28 @@ function manage(login, name) {
     db.close();
   }
 }
+// Dashboard UI bundles (docs/DASHBOARD.md#ui-bundles): build one from a copy of the UI sources,
+// optionally marked in its <title>, and install it on this controller.
+const owRun = args => { try { return {code: 0, output: execFileSync(ow, ['--data-dir', data, ...args], {encoding: 'utf8', stdio: 'pipe'})}; } catch (error) { return {code: error.status ?? 1, output: `${error.stdout || ''}${error.stderr || ''}`}; } };
+function installBundle({version, marker = '', api}) {
+  const source = fs.mkdtempSync(path.join(root, 'ui-src-'));
+  fs.cpSync(path.join(repo, 'crates/ow/ui'), source, {recursive: true});
+  const index = path.join(source, 'index.html');
+  fs.writeFileSync(index, fs.readFileSync(index, 'utf8').replace('<title>', `<title>${marker}`));
+  const out = path.join(source, 'dist');
+  const args = ['-I', path.join(repo, 'scripts/build-dashboard-ui.py'), '--source', source, '--out', out];
+  if (version) args.push('--version', version);
+  if (api) args.push('--api', String(api[0]), String(api[1]));
+  const tarball = execFileSync('python3', args, {encoding: 'utf8'}).trim();
+  return owRun(['dashboard-ui', 'install', tarball]);
+}
+if (process.env.OW_E2E_UI === 'bundle') {
+  // The whole suite then runs against the released bundle format instead of the built-in copy.
+  for (const result of [installBundle({}), owRun(['config', 'set', 'dashboard.ui_bundle', JSON.parse(fs.readFileSync(path.join(repo, 'crates/ow/ui/ui.json'))).version])]) {
+    if (result.code !== 0) throw Error(`UI bundle setup failed: ${result.output}`);
+  }
+}
+
 const dashboard = spawn(ow, ['--data-dir', data, 'dashboard', '--config', config, '--listen', `127.0.0.1:${dashboardPort}`], {
   env: {...process.env, PATH: `${bin}:${process.env.PATH}`, OW_E2E_WHOIS: whois},
   stdio: ['ignore', 'pipe', 'inherit'],
@@ -103,6 +125,24 @@ const proxy = https.createServer({key: fs.readFileSync(path.join(root, 'tls.key'
       try {
         manage(identity(request.headers)['tailscale-user-login'], JSON.parse(body).name);
         response.writeHead(204).end();
+      } catch (error) { response.writeHead(400).end(error.message); }
+    });
+    return;
+  }
+  // Test-only: install, select or damage a UI bundle on the running controller; reports
+  // the dashboard's PID so tests can show it never restarted.
+  if (request.method === 'POST' && request.url === '/__e2e/ui') {
+    let body = '';
+    request.on('data', chunk => body += chunk);
+    request.on('end', () => {
+      try {
+        const step = JSON.parse(body);
+        let result = {code: 0, output: ''};
+        if (step.action === 'install') result = installBundle(step);
+        else if (step.action === 'select') result = owRun(['config', 'set', 'dashboard.ui_bundle', step.version]);
+        else if (step.action === 'tamper') fs.appendFileSync(path.join(data, 'dashboard-ui', path.basename(step.version), 'app.js'), '\n// tampered\n');
+        else if (step.action !== 'pid') throw Error('unknown action');
+        response.writeHead(200, {'content-type': 'application/json'}).end(JSON.stringify({...result, pid: dashboard.pid}));
       } catch (error) { response.writeHead(400).end(error.message); }
     });
     return;

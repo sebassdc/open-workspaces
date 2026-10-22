@@ -308,6 +308,9 @@ $('terminal-close').addEventListener('click', closeTerminal);
 $('terminal-new').addEventListener('click', () => openTerminal(terminalId));
 $('terminal-dialog').addEventListener('cancel', event => { event.preventDefault(); closeTerminal(); });
 window.addEventListener('pagehide', closeTerminal);
+// Which UI the controller serves; a broken or incompatible bundle falls back to the built-in one and says why.
+api('/api/version').then(v => { $('ui-version').textContent = `Dashboard UI ${v.ui.version}${v.ui.source === 'builtin' ? ' (built-in)' : ''} · API ${v.api}`;
+  if (v.ui.fallback_reason) { $('ui-fallback').textContent = `The selected dashboard UI bundle is not served: ${v.ui.fallback_reason}. Showing the built-in UI.`; $('ui-fallback').hidden = false; } }).catch(() => {});
 
 const installCommand = `curl -fsSL ${location.origin}/cli/install.sh | sh`;
 $('cli-command').textContent = installCommand;

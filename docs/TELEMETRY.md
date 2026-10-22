@@ -62,6 +62,7 @@ Infrastructure code carries no telemetry setting.
 | `telemetry.forward_endpoint` | empty | `http(s)://host[:port][/path]` | OTLP/HTTP base URL to forward to (`/v1/metrics`, `/v1/logs` are appended). No user, password, query or fragment is accepted; secrets do not belong in settings. |
 | `alerts.offline_after_s` | `60` | 15–86400 | Grace period before an offline runner raises `node_offline`. |
 | `alerts.disk_low_gib` | `20` | 0–100000 | `disk_low` when a runner's free data-volume space is below this. |
+| `dashboard.ui_bundle` | `builtin` | `builtin` or an installed bundle version | UI bundle the dashboard serves; see [UI bundles](DASHBOARD.md#ui-bundles). Refused unless installed, intact and API-compatible. |
 
 ## What runners report
 

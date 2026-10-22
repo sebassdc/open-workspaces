@@ -1,4 +1,5 @@
-# Browser tests of the dashboard against a real `ow dashboard` and a fake worker,
+# Browser tests of the dashboard against a real `ow dashboard` and a fake worker, once
+# with the built-in UI and once with a UI bundle (docs/DASHBOARD.md#ui-bundles),
 # then docs/UI_FEATURES.md against their results: a feature marked "works"
 # whose test is gone, skipped or failing fails this workflow.
 name: dashboard-e2e
@@ -6,16 +7,20 @@ on:
   pull_request:
     # Labeled/unlabeled reruns the matrix check when the downgrade label changes.
     types: [opened, synchronize, reopened, labeled, unlabeled]
-    paths: [crates/**, e2e/**, docs/UI_FEATURES.md, Cargo.toml, Cargo.lock, .github/workflows/dashboard-e2e.yml]
+    paths: [crates/**, e2e/**, scripts/build-dashboard-ui.py, docs/UI_FEATURES.md, Cargo.toml, Cargo.lock, .github/workflows/dashboard-e2e.yml]
   push:
     branches: [main]
-    paths: [crates/**, e2e/**, docs/UI_FEATURES.md, Cargo.toml, Cargo.lock, .github/workflows/dashboard-e2e.yml]
+    paths: [crates/**, e2e/**, scripts/build-dashboard-ui.py, docs/UI_FEATURES.md, Cargo.toml, Cargo.lock, .github/workflows/dashboard-e2e.yml]
 permissions:
   contents: read
 jobs:
   browser:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ui: [builtin, bundle]
     defaults:
       run:
         working-directory: e2e
@@ -34,6 +39,8 @@ jobs:
       - name: Check the matrix checker
         run: node --test check-matrix.test.mjs
       - name: Run browser tests
+        env:
+          OW_E2E_UI: ${{ matrix.ui }}
         run: npx playwright test
       - name: Check the UI feature matrix against this run
         if: success() || failure()
@@ -53,7 +60,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: dashboard-e2e-results
+          name: dashboard-e2e-results-${{ matrix.ui }}
           path: |
             e2e/playwright-report/
             e2e/test-results/

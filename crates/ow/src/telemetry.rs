@@ -53,12 +53,14 @@ fn now() -> i64 {
 // Controller-held settings (one source; read on every acknowledgement).
 
 /// Allowed keys and their defaults.
-pub const KEYS: [(&str, &str); 5] = [
+pub const KEYS: [(&str, &str); 6] = [
     ("telemetry.enabled", "true"),
     ("telemetry.interval_s", "15"),
     ("telemetry.forward_endpoint", ""),
     ("alerts.offline_after_s", "60"),
     ("alerts.disk_low_gib", "20"),
+    // The dashboard UI bundle the controller serves (docs/DASHBOARD.md#ui-bundles).
+    (crate::dashboard_ui::SETTING, "builtin"),
 ];
 
 fn typed(key: &str, value: &str) -> Result<Value> {
@@ -76,6 +78,12 @@ fn typed(key: &str, value: &str) -> Result<Value> {
         "telemetry.interval_s" => number(5..=300),
         "alerts.offline_after_s" => number(15..=86400),
         "alerts.disk_low_gib" => number(0..=100_000),
+        crate::dashboard_ui::SETTING => {
+            if value != "builtin" {
+                crate::dashboard_ui::valid_version(value)?;
+            }
+            Ok(json!(value))
+        }
         "telemetry.forward_endpoint" => {
             if value.is_empty() {
                 return Ok(json!(""));
@@ -104,7 +112,7 @@ fn typed(key: &str, value: &str) -> Result<Value> {
 pub fn settings(db: &Connection) -> Result<Value> {
     // One query: it also runs with every acknowledgement.
     let stored: BTreeMap<String, String> = db
-        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key='config_version'")?
+        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key='config_version'")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut out = json!({});
@@ -1303,6 +1311,9 @@ pub fn config_command(root: &Path, action: crate::ConfigAction) -> Result<i32> {
             let actor = std::env::var("SUDO_USER")
                 .or_else(|_| std::env::var("USER"))
                 .unwrap_or_else(|_| "local".into());
+            if key == crate::dashboard_ui::SETTING {
+                crate::dashboard_ui::selectable(root, &value)?;
+            }
             set(root, &key, &value, &actor)?
         }
     };

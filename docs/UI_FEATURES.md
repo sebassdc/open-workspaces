@@ -174,6 +174,18 @@ isolated-network end-to-end test listed there.
 | Unexpected HTML without an auth redirect does not claim the login expired | works | v0.9.33 | `dialogs.spec.mjs › an unexpected HTML response without an auth redirect does not ask to sign in` |
 | Host node label rejects invalid characters and names the 64-character limit | works | v0.9.33 | `hosts.spec.mjs › host pool owner invites, budgets and revokes a Linux host` |
 
+## UI bundles
+
+| Feature | Status | Last passed | Test |
+| --- | --- | --- | --- |
+| UI version, API version and bundle capability shown (footer, `/api/version`) | works | v0.9.45 | `ui-bundle.spec.mjs › the API reports its version, the UI it serves and the bundle capability` |
+| Switch to a UI bundle live and roll back (to a bundle or the built-in UI) without restarting the controller | works | v0.9.45 | `ui-bundle.spec.mjs › a UI bundle switches live and rolls back without restarting the controller` |
+| Damaged bundle falls back to the built-in UI with a visible reason | works | v0.9.45 | `ui-bundle.spec.mjs › a damaged bundle falls back to the built-in UI and says why` |
+| Bundle for another dashboard API version refused | works | v0.9.45 | `ui-bundle.spec.mjs › a bundle for another dashboard API version is refused` |
+
+CI runs the whole suite twice: with the built-in UI and with the UI served from a
+bundle (`OW_E2E_UI=bundle`).
+
 ## Recovery transport isolation
 
 | Feature | Status | Last passed | Test |
