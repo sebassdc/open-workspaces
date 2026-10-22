@@ -29,6 +29,7 @@ browser test that guards it are listed in the [UI feature matrix](docs/UI_FEATUR
 | SSH and SFTP | Connect editors and standard SSH tools to explicitly enrolled Linux guests. | Opt-in | v0.1.0 | [SSH](docs/SSH.md) |
 | Interactive terminals | Use a guest PTY from `ow shell` or the dashboard, with resize and job control. | Core | v0.1.0 | [Terminals](docs/TERMINALS.md) |
 | Dashboard and tailnet login | Manage boxes in the browser using Tailscale identity and an operator-configured access grant; Access JWT remains an alternative. | Opt-in | v0.1.0; tailnet v0.2.0; grants v0.8.3 | [Dashboard](docs/DASHBOARD.md), [UI feature matrix](docs/UI_FEATURES.md) |
+| Dashboard UI bundles | Update the browser UI on its own: install a separately released, hash-checked UI bundle and switch or roll back with `ow config set dashboard.ui_bundle` on a running controller; a damaged or API-incompatible bundle falls back to the built-in UI and says so. `GET /api/version` advertises `dashboard_ui_bundle_v1`. | Core | v0.9.45; UI 1.0.0 | [UI bundles](docs/DASHBOARD.md#ui-bundles) |
 | Private previews | Publish a guest HTTP port as a separate authenticated tailnet HTTPS URL. | Opt-in | v0.8.0 | [Previews](docs/DAILY_USE.md#tailnet-https-previews-v080) |
 
 ### Snapshots, forks and recovery

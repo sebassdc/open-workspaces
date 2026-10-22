@@ -18,9 +18,11 @@ export default defineConfig({
     screenshot: 'only-on-failure',
   },
   projects: [
-    {name: 'dashboard', testIgnore: /hosts\.spec/},
+    {name: 'dashboard', testIgnore: /(hosts|ui-bundle)\.spec/},
     // Inviting a host changes placement for every user, so this runs alone, last.
     {name: 'host-pool', testMatch: /hosts\.spec/, dependencies: ['dashboard']},
+    // Switching the UI bundle changes the page for every user, so this runs alone, after that.
+    {name: 'ui-bundle', testMatch: /ui-bundle\.spec/, dependencies: ['host-pool']},
   ],
   webServer: {
     command: 'node harness/start.mjs',

@@ -1,0 +1,65 @@
+# Publishes the dashboard UI bundle as its own release, separate from the core release:
+# once crates/ow/ui reaches main, tag that commit dashboard-ui-vX.Y.Z (the version in
+# crates/ow/ui/ui.json) and attach ow-dashboard-ui-X.Y.Z.tar.gz and its .sha256.
+# Operators install it with `ow dashboard-ui install` (docs/DASHBOARD.md#ui-bundles).
+# A UI change under a version that is already released with other content fails, on the
+# pull request already, so every published bundle version names one content.
+name: dashboard-ui-release
+on:
+  push:
+    branches: [main]
+    paths: [crates/ow/ui/**, scripts/build-dashboard-ui.py, .github/workflows/dashboard-ui-release.yml]
+  pull_request:
+    paths: [crates/ow/ui/**, scripts/build-dashboard-ui.py, .github/workflows/dashboard-ui-release.yml]
+permissions:
+  contents: write
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the bundle twice; the bytes must match
+        run: |
+          set -euo pipefail
+          python3 -I scripts/build-dashboard-ui.py --out dist
+          python3 -I scripts/build-dashboard-ui.py --out "$RUNNER_TEMP/again"
+          cmp dist/*.tar.gz "$RUNNER_TEMP"/again/*.tar.gz
+          cat dist/*.sha256
+      - name: Refuse new content under a released version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import json; print(json.load(open("crates/ow/ui/ui.json"))["version"])')"
+          tag="dashboard-ui-v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release download "$tag" --pattern '*.sha256' --dir "$RUNNER_TEMP/released"
+            if ! cmp -s "$RUNNER_TEMP/released/ow-dashboard-ui-$version.tar.gz.sha256" "dist/ow-dashboard-ui-$version.tar.gz.sha256"; then
+              echo "::error::$tag is already released with other content; bump the version in crates/ow/ui/ui.json"
+              exit 1
+            fi
+            echo "$tag already holds this content"
+          fi
+      - name: Tag and publish the bundle release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import json; print(json.load(open("crates/ow/ui/ui.json"))["version"])')"
+          tag="dashboard-ui-v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already published"
+            exit 0
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            git tag "$tag" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag"
+          fi
+          api="$(python3 -c 'import json; a = json.load(open("crates/ow/ui/ui.json"))["api"]; print(a["min"], a["max"], sep="-")')"
+          gh release create "$tag" --verify-tag --latest=false \
+            --title "Dashboard UI $version" \
+            --notes "Dashboard UI bundle $version for dashboard API $api. Install with \`ow dashboard-ui install\`, then select it with \`ow config set dashboard.ui_bundle $version\`." \
+            "dist/ow-dashboard-ui-$version.tar.gz" "dist/ow-dashboard-ui-$version.tar.gz.sha256"

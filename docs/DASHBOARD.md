@@ -87,6 +87,8 @@ users through email PIN requires preserving other apps' login behavior first.
   Machines carry `created_at`; a live fork's own capture names its child as
   `fork`; a failed capture names its machine (`workspace`, null once deleted)
   and `failed_at`. Times are Unix seconds.
+- `GET /api/version` names the dashboard API version, the server version, its
+  capabilities and the UI being served (see [UI bundles](#ui-bundles)).
 - `POST /api/operation` accepts only create/start/stop/hibernate/snapshot/fork/
   restore/exec, with typed fields, strict unknown-field rejection, validated IDs,
   bounded memory profiles, 2,000-byte commands and 16 KiB operation bodies.
@@ -208,6 +210,61 @@ admission, verify on the actual host that a granted user can access only their
 machines, an ungranted user and tagged device are denied, a forged login/header
 is denied, and grant removal denies the next request and closes live streams.
 Local fake-daemon tests do not establish live tailnet propagation.
+
+## UI bundles
+
+The browser UI (`index.html`, `app.js`, `style.css` and the vendored xterm files)
+is a thin client over the API above; it renders nothing on the server. It ships
+in two forms:
+
+- **Built-in copy**: compiled into `ow` from `crates/ow/ui`. It is the default and
+  the fallback, so the dashboard is never empty.
+- **UI bundle**: `ow-dashboard-ui-<version>.tar.gz`, released on its own as
+  `dashboard-ui-v<version>` (with a `.sha256`), next to the core release. Its
+  version and supported dashboard API range come from `crates/ow/ui/ui.json`;
+  `scripts/build-dashboard-ui.py --out DIR` builds it reproducibly.
+
+A bundle holds `manifest.json` and exactly those six files:
+
+```json
+{"format": 1, "name": "ow-dashboard-ui", "version": "1.0.1",
+ "api": {"min": 1, "max": 1},
+ "files": {"index.html": "<sha256>", "app.js": "<sha256>", "...": "..."}}
+```
+
+Install, switch and roll back on the controller host, without restarting it:
+
+```sh
+sha256sum -c ow-dashboard-ui-1.0.1.tar.gz.sha256
+ow dashboard-ui install ow-dashboard-ui-1.0.1.tar.gz   # verify and keep <data>/dashboard-ui/1.0.1/
+ow dashboard-ui list                                   # installed bundles, selected one, API version
+ow config set dashboard.ui_bundle 1.0.1                # serve it from the next page load
+ow config set dashboard.ui_bundle 1.0.0                # roll back to an earlier bundle
+ow config set dashboard.ui_bundle builtin              # or to the copy built into ow
+```
+
+The setting lives with the controller's other settings (`ow config`, versioned
+and recorded in `config_changes`); infrastructure code carries none.
+
+- **Integrity**: install extracts only the known members, refuses links and
+  oversized files, checks every file against the manifest hash and writes fresh
+  files. The controller checks the hashes again whenever it serves the UI.
+- **Compatibility**: a bundle declares the dashboard API range it supports.
+  `ow config set` refuses a bundle that is missing, damaged or outside this
+  server's API version. If the selected bundle later stops qualifying (a file
+  changed on disk, or a core upgrade moved past its API range), the controller
+  serves the built-in copy, logs why, and the page shows a warning naming the reason.
+- **Security**: a bundle replaces file contents only. Routes, content types,
+  the CSP and other headers, authentication, Host/Origin checks and the API stay
+  with the server, so a bundle cannot widen what the page may load or do.
+- `GET /api/version` (authenticated) returns `{"api": 1, "server": "<ow version>",
+  "capabilities": ["dashboard_ui_bundle_v1"], "ui": {"source": "bundle" | "builtin",
+  "version", "api", "fallback_reason"}}`. A deployment checks the
+  `dashboard_ui_bundle_v1` capability there; the page footer shows the UI version.
+
+A UI change needs a new `ui.json` version: the `dashboard-ui-release` workflow
+refuses new content under a version that is already released. The dashboard
+browser tests run against both the built-in copy and a bundle.
 
 ## Run and deployment
 

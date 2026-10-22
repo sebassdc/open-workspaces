@@ -11,6 +11,9 @@ mod catalog;
 mod client;
 #[cfg(target_os = "linux")]
 mod dashboard;
+// Serving is Linux-only (dashboard.rs); install and list run on any controller host.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod dashboard_ui;
 #[cfg(any(target_os = "linux", test))]
 mod discovery;
 #[cfg(target_os = "linux")]
@@ -74,6 +77,15 @@ enum ConfigAction {
     Get { key: String },
     /// Change one setting; runners receive it within seconds.
     Set { key: String, value: String },
+}
+
+#[derive(Subcommand)]
+enum DashboardUiAction {
+    /// Verify a UI bundle tarball and keep it on this controller; selecting it is
+    /// `ow config set dashboard.ui_bundle <version>`.
+    Install { tarball: PathBuf },
+    /// Installed UI bundles, the selected one and this server's dashboard API version.
+    List,
 }
 
 #[derive(Parser)]
@@ -214,6 +226,11 @@ enum Action {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Host-only: dashboard UI bundles served by this controller (see docs/DASHBOARD.md).
+    DashboardUi {
+        #[command(subcommand)]
+        action: DashboardUiAction,
     },
     /// Connect this worker outbound; credentials are stored outside the guest.
     NodeAgent {
@@ -1002,6 +1019,7 @@ fn main_result() -> anyhow::Result<i32> {
             | Action::NodeAgent { .. }
             | Action::Health
             | Action::Config { .. }
+            | Action::DashboardUi { .. }
             | Action::Worker
             | Action::Supervisor
             | Action::Gateway { .. }

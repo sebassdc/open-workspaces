@@ -422,31 +422,39 @@ pub async fn handle(
     if request.uri().scheme().is_some() || request.uri().authority().is_some() {
         return secure((StatusCode::BAD_REQUEST, "Invalid target").into_response());
     }
-    if method == Method::GET {
-        let asset = match path {
-            "/" => Some(("text/html; charset=utf-8", include_str!("../ui/index.html"))),
-            "/app.js" => Some((
-                "text/javascript; charset=utf-8",
-                include_str!("../ui/app.js"),
-            )),
-            "/style.css" => Some(("text/css; charset=utf-8", include_str!("../ui/style.css"))),
-            "/vendor/xterm.js" => Some((
-                "text/javascript; charset=utf-8",
-                include_str!("../ui/vendor/xterm.js"),
-            )),
-            "/vendor/addon-fit.js" => Some((
-                "text/javascript; charset=utf-8",
-                include_str!("../ui/vendor/addon-fit.js"),
-            )),
-            "/vendor/xterm.css" => Some((
-                "text/css; charset=utf-8",
-                include_str!("../ui/vendor/xterm.css"),
-            )),
-            _ => None,
-        };
+    if method == Method::GET
+        && crate::dashboard_ui::ASSETS
+            .iter()
+            .any(|(asset, ..)| *asset == path)
+    {
+        // The bundle chooses file contents only; this server keeps routes, types and headers.
+        let (path, ui_root) = (path.to_owned(), root.clone());
+        let asset = tokio::task::spawn_blocking(move || {
+            crate::dashboard_ui::selected(ui_root.as_deref()).asset(&path)
+        })
+        .await
+        .ok()
+        .flatten();
         if let Some((kind, body)) = asset {
             return secure(([("content-type", kind)], body).into_response());
         }
+    }
+    if path == "/api/version" && method == Method::GET {
+        let ui_root = root.clone();
+        let ui = tokio::task::spawn_blocking(move || {
+            crate::dashboard_ui::selected(ui_root.as_deref()).info
+        })
+        .await
+        .unwrap_or(Value::Null);
+        return secure(
+            Json(json!({"ok":true,"result":{
+                "api":crate::dashboard_ui::API_VERSION,
+                "server":env!("CARGO_PKG_VERSION"),
+                "capabilities":[crate::dashboard_ui::CAPABILITY],
+                "ui":ui,
+            }}))
+            .into_response(),
+        );
     }
     if path == "/api/state" && method == Method::GET {
         let result = with_catalog(catalog, identity, move |catalog, user| {

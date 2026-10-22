@@ -1074,6 +1074,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         }
         Action::Health => return crate::telemetry::health_command(&root),
         Action::Config { action } => return crate::telemetry::config_command(&root, action),
+        Action::DashboardUi { action } => return crate::dashboard_ui::command(&root, action),
         _ => {}
     }
     let r = match cli.command {

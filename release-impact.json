@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.45",
+      "class": 1,
+      "changes": [
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Dashboard UI bundles: the dashboard serves its browser UI from a separately released, hash-checked bundle (ow-dashboard-ui-<version>.tar.gz, tag dashboard-ui-v<version>) chosen by the new controller setting dashboard.ui_bundle (default builtin), or from the copy built into ow. ow dashboard-ui install|list keeps verified bundles under <data>/dashboard-ui/; ow config set dashboard.ui_bundle switches or rolls back from the next page load with no restart, and refuses a missing, damaged or API-incompatible bundle. A bundle that stops qualifying falls back to the built-in UI with a visible reason. New GET /api/version (dashboard API 1, capability dashboard_ui_bundle_v1); routes, CSP, headers and authentication are unchanged. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-1 upgrade: the dashboard restarts alone, once; later UI updates need no core release.",
+      "waivers": {
+        "worker": "crates/ow/src/host.rs adds only the local ow dashboard-ui CLI arm; no worker code, operation, runtime or service changes."
+      }
+    },
+    {
       "version": "0.9.44",
       "class": 0,
       "changes": [
