@@ -63,7 +63,7 @@ browser test that guards it are listed in the [UI feature matrix](docs/UI_FEATUR
 | Controller without local compute | Run the controller/dashboard while placing boxes only on enrolled remote runners. | Opt-in | v0.9.8 | [Controller-only mode](docs/SINGLE_HOST.md#controller-without-local-compute) |
 | Placement authority | Persist transfer intent and enforce exact placement epochs at capable workers; installation alone moves nothing. | Not yet live | fences v0.8.6; catalog v0.9.3 | [Fencing](docs/PLACEMENT_FENCING.md), [catalog](docs/LIFECYCLE.md) |
 | Explicit runner retirement | Drain eligible runners, park sleeping boxes and produce an empty certificate; provider deletion is separate. | Not yet live | v0.9.13 | [Drain](docs/DRAIN.md) |
-| Node telemetry and fleet health | Runners report host, box and channel health as OpenTelemetry data; the controller raises node-offline and low-disk alerts, shows fleet health in the dashboard and `ow health`, and can forward to any OTLP collector. Settings live on the controller (`ow config`). | Core | v0.9.41 | [Telemetry](docs/TELEMETRY.md) |
+| Node telemetry and fleet health | Runners report host, box and channel health as OpenTelemetry data; the controller raises node-offline and low-disk alerts, shows fleet health in the dashboard and `ow health`, and can forward metrics and node and controller events (OTLP logs) to any OTLP collector. Settings live on the controller (`ow config`). | Core | v0.9.41; event logs v0.9.46 | [Telemetry](docs/TELEMETRY.md) |
 | Apple Silicon host | Run bounded Ubuntu ARM64 via a native helper; Linux-only capabilities and general host distribution remain limited. | Experimental | v0.1.0 | [Mac host](docs/MAC_HOST.md) |
 
 ### Limits, security and identity

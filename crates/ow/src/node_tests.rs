@@ -2604,7 +2604,8 @@ fn agent_sends_host_box_and_channel_telemetry_once_offered() {
     let names = event_names(&frames);
     assert_eq!(names[0], "ow.node.agent.started");
     assert!(
-        names.contains(&"ow.node.channel.disconnected".to_owned()),
+        names.contains(&"ow.node.channel.connected".to_owned())
+            && names.contains(&"ow.node.channel.disconnected".to_owned()),
         "{names:?}"
     );
     let metrics: Vec<Value> = frames

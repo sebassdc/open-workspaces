@@ -3,7 +3,8 @@
 Every runner's node agent reports host, box and channel health to the controller
 as OpenTelemetry (OTLP) data. The controller keeps the latest values and a short
 event log per runner, raises alerts and can forward everything to any OTLP
-collector. Settings live on the controller only. Shipped in v0.9.41; see
+collector: metrics, and since v0.9.46 every node and controller event as an OTLP
+log record. Settings live on the controller only. Shipped in v0.9.41; see
 [ADR 0009](adr/0009-node-telemetry-otlp.md) for the decisions.
 
 Before this, a runner whose node channel stopped reaching the controller stayed
@@ -36,6 +37,8 @@ ow config list                 # every setting, typed, with the configuration ve
 ow config get telemetry.interval_s
 ow config set telemetry.enabled false
 ow config set telemetry.forward_endpoint http://127.0.0.1:4318
+ow config set telemetry.log_level warn  # forward only WARN and ERROR events
+ow config set telemetry.logs false      # stop forwarding events; metrics still go
 ```
 
 A check from cron or a systemd timer can use the exit status of `ow health`. Every
@@ -60,6 +63,8 @@ Infrastructure code carries no telemetry setting.
 | `telemetry.enabled` | `true` | `true`, `false` | Runners collect and send telemetry; `false` also clears their queues. Alerts do not depend on it. |
 | `telemetry.interval_s` | `15` | 5–300 | Seconds between metric samples on each runner. |
 | `telemetry.forward_endpoint` | empty | `http(s)://host[:port][/path]` | OTLP/HTTP base URL to forward to (`/v1/metrics`, `/v1/logs` are appended). No user, password, query or fragment is accepted; secrets do not belong in settings. |
+| `telemetry.logs` | `true` | `true`, `false` | Forward node and controller events as OTLP logs when an endpoint is set. Events are still stored per runner. Takes effect within 3 s. |
+| `telemetry.log_level` | `info` | `info`, `warn`, `error` | Lowest event severity forwarded. Takes effect within 3 s. |
 | `alerts.offline_after_s` | `60` | 15–86400 | Grace period before an offline runner raises `node_offline`. |
 | `alerts.disk_low_gib` | `20` | 0–100000 | `disk_low` when a runner's free data-volume space is below this. |
 | `dashboard.ui_bundle` | `builtin` | `builtin` or an installed bundle version | UI bundle the dashboard serves; see [UI bundles](DASHBOARD.md#ui-bundles). Refused unless installed, intact and API-compatible. |
@@ -93,12 +98,49 @@ Resource attributes: `service.name=ow-node-agent`, `service.version`,
 Events are OTLP log records (`ExportLogsServiceRequest`) with `event.name` and a
 severity:
 
-| Event | When | Attributes |
-| --- | --- | --- |
-| `ow.node.agent.started` | agent process start | `ow.version` |
-| `ow.node.channel.disconnected` | first failure after the channel was up | `reason` |
-| `ow.node.channel.reconnected` | first acknowledgement after a loss | `reason`, `attempts`, `downtime_s` |
-| `ow.node.operation` | each timed operation | `op`, `outcome`, `duration_ms` |
+| Event | Severity | When | Attributes |
+| --- | --- | --- | --- |
+| `ow.node.agent.started` | INFO | agent process start (a restart) | `ow.version` |
+| `ow.node.agent.upgraded` | INFO | agent start under a new version of the data directory | `from`, `to` |
+| `ow.node.channel.connected` | INFO | first acknowledgement after start | `duration_ms` |
+| `ow.node.channel.disconnected` | WARN | first failure after the channel was up | `reason` |
+| `ow.node.channel.reconnected` | INFO | first acknowledgement after a loss | `reason`, `attempts`, `downtime_s` |
+| `ow.node.worker.restarted` | INFO | the worker answers from a new process | – |
+| `ow.node.worker.unavailable` | WARN | the worker stops answering status (once per outage) | – |
+| `ow.node.operation` | INFO, WARN on failure | each job the agent runs, except reads, streams and credential refreshes | `op`, `outcome` (ok, error), `duration_ms`, `ow.box.id` when the job names a box, `error` on failure |
+
+`ow.node.operation` covers box lifecycle (create, start, stop, resize, delete,
+hibernate, restore, snapshot, snapshot-delete, fork), recovery captures and
+seals (`seal-disk`, `export`, `import-prepare` and the other placement steps,
+`capture-push`, `capture-pull`, `capture-published`, `capture-cache`,
+`restore-policy`), image builds and pulls, file transfers (`put`, `get`),
+`exec`, SSH key and policy changes and cache eviction. Not logged: `status`,
+`list`, `stats`, `snapshots`, `inspect`, `ssh-info`, `cache-inventory`,
+`capture-progress`, `drain-inventory`, `aws-token`, `aws-creds`, `terminal`,
+`ssh`, `tunnel`. `error` is a fixed class: not_found, conflict, timeout,
+capacity, unsupported, refused, worker, failed, or agent (the job failed before
+the worker answered). The worker's error text, the command, file contents,
+environment values and box names never leave the runner.
+
+Worker operations that do not come through an agent job are reported too:
+- the controller's own worker (runner `local`), driven by the catalog in the
+  dashboard, the remote API or the CLI;
+- the scheduled recovery points (`ow backup recover`, the `ow-recovery` timer):
+  `recovery-prepare`, `recovery-seal` and `recovery-result` per box, plus one
+  `op=recovery` record per box for the whole point (capture, seal, upload and
+  result), with `error` when any step failed;
+- host CLI commands that drive the worker directly.
+
+These processes are short-lived or have no forwarder, so they hand each record
+over a local socket, `telemetry.sock` in the worker's data directory (mode
+0600), to the long-running process for that directory: the node agent for a
+runner, the node controller for `local`. That process reports it like its own:
+the agent queues an `ow.node.operation` record, the controller stores it in the
+`local` event log and forwards it. The socket takes one line per operation (op,
+box ID, duration, error class) and refuses anything else; the receiver hashes
+the box ID. Reads (`status`, `list` and the others above) are not handed over.
+When nothing listens (the agent or controller is down) the record is not
+reported.
 
 The controller writes its own events into the same per-runner log:
 - `ow.node.session.opened` and `ow.node.session.closed`, for sessions that stored
@@ -110,7 +152,10 @@ The controller writes its own events into the same per-runner log:
   A session that ends before any heartbeat is stored writes no event. It only
   updates the runner's latest close reason in `node_seen`, so a runner retrying
   every 2 s cannot flood the log.
-- `ow.alert.raised` and `ow.alert.cleared`.
+- `ow.alert.raised` (ERROR) and `ow.alert.cleared` (INFO), with `kind`.
+- `ow.controller.started`, with `ow.version`, and `ow.controller.upgraded`, with
+  `from` and `to`, when the catalog last ran under another version. These two
+  concern no runner and are forwarded only, not stored.
 
 These events exist even when the runner cannot send anything.
 
@@ -146,7 +191,9 @@ Surfaces:
 ## Protocol and compatibility
 
 - The agent adds `telemetry_v1: true` to its heartbeats. Old controllers store it and
-  do nothing else.
+  do nothing else. Agents from v0.9.46 also add `telemetry_logs_v1: true`: they
+  send the full event set above (operation records for every job, worker and
+  upgrade events). `ow health` and `ow nodes` show both flags per runner.
 - A new controller lists `telemetry-v1` in the `ready` acknowledgement's
   `extensions` and adds `"telemetry": {"enabled", "interval_s", "version"}`. Old
   agents read only `type`, `node`, `generation` and `extensions`, so they are
@@ -178,7 +225,7 @@ Surfaces:
 | Per-box series | 32 boxes |
 | Frames per controller session | 20 per 3 s tick; agents send at most 5 per second |
 | Stored per runner | latest summary (≤ 256 series) and 200 events |
-| Forwarder | 64 queued payloads, one attempt each, 5 s timeout, no redirects |
+| Forwarder | 64 queued payloads in memory (metrics and logs share it; never a disk queue), one attempt each, 5 s timeout, no redirects; a full queue or a failed post is counted in `ow.telemetry.forward.dropped` |
 
 Each event keeps the time it happened on the runner. A disconnect queued during
 an outage is stored and listed at its own time, not when it arrived. A
@@ -199,6 +246,15 @@ existing database step.
 `telemetry.forward_endpoint` makes the controller post each runner's payload
 (stamped with the authenticated `ow.node.id`) and its own series to
 `<endpoint>/v1/metrics` and `<endpoint>/v1/logs` (OTLP/HTTP, JSON). The
+runner's event log records and the controller's own events go to `/v1/logs`
+while `telemetry.logs` is on, filtered by `telemetry.log_level`. Each record has
+`timeUnixNano`, `severityNumber` (9, 13, 17) and `severityText` (INFO, WARN,
+ERROR), the event name as `body` and in the `event.name` attribute, and the
+attributes listed above. Runner records carry the runner's resource
+(`service.name=ow-node-agent`, `service.version` = release, `ow.node.id`);
+controller records carry `service.name=ow-controller` and `service.version`,
+and `ow.node.id` as a record attribute when the event concerns a runner. The
+forwarded history is not bounded by the 200 events kept per runner. The
 controller's own series:
 
 | Series | Value |
@@ -267,7 +323,25 @@ Run with `cargo test -p ow --bin ow telemetry` (Linux for the protocol tests):
 - **Receiver validation:** names, attributes, and stamping of the authenticated runner.
 - **Alerts:** offline after the grace period, disk low, and that unused invitations
   and revoked runners are skipped.
-- **Forwarder:** posts only once an endpoint is set.
+- **Forwarder:** posts only once an endpoint is set; `telemetry.logs` and
+  `telemetry.log_level` stop and filter log records within one refresh; posts
+  to an endpoint that is down are counted as dropped.
+- **Event logs:** every event type, from runner and controller, passes a check
+  against the OTLP/JSON `ExportLogsServiceRequest` schema with its documented
+  attributes; an operation record carries only classes and a hashed box ID,
+  never the command, file contents, environment or worker error text.
+- **Local operations:** the catalog's create, hibernate, start, stop and a
+  failed start on the controller's own worker each produce an operation record
+  in the `local` event log; a scheduled recovery run reports prepare, result and
+  the per-box `recovery` record, with the injected upload failure as an error;
+  the intake socket is owner-only, refuses malformed lines and quiet reads, and
+  an agent job's own worker requests are not reported twice.
+- **Real collector:** with an OpenTelemetry Collector on port 4318,
+  `OW_OTLP_ENDPOINT=http://127.0.0.1:4318 cargo test -p ow --bin ow
+  every_event_type_reaches_a_collector -- --ignored` sends every event type
+  through the forwarder, then turns `telemetry.logs` off and checks that the
+  next record is not sent. Run with otelcol-contrib 0.111.0 and its file
+  exporter: all 15 event types arrived with the attributes above.
 - **Controller end to end:**
   - an unnegotiated `otlp` frame closes the session;
   - a negotiated frame is stored under the authenticated runner;

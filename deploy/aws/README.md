@@ -380,7 +380,8 @@ sudo /srv/ow/run/dashboard/bin/ow --local --data-dir /srv/ow/.ow/controller conf
 Settings (`ow config list`) live in the controller's catalog and reach every
 runner within seconds; nothing is set per runner. Alert transitions are logged
 as `alert raised: …` lines in the controller unit's journal. `ow nodes` from a
-remote CLI shows `telemetry_v1` for each runner that supports it.
+remote CLI shows `telemetry_v1` and `telemetry_logs_v1` (events forwarded as
+OTLP logs) for each runner that supports them.
 
 ## Runner pool
 

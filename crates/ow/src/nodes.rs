@@ -1236,6 +1236,7 @@ pub fn controller(
     rt.block_on(async move {
         let routes = routes(c.clone());
         crate::telemetry::spawn_controller_tasks(c.root.clone());
+        crate::telemetry::serve_controller_intake(&c.root);
         tokio::spawn(proxies(c.clone()));
         let slots = Arc::new(Semaphore::new(128));
         if let (Some(cert), Some(key)) = (cert, key) {
@@ -1699,9 +1700,9 @@ pub fn agent(
     };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
     #[cfg(target_os = "linux")]
-    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true,"disk_resize_v1":status["disk_resize_v1"]==true,"snapshot_delete_v1":status["snapshot_delete_v1"]==true,"telemetry_v1":true});
+    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true,"disk_resize_v1":status["disk_resize_v1"]==true,"snapshot_delete_v1":status["snapshot_delete_v1"]==true,"telemetry_v1":true,"telemetry_logs_v1":true});
     #[cfg(target_os = "macos")]
-    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS,"telemetry_v1":true});
+    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS,"telemetry_v1":true,"telemetry_logs_v1":true});
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1720,6 +1721,16 @@ pub fn agent(
         first,
     ))));
     let telemetry = crate::telemetry::Agent::new(&node, crate::telemetry::salt(root));
+    telemetry.version_change(root);
+    {
+        let telemetry = telemetry.clone();
+        crate::telemetry::serve_intake(
+            root,
+            Arc::new(move |op, machine, elapsed, error| {
+                telemetry.operation(op, machine, elapsed, error)
+            }),
+        );
+    }
     {
         let prepared = prepared.clone();
         crate::telemetry::collector(
@@ -1737,12 +1748,13 @@ pub fn agent(
         );
     }
     {
-        let (latest, prepared, negotiated, root, hello) = (
+        let (latest, prepared, negotiated, root, hello, telemetry) = (
             latest.clone(),
             prepared.clone(),
             cache_negotiated.clone(),
             root.to_owned(),
             hello.clone(),
+            telemetry.clone(),
         );
         std::thread::spawn(move || {
             let mut refused = false;
@@ -1770,6 +1782,7 @@ pub fn agent(
                         other.and_then(Result::ok)
                     }
                 };
+                telemetry.worker(status.as_ref().and_then(|s| s["worker_pid"].as_u64()));
                 *latest.lock().unwrap() = status.clone();
                 match status.map(|s| {
                     build_beat(&hello, &s, &root, guided, negotiated.load(Ordering::SeqCst))
@@ -1998,7 +2011,6 @@ fn agent_job(
     ensure!(end + 1 == bytes.len(), "unexpected request suffix");
     let request: Value = serde_json::from_slice(&bytes[..end])?;
     let op = request["op"].as_str().context("op")?;
-    let mut timer = telemetry.map(|t| t.timer(op));
     ensure!(
         [
             "drain-inventory",
@@ -2043,6 +2055,7 @@ fn agent_job(
             || common::PLACEMENT_OPERATIONS.contains(&op),
         "unsupported node operation"
     );
+    let mut timer = telemetry.map(|t| t.timer(op, &request));
     // Only the worker process whose status passed the protocol check is driven; a job
     // that finds none (or another process on the socket) is answered with an error.
     let checked = worker.lock().unwrap().clone();
@@ -2103,6 +2116,8 @@ fn agent_job(
             journal_request(root, &request, common::placement_capable(&checked).is_ok())?;
         if let Some(timer) = &mut timer {
             timer.ok = response["ok"] == true;
+            timer.error =
+                crate::telemetry::error_class(response["error"].as_str().unwrap_or_default());
         }
         let data = serde_json::to_vec(&response)?;
         ensure!(data.len() < 1024 * 1024, "response too large");

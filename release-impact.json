@@ -2,6 +2,42 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.46",
+      "class": 1,
+      "changes": [
+        "controller",
+        "agent"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Event logs: when telemetry.forward_endpoint is set, the controller forwards every node and controller event as an OTLP log record through the existing bounded in-memory forwarder: channel connect, disconnect and reconnect with reason classes, session open and close, agent and controller starts and upgrades, worker restarts, every worker operation: agent jobs, the controller's own worker and the scheduled recovery points with their seals and results, handed to the agent or controller over an owner-only local socket (box lifecycle, recovery captures and seals) with op, outcome, duration, hashed box ID and error class, and alert transitions. No command, file content, environment value, box name or worker error text is sent. New controller settings telemetry.logs (default true) and telemetry.log_level (info|warn|error) take effect within 3 s; runners advertise telemetry_logs_v1. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class-1 upgrade: controller and agents restart; boxes keep running."
+    },
+    {
       "version": "0.9.45",
       "class": 1,
       "changes": [
