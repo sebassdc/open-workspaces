@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.47",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Box memory beyond 16 GiB: a box may have any memory in 256 MiB steps up to its runner's memory budget (at most 65536 MiB). Runners advertise that budget in the new capability max_guest_memory_v2_mib and keep max_guest_memory_mib at no more than 16384 MiB, so older controllers and agents accept their heartbeats; a controller sends sizes above 16384 MiB or off the old power-of-two list only to runners that advertise the new capability. The dashboard offers 32 and 64 GiB (dashboard UI 1.0.1). New controller setting limits.box_memory_mib (default 0: no pool-wide cap) caps the memory a box may be created or resized to, live with ow config set; existing boxes above a lowered cap still start and fork. Protocol, catalog schema, runtime and host layout are unchanged. Class 2: the worker restarts behind the capture gate."
+    },
+    {
       "version": "0.9.46",
       "class": 1,
       "changes": [

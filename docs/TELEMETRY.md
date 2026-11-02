@@ -67,6 +67,7 @@ Infrastructure code carries no telemetry setting.
 | `telemetry.log_level` | `info` | `info`, `warn`, `error` | Lowest event severity forwarded. Takes effect within 3 s. |
 | `alerts.offline_after_s` | `60` | 15–86400 | Grace period before an offline runner raises `node_offline`. |
 | `alerts.disk_low_gib` | `20` | 0–100000 | `disk_low` when a runner's free data-volume space is below this. |
+| `limits.box_memory_mib` | `0` | 0–65536 | Largest memory a box may be created or resized to. `0`: only the runner's memory budget limits it. Boxes already over a lowered limit still start. |
 | `dashboard.ui_bundle` | `builtin` | `builtin` or an installed bundle version | UI bundle the dashboard serves; see [UI bundles](DASHBOARD.md#ui-bundles). Refused unless installed, intact and API-compatible. |
 
 ## What runners report

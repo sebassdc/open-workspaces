@@ -72,7 +72,7 @@ fn now() -> i64 {
 // Controller-held settings (one source; read on every acknowledgement).
 
 /// Allowed keys and their defaults.
-pub const KEYS: [(&str, &str); 8] = [
+pub const KEYS: [(&str, &str); 9] = [
     ("telemetry.enabled", "true"),
     ("telemetry.interval_s", "15"),
     ("telemetry.forward_endpoint", ""),
@@ -83,6 +83,8 @@ pub const KEYS: [(&str, &str); 8] = [
     ("alerts.disk_low_gib", "20"),
     // The dashboard UI bundle the controller serves (docs/DASHBOARD.md#ui-bundles).
     (crate::dashboard_ui::SETTING, "builtin"),
+    // Largest memory one box may be created or resized to; 0 means only the runner's budget limits it.
+    ("limits.box_memory_mib", "0"),
 ];
 
 fn typed(key: &str, value: &str) -> Result<Value> {
@@ -112,6 +114,7 @@ fn typed(key: &str, value: &str) -> Result<Value> {
         "telemetry.interval_s" => number(5..=300),
         "alerts.offline_after_s" => number(15..=86400),
         "alerts.disk_low_gib" => number(0..=100_000),
+        "limits.box_memory_mib" => number(0..=u64::from(crate::common::HOST_MEMORY_MIB)),
         crate::dashboard_ui::SETTING => {
             if value != "builtin" {
                 crate::dashboard_ui::valid_version(value)?;
@@ -146,7 +149,7 @@ fn typed(key: &str, value: &str) -> Result<Value> {
 pub fn settings(db: &Connection) -> Result<Value> {
     // One query: it also runs with every acknowledgement.
     let stored: BTreeMap<String, String> = db
-        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key='config_version'")?
+        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key LIKE 'limits.%' OR key='config_version'")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut out = json!({});
@@ -2920,6 +2923,12 @@ mod tests {
         assert!(set(&root, "telemetry.logs", "yes", "t").is_err());
         let s = set(&root, "telemetry.log_level", "WARN", "t").unwrap();
         assert_eq!(s["telemetry.log_level"], "warn");
+        assert_eq!(s["limits.box_memory_mib"], 0);
+        assert!(set(&root, "limits.box_memory_mib", "65537", "t").is_err());
+        assert_eq!(
+            set(&root, "limits.box_memory_mib", "16384", "t").unwrap()["limits.box_memory_mib"],
+            16384
+        );
         let mut body = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"severityNumber":9},{"severityNumber":13}]}]}]});
         assert!(keep_logs(&mut body, 13));
         assert_eq!(
