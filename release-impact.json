@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.47",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Box memory beyond 16 GiB: a box may have any memory in 256 MiB steps up to its runner's memory budget (at most 65536 MiB). Runners advertise their whole budget as the per-guest memory ceiling; the dashboard offers 32 and 64 GiB. New controller setting limits.box_memory_mib (default 0: no pool-wide cap) caps the memory a box may be created or resized to, live with ow config set; boxes already above a lowered cap still start. The controller upgrades before the runners, so a mixed fleet keeps working."
+    },
+    {
       "version": "0.9.46",
       "class": 1,
       "changes": [
