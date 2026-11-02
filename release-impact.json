@@ -37,7 +37,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "Box memory beyond 16 GiB: a box may have any memory in 256 MiB steps up to its runner's memory budget (at most 65536 MiB). Runners advertise their whole budget as the per-guest memory ceiling; the dashboard offers 32 and 64 GiB. New controller setting limits.box_memory_mib (default 0: no pool-wide cap) caps the memory a box may be created or resized to, live with ow config set; boxes already above a lowered cap still start. The controller upgrades before the runners, so a mixed fleet keeps working."
+      "notes": "Box memory beyond 16 GiB: a box may have any memory in 256 MiB steps up to its runner's memory budget (at most 65536 MiB). Runners advertise that budget in the new capability max_guest_memory_v2_mib and keep max_guest_memory_mib at no more than 16384 MiB, so older controllers and agents accept their heartbeats; a controller sends sizes above 16384 MiB or off the old power-of-two list only to runners that advertise the new capability. The dashboard offers 32 and 64 GiB (dashboard UI 1.0.1). New controller setting limits.box_memory_mib (default 0: no pool-wide cap) caps the memory a box may be created or resized to, live with ow config set; existing boxes above a lowered cap still start and fork. Protocol, catalog schema, runtime and host layout are unchanged. Class 2: the worker restarts behind the capture gate."
     },
     {
       "version": "0.9.46",

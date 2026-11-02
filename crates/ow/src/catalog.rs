@@ -2585,10 +2585,15 @@ impl Catalog {
         if matches!(op.as_str(), "create" | "resize") {
             common::requested_resources(&request)?;
             common::requested_disk(&request)?;
-            if let Some(memory) = request["memory_mib"].as_u64() {
-                let cap = crate::telemetry::settings(&nodes::db(&self.root)?)?["limits.box_memory_mib"]
-                    .as_u64()
-                    .unwrap_or(0);
+            // Create defaults to 256 MiB like requested_resources; resize keeps the box's memory.
+            let memory = request["memory_mib"]
+                .as_u64()
+                .or((op == "create").then_some(256));
+            if let Some(memory) = memory {
+                let cap =
+                    crate::telemetry::settings(&nodes::db(&self.root)?)?["limits.box_memory_mib"]
+                        .as_u64()
+                        .unwrap_or(0);
                 ensure!(
                     cap == 0 || memory <= cap,
                     "memory {memory} MiB is over this pool's per-box limit of {cap} MiB (limits.box_memory_mib)"

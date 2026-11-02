@@ -166,6 +166,9 @@ pub fn requested_resources(request: &serde_json::Value) -> Result<(u32, u32)> {
     Ok((memory, cpus))
 }
 
+/// Workers that size boxes in any 256 MiB step report their ceiling here; older peers keep
+/// reading `max_guest_memory_mib`, which such workers cap at the old 16384 MiB.
+pub const GUEST_MEMORY_V2: &str = "max_guest_memory_v2_mib";
 /// Protocol v1 peers without optional shape fields retain the original worker ceiling.
 pub fn guest_limits(v: &serde_json::Value) -> Result<(u64, u64)> {
     fn limit(v: &serde_json::Value, key: &str, fallback: u64, ceiling: u64) -> Result<u64> {
@@ -177,7 +180,11 @@ pub fn guest_limits(v: &serde_json::Value) -> Result<(u64, u64)> {
         Ok(n)
     }
     Ok((
-        limit(v, "max_guest_memory_mib", 2048, u64::from(HOST_MEMORY_MIB))?,
+        if v.get(GUEST_MEMORY_V2).is_some() {
+            limit(v, GUEST_MEMORY_V2, 2048, u64::from(HOST_MEMORY_MIB))?
+        } else {
+            limit(v, "max_guest_memory_mib", 2048, 16384)?
+        },
         limit(v, "max_guest_vcpus", 4, 16)?,
     ))
 }
@@ -189,6 +196,10 @@ pub fn guest_shape(v: &serde_json::Value, memory: u64, cpus: u64) -> Result<()> 
         );
     }
     let (ram, cpu) = guest_limits(v)?;
+    ensure!(
+        v.get(GUEST_MEMORY_V2).is_some() || SHAPES_MIB[..7].iter().any(|m| u64::from(*m) == memory),
+        "this runner only accepts 256–16384 MiB power-of-two sizes; upgrade it first"
+    );
     ensure!(
         memory <= ram && cpus <= cpu,
         "shape exceeds worker per-guest ceiling"
@@ -206,16 +217,21 @@ mod capacity_tests {
         assert!(guest_shape(&legacy, 2048, 4).is_ok());
         assert!(guest_shape(&legacy, 4096, 2).is_err());
         assert!(guest_shape(&legacy, 256, 5).is_err());
-        let new = json!({"max_guest_memory_mib":16384,"max_guest_vcpus":16});
-        assert!(guest_shape(&new, 4096, 2).is_ok());
-        let big = json!({"max_guest_memory_mib":49152,"max_guest_vcpus":16});
-        assert!(guest_shape(&big, 32768, 16).is_ok());
-        assert!(guest_shape(&big, 65536, 16).is_err());
+        let old = json!({"max_guest_memory_mib":16384,"max_guest_vcpus":16});
+        assert!(guest_shape(&old, 4096, 2).is_ok());
+        assert!(guest_shape(&old, 3072, 2).is_err());
+        assert!(guest_shape(&old, 32768, 2).is_err());
+        let new = json!({"max_guest_memory_mib":16384,"max_guest_memory_v2_mib":47440,"max_guest_vcpus":16});
+        assert_eq!(guest_limits(&new).unwrap(), (47440, 16));
+        assert!(guest_shape(&new, 3072, 2).is_ok());
+        assert!(guest_shape(&new, 32768, 16).is_ok());
+        assert!(guest_shape(&new, 65536, 16).is_err());
         for bad in [
             json!({"max_guest_memory_mib":null}),
             json!({"max_guest_vcpus":"16"}),
             json!({"max_guest_vcpus":17}),
-            json!({"max_guest_memory_mib":65537}),
+            json!({"max_guest_memory_mib":16385}),
+            json!({"max_guest_memory_v2_mib":65537}),
         ] {
             assert!(guest_limits(&bad).is_err());
         }

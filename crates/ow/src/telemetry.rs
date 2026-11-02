@@ -2925,7 +2925,10 @@ mod tests {
         assert_eq!(s["telemetry.log_level"], "warn");
         assert_eq!(s["limits.box_memory_mib"], 0);
         assert!(set(&root, "limits.box_memory_mib", "65537", "t").is_err());
-        assert_eq!(set(&root, "limits.box_memory_mib", "16384", "t").unwrap()["limits.box_memory_mib"], 16384);
+        assert_eq!(
+            set(&root, "limits.box_memory_mib", "16384", "t").unwrap()["limits.box_memory_mib"],
+            16384
+        );
         let mut body = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"severityNumber":9},{"severityNumber":13}]}]}]});
         assert!(keep_logs(&mut body, 13));
         assert_eq!(
