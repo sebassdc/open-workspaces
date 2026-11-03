@@ -15,8 +15,9 @@ if [[ -n $prebuilt_guest && -f data/runtime-spike/guest/base.ext4 ]]; then
 fi
 if [[ -n $rust && ! -x "$CARGO_HOME/bin/rustup" ]]; then
   installer=data/runtime-spike/downloads/rustup-init
-  curl -fsSL --retry 2 https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init -o "$installer"
-  # Pin the installer used in this experiment; never execute a changed download.
+  curl -fsSL --retry 2 https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init -o "$installer"
+  # Pinned version and hash (the unversioned URL moves with each rustup release);
+  # never execute a changed download.
   printf '%s  %s\n' dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71 "$installer" | sha256sum --check
   chmod 700 "$installer"
   "$installer" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
