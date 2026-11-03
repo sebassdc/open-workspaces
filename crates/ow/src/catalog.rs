@@ -976,11 +976,7 @@ impl Catalog {
     ) -> Result<()> {
         let c = self;
         // Moves, forks, wakes and restores keep ordinary owners on `default` runners.
-        let pool: String = c.db.query_row(
-            "SELECT COALESCE((SELECT pool FROM node_placement_policy WHERE node=?1),'default')",
-            [target],
-            |r| r.get(0),
-        )?;
+        let pool = c.node_pool(target)?;
         if pool != "default" {
             let actor: i64 = c.db.query_row(
                 "SELECT owner FROM operations WHERE id=?1",
@@ -2268,6 +2264,14 @@ impl Catalog {
             extra.2 + pending.2,
         ))
     }
+    /// A runner's placement pool; the controller's own worker is in `default`.
+    fn node_pool(&self, node: &str) -> Result<String> {
+        Ok(self.db.query_row(
+            "SELECT COALESCE((SELECT pool FROM node_placement_policy WHERE node=?1),'default')",
+            [node],
+            |r| r.get(0),
+        )?)
+    }
     #[allow(clippy::too_many_arguments)]
     fn choose(
         &self,
@@ -2942,6 +2946,13 @@ impl Catalog {
                     self.save("machine",&physical,&json!({"state":"pending","image":request["image"].as_str().unwrap_or("alpine"),"memory_mib":request["memory_mib"].as_u64().unwrap_or(256),"vcpu_count":request["vcpu_count"].as_u64().unwrap_or(1)}))?;
                 }
             }
+            // A retried create keeps its first runner only when that runner is in the pool asked for.
+            if op == "create" && self.node_pool(&node)? != pool {
+                return Err(limits::Rejection(format!(
+                    "machine '{name}' is already being created in another pool; delete it or ask for that pool"
+                ))
+                .into());
+            }
             if let Some(chosen) = request["node"].as_str() {
                 ensure!(chosen == node, "placement is fixed");
             }
@@ -3020,6 +3031,14 @@ impl Catalog {
                         .into());
                     }
                     if !existing && new_child {
+                        // A fork's child stays on its runner; outside `default` that needs a pool admin.
+                        let pool = self.node_pool(&node)?;
+                        if pool != "default" && !self.pool_admin(user)? {
+                            return Err(limits::Rejection(format!(
+                                "machine '{name}' is on a runner in pool '{pool}'; only a pool admin can fork there"
+                            ))
+                            .into());
+                        }
                         self.db.execute(
                             "UPDATE resources SET node=?1 WHERE kind='machine' AND physical=?2",
                             params![node, target],

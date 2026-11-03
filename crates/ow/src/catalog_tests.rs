@@ -4774,6 +4774,11 @@ fn pools_take_only_creates_that_ask_from_admins_or_a_grant() {
     fake.worker("alpha");
     fake.worker("beta");
     quota_node(&fake);
+    // Placement prefers the fullest runner that fits: without the pool filter, beta would win.
+    nodes::db(&fake.root)
+        .unwrap()
+        .execute("UPDATE nodes SET memory_mib=2048,capabilities=json_set(capabilities,'$.memory_mib',2048) WHERE id='beta'", [])
+        .unwrap();
     assert!(nodes::set_pool(&fake.root, "missing", "jobs").is_err());
     assert!(nodes::set_pool(&fake.root, "beta", "bad pool").is_err());
     assert_eq!(
@@ -4838,6 +4843,37 @@ fn pools_take_only_creates_that_ask_from_admins_or_a_grant() {
     assert_eq!(node(&c, a, "asked"), "beta");
     c.operation(p, asked.clone()).unwrap();
     assert_eq!(node(&c, p, "asked"), "beta");
+    // A fork's child stays on its parent's runner, so outside `default` it needs a pool admin,
+    // even for the box's owner or a teammate it is shared with.
+    let mut gift = create("gift");
+    gift["pool"] = json!("jobs");
+    gift["owner"] = json!("alice@example.test");
+    c.operation(p, gift).unwrap();
+    assert_eq!(node(&c, a, "gift"), "beta");
+    let refused = c
+        .operation(a, json!({"op":"fork","id":"gift","child":"copy"}))
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("only a pool admin"),
+        "{refused:#}"
+    );
+    assert!(c.physical(a, "machine", "copy").is_err());
+    c.operation(
+        p,
+        json!({"op":"fork","id":"alice@example.test/gift","child":"admin-copy"}),
+    )
+    .unwrap();
+    assert_eq!(node(&c, p, "admin-copy"), "beta");
+    // A pending create keeps its runner only for a retry that asks for the same pool.
+    *fake.reject.lock().unwrap() = Some("create".into());
+    let mut stuck = create("stuck");
+    stuck["pool"] = json!("jobs");
+    stuck["owner"] = json!("alice@example.test");
+    assert!(c.operation(p, stuck).is_err());
+    *fake.reject.lock().unwrap() = None;
+    assert_eq!(node(&c, a, "stuck"), "beta");
+    let retry = c.operation(a, create("stuck")).unwrap_err();
+    assert!(retry.to_string().contains("another pool"), "{retry:#}");
     // A pool with no runner fails rather than falling back to `default`.
     let mut empty = create("empty");
     empty["pool"] = json!("nowhere");

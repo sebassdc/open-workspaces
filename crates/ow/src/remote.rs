@@ -826,9 +826,23 @@ async fn workload(app: &App, presented: String, mut request: Request) -> Respons
         )
             .into_response();
     };
-    request
-        .headers_mut()
-        .insert("x-ow-request", HeaderValue::from_static("dashboard"));
+    // Programs often add a charset; the operation API itself checks the JSON.
+    let json = request
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        });
+    let headers = request.headers_mut();
+    headers.insert("x-ow-request", HeaderValue::from_static("dashboard"));
+    if json {
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+    }
     crate::dashboard::handle(
         Some(catalog),
         Some(root),
@@ -3131,7 +3145,7 @@ mod tests {
                 .uri(path)
                 .header("host", "app.example.test")
                 .header("authorization", format!("Bearer {bearer}"))
-                .header("content-type", "application/json")
+                .header("content-type", "application/json; charset=utf-8")
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };

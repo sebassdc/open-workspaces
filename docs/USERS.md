@@ -236,17 +236,23 @@ another pool, even with `--node`.
 | Pool admin | yes | yes, any pool |
 | Workload token bound to that pool | only if bound to `default` | yes, its pool only |
 
-Moves, forks with `--node`, wakes and artifact restores follow the same rule: a
-target runner outside `default` is refused unless the person starting it is a
-pool admin. A pool with no runner that fits refuses the create; it never falls
-back to `default`.
+Forks (whose child stays on its parent's runner), moves, forks with `--node`,
+wakes and artifact restores follow the same rule: a runner outside `default` is
+refused unless the person starting it is a pool admin. A box made in another pool
+for an ordinary owner can be used, stopped and deleted by them, but not forked
+there. A wake does not remember a box's pool: a parked box of an ordinary owner
+(or a token's) wakes only on a `default` runner. A retried create keeps the runner
+its first attempt chose only when it asks for that runner's pool. A pool with no
+runner that fits refuses the create; it never falls back to `default`.
 
 ## Workload tokens
 
 A workload token is a scoped API credential for a program, not a person. It is
 bound to one owner and one pool, and allows only `create`, `put`, `exec`, `stop`
 and `delete`, on boxes that owner owns (`stop` because a running box must be
-stopped before it is deleted). Everything else is refused before any worker
+stopped before it is deleted). The pool binds where it creates; `put`, `exec`,
+`stop` and `delete` reach every box of its owner, in any pool, so give each
+program an owner of its own. Everything else is refused before any worker
 contact: other operations, `OWNER@example.com/BOX` addresses (shares included),
 `owner` on create, another pool, the dashboard and `/api/state`. Owner limits
 apply to its creates as to the owner's own.
@@ -266,7 +272,9 @@ tokens stop working rather than gain access). The gateway never logs it. `revoke
 deletes it; the next request with it is refused. Requests it already started
 finish. Use an owner email of its own: one nobody has signed in with becomes a
 program-only owner (its catalog subject is set to `workload:EMAIL`), so no later
-login can claim its boxes. A token for an owner who has signed in acts as that
+login can claim its boxes. That includes an email someone reserved by sharing or
+transferring a box to it: that person can then never sign in with it, and the
+token reaches the boxes transferred to it, so pick a new email. A token for an owner who has signed in acts as that
 person, within the scope above. The controller must have had one sign-in before
 the first program-only owner, so it knows its identity provider.
 
@@ -280,7 +288,8 @@ curl -sS http://127.0.0.1:8787/api/operation \
   -d '{"op":"create","id":"job-1","image":"ubuntu","memory_mib":4096,"vcpu_count":2}'
 ```
 
-`Host` must be the gateway's configured hostname. `put` copies a file into the box
+`Host` must be the gateway's configured hostname and `Content-Type`
+`application/json` (a `charset` parameter is fine). `put` copies a file into the box
 without putting its contents on a command line, e.g. a one-time setup file:
 `{"op":"put","id":"job-1","path":"/run/setup.json","data":"BASE64"}` (256 KiB at
 most), then `{"op":"exec","id":"job-1","command":"..."}`, `{"op":"stop","id":"job-1"}`
