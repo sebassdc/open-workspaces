@@ -428,6 +428,24 @@ class Machine(unittest.TestCase):
         self.assertEqual(h.pin("worker"), self.new)
         self.assertNotIn("canary", ops.calls)
 
+    def test_the_report_is_read_from_a_worker_that_is_not_busy(self):
+        ops = Fake({"a": "running"})
+        real, answers = ops.worker_status, []
+
+        def worker_status():
+            status = real()
+            if not answers and "verify" in ops.calls:
+                # Still busy right after verify: its last answer predates the adoption.
+                answers.append(1)
+                return {**status, "busy": True, "adoption": []}
+            return status
+
+        ops.worker_status = worker_status
+        with mock.patch.object(u.time, "sleep"):
+            self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        self.assertEqual(answers, [1])
+        self.assertEqual((self.journal()["adoption"], self.journal()["error"]), ({"a": "kept"}, None))
+
     def test_a_box_the_new_worker_cannot_adopt_is_hibernated_and_woken_not_lost(self):
         ops = Fake({"a": "running", "b": "running"}, fail={"adopt:b"})
         self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())

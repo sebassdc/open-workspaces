@@ -739,11 +739,17 @@ def execute(plan_, ops, frm, to, target_name):
     finish(j, ops)
 
 
-def adoption(handed, ops):
+def adoption(handed, ops, wait=300):
     """Per box handed over: kept (same VMM PID, adopted) or what the new worker did instead.
     A box it hibernated is woken by finish() like any other recorded box."""
+    # A busy worker answers with its last status, which may predate the adoption.
+    end = time.monotonic() + wait
+    status = ops.worker_status() or {}
+    while status.get("busy") and time.monotonic() < end:
+        time.sleep(1)
+        status = ops.worker_status() or {}
     now = ops.vmm_pids(list(handed))
-    report = {e.get("id"): e for e in (ops.worker_status() or {}).get("adoption") or []}
+    report = {e.get("id"): e for e in status.get("adoption") or []}
     out = {}
     for box, pid in handed.items():
         entry = report.get(box) or {}
