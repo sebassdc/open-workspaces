@@ -165,11 +165,17 @@ different from a machine's `admin` share role.
 | `ow transfer BOX --to EMAIL [--keep-access]` | yes | yes, any box | no | no |
 | `ow fork BOX CHILD --owner EMAIL` | yes | yes, any box | no | no |
 | `ow create NAME --owner EMAIL` | no | yes | no | no |
+| `ow start` / `ow hibernate` | yes | yes, any box | yes | no |
+| `ow stop` | yes | yes, any box | `admin` only | no |
+| `ow resize BOX --cpus/--memory/--disk` | yes | yes, any box | no | no |
+| `ow delete`, `ow rename`, sharing | yes | no | no | no |
 
 A pool admin reaches another owner's box (`alice@example.com/BOX`) to transfer,
-fork or manage its [AWS role](AWS_ACCESS.md). The dashboard lists those actions
-under Pool machines; AWS roles must still be allowed for the box owner. Exec,
-shells, SSH, lifecycle and sharing still need ownership or a share. A pool admin's fork of another owner's box copies everything on it into a
+fork, manage its [AWS role](AWS_ACCESS.md), or start, stop, hibernate and resize
+it. The dashboard lists those actions under Pool machines; AWS roles must still be
+allowed for the box owner, and a resize counts against the box owner's
+[limits](LIMITS.md), not the admin's. Exec, shells, SSH, snapshots, renaming,
+deleting and sharing still need ownership or a share. A pool admin's fork of another owner's box copies everything on it into a
 box the admin chooses the owner of, so the list should hold only people trusted
 with every box in the pool.
 
@@ -202,9 +208,12 @@ pool admin the box owner's. Like every fork, it inherits no shares or SSH keys.
 
 **Audit.** Every transfer, create for someone else, fork into someone else's name
 space and pool admin fork is a row in the catalog's `audit` table (actor, action,
-machine, source, old and new owner, keep-access, time). The actor and both owners
-see it in `ow audit` and the dashboard's Ownership changes list. The table is
-additive: catalog schema 7 is unchanged and an older controller ignores it.
+machine, source, old and new owner, keep-access, time). So is every start, stop,
+hibernate or resize a pool admin runs on another owner's box, with the box owner as
+`to`; it is written when the action is dispatched, so a refused or failed one is
+still on record. The actor and the owners see it in `ow audit` and the
+dashboard's Ownership changes list. The table is additive: catalog schema 7 is
+unchanged and an older controller ignores it.
 
 Evidence (2026-10-20): `catalog::multinode_tests::transfer_by_owner_or_pool_admin_keeps_the_box_and_moves_its_owner`
 and `catalog::multinode_tests::pool_admins_create_and_fork_for_others_and_owners_fork_for_others`

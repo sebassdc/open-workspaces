@@ -4608,6 +4608,139 @@ fn pool_admins_create_and_fork_for_others_and_owners_fork_for_others() {
 }
 
 #[test]
+fn pool_admins_run_lifecycle_and_resize_on_any_box_audited_and_within_the_owners_limits() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    quota_node(&fake);
+    c.pool_admins = vec!["admin@example.test".into()];
+    let a = c.user(&identity("alice")).unwrap();
+    let e = c.user(&identity("eve")).unwrap();
+    let p = c.user(&identity("admin")).unwrap();
+    c.operation(
+        a,
+        json!({"op":"create","id":"demo","memory_mib":256,"vcpu_count":1}),
+    )
+    .unwrap();
+    let address = "alice@example.test/demo";
+    let resize = |cpus: u64| json!({"op":"resize","id":address,"memory_mib":512,"vcpu_count":cpus});
+    // A stranger reaches none of it, and no worker is contacted.
+    let calls = fake.calls.load(Ordering::SeqCst);
+    for op in ["start", "stop", "hibernate"] {
+        assert!(
+            c.operation(e, json!({"op":op,"id":address})).is_err(),
+            "{op}"
+        );
+    }
+    assert!(c.operation(e, resize(2)).is_err());
+    assert_eq!(calls, fake.calls.load(Ordering::SeqCst));
+    // The pool admin hibernates, starts, stops and resizes it; replies name the owner's box.
+    let hibernated = c
+        .operation(p, json!({"op":"hibernate","id":address}))
+        .unwrap();
+    assert_eq!(hibernated["id"], address);
+    assert_eq!(
+        c.operation(p, json!({"op":"start","id":address})).unwrap()["state"],
+        "running"
+    );
+    let stopped = c.operation(p, json!({"op":"stop","id":address})).unwrap();
+    assert_eq!(stopped["workspace"]["id"], address);
+    // Sizing counts against the owner's limits, never the admin's larger ones.
+    std::fs::write(
+        fake.root.join("limits.json"),
+        json!({"owner_defaults":{"cpus":2,"memory_mib":32768,"disk_gib":256,"boxes":8},"owners":{p.to_string():{"cpus":64,"memory_mib":65536,"disk_gib":1024,"boxes":64}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        fake.root.join("limits.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    let over = c.operation(p, resize(4)).unwrap_err();
+    assert!(
+        over.downcast_ref::<limits::Rejection>()
+            .is_some_and(|r| r.0.contains("owner CPU limit exceeded")),
+        "{over:#}"
+    );
+    let resized = c.operation(p, resize(2)).unwrap();
+    assert_eq!(
+        (
+            resized["id"].as_str(),
+            resized["memory_mib"].as_u64(),
+            resized["vcpu_count"].as_u64()
+        ),
+        (Some(address), Some(512), Some(2))
+    );
+    assert_eq!(c.state(a).unwrap()["workspaces"][0]["memory_mib"], 512);
+    // Data access, the owner's settings and deletion stay with the owner and shares.
+    for denied in [
+        json!({"op":"exec","id":address,"command":"id"}),
+        json!({"op":"get","id":address,"path":"/etc/hostname"}),
+        json!({"op":"snapshot","id":address,"name":"peek"}),
+        json!({"op":"ssh-keys","id":address,"keys":[],"upgrade":false}),
+        json!({"op":"ssh-info","id":address}),
+        json!({"op":"share","id":address,"with":"eve@example.test"}),
+        json!({"op":"rename","id":address,"name":"other"}),
+        json!({"op":"delete","id":address}),
+    ] {
+        assert!(c.operation(p, denied.clone()).is_err(), "{denied}");
+    }
+    assert!(c.terminal_target(p, address).is_err() && c.ssh_target(p, address).is_err());
+    // Each dispatched action is on record for the owner and the admin; refusals made no row.
+    fn rows(c: &mut Catalog, user: i64) -> Vec<String> {
+        c.state(user).unwrap()["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {} {} by {}",
+                    r["action"].as_str().unwrap(),
+                    r["to"].as_str().unwrap(),
+                    r["machine"].as_str().unwrap(),
+                    r["by"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+    let expected = [
+        "resize alice@example.test demo by admin@example.test",
+        "stop alice@example.test demo by admin@example.test",
+        "start alice@example.test demo by admin@example.test",
+        "hibernate alice@example.test demo by admin@example.test",
+    ];
+    assert_eq!(rows(&mut c, a), expected);
+    assert_eq!(rows(&mut c, p), expected);
+    assert!(rows(&mut c, e).is_empty());
+    // The owner's own lifecycle is no admin action.
+    c.operation(a, json!({"op":"start","id":"demo"})).unwrap();
+    assert_eq!(rows(&mut c, a).len(), 4);
+}
+
+#[test]
+fn audit_table_from_before_lifecycle_actions_is_widened_and_keeps_its_rows() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let a = c.user(&identity("alice")).unwrap();
+    c.db.execute_batch("DROP TABLE audit; CREATE TABLE audit(id INTEGER PRIMARY KEY, operation INTEGER NOT NULL UNIQUE, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, actor INTEGER NOT NULL REFERENCES users(id), action TEXT NOT NULL CHECK(action IN ('transfer','create','fork')), machine TEXT NOT NULL, source TEXT, from_owner INTEGER REFERENCES users(id), to_owner INTEGER NOT NULL REFERENCES users(id), keep_access INTEGER NOT NULL DEFAULT 0);").unwrap();
+    c.db.execute(
+        "INSERT INTO audit(operation,actor,action,machine,to_owner) VALUES(1,?1,'create','old',?1)",
+        [a],
+    )
+    .unwrap();
+    drop(c);
+    for _ in 0..2 {
+        let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+        assert_eq!(c.state(a).unwrap()["audit"][0]["machine"], "old");
+        c.db.execute(
+            "INSERT INTO audit(operation,actor,action,machine,to_owner) VALUES(2,?1,'resize','old',?1) ON CONFLICT(operation) DO NOTHING",
+            [a],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
 fn transfer_moves_stored_capture_and_snapshot_authority_to_the_new_owner() {
     use crate::transfers::*;
     let (_fake, mut c, user, physical, intent) = transfer_fixture();

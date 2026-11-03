@@ -372,6 +372,11 @@ and fork with `--owner` make a new box directly in Bob's name space, counted
 against his limits. Bob and you both see the change in `ow audit` and the
 dashboard's Ownership changes list. Details: [USERS.md](USERS.md#pool-admins-and-transfers).
 
+A pool admin can also start, stop, hibernate or resize another owner's box by its
+full address, for example `ow --server URL resize bob@example.com/demo --memory 4096`
+once it is stopped. The resize counts against Bob's limits, and Bob sees each
+action in `ow audit`.
+
 ### Move or fork to an explicit runner
 
 Owners can use `ow --server URL move BOX --node RUNNER`; existing fork permissions
