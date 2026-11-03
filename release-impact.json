@@ -42,6 +42,9 @@
           ]
         }
       },
+      "waivers": {
+        "dashboard": "dashboard.rs changes only a test: the worker operations the dashboard refuses now list detach and hibernate-unresponsive"
+      },
       "host_layout": 2,
       "in_place_from": "0.5.0",
       "notes": "Worker hand-over (ADR 0011): running VMMs outlive a worker restart and the new worker adopts them, so a worker-only upgrade or `ow-host restart --worker` keeps every box running (seconds of downtime, no RAM capture). A VMM, guest kernel or worker unit change still hibernates, as does a failed adoption (per box). The controller setting upgrade.worker_handover (default true) turns it off; `--hibernate` forces the old path once; runners advertise worker_handover_v1. The worker unit gets KillMode=process. Class 2: this upgrade itself still hibernates, since the running worker cannot hand over yet."
