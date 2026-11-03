@@ -309,6 +309,37 @@ fn recorded_runs(record: &Value) -> Option<u32> {
     .then_some(pid)
 }
 
+/// Whether this host lets a later worker take a VMM's fds (`pidfd_getfd`, Linux 5.6+, not
+/// refused by Yama's `ptrace_scope` 3); without it a restart must hibernate (ADR 0011).
+pub fn handover_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        if std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+            .is_ok_and(|s| s.trim() == "3")
+        {
+            return false;
+        }
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
+        if raw < 0 {
+            return false;
+        }
+        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+        let taken = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_getfd,
+                pidfd.as_raw_fd(),
+                pidfd.as_raw_fd(),
+                0,
+            )
+        };
+        if taken < 0 {
+            return false;
+        }
+        drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(taken as i32) });
+        true
+    })
+}
+
 /// The recorded VMM's PID when that very process still runs.
 pub fn recorded_live_pid(directory: &Path) -> Option<u32> {
     let record: Value =
@@ -507,83 +538,115 @@ impl Vm {
         kernel_sha256: &str,
         hash: impl Fn(&Path) -> Result<String>,
     ) -> Result<Adoption> {
+        // Only the identity is needed to find the process; anything else that is wrong
+        // with a verified, running VMM refuses it (the caller ends it), never leaves it
+        // running unmanaged.
         let record: Value = serde_json::from_slice(&std::fs::read(directory.join(RECORD))?)
             .context("invalid VMM record")?;
-        ensure!(
-            record["format"] == RECORD_FORMAT,
-            "VMM record format {} is not {RECORD_FORMAT}",
-            record["format"]
-        );
         let Some(pid) = recorded_runs(&record) else {
             return Ok(Adoption::Gone);
         };
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         if raw < 0 {
-            return Ok(Adoption::Gone);
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(Adoption::Gone);
+            }
+            // Out of fds or memory: it may run still, so keep its record and TAP.
+            return Err(error).context(format!("pidfd of VMM {pid}"));
         }
         let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
         // The pidfd names whichever process held the PID when it was opened: check again.
         if recorded_runs(&record) != Some(pid) {
             return Ok(Adoption::Gone);
         }
-        let refused =
-            |reason: String, pidfd| Ok(Adoption::Refused(reason, Vmm::Adopted { pid, pidfd }));
-        let running = match hash(Path::new(&format!("/proc/{pid}/exe"))) {
-            Ok(running) => running,
-            Err(e) => return refused(format!("VMM {pid}: reading its binary: {e:#}"), pidfd),
-        };
-        if running != vmm_sha256 {
-            return refused(
-                format!("VMM {pid} runs binary {running}, this worker runs {vmm_sha256}"),
-                pidfd,
-            );
+        match Self::take_over(
+            directory,
+            &record,
+            pid,
+            pidfd,
+            vmm_sha256,
+            kernel_sha256,
+            hash,
+        ) {
+            Ok(vm) => Ok(Adoption::Adopted(Box::new(vm))),
+            Err((e, pidfd)) => Ok(Adoption::Refused(
+                format!("VMM {pid}: {e:#}"),
+                Vmm::Adopted { pid, pidfd },
+            )),
         }
-        if record["kernel_sha256"] != kernel_sha256 {
-            return refused(
-                format!(
-                    "VMM {pid} booted guest kernel {}, this worker boots {kernel_sha256}",
-                    record["kernel_sha256"]
-                ),
-                pidfd,
-            );
-        }
-        let take = |fd: &Value| -> Result<File> {
-            let fd = fd.as_i64().context("record fd")? as i32;
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+    }
+
+    /// Takes a verified VMM over, or hands its pidfd back with the reason it cannot.
+    fn take_over(
+        directory: &Path,
+        record: &Value,
+        pid: u32,
+        pidfd: std::os::fd::OwnedFd,
+        vmm_sha256: &str,
+        kernel_sha256: &str,
+        hash: impl Fn(&Path) -> Result<String>,
+    ) -> std::result::Result<Self, (anyhow::Error, std::os::fd::OwnedFd)> {
+        let parts = (|| -> Result<_> {
             ensure!(
-                raw >= 0,
-                "taking fd {fd} of VMM {pid}: {}",
-                std::io::Error::last_os_error()
+                record["format"] == RECORD_FORMAT,
+                "record format {} is not {RECORD_FORMAT}",
+                record["format"]
             );
-            Ok(unsafe { File::from_raw_fd(raw as i32) })
-        };
-        let (master, errors) =
-            match take(&record["pty_fd"]).and_then(|m| Ok((m, take(&record["log_fd"])?))) {
-                Ok(fds) => fds,
-                Err(e) => return refused(format!("{e:#}"), pidfd),
+            let running =
+                hash(Path::new(&format!("/proc/{pid}/exe"))).context("reading its binary")?;
+            ensure!(
+                running == vmm_sha256,
+                "runs binary {running}, this worker runs {vmm_sha256}"
+            );
+            ensure!(
+                record["kernel_sha256"] == kernel_sha256,
+                "booted guest kernel {}, this worker boots {kernel_sha256}",
+                record["kernel_sha256"]
+            );
+            let tap = record["tap"].as_str().context("record TAP")?.to_owned();
+            let address = record["address"]
+                .as_str()
+                .context("record address")?
+                .to_owned();
+            let take = |fd: &Value| -> Result<File> {
+                let fd = fd.as_i64().context("record fd")? as i32;
+                let raw = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+                ensure!(
+                    raw >= 0,
+                    "taking its fd {fd}: {}",
+                    std::io::Error::last_os_error()
+                );
+                Ok(unsafe { File::from_raw_fd(raw as i32) })
             };
-        let diagnostics = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(directory.join("vmm.log"))?;
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(directory.join("serial.log"))?;
-        let vm = Self {
-            child: Vmm::Adopted { pid, pidfd },
-            master,
-            log,
-            diagnostics: Some(drain(errors, diagnostics)),
-            buffer: Vec::new(),
-            socket: directory.join("api.sock"),
-            tap: record["tap"].as_str().context("record TAP")?.into(),
-            address: record["address"].as_str().context("record address")?.into(),
-            // The last captured image is not known here: the next capture is a full one.
-            memory_base: MemoryBase::Unknown,
-            keep: false,
-        };
-        Ok(Adoption::Adopted(Box::new(vm)))
+            let master = take(&record["pty_fd"])?;
+            let errors = take(&record["log_fd"])?;
+            let diagnostics = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join("vmm.log"))?;
+            let log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join("serial.log"))?;
+            Ok((master, errors, diagnostics, log, tap, address))
+        })();
+        match parts {
+            Ok((master, errors, diagnostics, log, tap, address)) => Ok(Self {
+                child: Vmm::Adopted { pid, pidfd },
+                master,
+                log,
+                diagnostics: Some(drain(errors, diagnostics)),
+                buffer: Vec::new(),
+                socket: directory.join("api.sock"),
+                tap,
+                address,
+                // The last captured image is not known here: the next capture is a full one.
+                memory_base: MemoryBase::Unknown,
+                keep: false,
+            }),
+            Err(e) => Err((e, pidfd)),
+        }
     }
 
     /// Checks an adopted VMM answers: its API (a VM a capture left paused runs again) and

@@ -1767,8 +1767,9 @@ impl Runtime {
         Ok(count)
     }
 
-    // Called only at startup: the exclusive worker lock and dead VM children make
-    // unpublished staging directories unreachable by any running capture or guest.
+    // Called only at startup: the exclusive worker lock and the previous worker's exit make
+    // unpublished staging directories unreachable by any running capture. A VMM it left
+    // running (ADR 0011) writes a capture only inside a request, which ended with it.
     fn cleanup_pending_snapshots(&self) -> Result<()> {
         let preserved: Vec<_> = self
             .state
@@ -2070,7 +2071,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"worker_handover_v1":true,"adoption":self.adoption,"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"recovery_disk_only_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"aws_metadata_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
+                "worker_pid":std::process::id(),"worker_handover_v1":vm::handover_supported(),"adoption":self.adoption,"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"recovery_disk_only_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"aws_metadata_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":max_memory().min(16384),"max_guest_memory_v2_mib":max_memory(),"max_guest_vcpus":16,"max_guest_vcpus_v2":max_cpus().min(crate::common::GUEST_MAX_VCPUS),
@@ -2431,7 +2432,9 @@ impl Runtime {
     /// Adopts the VMMs an earlier worker left running (ADR 0011). A box whose VMM is gone,
     /// or one this worker cannot keep (another binary or guest kernel, its fds not taken,
     /// or a box that is not stopped: its VMM outlived a capture or move), keeps its disk and
-    /// state and its VMM is ended; an adopted one that does not answer is hibernated.
+    /// state and its VMM is ended. An adopted one that does not answer stays adopted and is
+    /// reported `unresponsive`: hibernating it here would hold the starting worker for as
+    /// long as its RAM takes to write, so the upgrader hibernates it afterwards.
     /// Returns, per box, what happened.
     pub fn adopt(&mut self) -> Vec<Value> {
         let ids: Vec<String> = self
@@ -2506,17 +2509,9 @@ impl Runtime {
                     .unwrap()
                     .healthy(std::time::Duration::from_secs(10))
             });
-        let Err(unhealthy) = checked else {
-            return Ok(("adopted", None));
-        };
-        // Its RAM is still intact: save it rather than keep a box nobody can manage.
-        let mut request = json!({"op":"hibernate","id":id});
-        if let Some(managed) = self.state.placements.get(id) {
-            request["placement"] = json!(managed.authority);
-        }
-        match self.request(&request) {
-            Ok(_) => Ok(("hibernated", Some(format!("{unhealthy:#}")))),
-            Err(e) => bail!("adopted but unresponsive ({unhealthy:#}); hibernating failed: {e:#}"),
+        match checked {
+            Ok(()) => Ok(("adopted", None)),
+            Err(unhealthy) => Ok(("unresponsive", Some(format!("{unhealthy:#}")))),
         }
     }
 

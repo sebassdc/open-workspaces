@@ -101,10 +101,17 @@ No VMM is ever left running that no worker manages. Per box:
 - the box is not `stopped` (hibernated, exporting or moved: the worker died after
   the capture and before dropping the VMM): the VMM is ended the same way, so no
   second copy of the box runs;
-- checks 4-5 (or re-attaching its network) fail on an adopted VMM: the worker
-  hibernates it with its normal hibernation, and the upgrade's resume step wakes
-  it; if that fails too, the VMM stays adopted and running (stop or hibernate it
-  later), and the box is reported.
+- checks 4-5 (or re-attaching its network) fail on an adopted VMM: it stays
+  adopted and running, reported `unresponsive`. The worker does not hibernate it
+  while starting (that would hold the new worker, and the upgrader's quiesce, for
+  as long as its RAM takes to write); the upgrader hibernates it after verify and
+  its resume step wakes it. If that hibernation fails too, the box keeps running
+  under the new worker and is reported.
+
+Checks 2-3 are kept out of an upgrade's way before it starts (§5): the upgrader
+compares the Firecracker and guest kernel bytes of both releases, and hands over
+only when the running worker advertises `worker_handover_v1`, which it does only
+where `pidfd_getfd` works (Linux 5.6+, Yama `ptrace_scope` below 3).
 
 ### 5. The upgrader decides: hand over or hibernate
 
@@ -122,7 +129,12 @@ these holds, and otherwise hibernate exactly as today:
 - the controller setting `upgrade.worker_handover` is on (the default) and
   `--hibernate` was not passed.
 
-The plan prints which path it takes and why. The journal step `hibernate` becomes
+The plan prints which path it takes and why. Just before the hand-over the
+upgrader checks once more on the host itself: the running worker advertises
+`worker_handover_v1`, and the staged release's Firecracker binary and guest
+kernels hash the same as the running one's (the manifest's runtime label alone
+could hide a different binary). Either failing takes the hibernate path, recorded
+as `handover_refused` in the journal. The journal step `hibernate` becomes
 `handover` on that path: the old worker is quiesced and drained as today, the
 running boxes are recorded, the worker answers a new `detach` request (it
 forgets its VMMs without killing them and exits its loop), the unit stops, the
@@ -139,18 +151,20 @@ new worker hibernates the boxes on stop and the old one wakes them.
 `upgrade.worker_handover` is a controller setting (catalog `settings` table,
 `ow config`), delivered to runners on every heartbeat acknowledgement and stored
 by the node agent for the upgrader to read; no per-runner or IaC switch. A worker
-that can adopt reports `worker_handover_v1` in its status, the agent advertises
-it, and `ow nodes` shows it per node.
+that can adopt on its host reports `worker_handover_v1` in its status, the agent
+advertises it with every heartbeat, and `ow nodes` shows it per node.
 
 ## Consequences
 
 - Box downtime on a worker-only upgrade becomes the worker swap (seconds) instead
   of a RAM write and hash per box. The guest's processes, clock and memory are
   untouched.
-- A worker that exits without hibernating (a crash) no longer kills the VMMs; the
-  next worker started adopts them. The unit does not restart by itself after such
-  an exit today (the supervisor exits 0, and its stop hook waits for a worker that
-  is gone); that is unchanged here.
+- A worker that crashes no longer kills the VMMs: the supervisor exits with an
+  error, the stop hook finds no live worker behind a stale control socket (it used
+  to retry against it forever), and `Restart=on-failure` starts a worker that
+  adopts them.
+- Published HTTP ports (`ow publish` gateways) stop with the old worker, as on any
+  worker stop; the boxes keep running.
 - A reboot or instance stop in the seconds between the old worker's detach and the
   new worker's start finds no worker to hibernate the boxes: they boot cold from
   their disks.

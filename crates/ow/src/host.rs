@@ -240,9 +240,7 @@ fn worker(root: PathBuf) -> Result<()> {
                 .is_some_and(|a| a.len() == 1 && a[0]["ifname"] == "lo"),
         "worker requires a fresh isolated network namespace; use ow up"
     );
-    network::initialize()?;
-    // Per-box AWS role credentials at 169.254.169.254, on its own threads and state.
-    ow_core::metadata::start()?;
+    // Before touching the network: a second worker may share a running one's namespace.
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -252,6 +250,9 @@ fn worker(root: PathBuf) -> Result<()> {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "worker already owns this data directory"
     );
+    network::initialize()?;
+    // Per-box AWS role credentials at 169.254.169.254, on its own threads and state.
+    ow_core::metadata::start()?;
     let socket = root.join("control.sock");
     if socket.exists() {
         fs::remove_file(&socket)?;
@@ -784,7 +785,10 @@ fn supervise(root: &Path) -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
     loop {
-        if children.0[0].try_wait()?.is_some() {
+        if let Some(status) = children.0[0].try_wait()? {
+            // A crash: fail, so systemd restarts the unit and the next worker adopts the
+            // VMMs this one left running (ADR 0011). A shutdown or detach exits 0.
+            ensure!(status.success(), "worker exited: {status}");
             return Ok(());
         }
         if children.0[1].try_wait()?.is_some() {
@@ -1038,7 +1042,12 @@ pub fn run(cli: Cli) -> Result<i32> {
             detach,
         } => {
             if detach {
-                let result = wire::request(&root, json!({"op":"detach"}))?;
+                // Queued behind whatever the worker is doing, like a hibernation.
+                let (_, result) = wire::connect_waiting(
+                    &root,
+                    &json!({"op":"detach"}),
+                    wire::reply_wait(&json!({"op":"hibernate"})),
+                )?;
                 let started = Instant::now();
                 while root.join("control.sock").exists() {
                     ensure!(
@@ -1050,7 +1059,8 @@ pub fn run(cli: Cli) -> Result<i32> {
                 println!("{result}");
                 return Ok(0);
             }
-            if hibernate && root.join("control.sock").exists() {
+            // A socket nobody listens on is a worker that died: nothing to hibernate.
+            if hibernate && UnixStream::connect(root.join("control.sock")).is_ok() {
                 if wait {
                     hibernate_all_waiting(&root);
                 } else {
@@ -1069,7 +1079,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             } else {
                 unpublish_all(&root, None)?;
             }
-            if root.join("control.sock").exists() {
+            if UnixStream::connect(root.join("control.sock")).is_ok() {
                 wire::request(&root, json!({"op":"shutdown"}))?;
                 let started = Instant::now();
                 while root.join("control.sock").exists() {

@@ -225,6 +225,25 @@ class HandOver(unittest.TestCase):
             self.assertFalse(u.handover_enabled())
 
 
+class HandOverBlocker(unittest.TestCase):
+    def test_the_bytes_of_firecracker_and_the_kernel_and_the_worker_capability_decide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h.ROOT = Path(tmp)
+            for release in ("old", "new"):
+                assets = h.p(f"{h.SRV}/releases/{release}/assets")
+                (assets / "official/release-v1").mkdir(parents=True)
+                (assets / "downloads").mkdir()
+                (assets / "official/release-v1/firecracker-v1").write_bytes(b"vmm")
+                (assets / "downloads/vmlinux-6").write_bytes(b"kernel")
+            ops = u.HostOps()
+            with mock.patch.object(u.HostOps, "worker_status", return_value={"worker_handover_v1": True}):
+                self.assertIsNone(ops.handover_blocker("old", "new"))
+                h.p(f"{h.SRV}/releases/new/assets/downloads/vmlinux-6").write_bytes(b"another kernel")
+                self.assertIn("guest kernel differs", ops.handover_blocker("old", "new"))
+            with mock.patch.object(u.HostOps, "worker_status", return_value={"worker_handover_v1": False}):
+                self.assertIn("cannot hand over on this host", ops.handover_blocker("old", "old"))
+
+
 class Fake:
     """A host: three units, a worker with boxes, and failures to inject."""
 
@@ -262,9 +281,8 @@ class Fake:
             self.report = []
             for box in self.handed:
                 if f"adopt:{box}" in self.fail:
-                    self.box[box] = "hibernated"
-                    self.pids.pop(box)
-                    self.report.append({"id": box, "result": "hibernated", "detail": "guest did not answer"})
+                    # Adopted, but its guest does not answer: it keeps running, reported.
+                    self.report.append({"id": box, "result": "unresponsive", "detail": "guest did not answer"})
                 else:
                     self.report.append({"id": box, "result": "adopted", "detail": None})
             self.handed = []
@@ -278,6 +296,16 @@ class Fake:
                     self.box[box] = "hibernated"
                     self.pids.pop(box, None)
         self.up[name] = False
+
+    blocker = None
+
+    def handover_blocker(self, frm, to):
+        return self.blocker
+
+    def hibernate_box(self, box):
+        self._hit(f"hibernate-box:{box}")
+        self.box[box] = "hibernated"
+        self.pids.pop(box, None)
 
     def handover(self, release):
         self._hit("handover")
@@ -452,9 +480,29 @@ class Machine(unittest.TestCase):
         j = self.journal()
         self.assertEqual(j["step"], "done")
         self.assertEqual(j["adoption"]["a"], "kept")
-        self.assertIn("hibernated: guest did not answer", j["adoption"]["b"])
+        self.assertEqual(j["adoption"]["b"], "unresponsive: guest did not answer; hibernated")
         self.assertIn("not kept running through the hand-over: b", j["error"])
+        # The upgrader saved it after verify (the new worker started without waiting on it).
+        self.assertLess(ops.calls.index("verify"), ops.calls.index("hibernate-box:b"))
         self.assertIn("resume:b", ops.calls)
+        self.assertEqual(ops.box, {"a": "running", "b": "running"})
+
+    def test_an_unresponsive_box_that_cannot_be_hibernated_keeps_running_reported(self):
+        ops = Fake({"a": "running"}, fail={"adopt:a", "hibernate-box:a"})
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual(j["step"], "done")
+        self.assertIn("hibernating failed", j["adoption"]["a"])
+        self.assertEqual(ops.box["a"], "running")
+
+    def test_the_bytes_decide_when_the_label_hides_a_runtime_change(self):
+        ops = Fake({"a": "running", "b": "running"})
+        ops.blocker = "the staged Firecracker binary or guest kernel differs from the running one"
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual((j["step"], j["handover_refused"]), ("done", ops.blocker))
+        self.assertIn("hibernate", ops.calls)
+        self.assertNotIn("handover", ops.calls)
         self.assertEqual(ops.box, {"a": "running", "b": "running"})
 
     def test_a_failed_detach_aborts_and_the_old_worker_keeps_its_boxes(self):

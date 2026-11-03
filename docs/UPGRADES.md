@@ -494,13 +494,16 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
 - **Journal**: the `hibernate` step becomes `handover`; it records each running
   box's VMM PID, and after verify the journal's `adoption` says per box `kept`
   (adopted, same PID) or what the new worker did instead.
-- **Per box fallback**: no VMM is left that no worker manages. A VMM that is
-  gone leaves its box stopped with its disk (as a worker crash did). One this
-  worker cannot keep (another binary or guest kernel, its fds not taken, or a
-  box that is not stopped) is ended: the box keeps its disk and loses its RAM
-  state. An adopted VMM whose API or guest does not answer is hibernated, and
-  the upgrade's resume step wakes it. The journal error names every box not
-  kept running; none of these rolls the upgrade back.
+- **Per box fallback**: a VMM that is gone leaves its box stopped with its disk
+  (as a worker crash did). One this worker cannot keep (another binary or guest
+  kernel, its fds not taken, or a box that is not stopped) is ended: the box
+  keeps its disk and loses its RAM state; the upgrader prevents the first two
+  by comparing the staged Firecracker and kernel bytes and requiring the running
+  worker's `worker_handover_v1` (only where `pidfd_getfd` works) before it hands
+  over. An adopted VMM whose API or guest does not answer stays running,
+  reported `unresponsive`; the upgrader hibernates it after verify and its resume
+  step wakes it. The journal error names every box not kept running; none of
+  these rolls the upgrade back.
 - **Abort and rollback**: before the switch, the old worker starts again and
   adopts its own VMMs. After it, rollback stops the new worker, which
   hibernates every box (the unit's `ExecStop`), and the old one wakes them.
@@ -508,13 +511,14 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
   forwarding stays off until the uplink is back. `slirp4netns` restarts with
   the worker, so guest connections to the Internet open during the swap are
   reset; new ones work as soon as the worker is up. SSH and terminal streams
-  reconnect, as on a class 1 restart.
+  reconnect, as on a class 1 restart. Published HTTP ports (`ow publish`)
+  stop with the old worker, as on any worker stop.
 - **First upgrade**: 0.9.51 itself installs through hibernation (0.9.50's
   worker cannot detach, and the worker unit gains `KillMode=process`). From
   0.9.51 on, `ow-host restart --worker` and worker-only upgrades hand over.
 
-A worker that exits without hibernating no longer takes its VMMs with it: the next
-worker started adopts them the same way. The host check below records timings. A reboot in the seconds between detach and
+A worker that crashes no longer takes its VMMs with it: its supervisor exits with
+an error, systemd restarts the unit, and the new worker adopts them the same way. The host check below records timings. A reboot in the seconds between detach and
 the new worker's start boots those boxes cold from their disks.
 
 ### Sandbox EC2 check: hand-over (2026-11-03)
@@ -545,6 +549,12 @@ guest pause, against 80-100 s of hibernation and wake for 5 GiB of boxes here
 control group while starting unit. Ignoring.", as expected with
 `KillMode=process`. The VMM held its console (`/dev/ptmx`) as fd 3 and its log
 pipe's read end as fd 4 throughout.
+
+In the forced-failure run the new worker hibernated the unresponsive box itself
+while starting (the 52.9 s start). After review that hibernation moved to the
+upgrader, after verify, so a large unresponsive box cannot hold the new worker's
+start past the upgrader's quiesce limit and turn into a rollback; that version
+was checked with the upgrader's state-machine tests, not on a host.
 
 Found and fixed during the run: the upgrader read the adoption report from a
 busy worker's last answer, which predated the adoption, and reported every box

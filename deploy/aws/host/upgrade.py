@@ -529,6 +529,24 @@ class HostOps:
                    "OW_ASSET_DIR": f"{h.SRV}/run/worker/assets"})
         h.systemctl("stop", h.UNITS["worker"])
 
+    def handover_blocker(self, frm, to):
+        """Why the staged worker cannot adopt what runs, checked on the bytes themselves
+        (the manifest's runtime label could hide a different binary), or None."""
+        if (self.worker_status() or {}).get("worker_handover_v1") is not True:
+            return "the running worker cannot hand over on this host"
+
+        def runtime(release):
+            assets = p(f"{h.SRV}/releases/{release}/assets")
+            files = [*sorted(assets.glob("official/*/firecracker-v*")), *sorted(assets.glob("downloads/vmlinux-*"))]
+            return [(f.name, hashlib.sha256(f.read_bytes()).hexdigest()) for f in files if f.is_file()]
+
+        if runtime(frm) != runtime(to):
+            return "the staged Firecracker binary or guest kernel differs from the running one"
+        return None
+
+    def hibernate_box(self, box):
+        h.ow("hibernate", box, timeout=1800)
+
     def vmm_pids(self, boxes):
         """The VMM PID each box's record names (machines/ID/vmm.json), for boxes that have one."""
         pids = {}
@@ -704,7 +722,11 @@ def execute(plan_, ops, frm, to, target_name):
             if plan_.get("gate"):
                 # The last gate: nothing can start now, so this is every capture the new worker meets.
                 j.value["cold"] = gate(plan_["gate"], ops.captures())
-            if plan_.get("worker_path") == "handover":
+            blocker = plan_.get("worker_path") == "handover" and ops.handover_blocker(frm["worker"], to["worker"])
+            if blocker:
+                say(f"worker restart: hibernate ({blocker})")
+                j.value["handover_refused"] = blocker
+            if plan_.get("worker_path") == "handover" and not blocker:
                 # The VMMs keep running; verify then finds each one adopted by its PID.
                 j.value["handover"] = ops.vmm_pids(j["resume"])
                 j.step("handover")
@@ -755,9 +777,16 @@ def adoption(handed, ops, wait=300):
         entry = report.get(box) or {}
         if entry.get("result") == "adopted" and now.get(box) == pid:
             out[box] = "kept"
-        else:
-            out[box] = f"{entry.get('result', 'not adopted')}: {entry.get('detail') or 'no report'}"
-            say(f"{box} was not kept running ({out[box]})")
+            continue
+        out[box] = f"{entry.get('result', 'not adopted')}: {entry.get('detail') or 'no report'}"
+        if entry.get("result") == "unresponsive":
+            # Adopted but its API or guest did not answer: save its RAM; finish() wakes it.
+            try:
+                ops.hibernate_box(box)
+                out[box] += "; hibernated"
+            except Exception as e:  # noqa: BLE001 - it stays adopted and running
+                out[box] += f"; hibernating failed: {e}"
+        say(f"{box} was not kept running ({out[box]})")
     return out
 
 
