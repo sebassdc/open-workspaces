@@ -1,6 +1,7 @@
 # ADR 0011: a worker restart hands running VMMs to the next worker
 
-Status: implemented in 0.9.51 (sandbox check in [UPGRADES.md](../UPGRADES.md)). Amends [ADR 0005](0005-change-classes-and-engine-boundary.md),
+Status: implemented in 0.9.51; the check on a real host is recorded in
+[UPGRADES.md](../UPGRADES.md#worker-hand-over-keeps-boxes-running) when done. Amends [ADR 0005](0005-change-classes-and-engine-boundary.md),
 which left worker re-adoption of running VMMs out.
 Pattern: ADR 0005's journaled upgrade state machine (abort before the switch,
 rollback after it) and its release-impact manifest; the worker's delegated cgroup
@@ -35,25 +36,32 @@ running if they did not die with their worker. Today they die because of five ti
   unchanged, so a reboot, instance stop or a plain `systemctl stop` still
   hibernates; anything left after it no longer dies with the unit, and the next
   worker adopts it.
+- `guests` is a sibling of the worker's own subgroup (`DelegateSubgroup=control`),
+  not its child: `control` never enables controllers for children, so the
+  restarted unit can always attach its new supervisor there while VMMs still run
+  (cgroup v2 refuses processes in a cgroup that enables controllers for children).
 - The VMM itself holds the other end of its own ties: the PTY master and the
   diagnostics pipe's read end are inherited into the Firecracker process as fds 3
   and 4 (not close-on-exec). While the VMM lives the console never hangs up and the
   pipe never loses its reader. Output written while no worker reads waits in the
   kernel buffers (a few seconds of a quiet console).
-- At spawn the worker writes `machines/ID/vmm.json`: VMM PID, its start time
-  (`/proc/PID/stat` field 22, which defeats PID reuse), the binary's path and
-  SHA-256, the guest kernel's SHA-256, network index, TAP, address, the fd
-  numbers, and a record format version. It is removed when the VMM is reaped.
+- As soon as the VMM process exists the worker writes `machines/ID/vmm.json`: the
+  boot ID, VMM PID and its start time (`/proc/PID/stat` field 22; with the boot ID
+  this defeats PID reuse), the Firecracker binary's and guest kernel's SHA-256,
+  network index, TAP, address, the fd numbers, and a record format version. It is
+  removed when the VMM is reaped.
 
 ### 2. Namespaces persist through the VMMs
 
 The user and network namespaces are kept alive by the VMMs inside them. A new
 supervisor that finds a live recorded VMM enters that VMM's namespaces
-(`nsenter --target PID --user --net`) instead of creating fresh ones; with no live
-VMM it unshares fresh ones as today. Inside, the worker re-applies its nftables
-policy as one atomic `nft -f` transaction (delete and recreate the table, re-add
-the adopted boxes' set elements), so there is no instant without the forward
-policy. `slirp4netns` is restarted against the new worker PID and recreates
+(`nsenter --target PID --user --net --preserve-credentials`: the unprivileged
+worker user is root inside through the first worker's mapping) instead of
+creating fresh ones; with no live VMM it unshares fresh ones as today. Inside, the
+worker replaces its nftables policy in one `nft -f` transaction, so the forward
+chain is never absent; forwarding stays off until the uplink and host addresses
+are back, and each adopted box's set elements are added as it is adopted (a guest
+not yet adopted is dropped, fail-closed). `slirp4netns` is restarted against the new worker PID and recreates
 `tap-egress`: guest TCP connections to the Internet that were open during the
 switch are reset; new ones work as soon as the uplink is up. Inbound SSH and
 terminal streams go through the worker and reconnect, as on a class 1 restart.
@@ -62,9 +70,9 @@ terminal streams go through the worker and reconnect, as on a class 1 restart.
 
 On start the worker reads every `vmm.json` and adopts a VMM only if all hold:
 
-1. the PID is alive and its start time matches the record;
-2. `/proc/PID/exe` is the recorded Firecracker binary and its hash is the one
-   this worker would run, and the recorded guest kernel hash is this worker's;
+1. the boot, PID and start time match the record;
+2. the hash of `/proc/PID/exe` is the hash of the Firecracker binary this worker
+   runs, and the recorded guest kernel hash is this worker's;
 3. `pidfd_open` + `pidfd_getfd` retrieve fds 3 and 4 (the PTY master and the log
    pipe); a fresh drain thread resumes `vmm.log`;
 4. the VMM API socket answers and reports the VM running (a paused VM, left by a
@@ -81,18 +89,22 @@ pidfd (poll for exit, `pidfd_send_signal`), never a PID read from disk.
 
 ### 4. A failed adoption falls back to hibernation, never to a lost box
 
-Per box, in order:
+No VMM is ever left running that no worker manages. Per box:
 
-- checks 1-3 fail and the VMM is dead: its TAP and record are cleaned and the box
-  is `stopped` with its disk (what a worker crash does today);
-- check 1 fails (the PID now names another process): it is never signalled; the
-  box is `stopped` with its disk;
-- check 2 fails on the recorded, live VMM (another binary or guest kernel): it is
-  never signalled and keeps running; the box is `failed` and reported. Its TAP
-  stays, so no second VMM can start on its disk;
+- check 1 fails: the recorded process is gone (a PID that now names another
+  process is never signalled). Its TAP and record are cleaned; the box keeps its
+  disk and the state recovery gave it (`stopped`, as after a worker crash today);
+- checks 2-3 fail on the recorded, live VMM (another binary or guest kernel, its
+  binary unreadable, its fds not taken): this worker cannot manage it, so it ends
+  it through its pidfd and cleans up as above; the box keeps its disk, its RAM
+  state is lost and reported;
+- the box is not `stopped` (hibernated, exporting or moved: the worker died after
+  the capture and before dropping the VMM): the VMM is ended the same way, so no
+  second copy of the box runs;
 - checks 4-5 (or re-attaching its network) fail on an adopted VMM: the worker
-  hibernates it with its normal hibernation; if that fails too, the VMM stays
-  adopted and running, and the box is reported.
+  hibernates it with its normal hibernation, and the upgrade's resume step wakes
+  it; if that fails too, the VMM stays adopted and running (stop or hibernate it
+  later), and the box is reported.
 
 ### 5. The upgrader decides: hand over or hibernate
 
@@ -105,7 +117,8 @@ these holds, and otherwise hibernate exactly as today:
 - the target entry's `runtime.handover` window (`{"speaks": N, "accepts": [lo,
   hi]}`) accepts the source entry's `speaks`. A release without the field cannot
   hand over: the upgrade that installs this feature still hibernates;
-- the worker unit file renders unchanged (a unit change may move the cgroup);
+- the worker's unit files render unchanged and no worker config change is pending
+  (either may move the cgroup or namespaces the VMMs live in);
 - the controller setting `upgrade.worker_handover` is on (the default) and
   `--hibernate` was not passed.
 
@@ -113,12 +126,13 @@ The plan prints which path it takes and why. The journal step `hibernate` become
 `handover` on that path: the old worker is quiesced and drained as today, the
 running boxes are recorded, the worker answers a new `detach` request (it
 forgets its VMMs without killing them and exits its loop), the unit stops, the
-pin switches, the new worker starts and adopts. **verify** additionally requires
-every recorded box to be `running` with its recorded VMM PID. **abort** before the
-switch: the old worker restarts and adopts its own VMMs. **rollback** after the
-switch takes today's path: the new worker hibernates the boxes on stop and the old
-one wakes them. A box that is neither adopted nor hibernated is reported in the
-journal's error, as a box that does not resume is today.
+pin switches, the new worker starts and adopts. **verify** is unchanged; after
+it the journal's `adoption` says per box whether it was kept (adopted with its
+recorded VMM PID) or what happened instead, and the journal's error names every
+box not kept. A box not kept never rolls the upgrade back: a rollback would
+hibernate every other box. **abort** before the switch: the old worker restarts
+and adopts its own VMMs. **rollback** after the switch takes today's path: the
+new worker hibernates the boxes on stop and the old one wakes them.
 
 ### 6. Switch and advertisement
 
@@ -133,7 +147,13 @@ it, and `ow nodes` shows it per node.
 - Box downtime on a worker-only upgrade becomes the worker swap (seconds) instead
   of a RAM write and hash per box. The guest's processes, clock and memory are
   untouched.
-- A worker crash no longer kills the VMMs; the restarted worker adopts them.
+- A worker that exits without hibernating (a crash) no longer kills the VMMs; the
+  next worker started adopts them. The unit does not restart by itself after such
+  an exit today (the supervisor exits 0, and its stop hook waits for a worker that
+  is gone); that is unchanged here.
+- A reboot or instance stop in the seconds between the old worker's detach and the
+  new worker's start finds no worker to hibernate the boxes: they boot cold from
+  their disks.
 - Firecracker, guest kernel and host-layout changes keep paying the full
   hibernate cost.
 - Not decided here: keeping `slirp4netns` across the switch so outbound

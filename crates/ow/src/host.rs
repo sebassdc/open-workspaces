@@ -720,11 +720,13 @@ fn supervise(root: &Path) -> Result<()> {
         Ok(command.spawn()?)
     }
     let mut namespaces = match surviving_vmm(root) {
-        // As root inside: the mapping the first worker's `--map-root-user` made.
+        // Unprivileged: keep this user, which the first worker's `--map-root-user` maps to
+        // root inside (without it nsenter's setgroups fails, denied in that namespace).
         Some(pid) => {
             let mut command = Command::new("nsenter");
             command
                 .args(["--target", &pid.to_string(), "--user", "--net"])
+                .arg("--preserve-credentials")
                 .env(ADOPT, "1");
             command
         }

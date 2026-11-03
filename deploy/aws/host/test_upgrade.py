@@ -195,7 +195,10 @@ class HandOver(unittest.TestCase):
     def test_the_switch_the_flag_and_a_unit_change_hibernate(self):
         entries = (entry("0.5.1", ["worker"], 2, handover=(1, 1, 1)), entry("0.5.2", ["worker"], 2, handover=(1, 1, 1)))
         self.assertEqual(self.path(*entries, handover=False)[0], "hibernate")
-        self.assertEqual(self.path(*entries, rendered={"worker"}), ("hibernate", "the worker's unit files change"))
+        self.assertEqual(self.path(*entries, rendered={"worker"}),
+                         ("hibernate", "the worker's unit files or config change"))
+        # `ow-host apply` already wrote them and left the restart pending.
+        self.assertEqual(self.path(*entries, pending={"worker"})[0], "hibernate")
 
     def test_a_restart_without_a_worker_restart_has_no_path(self):
         plan = u.plan(manifest(entry("0.5.1", ["dashboard"], 1)), AT, "0.5.1")

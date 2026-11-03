@@ -1571,6 +1571,8 @@ fn build_beat(
         json!(status["managed_lifecycle_v1"] == true && common::placement_capable(status).is_ok());
     beat["aws_identity_v1"] = json!(status["aws_identity_v1"] == true);
     beat["aws_metadata_v1"] = json!(status["aws_metadata_v1"] == true);
+    // A worker restarted under this agent may adopt VMMs where the old one could not.
+    beat["worker_handover_v1"] = json!(status["worker_handover_v1"] == true);
     // Disk-only automatic recovery points from the worker, and this agent's reconnect when
     // the controller goes silent: together a capture no longer takes the runner offline.
     beat["recovery_disk_only_v1"] = json!(status["recovery_disk_only_v1"] == true);

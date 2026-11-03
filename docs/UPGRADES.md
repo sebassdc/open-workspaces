@@ -486,7 +486,7 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
   worker crosses lists `vmm` or `guest-kernel`, both releases' `runtime.vmm`
   and guest kernel hash are equal, the target's `runtime.handover.accepts`
   covers the running release's `runtime.handover.speaks`, the worker's unit
-  files render unchanged, the controller setting `upgrade.worker_handover` is
+  files render unchanged and no worker config change is pending, the controller setting `upgrade.worker_handover` is
   on (default; the node agent stores it in `runner/controller-settings.json`)
   and `--hibernate` was not passed. `--plan` prints the path and why. Otherwise
   the worker restarts through hibernation as before. `ow-host restart --worker`
@@ -494,12 +494,13 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
 - **Journal**: the `hibernate` step becomes `handover`; it records each running
   box's VMM PID, and after verify the journal's `adoption` says per box `kept`
   (adopted, same PID) or what the new worker did instead.
-- **Per box fallback**: a VMM that is gone leaves its box stopped with its disk
-  (as a worker crash did); one that runs another binary or guest kernel is left
-  alone and its box marked failed (its TAP stays, so no second VMM starts on
-  its disk); an adopted VMM whose API or guest does not answer is hibernated,
-  and the upgrade's resume step wakes it. The journal error names every box not
-  kept running.
+- **Per box fallback**: no VMM is left that no worker manages. A VMM that is
+  gone leaves its box stopped with its disk (as a worker crash did). One this
+  worker cannot keep (another binary or guest kernel, its fds not taken, or a
+  box that is not stopped) is ended: the box keeps its disk and loses its RAM
+  state. An adopted VMM whose API or guest does not answer is hibernated, and
+  the upgrade's resume step wakes it. The journal error names every box not
+  kept running; none of these rolls the upgrade back.
 - **Abort and rollback**: before the switch, the old worker starts again and
   adopts its own VMMs. After it, rollback stops the new worker, which
   hibernates every box (the unit's `ExecStop`), and the old one wakes them.
@@ -512,8 +513,9 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
   worker cannot detach, and the worker unit gains `KillMode=process`). From
   0.9.51 on, `ow-host restart --worker` and worker-only upgrades hand over.
 
-A worker that crashes no longer takes its VMMs with it either: the next worker
-adopts them the same way.
+A worker that exits without hibernating no longer takes its VMMs with it: the next
+worker started adopts them the same way. A reboot in the seconds between detach and
+the new worker's start boots those boxes cold from their disks.
 
 ## Order for 0.9.48 and later
 

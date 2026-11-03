@@ -65,7 +65,7 @@ def worker_path(entries, frm, to, rendered=(), enabled=True):
     if not enabled:
         return "hibernate", "hand-over is off (upgrade.worker_handover or --hibernate)"
     if "worker" in rendered:
-        return "hibernate", "the worker's unit files change"
+        return "hibernate", "the worker's unit files or config change"
     lo, hi = sorted((version(frm), version(to)))
     changed = sorted({c for e in entries.values() if lo < version(e["version"]) <= hi for c in e["changes"]}
                      & {"vmm", "guest-kernel"})
@@ -181,8 +181,10 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
                          "kernel_sha256": goal["runtime"]["guest_kernel_sha256"], "cpu": (compat or {}).get("cpu")}
         plan_["cold"] = gate(plan_["gate"], captures)
     if "worker" in restart:
+        # A pending config restart already rewrote the unit files: a change there may move
+        # the cgroup or namespaces the VMMs live in.
         plan_["worker_path"], plan_["worker_path_why"] = worker_path(
-            entries, pins["worker"], move.get("worker", pins["worker"]), rendered, handover)
+            entries, pins["worker"], move.get("worker", pins["worker"]), {*rendered, *pending}, handover)
     if plan_["class"] > max_class:
         raise Refused(f"class {plan_['class']} ({', '.join(restart)}) exceeds --max-class {max_class}")
     return plan_
@@ -975,8 +977,10 @@ def restart_worker(ops=None, hibernate=False):
         recover(ops)
         frm = h.pins()
         # The same release on both sides: the running worker says whether it can.
-        can = not hibernate and handover_enabled() and (ops.worker_status() or {}).get("worker_handover_v1") is True
-        path = ("handover", "same release") if can else ("hibernate", "hand-over is off or unsupported")
+        can = (not hibernate and handover_enabled() and "worker" not in h.pending()
+               and (ops.worker_status() or {}).get("worker_handover_v1") is True)
+        path = ("handover", "same release") if can else (
+            "hibernate", "hand-over is off or unsupported, or a worker config change is pending")
         say(f"worker restart: {path[0]} ({path[1]})")
         execute({"class": 2, "restart": ["worker"], "move": {}, "catalog_backup": False,
                  "worker_path": path[0], "worker_path_why": path[1]}, ops, frm, dict(frm),

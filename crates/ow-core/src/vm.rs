@@ -27,9 +27,11 @@ pub fn delegated_cgroup() -> Result<PathBuf> {
     Ok(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
 }
 
-/// Splits the worker's delegated cgroup: the worker moves into `control` (CPU weight
-/// 1000, protected memory) and every VMM starts in `guests` (weight 100), so contention
-/// and memory reclaim fall on the guests before the worker that controls them.
+/// Splits the worker's delegated cgroup: the worker keeps the subgroup systemd started it
+/// in (`DelegateSubgroup=control`: CPU weight 1000, protected memory) and every VMM starts
+/// in its sibling `guests` (weight 100), so contention and memory reclaim fall on the
+/// guests before the worker that controls them. `control` never enables controllers for
+/// children, so a restarted unit can join it while VMMs it left still run (ADR 0011).
 pub fn isolate_guests(cgroup: &Path) -> Result<()> {
     let procs = split_cgroup(cgroup)?;
     let _ = GUEST_CGROUP.set(std::ffi::CString::new(
@@ -37,20 +39,15 @@ pub fn isolate_guests(cgroup: &Path) -> Result<()> {
     )?);
     Ok(())
 }
-fn split_cgroup(cgroup: &Path) -> Result<PathBuf> {
-    let (control, guests) = (cgroup.join("control"), cgroup.join("guests"));
-    for dir in [&control, &guests] {
-        match std::fs::create_dir(dir) {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            other => other?,
-        }
+fn split_cgroup(control: &Path) -> Result<PathBuf> {
+    let unit = control.parent().context("delegated cgroup has no parent")?;
+    let guests = unit.join("guests");
+    match std::fs::create_dir(&guests) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        other => other?,
     }
-    // A cgroup that enables controllers for its children may hold no process itself.
-    for pid in std::fs::read_to_string(cgroup.join("cgroup.procs"))?.lines() {
-        // One that exited meanwhile is gone; any other left behind fails the next write.
-        let _ = std::fs::write(control.join("cgroup.procs"), pid);
-    }
-    std::fs::write(cgroup.join("cgroup.subtree_control"), "+cpu +memory")?;
+    // The unit's own cgroup holds no process (all are in its subgroups).
+    std::fs::write(unit.join("cgroup.subtree_control"), "+cpu +memory")?;
     std::fs::write(control.join("cpu.weight"), "1000")?;
     std::fs::write(control.join("memory.min"), (64u64 << 20).to_string())?;
     std::fs::write(control.join("memory.low"), (256u64 << 20).to_string())?;
@@ -295,21 +292,38 @@ pub fn start_time(pid: u32) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
+fn boot_id() -> Option<String> {
+    Some(
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()?
+            .trim()
+            .to_owned(),
+    )
+}
+
+/// Whether the recorded process still runs: same boot, same PID, same start time.
+fn recorded_runs(record: &Value) -> Option<u32> {
+    let pid = u32::try_from(record["pid"].as_u64()?).ok()?;
+    (record["boot_id"].as_str()? == boot_id()?
+        && start_time(pid)? == record["start_time"].as_u64()?)
+    .then_some(pid)
+}
+
 /// The recorded VMM's PID when that very process still runs.
 pub fn recorded_live_pid(directory: &Path) -> Option<u32> {
     let record: Value =
         serde_json::from_slice(&std::fs::read(directory.join(RECORD)).ok()?).ok()?;
-    let pid = u32::try_from(record["pid"].as_u64()?).ok()?;
-    (start_time(pid)? == record["start_time"].as_u64()?).then_some(pid)
+    recorded_runs(&record)
 }
 
-/// What became of a recorded VMM when a worker started.
+/// What a worker found of a recorded VMM.
 pub enum Adoption {
-    /// The recorded process no longer runs: the box's TAP and record are cleaned.
+    /// The recorded process no longer runs.
     Gone,
-    /// The recorded process runs a binary or guest kernel this worker does not: it is
-    /// left alone (its TAP stays, so the box cannot start a second VMM on its disk).
-    Foreign(String),
+    /// The recorded VMM runs, verified, but this worker cannot keep it: another binary or
+    /// guest kernel, or its console and log could not be taken. The caller ends it through
+    /// this handle, so no VMM is left that no worker manages.
+    Refused(String, Vmm),
     Adopted(Box<Vm>),
 }
 
@@ -328,7 +342,9 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn spawn(binary: &Path, directory: &Path, index: u32) -> Result<Self> {
+    /// `record` carries what the caller adds to `vmm.json` (the hashes of the binary and
+    /// guest kernel); the record is written as soon as the process exists.
+    pub fn spawn(binary: &Path, directory: &Path, index: u32, record: Value) -> Result<Self> {
         let tap = format!("ow{index}");
         let address = format!("198.18.{}.{}", index / 64, index % 64 * 4 + 2);
         let host_address = format!("198.18.{}.{}/30", index / 64, index % 64 * 4 + 1);
@@ -433,6 +449,9 @@ impl Vm {
                 memory_base: MemoryBase::Unknown,
                 keep: false,
             };
+            // Before anything can fail or the worker die: a later worker finds this VMM by
+            // it (ADR 0011). Any error drops `vm`, which ends the VMM.
+            vm.write_record(index, record)?;
             let started = Instant::now();
             while !vm.socket.exists() {
                 ensure!(vm.child.try_wait()?.is_none(), "VMM exited during startup");
@@ -451,12 +470,13 @@ impl Vm {
         result
     }
 
-    /// What `machines/ID/vmm.json` records about this VMM; the caller adds the hashes of
-    /// the binary and guest kernel it runs.
-    pub fn record(&self, index: u32) -> Result<Value> {
+    /// `machines/ID/vmm.json`: the process (boot, PID, start time), its network and the
+    /// fds it holds, plus the caller's `extra` fields.
+    fn write_record(&self, index: u32, extra: Value) -> Result<()> {
         let pid = self.child.id();
-        Ok(json!({
+        let mut record = json!({
             "format": RECORD_FORMAT,
+            "boot_id": boot_id().context("boot ID")?,
             "pid": pid,
             "start_time": start_time(pid).context("VMM start time")?,
             "index": index,
@@ -464,7 +484,18 @@ impl Vm {
             "address": self.address,
             "pty_fd": PTY_FD,
             "log_fd": LOG_FD,
-        }))
+        });
+        if let (Some(record), Value::Object(extra)) = (record.as_object_mut(), extra) {
+            record.extend(extra);
+        }
+        let directory = self.socket.parent().context("VMM directory")?;
+        let temporary = directory.join(format!("{RECORD}.{}", nonce()?));
+        let mut file = File::create(&temporary)?;
+        file.write_all(record.to_string().as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, directory.join(RECORD))?;
+        File::open(directory)?.sync_all()?;
+        Ok(())
     }
 
     /// Takes over the VMM an earlier worker recorded in `directory`, after checking it is
@@ -483,31 +514,38 @@ impl Vm {
             "VMM record format {} is not {RECORD_FORMAT}",
             record["format"]
         );
-        let pid = u32::try_from(record["pid"].as_u64().context("record PID")?)?;
-        let recorded = record["start_time"].as_u64().context("record start time")?;
-        if start_time(pid) != Some(recorded) {
+        let Some(pid) = recorded_runs(&record) else {
             return Ok(Adoption::Gone);
-        }
+        };
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         if raw < 0 {
             return Ok(Adoption::Gone);
         }
         let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
         // The pidfd names whichever process held the PID when it was opened: check again.
-        if start_time(pid) != Some(recorded) {
+        if recorded_runs(&record) != Some(pid) {
             return Ok(Adoption::Gone);
         }
-        let running = hash(Path::new(&format!("/proc/{pid}/exe")))?;
+        let refused =
+            |reason: String, pidfd| Ok(Adoption::Refused(reason, Vmm::Adopted { pid, pidfd }));
+        let running = match hash(Path::new(&format!("/proc/{pid}/exe"))) {
+            Ok(running) => running,
+            Err(e) => return refused(format!("VMM {pid}: reading its binary: {e:#}"), pidfd),
+        };
         if running != vmm_sha256 {
-            return Ok(Adoption::Foreign(format!(
-                "VMM {pid} runs binary {running}, this worker runs {vmm_sha256}"
-            )));
+            return refused(
+                format!("VMM {pid} runs binary {running}, this worker runs {vmm_sha256}"),
+                pidfd,
+            );
         }
         if record["kernel_sha256"] != kernel_sha256 {
-            return Ok(Adoption::Foreign(format!(
-                "VMM {pid} booted guest kernel {}, this worker boots {kernel_sha256}",
-                record["kernel_sha256"]
-            )));
+            return refused(
+                format!(
+                    "VMM {pid} booted guest kernel {}, this worker boots {kernel_sha256}",
+                    record["kernel_sha256"]
+                ),
+                pidfd,
+            );
         }
         let take = |fd: &Value| -> Result<File> {
             let fd = fd.as_i64().context("record fd")? as i32;
@@ -519,8 +557,11 @@ impl Vm {
             );
             Ok(unsafe { File::from_raw_fd(raw as i32) })
         };
-        let master = take(&record["pty_fd"])?;
-        let errors = take(&record["log_fd"])?;
+        let (master, errors) =
+            match take(&record["pty_fd"]).and_then(|m| Ok((m, take(&record["log_fd"])?))) {
+                Ok(fds) => fds,
+                Err(e) => return refused(format!("{e:#}"), pidfd),
+            };
         let diagnostics = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1662,7 +1703,7 @@ mod adoption_tests {
     }
 
     fn record(directory: &Path, pid: u32, start: u64) {
-        let value = json!({"format":RECORD_FORMAT,"pid":pid,"start_time":start,"index":7,"tap":"fixture-no-host-interface",
+        let value = json!({"format":RECORD_FORMAT,"boot_id":boot_id().unwrap(),"pid":pid,"start_time":start,"index":7,"tap":"fixture-no-host-interface",
             "address":"198.18.0.30","pty_fd":PTY_FD,"log_fd":LOG_FD,"vmm_sha256":"vmm","kernel_sha256":"kernel"});
         std::fs::write(directory.join(RECORD), value.to_string()).unwrap();
     }
@@ -1680,6 +1721,16 @@ mod adoption_tests {
             None,
             "a reused PID is not the recorded VMM"
         );
+        let mut other_boot: Value =
+            serde_json::from_slice(&std::fs::read(directory.join(RECORD)).unwrap()).unwrap();
+        other_boot["start_time"] = json!(start);
+        other_boot["boot_id"] = json!("an-earlier-boot");
+        std::fs::write(directory.join(RECORD), other_boot.to_string()).unwrap();
+        assert_eq!(
+            recorded_live_pid(&directory),
+            None,
+            "a process of another boot is not it"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1691,20 +1742,25 @@ mod adoption_tests {
         drop(console_write);
         let mut ready = [0u8; 6];
         (&console_read).read_exact(&mut ready).unwrap();
-        assert_eq!(&ready, b"ready\n", "its diagnostic line waits in the log pipe");
+        assert_eq!(
+            &ready, b"ready\n",
+            "its diagnostic line waits in the log pipe"
+        );
         let pid = child.id();
         let start = start_time(pid).unwrap();
         record(&directory, pid, start);
         let hash = |_: &Path| Ok("vmm".to_owned());
         let other = |_: &Path| Ok("another".to_owned());
+        // Refused: the caller gets a handle to end it with, and nothing signalled it yet.
         assert!(matches!(
             Vm::adopt(&directory, "vmm", "kernel", other).unwrap(),
-            Adoption::Foreign(reason) if reason.contains("another")
+            Adoption::Refused(reason, process) if reason.contains("another") && process.id() == pid
         ));
         assert!(matches!(
             Vm::adopt(&directory, "vmm", "other-kernel", hash).unwrap(),
-            Adoption::Foreign(reason) if reason.contains("guest kernel")
+            Adoption::Refused(reason, _) if reason.contains("guest kernel")
         ));
+        assert!(child.try_wait().unwrap().is_none());
         let Adoption::Adopted(mut vm) = Vm::adopt(&directory, "vmm", "kernel", hash).unwrap()
         else {
             panic!("not adopted");
@@ -1785,19 +1841,19 @@ mod guest_isolation_tests {
     }
 
     #[test]
-    fn the_worker_moves_into_control_and_protects_it() {
-        // A plain directory stands in for the delegated cgroup: the same writes land.
-        let cgroup = std::env::temp_dir().join(format!("ow-cg-{}", nonce().unwrap()));
-        std::fs::create_dir(&cgroup).unwrap();
-        std::fs::write(cgroup.join("cgroup.procs"), "4242\n").unwrap();
-        let procs = split_cgroup(&cgroup).unwrap();
-        let read = |p: &str| std::fs::read_to_string(cgroup.join(p)).unwrap();
-        assert_eq!(read("control/cgroup.procs"), "4242");
+    fn the_worker_keeps_control_protected_and_guests_are_its_sibling() {
+        // Plain directories stand in for the unit's cgroup and its `control` subgroup.
+        let unit = std::env::temp_dir().join(format!("ow-cg-{}", nonce().unwrap()));
+        std::fs::create_dir_all(unit.join("control")).unwrap();
+        let procs = split_cgroup(&unit.join("control")).unwrap();
+        let read = |p: &str| std::fs::read_to_string(unit.join(p)).unwrap();
         assert_eq!(read("cgroup.subtree_control"), "+cpu +memory");
         assert_eq!(read("control/cpu.weight"), "1000");
         assert_eq!(read("control/memory.low"), (256u64 << 20).to_string());
-        assert!(cgroup.join("guests").is_dir());
-        assert_eq!(procs, cgroup.join("guests/cgroup.procs"));
-        std::fs::remove_dir_all(cgroup).unwrap();
+        // `control` enables nothing for children: a restarted unit can always join it.
+        assert!(!unit.join("control/cgroup.subtree_control").exists());
+        assert!(unit.join("guests").is_dir());
+        assert_eq!(procs, unit.join("guests/cgroup.procs"));
+        std::fs::remove_dir_all(unit).unwrap();
     }
 }
