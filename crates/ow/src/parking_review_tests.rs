@@ -156,6 +156,7 @@ fn actual_start_api_wakes_stopped_and_hibernated_boxes() {
                 request,
                 None,
                 None,
+                None,
             ))
         });
         assert_eq!(response.status(), axum::http::StatusCode::OK);
@@ -760,6 +761,7 @@ fn start_api(
             email: "owner@example.test".into(),
         },
         request,
+        None,
         None,
         None,
     ));

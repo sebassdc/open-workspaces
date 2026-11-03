@@ -56,12 +56,12 @@ fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
-fn random_secret() -> Result<String> {
+pub(crate) fn random_secret() -> Result<String> {
     let mut bytes = [0u8; 32];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
-fn digest(secret: &str) -> String {
+pub(crate) fn digest(secret: &str) -> String {
     format!("{:x}", Sha256::digest(secret.as_bytes()))
 }
 
@@ -343,6 +343,26 @@ pub fn budget(root: &Path, node: &str, memory: u32, slots: u32, cpus: u32) -> Re
     Ok(
         json!({"node":node,"memory":memory,"slots":slots,"cpus":cpus,"operator_configuration_required":true}),
     )
+}
+/// Put a runner in a placement pool. Creates land on it only when they ask for that pool;
+/// boxes already on it stay where they are.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn set_pool(root: &Path, node: &str, pool: &str) -> Result<Value> {
+    crate::common::identifier(pool)?;
+    let db = db(root)?;
+    ensure!(
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1)",
+            [node],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "unknown node"
+    );
+    db.execute(
+        "INSERT INTO node_placement_policy(node,pool) VALUES(?1,?2) ON CONFLICT(node) DO UPDATE SET pool=excluded.pool",
+        [node, pool],
+    )?;
+    Ok(json!({"node":node,"pool":pool}))
 }
 pub fn revoke(root: &Path, node: &str) -> Result<()> {
     ensure!(

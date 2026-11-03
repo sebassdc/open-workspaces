@@ -1075,6 +1075,9 @@ pub fn run(cli: Cli) -> Result<i32> {
         Action::Health => return crate::telemetry::health_command(&root),
         Action::Config { action } => return crate::telemetry::config_command(&root, action),
         Action::DashboardUi { action } => return crate::dashboard_ui::command(&root, action),
+        Action::NodePool { .. } | Action::Token { .. } => {
+            bail!("node pools and workload tokens are managed on a Linux controller")
+        }
         _ => {}
     }
     let r = match cli.command {
@@ -1090,10 +1093,11 @@ pub fn run(cli: Cli) -> Result<i32> {
             disk,
             node,
             owner,
+            pool,
         } => {
             ensure!(
-                node.is_none() && owner.is_none(),
-                "local placement is this Mac; --owner requires a remote controller"
+                node.is_none() && owner.is_none() && pool.is_none(),
+                "local placement is this Mac; --owner and --pool require a remote controller"
             );
             ensure!(
                 disk.is_none(),

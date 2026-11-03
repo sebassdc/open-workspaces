@@ -73,6 +73,8 @@ struct Operation {
     keep_access: Option<bool>,
     #[serde(default)]
     owner: Option<String>,
+    #[serde(default)]
+    pool: Option<String>,
 }
 
 fn validated(bytes: &[u8]) -> Result<Value> {
@@ -111,6 +113,11 @@ fn validated(bytes: &[u8]) -> Result<Value> {
         );
         crate::common::email(&owner.to_ascii_lowercase())?;
         request["owner"] = json!(owner);
+    }
+    if let Some(pool) = operation.pool {
+        ensure!(operation.op == "create", "only create takes a pool");
+        runtime::identifier(&pool)?;
+        request["pool"] = json!(pool);
     }
     match operation.op.as_str() {
         "create" => {
@@ -416,6 +423,7 @@ pub async fn handle(
     request: Request,
     pool_owner: Option<i64>,
     preview_host: Option<String>,
+    workload_pool: Option<String>,
 ) -> Response {
     let path = request.uri().path();
     let method = request.method().clone();
@@ -523,6 +531,21 @@ pub async fn handle(
             );
         }
     };
+    // A workload token reaches only its owner's own boxes, through a few operations.
+    if let Some(pool) = &workload_pool {
+        operation = match crate::tokens::scoped(operation, pool) {
+            Ok(operation) => operation,
+            Err(error) => {
+                return secure(
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"ok":false,"error":error.to_string()})),
+                    )
+                        .into_response(),
+                );
+            }
+        };
+    }
     // A moved child's ordinary fork keeps its existing use-role permission and defaults to its runner.
     if operation["op"] == "fork" && !operation["node"].is_string() {
         let target = catalog.as_ref().and_then(|shared| {

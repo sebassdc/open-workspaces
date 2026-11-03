@@ -816,6 +816,11 @@ pub fn run(cli: Cli) -> Result<i32> {
             crate::nodes::revoke(&root, &node)?;
             return Ok(0);
         }
+        Action::NodePool { node, pool } => {
+            println!("{}", crate::nodes::set_pool(&root, &node, &pool)?);
+            return Ok(0);
+        }
+        Action::Token { action } => return crate::tokens::command(&root, action),
         Action::Nodes => {
             let mut nodes = crate::nodes::inventory(&root)?;
             crate::telemetry::annotate(&mut nodes, &crate::telemetry::health(&root)?);
@@ -947,10 +952,11 @@ pub fn run(cli: Cli) -> Result<i32> {
             disk,
             node,
             owner,
+            pool,
         } => {
             ensure!(
-                node.is_none() && owner.is_none(),
-                "--node and --owner require a remote controller"
+                node.is_none() && owner.is_none() && pool.is_none(),
+                "--node, --owner and --pool require a remote controller"
             );
             json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"disk_gib":disk.unwrap_or(common::DEFAULT_DISK_GIB)})
         }

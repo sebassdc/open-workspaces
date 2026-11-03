@@ -165,6 +165,9 @@ print one JSON value on stdout, without an interactive prompt or progress banner
   (the machine's owner or a pool admin; works with `--node` too): the new box is made in
   that owner's name space and counts against their limits. A fork inherits no
   shares or SSH keys.
+- `create NAME --pool POOL`: place it on a runner in that placement pool
+  (default `default`). Other pools are for pool admins and workload tokens bound
+  to that pool; see [placement pools](USERS.md#placement-pools).
 - `audit`: ownership changes that involve you (as actor, old or new owner), newest
   first: who, what, when, from and to.
 - `delete-snapshot NAME SNAPSHOT`: delete one of your named snapshots of that
@@ -178,7 +181,7 @@ print one JSON value on stdout, without an interactive prompt or progress banner
   and transfer captures cannot be deleted this way.
 
 Host participation, enrollment, local image build, backup, `node` (singular),
-`up`/`down`, `dashboard`/`serve` and `node-*` are host/operator commands, not steps
+`up`/`down`, `dashboard`/`serve`, `token` and `node-*` (including `node-pool`) are host/operator commands, not steps
 needed by a remote coworker agent. `host invite/budget/revoke` additionally require
 owner administration. Local image list keeps its existing golden-image JSON
 schema and `--runner` option; remote listing refuses `--runner`.

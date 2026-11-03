@@ -451,9 +451,10 @@ pub fn run(url: &str, action: Action, retry: Option<String>) -> Result<i32> {
             disk,
             node,
             owner,
+            pool,
         } => {
-            let mut request = json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"disk_gib":disk.or((image != "ubuntu-arm64").then_some(crate::common::DEFAULT_DISK_GIB)),"node":node,"owner":owner});
-            for key in ["disk_gib", "owner"] {
+            let mut request = json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"disk_gib":disk.or((image != "ubuntu-arm64").then_some(crate::common::DEFAULT_DISK_GIB)),"node":node,"owner":owner,"pool":pool});
+            for key in ["disk_gib", "owner", "pool"] {
                 if request[key].is_null() {
                     request.as_object_mut().unwrap().remove(key);
                 }
