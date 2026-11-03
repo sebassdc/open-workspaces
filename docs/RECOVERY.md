@@ -107,6 +107,15 @@ or failures can exceed it. One measured box (64 GiB disk, 4 GiB RAM, n=1) took
 failure. Measure each intended host/cohort including capture, queue and upload
 time before relying on that target. A worker upgrade still pauses that worker's
 boxes through the existing upgrade policy; adding this timer never restarts it.
+While an upgrade journal is open, `ow-host upgrade` keeps this timer stopped and
+stops a run in flight (its next run retries the upload), then starts the timer
+again when the upgrade ends ([UPGRADES.md](UPGRADES.md)). No point is taken
+during that window, so expect one late point per upgrade.
+
+Box disks stay sparse: they are attached with discard and the guest's root is
+mounted with `discard`, so freed blocks return to the host as holes, which
+hashing, sealing and upload skip. A disk that ran before this release gets one
+background `fstrim /` at its next cold boot.
 
 ## Transfer format and retention
 

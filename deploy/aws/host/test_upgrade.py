@@ -157,8 +157,10 @@ class Planner(unittest.TestCase):
 class Fake:
     """A host: three units, a worker with boxes, and failures to inject."""
 
-    def __init__(self, boxes, fail=(), kill=(), present=("worker", "agent", "dashboard"), late=None):
+    def __init__(self, boxes, fail=(), kill=(), present=("worker", "agent", "dashboard"), late=None,
+                 timers=("ow-recovery.timer",)):
         self.present = list(present)
+        self.ticking = set(timers)  # the timers systemd runs
         self.up = {name: True for name in present}
         self.box = dict(boxes)
         self.fail, self.kill = set(fail), set(kill)
@@ -187,6 +189,17 @@ class Fake:
     def stop(self, name):
         self._hit(f"stop:{name}")
         self.up[name] = False
+
+    def timers(self):
+        return [timer for timer in u.TIMERS if timer in self.ticking]
+
+    def pause_timers(self, timers):
+        self.calls.append("pause-timers")
+        self.ticking -= set(timers)
+
+    def resume_timers(self, timers):
+        self.calls.append("resume-timers")
+        self.ticking |= set(timers)
 
     def worker_status(self):
         if not self.up["worker"]:
@@ -452,6 +465,57 @@ class Machine(unittest.TestCase):
         self.assertLess(ops.calls.index("catalog-backup"), ops.calls.index("stop:dashboard"))
         self.assertTrue(self.journal()["catalog_backup"])
 
+    def test_timers_stay_stopped_while_the_journal_is_open(self):
+        ops = Fake({"a": "running"}, timers=("ow-recovery.timer",))
+        during = []
+        real = ops.hibernate_all
+        ops.hibernate_all = lambda release: (during.append(set(ops.ticking)), real(release))
+        self.run_plan(ops, ["worker"], 2, ["worker"])
+        self.assertEqual(during, [set()], "no recovery run meets the worker restart")
+        self.assertLess(ops.calls.index("pause-timers"), ops.calls.index("hibernated:a"))
+        self.assertEqual((self.journal()["paused"], ops.ticking), (["ow-recovery.timer"], {"ow-recovery.timer"}),
+                         "exactly the timers that ran start again; the stopped backup timer stays stopped")
+
+    def test_abort_and_rollback_start_the_paused_timers_again(self):
+        for fail, end in (({"capture:a"}, "aborted"), ({"verify"}, "rolled-back")):
+            for name in (*h.PINS, "current"):
+                h.set_pin(name, self.old)
+            ops = Fake({"a": "running"}, fail=fail, timers=u.TIMERS)
+            if fail == {"verify"}:
+                real = ops.verify
+                ops.verify = lambda expected: (expected["worker"] == "0.5.0" and ops.fail.clear(), real(expected))
+            with self.assertRaises(RuntimeError):
+                self.run_plan(ops, ["worker"], 2, ["worker"])
+            self.assertEqual((self.journal()["step"], ops.ticking), (end, set(u.TIMERS)))
+
+    def test_a_reboot_mid_upgrade_pauses_the_timers_again_until_recovered(self):
+        ops = Fake({"a": "running"}, kill={"start:worker"}, timers=("ow-recovery.timer",))
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_plan(ops, ["worker"], 2, ["worker"])
+        self.assertEqual(ops.ticking, set())
+        ops.kill.clear()
+        ops.ticking = set(u.TIMERS)  # the reboot: systemd starts every enabled timer
+        during = []
+        real = ops.verify
+        ops.verify = lambda expected: (during.append(set(ops.ticking)), real(expected))
+        u.recover(ops)
+        self.assertEqual(during, [set()], "the rollback's worker meets no recovery run")
+        self.assertEqual((self.journal()["step"], ops.ticking), ("rolled-back", set(u.TIMERS)),
+                         "recover pauses and restarts the timers it found running too")
+
+    def test_a_journal_from_an_older_upgrader_pauses_the_running_timers_while_recovered(self):
+        ops = Fake({"a": "hibernated"}, timers=("ow-recovery.timer",))
+        h.write_json(u.JOURNAL, {"step": "hibernate", "from": self.frm, "to": self.frm, "class": 2,
+                                 "restart": ["worker"], "resume": ["a"], "error": None})
+        ops.up["worker"] = False
+        during = []
+        real = ops.start
+        ops.start = lambda name: (during.append(set(ops.ticking)), real(name))
+        u.recover(ops)
+        self.assertEqual(during, [set()])
+        self.assertEqual((self.journal()["step"], ops.box["a"], ops.ticking),
+                         ("aborted", "running", {"ow-recovery.timer"}))
+
     def test_a_done_journal_needs_no_recovery(self):
         ops = Fake({"a": "running"})
         self.run_plan(ops, ["dashboard"], 1, ["dashboard"])
@@ -526,6 +590,34 @@ class Quiesce(unittest.TestCase):
             server.close()
             self.assertEqual(seen, [{"op": "quiesce", "closing": True}, {"op": "quiesce", "closing": False},
                                     {"op": "quiesce", "closing": True}])
+
+
+class Timers(unittest.TestCase):
+    def test_host_ops_stop_the_recovery_run_and_start_only_timers_that_exist(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(h, "run", return_value="") as run:
+            h.ROOT = Path(tmp)
+            ops = u.HostOps()
+            ops.pause_timers(["ow-recovery.timer"])
+            h.write_json("/etc/systemd/system/ow-backup.timer", {})
+            ops.resume_timers(["ow-recovery.timer", "ow-backup.timer"])
+            self.assertEqual([c.args[0] for c in run.call_args_list],
+                             [["systemctl", "stop", "ow-recovery.timer"],
+                              ["systemctl", "stop", "ow-recovery.service"],
+                              ["systemctl", "start", "ow-backup.timer"]])
+
+    def test_apply_leaves_the_timers_stopped_while_a_journal_is_open(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(h, "run", return_value="") as run:
+            h.ROOT = Path(tmp)
+            for timer in u.TIMERS:
+                h.write_json(f"/etc/systemd/system/{timer}", {})
+            for step, flag in (("hibernate", []), ("done", ["--now"])):
+                h.write_json(u.JOURNAL, {"step": step})
+                run.reset_mock()
+                h.services()
+                self.assertEqual([c.args[0] for c in run.call_args_list],
+                                 [["systemctl", "enable", *flag, timer] for timer in u.TIMERS])
 
 
 class Staging(unittest.TestCase):

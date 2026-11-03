@@ -32,6 +32,9 @@ PIN_CLASS = {"worker": 2, "agent": 1, "dashboard": 1}
 BEFORE_SWITCH = ("catalog-backup", "drain", "hibernate", "stop", "sync-images")
 AFTER_SWITCH = ("switch", "start", "verify")
 TERMINAL = ("done", "aborted", "rolled-back", "failed")
+# Paused while a journal is open: a recovery run's capture or hash holds the
+# one-request worker, and a backup's reads compete with the hibernation.
+TIMERS = ("ow-recovery.timer", "ow-backup.timer")
 
 
 def version(text):
@@ -440,6 +443,23 @@ class HostOps:
     def stop(self, name):
         h.systemctl("stop", h.UNITS[name])
 
+    def timers(self):
+        return [timer for timer in TIMERS if h.unit_exists(timer) and h.active(timer)]
+
+    def pause_timers(self, timers):
+        """Stopped, not disabled: a reboot starts them again. A recovery run in flight is
+        stopped too (it retries a killed upload on its next run); a backup run in flight
+        finishes, as it never asks the worker for anything."""
+        for timer in timers:
+            h.systemctl("stop", timer, check=False)  # one a new release removed is stopped
+        if "ow-recovery.timer" in timers:
+            h.systemctl("stop", "ow-recovery.service", check=False)
+
+    def resume_timers(self, timers):
+        for timer in timers:
+            if h.unit_exists(timer):  # the new release's setup may have removed it
+                h.systemctl("start", timer)
+
     def captures(self):
         return captures((self.worker_status() or {}).get("compat"))
 
@@ -609,11 +629,13 @@ def execute(plan_, ops, frm, to, target_name):
     worker = "worker" in restart
     j = Journal({"id": f"u-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}", "from": frm, "to": to,
                  "class": plan_["class"], "restart": restart, "resume": [], "catalog_backup": None,
-                 "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "error": None})
+                 "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "error": None,
+                 "paused": ops.timers()})
     if plan_.get("catalog_backup") and not plan_.get("rollback_auto", True):
         j.value["rollback_blocked"] = ("the old releases cannot read the migrated catalog: restore the copy in "
                                        f"{h.DATA}/backups with every writer stopped, or fix forward")
     j.step("gated")
+    ops.pause_timers(j["paused"])
     try:
         if plan_["catalog_backup"] and any(name in restart for name in ("agent", "dashboard")):
             j.step("catalog-backup")
@@ -674,6 +696,7 @@ def finish(j, ops):
     if failed:
         j.value["error"] = f"still hibernated (each wakes on its next connection): {', '.join(failed)}"
         say(j.value["error"])
+    ops.resume_timers(j["paused"])
     j.step("done")
 
 
@@ -706,6 +729,7 @@ def abort(j, ops):
     ops.drain(False)
     if failed:
         j.value["error"] = f"{j.value.get('error')}; still hibernated: {', '.join(failed)}"
+    ops.resume_timers(j["paused"])
     j.step("aborted")
     say(f"upgrade aborted: {j.value['error']}")
 
@@ -728,6 +752,7 @@ def rollback(j, ops):
     lift(j, ops)
     resume(j, ops)
     ops.drain(False)
+    ops.resume_timers(j["paused"])
     j.step("rolled-back")
     say(f"upgrade rolled back: {j.value['error']}")
 
@@ -779,10 +804,16 @@ def recover(ops=None, boot=False):
     step = value["step"]
     say(f"recovering an upgrade interrupted at {step}")
     j.value["error"] = j.value.get("error") or f"interrupted at {step}"
+    # A reboot (or an older upgrader, which paused none) left timers running: they pause
+    # too, recorded first, and start again with the rest when the journal closes.
+    j.value["paused"] = sorted({*j.value.get("paused", []), *ops.timers()})
+    h.write_json(JOURNAL, j.value)
+    ops.pause_timers(j["paused"])
     if boot:
         # A new instance: its pins came from the config, so only the boxes and the drain remain.
         resume(j, ops)
         ops.drain(False)
+        ops.resume_timers(j["paused"])
         j.step("aborted")
     elif step in BEFORE_SWITCH or step == "gated":
         abort(j, ops)
