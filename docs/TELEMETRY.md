@@ -68,6 +68,7 @@ Infrastructure code carries no telemetry setting.
 | `alerts.offline_after_s` | `60` | 15–86400 | Grace period before an offline runner raises `node_offline`. |
 | `alerts.disk_low_gib` | `20` | 0–100000 | `disk_low` when a runner's free data-volume space is below this. |
 | `limits.box_memory_mib` | `0` | 0–65536 | Largest memory a box may be created or resized to. `0`: only the runner's memory budget limits it. Boxes already over a lowered limit still start. |
+| `upgrade.worker_handover` | `true` | `true`, `false` | A worker upgrade or restart that keeps the VMM and guest kernel hands the running boxes to the new worker instead of hibernating them ([UPGRADES.md](UPGRADES.md#worker-hand-over-keeps-boxes-running)). Runners store it for `ow-host upgrade` within 3 s. |
 | `dashboard.ui_bundle` | `builtin` | `builtin` or an installed bundle version | UI bundle the dashboard serves; see [UI bundles](DASHBOARD.md#ui-bundles). Refused unless installed, intact and API-compatible. |
 
 ## What runners report

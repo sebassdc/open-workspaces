@@ -12,8 +12,8 @@ it; /usr/local/sbin/ow-host runs the copy in /srv/ow/current.
   setup                 render units and files from the stored config; print what changed
   apply                 fetch the SSM config, validate, store, set up, act on class 0; report the rest
   ready [--wait S] [--images]
-  restart --control-plane | --worker
-  upgrade [REF] [--plan] [--accept-cold] [--max-class N] [--controller-version V (runner hosts)]
+  restart --control-plane | --worker [--hibernate]
+  upgrade [REF] [--plan] [--accept-cold] [--hibernate] [--max-class N] [--controller-version V (runner hosts)]
   recover               finish or undo an upgrade that was interrupted
   status
 
@@ -355,7 +355,7 @@ def render(config, budget):
     )
     files["/etc/systemd/system/open-workspaces-worker.service"] = (
         f"""[Unit]
-Description=Open Workspaces worker and its VMs (a restart hibernates the running boxes)
+Description=Open Workspaces worker and its VMs
 After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=/srv/ow
@@ -364,12 +364,16 @@ RequiresMountsFor=/srv/ow
 User=ow
 EnvironmentFile=/etc/open-workspaces/worker.env
 ExecStart={worker_bin} --data-dir {RUNNER} supervisor
-# A stop (reboot, instance stop, ow-host restart --worker) hibernates the running
-# boxes first, with wakes refused, so their processes survive (about 25 s per 1 GiB,
-# much longer on a slow volume). It retries until every box is hibernated and has no
-# timeout: whatever still runs when the stop command ends is killed with the unit.
+# A stop (reboot, instance stop, ow-host restart --worker --hibernate) hibernates the
+# running boxes first, with wakes refused, so their processes survive (about 25 s per
+# 1 GiB, much longer on a slow volume). It retries until every box is hibernated and has
+# no timeout. An upgrade that keeps the VMM and guest kernel detaches the worker first
+# (`down --detach`): the stop then finds no worker and the VMMs keep running.
 ExecStop={worker_bin} --data-dir {RUNNER} down --hibernate --wait
 TimeoutStopSec=infinity
+# Only the supervisor is signalled: VMMs outlive the worker, and the next one adopts them
+# (docs/adr/0011). A shutdown still ends them after ExecStop hibernated them.
+KillMode=process
 Restart=on-failure
 RestartSec=5
 # The worker and its VMs stay below the host reserve. Within that, the worker runs in a
@@ -1400,10 +1404,14 @@ def main(argv):
     which = restart.add_mutually_exclusive_group(required=True)
     which.add_argument("--control-plane", action="store_true")
     which.add_argument("--worker", action="store_true")
+    restart.add_argument("--hibernate", action="store_true",
+                         help="hibernate the running boxes instead of handing them to the new worker")
     u = sub.add_parser("upgrade")
     u.add_argument("ref", nargs="?")
     u.add_argument("--plan", action="store_true", help="print the plan and change nothing")
     u.add_argument("--accept-cold", action="store_true", help="allow boxes whose captures cannot resume to boot cold")
+    u.add_argument("--hibernate", action="store_true",
+                   help="hibernate the running boxes even when the new worker could adopt them")
     u.add_argument("--max-class", type=int, choices=range(4), default=2)
     u.add_argument("--controller-version", help="runner hosts: the release the controller's agent runs")
     u.add_argument("--from-source", action="store_true", help="build the release on the host even if it has released binaries")
@@ -1458,9 +1466,10 @@ def main(argv):
                 clear_pending({"agent"})
                 ready(300)
                 return 0
-            return upgrade.restart_worker()
+            return upgrade.restart_worker(hibernate=args.hibernate)
         return upgrade.upgrade(args.ref, plan_only=args.plan, accept_cold=args.accept_cold, max_class=args.max_class,
-                               controller=args.controller_version, from_source=args.from_source)
+                               controller=args.controller_version, from_source=args.from_source,
+                               hibernate=args.hibernate)
     except Refused as e:
         print(f"refused: {e}", file=sys.stderr)
         return 3

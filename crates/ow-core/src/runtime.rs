@@ -667,6 +667,8 @@ pub struct Runtime {
     /// Per-box AWS access: the VMM process that last received a token, by box. A cold start
     /// is a new process with an empty `/run`, so the controller's `check` then sees none.
     aws_delivered: BTreeMap<String, u32>,
+    /// What became of each VMM an earlier worker left running (`adopt`), for `status`.
+    adoption: Vec<Value>,
     #[cfg(test)]
     crash: Option<&'static str>,
 }
@@ -840,6 +842,7 @@ impl Runtime {
             staged: None,
             unsealed: BTreeMap::new(),
             aws_delivered: BTreeMap::new(),
+            adoption: Vec::new(),
             #[cfg(test)]
             crash: None,
         };
@@ -984,6 +987,11 @@ impl Runtime {
             &self.machine_dir(&workspace.id),
             workspace.index,
         )?;
+        // Before the guest runs: a later worker adopts this VMM by it (ADR 0011).
+        let mut record = machine.record(workspace.index)?;
+        record["vmm_sha256"] = json!(hash(&self.binary())?);
+        record["kernel_sha256"] = json!(self.kernel_hash);
+        atomic_json(&self.machine_dir(&workspace.id).join(vm::RECORD), &record)?;
         // Dropping `machine` (any failure below, a stop, a hibernation) detaches it again.
         crate::metadata::attach(workspace.index, &workspace.id)?;
         if let Some(snapshot) = snapshot {
@@ -2064,7 +2072,7 @@ impl Runtime {
                 "version":env!("CARGO_PKG_VERSION"),"worker_protocol":crate::common::WORKER_PROTOCOL,
                 // What this worker writes into captures and requires to resume one (upgrade gate).
                 "compat":{"runtime":crate::common::RUNTIME,"cpu":self.cpu,"kernel_sha256":self.kernel_hash},
-                "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"recovery_disk_only_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"aws_metadata_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
+                "worker_pid":std::process::id(),"worker_handover_v1":true,"adoption":self.adoption,"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"recovery_disk_only_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"aws_metadata_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
                 "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":max_memory().min(16384),"max_guest_memory_v2_mib":max_memory(),"max_guest_vcpus":16,"max_guest_vcpus_v2":max_cpus().min(crate::common::GUEST_MAX_VCPUS),
@@ -2422,6 +2430,100 @@ impl Runtime {
         }
     }
 
+    /// Adopts the VMMs an earlier worker left running (ADR 0011). A box whose VMM is gone
+    /// stays stopped with its disk; one whose VMM runs another binary or guest kernel is
+    /// left alone; an adopted one that does not answer is hibernated. Returns, per box,
+    /// what happened.
+    pub fn adopt(&mut self) -> Vec<Value> {
+        let ids: Vec<String> = self
+            .state
+            .workspaces
+            .keys()
+            .filter(|id| self.machine_dir(id).join(vm::RECORD).exists())
+            .cloned()
+            .collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let vmm = hash(&self.binary());
+        let mut report = Vec::new();
+        for id in ids {
+            let result = match &vmm {
+                Ok(vmm) => self.adopt_one(&id, vmm),
+                Err(e) => Err(anyhow::anyhow!("hashing this worker's VMM binary: {e:#}")),
+            };
+            let entry = match result {
+                Ok((outcome, detail)) => json!({"id":id,"result":outcome,"detail":detail}),
+                Err(e) => json!({"id":id,"result":"failed","detail":format!("{e:#}")}),
+            };
+            eprintln!("adoption: {entry}");
+            report.push(entry);
+        }
+        if let Err(e) = self.save() {
+            eprintln!("adoption: saving state: {e:#}");
+        }
+        self.adoption = report.clone();
+        report
+    }
+
+    fn adopt_one(&mut self, id: &str, vmm: &str) -> Result<(&'static str, Option<String>)> {
+        let directory = self.machine_dir(id);
+        let workspace = self.state.workspaces[id].clone();
+        // A hibernated or moved box's VMM was dropped after its capture: never a second one.
+        if workspace.state != "stopped" {
+            return Ok(("skipped", Some(format!("box is {}", workspace.state))));
+        }
+        let machine = match Vm::adopt(&directory, vmm, &self.kernel_hash, hash)? {
+            vm::Adoption::Gone => {
+                // The TAP outlived its VMM; a cold start makes it again.
+                let _ = vm::host("ip", &["link", "del", &format!("ow{}", workspace.index)]);
+                crate::network::unregister(workspace.index);
+                fs::remove_file(directory.join(vm::RECORD))?;
+                return Ok(("gone", None));
+            }
+            vm::Adoption::Foreign(reason) => {
+                self.state.workspaces.get_mut(id).unwrap().state = "failed".into();
+                return Ok(("foreign", Some(reason)));
+            }
+            vm::Adoption::Adopted(machine) => *machine,
+        };
+        self.machines.insert(id.into(), machine);
+        self.state.workspaces.get_mut(id).unwrap().state = "running".into();
+        self.idle.touch(id, std::time::Instant::now());
+        let checked = crate::network::register(workspace.index)
+            .and_then(|()| crate::metadata::attach(workspace.index, id))
+            .and_then(|()| {
+                self.machines
+                    .get_mut(id)
+                    .unwrap()
+                    .healthy(std::time::Duration::from_secs(10))
+            });
+        let Err(unhealthy) = checked else {
+            return Ok(("adopted", None));
+        };
+        // Its RAM is still intact: save it rather than keep a box nobody can manage.
+        let mut request = json!({"op":"hibernate","id":id});
+        if let Some(managed) = self.state.placements.get(id) {
+            request["placement"] = json!(managed.authority);
+        }
+        match self.request(&request) {
+            Ok(_) => Ok(("hibernated", Some(format!("{unhealthy:#}")))),
+            Err(e) => bail!("adopted but unresponsive ({unhealthy:#}); hibernating failed: {e:#}"),
+        }
+    }
+
+    /// Hands every running VMM to the next worker (ADR 0011): forgets them without
+    /// stopping them; their records stay for `adopt`. Nothing may start afterwards.
+    pub fn detach(&mut self) -> Value {
+        self.closing = true;
+        let machines = std::mem::take(&mut self.machines);
+        let ids: Vec<_> = machines.keys().cloned().collect();
+        for machine in machines.into_values() {
+            machine.detach();
+        }
+        json!({"detached":ids})
+    }
+
     pub fn shutdown(&mut self) {
         let ids: Vec<_> = self.machines.keys().cloned().collect();
         for id in ids {
@@ -2461,6 +2563,7 @@ mod disk_tests {
             staged: None,
             unsealed: BTreeMap::new(),
             aws_delivered: BTreeMap::new(),
+            adoption: Vec::new(),
             crash: None,
         }
     }

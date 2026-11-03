@@ -24,6 +24,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Set for a worker started inside the namespaces of VMMs an earlier worker left running.
+const ADOPT: &str = "OW_WORKER_ADOPT";
+
+/// A VMM an earlier worker left running, whose user and network namespaces (with the TAPs
+/// and policy) the next worker must enter to adopt it (ADR 0011).
+fn surviving_vmm(root: &Path) -> Option<u32> {
+    fs::read_dir(root.join("machines"))
+        .ok()?
+        .flatten()
+        .find_map(|entry| vm::recorded_live_pid(&entry.path()))
+}
+
 pub(crate) fn data_root(value: Option<PathBuf>) -> Result<PathBuf> {
     let path = value
         .or_else(|| std::env::var_os("OW_DATA_DIR").map(PathBuf::from))
@@ -220,10 +232,12 @@ fn worker(root: PathBuf) -> Result<()> {
     }
     let output = Command::new("ip").args(["-j", "link", "show"]).output()?;
     let links: Value = serde_json::from_slice(&output.stdout)?;
+    // A supervisor that found running VMMs entered their namespace (ADR 0011).
     ensure!(
-        links
-            .as_array()
-            .is_some_and(|a| a.len() == 1 && a[0]["ifname"] == "lo"),
+        std::env::var_os(ADOPT).is_some()
+            || links
+                .as_array()
+                .is_some_and(|a| a.len() == 1 && a[0]["ifname"] == "lo"),
         "worker requires a fresh isolated network namespace; use ow up"
     );
     network::initialize()?;
@@ -249,6 +263,12 @@ fn worker(root: PathBuf) -> Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     let (requests, incoming) = std::sync::mpsc::channel();
     control(listener, runtime.clone(), stopping.clone(), requests);
+    // After the control thread: it answers status (busy) meanwhile, so the supervisor
+    // brings the uplink up while each adopted guest is checked.
+    runtime
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
+        .adopt();
     let terminals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut idle_check = Instant::now();
     // Live forks whose capture a sealing thread finished: (reply, parent, child, capture).
@@ -386,6 +406,13 @@ fn worker(root: PathBuf) -> Result<()> {
                                 wire::send(&mut stream, &wire::response(Err(error)))?;
                             }
                         }
+                    } else if operation == "detach" {
+                        let detached = runtime
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
+                            .detach();
+                        stopping.store(true, Ordering::SeqCst);
+                        wire::send(&mut stream, &json!({"ok":true,"result":detached}))?;
                     } else if operation == "shutdown" {
                         runtime
                             .lock()
@@ -692,9 +719,23 @@ fn supervise(root: &Path) -> Result<()> {
         }
         Ok(command.spawn()?)
     }
+    let mut namespaces = match surviving_vmm(root) {
+        // As root inside: the mapping the first worker's `--map-root-user` made.
+        Some(pid) => {
+            let mut command = Command::new("nsenter");
+            command
+                .args(["--target", &pid.to_string(), "--user", "--net"])
+                .env(ADOPT, "1");
+            command
+        }
+        None => {
+            let mut command = Command::new("unshare");
+            command.args(["--user", "--map-root-user", "--net"]);
+            command
+        }
+    };
     let mut children = Children(vec![owned_child(
-        Command::new("unshare")
-            .args(["--user", "--map-root-user", "--net"])
+        namespaces
             .arg(std::env::current_exe()?)
             .arg("--data-dir")
             .arg(root)
@@ -989,7 +1030,24 @@ pub fn run(cli: Cli) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&up(&root)?)?);
             return Ok(0);
         }
-        Action::Down { hibernate, wait } => {
+        Action::Down {
+            hibernate,
+            wait,
+            detach,
+        } => {
+            if detach {
+                let result = wire::request(&root, json!({"op":"detach"}))?;
+                let started = Instant::now();
+                while root.join("control.sock").exists() {
+                    ensure!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "worker detach timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                println!("{result}");
+                return Ok(0);
+            }
             if hibernate && root.join("control.sock").exists() {
                 if wait {
                     hibernate_all_waiting(&root);

@@ -193,8 +193,128 @@ pub fn host(command: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The fds the VMM inherits and holds itself, so they outlive the worker (ADR 0011): its
+/// serial console's PTY master and the read end of its diagnostics pipe.
+const PTY_FD: i32 = 3;
+const LOG_FD: i32 = 4;
+/// `machines/ID/vmm.json`: what a later worker needs to find and adopt this VMM.
+pub const RECORD: &str = "vmm.json";
+const RECORD_FORMAT: u64 = 1;
+
+/// A VMM process: spawned by this worker, or adopted from an earlier one.
+pub enum Vmm {
+    Spawned(Child),
+    /// Not this process's child: observed and signalled through its pidfd only.
+    Adopted {
+        pid: u32,
+        pidfd: std::os::fd::OwnedFd,
+    },
+}
+
+impl From<Child> for Vmm {
+    fn from(child: Child) -> Self {
+        Self::Spawned(child)
+    }
+}
+
+impl Vmm {
+    pub fn id(&self) -> u32 {
+        match self {
+            Self::Spawned(child) => child.id(),
+            Self::Adopted { pid, .. } => *pid,
+        }
+    }
+
+    /// `Some(())` once the process exited.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<()>> {
+        match self {
+            Self::Spawned(child) => child.try_wait().map(|s| s.map(|_| ())),
+            Self::Adopted { pidfd, .. } => Ok(pidfd_exited(pidfd, 0)?.then_some(())),
+        }
+    }
+
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Spawned(child) => child.kill(),
+            Self::Adopted { pidfd, .. } => {
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                };
+                let error = std::io::Error::last_os_error();
+                // Exited already (its zombie is its new parent's to reap).
+                if rc < 0 && error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn wait(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Spawned(child) => child.wait().map(|_| ()),
+            Self::Adopted { pidfd, .. } => {
+                while !pidfd_exited(pidfd, -1)? {}
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Whether a pidfd's process exited, waiting up to `timeout_ms` (-1: until it does).
+fn pidfd_exited(pidfd: &std::os::fd::OwnedFd, timeout_ms: i32) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready >= 0 {
+            return Ok(ready > 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// A process's start time in clock ticks since boot (`/proc/PID/stat` field 22): with the
+/// PID it names one process, never a later one that reused the PID.
+pub fn start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the parenthesised command name, which may itself hold spaces.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// The recorded VMM's PID when that very process still runs.
+pub fn recorded_live_pid(directory: &Path) -> Option<u32> {
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(directory.join(RECORD)).ok()?).ok()?;
+    let pid = u32::try_from(record["pid"].as_u64()?).ok()?;
+    (start_time(pid)? == record["start_time"].as_u64()?).then_some(pid)
+}
+
+/// What became of a recorded VMM when a worker started.
+pub enum Adoption {
+    /// The recorded process no longer runs: the box's TAP and record are cleaned.
+    Gone,
+    /// The recorded process runs a binary or guest kernel this worker does not: it is
+    /// left alone (its TAP stays, so the box cannot start a second VMM on its disk).
+    Foreign(String),
+    Adopted(Box<Vm>),
+}
+
 pub struct Vm {
-    pub child: Child,
+    pub child: Vmm,
     master: File,
     log: File,
     diagnostics: Option<std::thread::JoinHandle<()>>,
@@ -203,6 +323,8 @@ pub struct Vm {
     pub tap: String,
     pub address: String,
     memory_base: MemoryBase,
+    /// Detached for the next worker: dropping it leaves the VMM, TAP and policy running.
+    keep: bool,
 }
 
 impl Vm {
@@ -251,7 +373,13 @@ impl Vm {
                 .create(true)
                 .append(true)
                 .open(directory.join("vmm.log"))?;
-            let parent_pid = std::process::id();
+            let mut pipe = [-1; 2];
+            ensure!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } == 0,
+                "VMM log pipe failed"
+            );
+            let (errors, writer) =
+                unsafe { (File::from_raw_fd(pipe[0]), File::from_raw_fd(pipe[1])) };
             let mut command = guest_command(binary);
             command
                 .args([
@@ -265,44 +393,30 @@ impl Vm {
                 .current_dir(directory)
                 .stdin(Stdio::from(slave.try_clone()?))
                 .stdout(Stdio::from(slave.try_clone()?))
-                .stderr(Stdio::piped());
+                .stderr(Stdio::from(writer));
+            let (pty, reader) = (master.as_raw_fd(), errors.as_raw_fd());
+            // No parent-death signal: the VMM outlives a worker restart and the next worker
+            // adopts it (ADR 0011). It holds its own console master and log reader as fds 3
+            // and 4, so neither hangs up while no worker holds them.
             unsafe {
                 command.pre_exec(move || {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    // Through fds >= 10 first: a source already at 3 or 4 is not clobbered.
+                    let pty = libc::fcntl(pty, libc::F_DUPFD_CLOEXEC, 10);
+                    let reader = libc::fcntl(reader, libc::F_DUPFD_CLOEXEC, 10);
+                    // dup2 leaves the new fds without close-on-exec.
+                    if pty < 0
+                        || reader < 0
+                        || libc::dup2(pty, PTY_FD) < 0
+                        || libc::dup2(reader, LOG_FD) < 0
+                    {
                         return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::getppid() != parent_pid as i32 {
-                        return Err(std::io::Error::other("worker exited during spawn"));
                     }
                     as_guest()
                 });
             }
-            let mut child = command.spawn()?;
-            let mut errors = child.stderr.take().context("VMM stderr missing")?;
-            let diagnostic_thread = std::thread::spawn(move || {
-                let mut diagnostics = diagnostics;
-                let mut bytes = [0; 8192];
-                let mut recording = true;
-                loop {
-                    let Ok(n) = errors.read(&mut bytes) else {
-                        break;
-                    };
-                    if n == 0 {
-                        break;
-                    }
-                    let remaining = (4 * 1024 * 1024u64).saturating_sub(
-                        diagnostics
-                            .metadata()
-                            .map(|m| m.len())
-                            .unwrap_or(4 * 1024 * 1024),
-                    ) as usize;
-                    if recording && diagnostics.write_all(&bytes[..n.min(remaining)]).is_err() {
-                        // A full/unavailable diagnostic sink must not block or
-                        // break the VMM's logging pipe. Drain and discard.
-                        recording = false;
-                    }
-                }
-            });
+            let child = Vmm::Spawned(command.spawn()?);
+            drop(command);
+            let diagnostic_thread = drain(errors, diagnostics);
             let log = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -317,6 +431,7 @@ impl Vm {
                 tap: tap.clone(),
                 address,
                 memory_base: MemoryBase::Unknown,
+                keep: false,
             };
             let started = Instant::now();
             while !vm.socket.exists() {
@@ -336,10 +451,171 @@ impl Vm {
         result
     }
 
+    /// What `machines/ID/vmm.json` records about this VMM; the caller adds the hashes of
+    /// the binary and guest kernel it runs.
+    pub fn record(&self, index: u32) -> Result<Value> {
+        let pid = self.child.id();
+        Ok(json!({
+            "format": RECORD_FORMAT,
+            "pid": pid,
+            "start_time": start_time(pid).context("VMM start time")?,
+            "index": index,
+            "tap": self.tap,
+            "address": self.address,
+            "pty_fd": PTY_FD,
+            "log_fd": LOG_FD,
+        }))
+    }
+
+    /// Takes over the VMM an earlier worker recorded in `directory`, after checking it is
+    /// the very process recorded (PID and start time) and runs the binary and guest kernel
+    /// this worker runs. Signals nothing it did not verify.
+    pub fn adopt(
+        directory: &Path,
+        vmm_sha256: &str,
+        kernel_sha256: &str,
+        hash: impl Fn(&Path) -> Result<String>,
+    ) -> Result<Adoption> {
+        let record: Value = serde_json::from_slice(&std::fs::read(directory.join(RECORD))?)
+            .context("invalid VMM record")?;
+        ensure!(
+            record["format"] == RECORD_FORMAT,
+            "VMM record format {} is not {RECORD_FORMAT}",
+            record["format"]
+        );
+        let pid = u32::try_from(record["pid"].as_u64().context("record PID")?)?;
+        let recorded = record["start_time"].as_u64().context("record start time")?;
+        if start_time(pid) != Some(recorded) {
+            return Ok(Adoption::Gone);
+        }
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if raw < 0 {
+            return Ok(Adoption::Gone);
+        }
+        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+        // The pidfd names whichever process held the PID when it was opened: check again.
+        if start_time(pid) != Some(recorded) {
+            return Ok(Adoption::Gone);
+        }
+        let running = hash(Path::new(&format!("/proc/{pid}/exe")))?;
+        if running != vmm_sha256 {
+            return Ok(Adoption::Foreign(format!(
+                "VMM {pid} runs binary {running}, this worker runs {vmm_sha256}"
+            )));
+        }
+        if record["kernel_sha256"] != kernel_sha256 {
+            return Ok(Adoption::Foreign(format!(
+                "VMM {pid} booted guest kernel {}, this worker boots {kernel_sha256}",
+                record["kernel_sha256"]
+            )));
+        }
+        let take = |fd: &Value| -> Result<File> {
+            let fd = fd.as_i64().context("record fd")? as i32;
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+            ensure!(
+                raw >= 0,
+                "taking fd {fd} of VMM {pid}: {}",
+                std::io::Error::last_os_error()
+            );
+            Ok(unsafe { File::from_raw_fd(raw as i32) })
+        };
+        let master = take(&record["pty_fd"])?;
+        let errors = take(&record["log_fd"])?;
+        let diagnostics = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("vmm.log"))?;
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("serial.log"))?;
+        let vm = Self {
+            child: Vmm::Adopted { pid, pidfd },
+            master,
+            log,
+            diagnostics: Some(drain(errors, diagnostics)),
+            buffer: Vec::new(),
+            socket: directory.join("api.sock"),
+            tap: record["tap"].as_str().context("record TAP")?.into(),
+            address: record["address"].as_str().context("record address")?.into(),
+            // The last captured image is not known here: the next capture is a full one.
+            memory_base: MemoryBase::Unknown,
+            keep: false,
+        };
+        Ok(Adoption::Adopted(Box::new(vm)))
+    }
+
+    /// Checks an adopted VMM answers: its API (a VM a capture left paused runs again) and
+    /// a guest command on its console within `timeout`.
+    pub fn healthy(&mut self, timeout: Duration) -> Result<()> {
+        let info = self.api_get("/")?;
+        match info["state"].as_str() {
+            Some("Running") => {}
+            Some("Paused") => self.resume()?,
+            other => anyhow::bail!("VMM state {other:?}"),
+        }
+        let (_, code) = self.command_within("true", timeout)?;
+        ensure!(code == 0, "guest exit {code}");
+        Ok(())
+    }
+
+    /// Leaves the VMM, its TAP and network policy running for the next worker.
+    pub fn detach(mut self) {
+        self.keep = true;
+    }
+
     pub fn api(&self, method: &str, endpoint: &str, body: Value) -> Result<()> {
         self.api_waiting(method, endpoint, body, 30)
     }
 
+    fn api_get(&self, endpoint: &str) -> Result<Value> {
+        let output = Command::new("curl")
+            .args(["-sS", "--max-time", "10", "--unix-socket"])
+            .arg(&self.socket)
+            .args(["-w", "\n%{http_code}"])
+            .arg(format!("http://localhost{endpoint}"))
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "VMM API transport: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout)?;
+        let (body, status) = text.rsplit_once('\n').context("invalid VMM response")?;
+        ensure!(status == "200", "VMM {endpoint}: HTTP {status}: {body}");
+        Ok(serde_json::from_str(body)?)
+    }
+}
+
+/// Copies the VMM's diagnostics into `vmm.log`, capped at 4 MiB, until the pipe closes.
+fn drain(mut errors: File, diagnostics: File) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut diagnostics = diagnostics;
+        let mut bytes = [0; 8192];
+        let mut recording = true;
+        loop {
+            let Ok(n) = errors.read(&mut bytes) else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            let remaining = (4 * 1024 * 1024u64).saturating_sub(
+                diagnostics
+                    .metadata()
+                    .map(|m| m.len())
+                    .unwrap_or(4 * 1024 * 1024),
+            ) as usize;
+            if recording && diagnostics.write_all(&bytes[..n.min(remaining)]).is_err() {
+                // A full/unavailable diagnostic sink must not block or
+                // break the VMM's logging pipe. Drain and discard.
+                recording = false;
+            }
+        }
+    })
+}
+
+impl Vm {
     /// `api` with a longer limit, for calls that write guest RAM to disk: a 4 GiB
     /// snapshot took over 30 s on a gp3 volume at its baseline throughput.
     fn api_waiting(&self, method: &str, endpoint: &str, body: Value, seconds: u32) -> Result<()> {
@@ -644,11 +920,20 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        // Child belongs to this worker; never signal a PID loaded from disk.
+        if self.keep {
+            // Handed to the next worker: its drain thread ends with this process.
+            return;
+        }
+        // Spawned here or adopted through a pidfd; never signal a PID loaded from disk.
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(thread) = self.diagnostics.take() {
             let _ = thread.join();
+        }
+        if let Some(directory) = self.socket.parent()
+            && !directory.as_os_str().is_empty()
+        {
+            let _ = std::fs::remove_file(directory.join(RECORD));
         }
         if let Ok(index) = self.tap.trim_start_matches("ow").parse() {
             // Before the TAP goes: a later box on this index must not answer as this one.
@@ -721,7 +1006,8 @@ mod command_tests {
         }
         let child = shell.spawn().unwrap();
         let mut vm = Vm {
-            child,
+            child: child.into(),
+            keep: false,
             master,
             log: File::create(&log).unwrap(),
             diagnostics: None,
@@ -935,7 +1221,8 @@ mod clock_tests {
         });
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let mut vm = Vm {
-            child,
+            child: child.into(),
+            keep: false,
             master: std::os::fd::OwnedFd::from(master).into(),
             log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
             diagnostics: None,
@@ -1153,7 +1440,8 @@ fn capture_fixture_steps(
     });
     (
         Vm {
-            child: Command::new("sleep").arg("60").spawn().unwrap(),
+            child: Command::new("sleep").arg("60").spawn().unwrap().into(),
+            keep: false,
             master: std::os::fd::OwnedFd::from(master).into(),
             log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
             diagnostics: None,
@@ -1333,6 +1621,140 @@ mod memory_tests {
         assert!(!staging.join("memory.diff").exists());
         assert!(matches!(vm.memory_base, MemoryBase::Image(_)));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod adoption_tests {
+    use super::*;
+
+    fn scratch() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ow-adopt-{}", nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    fn pipe() -> (File, File) {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+    }
+
+    /// A stand-in VMM: holds a console end at fd 3 and its log pipe's read end at fd 4,
+    /// as `Vm::spawn` arranges, writes a diagnostic line, says ready on its console and sleeps.
+    fn vmm(console: &File, log: (File, File)) -> Child {
+        let (pty, reader) = (console.as_raw_fd(), log.0.as_raw_fd());
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "echo diagnostic >&2; echo ready >&3; exec sleep 60"])
+            .stderr(Stdio::from(log.1));
+        unsafe {
+            command.pre_exec(move || {
+                let pty = libc::fcntl(pty, libc::F_DUPFD_CLOEXEC, 10);
+                let reader = libc::fcntl(reader, libc::F_DUPFD_CLOEXEC, 10);
+                if libc::dup2(pty, PTY_FD) < 0 || libc::dup2(reader, LOG_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().unwrap()
+    }
+
+    fn record(directory: &Path, pid: u32, start: u64) {
+        let value = json!({"format":RECORD_FORMAT,"pid":pid,"start_time":start,"index":7,"tap":"fixture-no-host-interface",
+            "address":"198.18.0.30","pty_fd":PTY_FD,"log_fd":LOG_FD,"vmm_sha256":"vmm","kernel_sha256":"kernel"});
+        std::fs::write(directory.join(RECORD), value.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_process_is_named_by_its_pid_and_start_time() {
+        let start = start_time(std::process::id()).unwrap();
+        assert_eq!(start_time(std::process::id()), Some(start));
+        let directory = scratch();
+        record(&directory, std::process::id(), start);
+        assert_eq!(recorded_live_pid(&directory), Some(std::process::id()));
+        record(&directory, std::process::id(), start + 1);
+        assert_eq!(
+            recorded_live_pid(&directory),
+            None,
+            "a reused PID is not the recorded VMM"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_later_worker_takes_the_vmm_fds_and_ends_it_through_its_pidfd() {
+        let directory = scratch();
+        let (console_read, console_write) = pipe();
+        let mut child = vmm(&console_write, pipe());
+        drop(console_write);
+        let mut ready = [0u8; 6];
+        (&console_read).read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready\n", "its diagnostic line waits in the log pipe");
+        let pid = child.id();
+        let start = start_time(pid).unwrap();
+        record(&directory, pid, start);
+        let hash = |_: &Path| Ok("vmm".to_owned());
+        let other = |_: &Path| Ok("another".to_owned());
+        assert!(matches!(
+            Vm::adopt(&directory, "vmm", "kernel", other).unwrap(),
+            Adoption::Foreign(reason) if reason.contains("another")
+        ));
+        assert!(matches!(
+            Vm::adopt(&directory, "vmm", "other-kernel", hash).unwrap(),
+            Adoption::Foreign(reason) if reason.contains("guest kernel")
+        ));
+        let Adoption::Adopted(mut vm) = Vm::adopt(&directory, "vmm", "kernel", hash).unwrap()
+        else {
+            panic!("not adopted");
+        };
+        assert_eq!(vm.child.id(), pid);
+        assert!(vm.child.try_wait().unwrap().is_none());
+        // fd 3 of the VMM is now this worker's console.
+        vm.master.write_all(b"x").unwrap();
+        let mut byte = [0u8; 1];
+        (&console_read).read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+        drop(vm);
+        // Dropping it ended the process (through the pidfd) and drained its log pipe.
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+        let log = std::fs::read_to_string(directory.join("vmm.log")).unwrap();
+        assert!(log.contains("diagnostic"), "{log:?}");
+        assert!(
+            !directory.join(RECORD).exists(),
+            "a reaped VMM's record goes with it"
+        );
+        record(&directory, pid, start);
+        assert!(matches!(
+            Vm::adopt(&directory, "vmm", "kernel", hash).unwrap(),
+            Adoption::Gone
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_detached_vmm_keeps_running() {
+        let directory = scratch();
+        let (_console_read, console_write) = pipe();
+        let mut child = vmm(&console_write, pipe());
+        let pid = child.id();
+        record(&directory, pid, start_time(pid).unwrap());
+        let Adoption::Adopted(vm) =
+            Vm::adopt(&directory, "vmm", "kernel", |_: &Path| Ok("vmm".to_owned())).unwrap()
+        else {
+            panic!("not adopted");
+        };
+        vm.detach();
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "detaching never signals"
+        );
+        assert!(directory.join(RECORD).exists(), "the next worker finds it");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 

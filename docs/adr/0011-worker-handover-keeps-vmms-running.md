@@ -1,6 +1,6 @@
 # ADR 0011: a worker restart hands running VMMs to the next worker
 
-Status: proposed. Amends [ADR 0005](0005-change-classes-and-engine-boundary.md),
+Status: implemented in 0.9.51 (sandbox check in [UPGRADES.md](../UPGRADES.md)). Amends [ADR 0005](0005-change-classes-and-engine-boundary.md),
 which left worker re-adoption of running VMMs out.
 Pattern: ADR 0005's journaled upgrade state machine (abort before the switch,
 rollback after it) and its release-impact manifest; the worker's delegated cgroup
@@ -71,9 +71,10 @@ On start the worker reads every `vmm.json` and adopts a VMM only if all hold:
    capture interrupted mid-way, is resumed);
 5. a guest command (`true` with a fresh marker) answers on the console within 10 s.
 
-An adopted box is `running` again with the same VMM PID; its per-box metadata
-endpoint is re-attached, its SSH policy re-applied, and its idle timer reset. The
-dirty-page base is unknown, so its next capture is a full one.
+An adopted box is `running` again with the same VMM PID; its network policy
+elements and per-box metadata endpoint are re-attached and its idle timer reset
+(its SSH policy lives in the guest and on disk, unchanged). The dirty-page base is
+unknown, so its next capture is a full one.
 
 An adopted VMM is not this process's child: liveness and kill go through its
 pidfd (poll for exit, `pidfd_send_signal`), never a PID read from disk.
@@ -84,12 +85,14 @@ Per box, in order:
 
 - checks 1-3 fail and the VMM is dead: its TAP and record are cleaned and the box
   is `stopped` with its disk (what a worker crash does today);
-- checks 1-2 fail on a live VMM (wrong binary, PID reused): it is never signalled;
-  the box is `stopped` with its disk and the mismatch is logged and reported;
-- checks 4-5 fail on a live, verified VMM: the worker hibernates it through its
-  API socket (pause, full snapshot, disk reflink: the capture path minus the guest
-  `sync`), then terminates it; if that fails too, the VMM is left running and
-  reported, and the next restart tries again.
+- check 1 fails (the PID now names another process): it is never signalled; the
+  box is `stopped` with its disk;
+- check 2 fails on the recorded, live VMM (another binary or guest kernel): it is
+  never signalled and keeps running; the box is `failed` and reported. Its TAP
+  stays, so no second VMM can start on its disk;
+- checks 4-5 (or re-attaching its network) fail on an adopted VMM: the worker
+  hibernates it with its normal hibernation; if that fails too, the VMM stays
+  adopted and running, and the box is reported.
 
 ### 5. The upgrader decides: hand over or hibernate
 

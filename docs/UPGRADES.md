@@ -11,7 +11,7 @@ is in [deploy/aws/README.md](../deploy/aws/README.md#upgrades-in-place).
 | --- | --- | --- | --- |
 | 0 config | nothing, or a file is rewritten | untouched | untouched |
 | 1 control plane | `open-workspaces.service` (controller and node agent) or `open-workspaces-dashboard.service` | untouched: processes, RAM, idle timers | dropped once; clients reconnect |
-| 2 runner | `open-workspaces-worker.service` | hibernated, worker swapped, resumed; processes continue when every capture still matches | dropped |
+| 2 runner | `open-workspaces-worker.service` | kept running and adopted by the new worker when the VMM and guest kernel stay ([hand-over](#worker-hand-over-keeps-boxes-running)); otherwise hibernated, worker swapped, resumed, and processes continue when every capture still matches | dropped |
 | 3 host | the instance | hibernated before, resumed after; a new host kernel boots RAM states cold | dropped |
 
 A release's class is the highest class of the units it moves on that host; a
@@ -470,6 +470,50 @@ stays hibernated until capacity frees. The node agent's heartbeats no longer wai
 on worker status, cache inventory or status-file writes. Protocol windows, worker
 interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are
 unchanged.
+
+## Worker hand-over keeps boxes running
+
+From 0.9.51 ([ADR 0011](adr/0011-worker-handover-keeps-vmms-running.md)) a
+worker restart that keeps Firecracker and the guest kernel does not hibernate
+anything: the old worker detaches from its VMMs (`ow down --detach`) and exits,
+the VMMs keep running in the unit's `guests` cgroup (`KillMode=process`), and
+the new worker enters their namespaces and adopts each one (PID and start time,
+Firecracker binary hash, guest kernel hash, then its console and log pipe
+through `pidfd_getfd`, its API and a guest command within 10 s). Guest
+processes, RAM and clock are untouched; only the worker swap is downtime.
+
+- **When**: `ow-host upgrade` plans `worker_path: handover` when no release the
+  worker crosses lists `vmm` or `guest-kernel`, both releases' `runtime.vmm`
+  and guest kernel hash are equal, the target's `runtime.handover.accepts`
+  covers the running release's `runtime.handover.speaks`, the worker's unit
+  files render unchanged, the controller setting `upgrade.worker_handover` is
+  on (default; the node agent stores it in `runner/controller-settings.json`)
+  and `--hibernate` was not passed. `--plan` prints the path and why. Otherwise
+  the worker restarts through hibernation as before. `ow-host restart --worker`
+  hands over when the running worker advertises `worker_handover_v1`.
+- **Journal**: the `hibernate` step becomes `handover`; it records each running
+  box's VMM PID, and after verify the journal's `adoption` says per box `kept`
+  (adopted, same PID) or what the new worker did instead.
+- **Per box fallback**: a VMM that is gone leaves its box stopped with its disk
+  (as a worker crash did); one that runs another binary or guest kernel is left
+  alone and its box marked failed (its TAP stays, so no second VMM starts on
+  its disk); an adopted VMM whose API or guest does not answer is hibernated,
+  and the upgrade's resume step wakes it. The journal error names every box not
+  kept running.
+- **Abort and rollback**: before the switch, the old worker starts again and
+  adopts its own VMMs. After it, rollback stops the new worker, which
+  hibernates every box (the unit's `ExecStop`), and the old one wakes them.
+- **Network**: the nftables policy is replaced in one transaction and
+  forwarding stays off until the uplink is back. `slirp4netns` restarts with
+  the worker, so guest connections to the Internet open during the swap are
+  reset; new ones work as soon as the worker is up. SSH and terminal streams
+  reconnect, as on a class 1 restart.
+- **First upgrade**: 0.9.51 itself installs through hibernation (0.9.50's
+  worker cannot detach, and the worker unit gains `KillMode=process`). From
+  0.9.51 on, `ow-host restart --worker` and worker-only upgrades hand over.
+
+A worker that crashes no longer takes its VMMs with it either: the next worker
+adopts them the same way.
 
 ## Order for 0.9.48 and later
 

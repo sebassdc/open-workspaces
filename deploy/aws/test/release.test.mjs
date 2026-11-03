@@ -39,6 +39,10 @@ test("the manifest is ordered, complete for this release and self-consistent", (
         assert.ok(e.catalog.min_reader <= e.catalog.schema, `${e.version}: catalog floor`);
         assert.ok(e.runtime.resumes.includes(e.runtime.vmm), `${e.version}: a worker resumes its own captures`);
         assert.match(e.runtime.guest_kernel_sha256, /^[0-9a-f]{64}$/);
+        if (e.runtime.handover) {
+            const [lo, hi] = e.runtime.handover.accepts;
+            assert.ok(lo <= e.runtime.handover.speaks && e.runtime.handover.speaks <= hi, `${e.version}: a worker adopts its own VMMs`);
+        }
     }
 });
 
@@ -54,6 +58,10 @@ test("this release's entry matches the code", () => {
     assert.ok(constant("RUNTIMES").includes(JSON.stringify(entry.runtime.vmm)), "the controller admits it");
     assert.deepEqual(entry.runtime.resumes, [entry.runtime.vmm], "Snapshot::resumable compares common::RUNTIME only");
     assert.match(read("crates/ow-core/src/runtime.rs"), /self\.runtime == crate::common::RUNTIME/);
+    // ADR 0011: the VMM record a worker writes is what a later worker's Vm::adopt reads.
+    const record = Number(read("crates/ow-core/src/vm.rs").match(/^const RECORD_FORMAT: u64 = (\d+);/m)[1]);
+    assert.equal(entry.runtime.handover?.speaks, record, "the VMM record format the worker writes");
+    assert.deepEqual(entry.runtime.handover.accepts, [record, record], "Vm::adopt reads its own record format only");
     assert.equal(entry.catalog.schema, Number(read("crates/ow/src/nodes.rs").match(/^pub\(crate\) const SCHEMA: i64 = (\d+);/m)[1]));
     const floors = [...read("crates/ow/src/catalog.rs").matchAll(/VALUES\('min_reader_schema','(\d+)'\)/g)].map((m) => Number(m[1]));
     assert.ok(floors.length, "catalog migrations declare their reader floor");

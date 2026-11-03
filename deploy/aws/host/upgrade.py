@@ -29,7 +29,7 @@ LOCK = f"{h.DATA}/upgrade.lock"
 MOVES = {"dashboard": "dashboard", "controller": "agent", "agent": "agent",
          "worker": "worker", "vmm": "worker", "guest-kernel": "worker"}
 PIN_CLASS = {"worker": 2, "agent": 1, "dashboard": 1}
-BEFORE_SWITCH = ("catalog-backup", "drain", "hibernate", "stop", "sync-images")
+BEFORE_SWITCH = ("catalog-backup", "drain", "hibernate", "handover", "stop", "sync-images")
 AFTER_SWITCH = ("switch", "start", "verify")
 TERMINAL = ("done", "aborted", "rolled-back", "failed")
 # Paused while a journal is open: a recovery run's capture or hash holds the
@@ -59,8 +59,37 @@ def gate(rule, captures):
     return cold
 
 
+def worker_path(entries, frm, to, rendered=(), enabled=True):
+    """How the worker restarts from release `frm` to `to` (ADR 0011): ("handover", why) when
+    the running VMMs can pass to the new worker, else ("hibernate", why)."""
+    if not enabled:
+        return "hibernate", "hand-over is off (upgrade.worker_handover or --hibernate)"
+    if "worker" in rendered:
+        return "hibernate", "the worker's unit files change"
+    lo, hi = sorted((version(frm), version(to)))
+    changed = sorted({c for e in entries.values() if lo < version(e["version"]) <= hi for c in e["changes"]}
+                     & {"vmm", "guest-kernel"})
+    if changed:
+        return "hibernate", f"{' and '.join(changed)} change"
+    old, new = entries[frm].get("runtime") or {}, entries[to].get("runtime") or {}
+    if not old or (old.get("vmm"), old.get("guest_kernel_sha256")) != (new.get("vmm"), new.get("guest_kernel_sha256")):
+        return "hibernate", "the VMM or guest kernel differs"
+    speaks = (old.get("handover") or {}).get("speaks")
+    if speaks is None:
+        return "hibernate", f"the {frm} worker cannot hand over its VMMs"
+    lo, hi = (new.get("handover") or {}).get("accepts", (1, 0))
+    if not lo <= speaks <= hi:
+        return "hibernate", f"the {to} worker cannot adopt VMMs from {frm} (hand-over {speaks}, accepts {lo}..{hi})"
+    return "handover", "same VMM and guest kernel: the new worker adopts the running VMMs"
+
+
+def handover_enabled():
+    """The controller's `upgrade.worker_handover`, as the node agent last received it."""
+    return (h.read_json(f"{h.RUNNER}/controller-settings.json") or {}).get("upgrade.worker_handover") is not False
+
+
 def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), captures=(), compat=None,
-         accept_cold=False, max_class=2, controller=None, installed=None):
+         accept_cold=False, max_class=2, controller=None, installed=None, handover=True):
     """The upgrade of one host from `pins` (pin -> release version) to version `target`.
 
     rendered: pins whose unit files the target release renders differently.
@@ -73,6 +102,7 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
     controller: on a runner host, the release its controller runs: the new agent must speak
               a protocol that controller accepts (controllers upgrade first).
     installed: optional installed unit pins; dormant pins still move, but do not restart.
+    handover: whether a worker restart may hand the running VMMs over (see worker_path).
     Returns the plan; raises Refused, naming what to do instead."""
     entries = {e["version"]: e for e in manifest["releases"]}
     if target not in entries:
@@ -150,6 +180,9 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
         plan_["gate"] = {"target": target, "resumes": goal["runtime"]["resumes"], "accept_cold": accept_cold,
                          "kernel_sha256": goal["runtime"]["guest_kernel_sha256"], "cpu": (compat or {}).get("cpu")}
         plan_["cold"] = gate(plan_["gate"], captures)
+    if "worker" in restart:
+        plan_["worker_path"], plan_["worker_path_why"] = worker_path(
+            entries, pins["worker"], move.get("worker", pins["worker"]), rendered, handover)
     if plan_["class"] > max_class:
         raise Refused(f"class {plan_['class']} ({', '.join(restart)}) exceeds --max-class {max_class}")
     return plan_
@@ -485,6 +518,24 @@ class HostOps:
                    "OW_ASSET_DIR": f"{h.SRV}/run/worker/assets"})
         h.systemctl("stop", h.UNITS["worker"])  # its stop hook finds no worker: a no-op
 
+    def handover(self, release):
+        # The old worker's own binary: it forgets its VMMs, which keep running, and exits;
+        # the unit's stop then finds no worker and leaves them (KillMode=process).
+        h.run([str(p(f"{h.SRV}/releases/{release}/bin/ow")), "--data-dir", h.RUNNER, "down", "--detach"],
+              user="ow", capture=False, timeout=120,
+              env={"HOME": "/srv/ow", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                   "OW_ASSET_DIR": f"{h.SRV}/run/worker/assets"})
+        h.systemctl("stop", h.UNITS["worker"])
+
+    def vmm_pids(self, boxes):
+        """The VMM PID each box's record names (machines/ID/vmm.json), for boxes that have one."""
+        pids = {}
+        for box in boxes:
+            record = h.read_json(f"{h.RUNNER}/machines/{box}/vmm.json")
+            if record and record.get("pid"):
+                pids[box] = record["pid"]
+        return pids
+
     def _quiesce(self, closing):
         script = ("import json,socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(1200); "
                   "s.connect(sys.argv[1]); s.sendall(json.dumps({'op':'quiesce','closing':sys.argv[2]=='1'}).encode()+b'\\n'); "
@@ -651,8 +702,14 @@ def execute(plan_, ops, frm, to, target_name):
             if plan_.get("gate"):
                 # The last gate: nothing can start now, so this is every capture the new worker meets.
                 j.value["cold"] = gate(plan_["gate"], ops.captures())
-            j.step("hibernate")
-            ops.hibernate_all(frm["worker"])
+            if plan_.get("worker_path") == "handover":
+                # The VMMs keep running; verify then finds each one adopted by its PID.
+                j.value["handover"] = ops.vmm_pids(j["resume"])
+                j.step("handover")
+                ops.handover(frm["worker"])
+            else:
+                j.step("hibernate")
+                ops.hibernate_all(frm["worker"])
         j.step("stop")
         for name in ("dashboard", "agent"):
             if name in restart and name != "worker":
@@ -675,7 +732,25 @@ def execute(plan_, ops, frm, to, target_name):
         j.value["error"] = f"{e}"
         rollback(j, ops)
         raise
+    if j.value.get("handover"):
+        j.value["adoption"] = adoption(j["handover"], ops)
     finish(j, ops)
+
+
+def adoption(handed, ops):
+    """Per box handed over: kept (same VMM PID, adopted) or what the new worker did instead.
+    A box it hibernated is woken by finish() like any other recorded box."""
+    now = ops.vmm_pids(list(handed))
+    report = {e.get("id"): e for e in (ops.worker_status() or {}).get("adoption") or []}
+    out = {}
+    for box, pid in handed.items():
+        entry = report.get(box) or {}
+        if entry.get("result") == "adopted" and now.get(box) == pid:
+            out[box] = "kept"
+        else:
+            out[box] = f"{entry.get('result', 'not adopted')}: {entry.get('detail') or 'no report'}"
+            say(f"{box} was not kept running ({out[box]})")
+    return out
 
 
 def version_of(release):
@@ -693,8 +768,11 @@ def finish(j, ops):
     j.step("undrain")
     ops.drain(False)
     h.clear_pending(set(j["restart"]))
-    if failed:
-        j.value["error"] = f"still hibernated (each wakes on its next connection): {', '.join(failed)}"
+    lost = sorted(box for box, result in (j.value.get("adoption") or {}).items() if result != "kept")
+    if failed or lost:
+        j.value["error"] = "; ".join(filter(None, (
+            lost and f"not kept running through the hand-over: {', '.join(lost)}",
+            failed and f"still hibernated (each wakes on its next connection): {', '.join(failed)}")))
         say(j.value["error"])
     ops.resume_timers(j["paused"])
     j.step("done")
@@ -823,7 +901,8 @@ def recover(ops=None, boot=False):
         finish(j, ops)
 
 
-def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None, controller=None, from_source=False):
+def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None, controller=None, from_source=False,
+            hibernate=False):
     ops = ops or HostOps()
     with locked():
         recover(ops)
@@ -855,7 +934,8 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
                        for n in h.ow("node", "list", timeout=30) if n["id"] != h.local_node() and not n.get("revoked")]
         common = dict(rendered=render_diff(target), pending=set(h.pending()), runners=runners,
                       compat=compat, accept_cold=accept_cold, max_class=max_class, controller=controller,
-                      installed=ops.units() if config["role"] == "controller" else None)
+                      installed=ops.units() if config["role"] == "controller" else None,
+                      handover=not hibernate and handover_enabled())
         current = {name: version_of(frm[name]) for name in pin_names}
         result = plan(target["manifest"], current, target["version"], captures=captures(compat) if "worker" in current else (), **common)
         say(json.dumps({"plan": result, "release": target["release"]}, indent=2))
@@ -886,14 +966,19 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
         return 0
 
 
-def restart_worker(ops=None):
-    """Class 2 restart on the same releases: drain, hibernate, restart, resume."""
+def restart_worker(ops=None, hibernate=False):
+    """Class 2 restart on the same releases: drain, hand over (or hibernate), restart, resume."""
     if h.role() == "controller":
         raise Refused("controller role has no worker to restart")
     ops = ops or HostOps()
     with locked():
         recover(ops)
         frm = h.pins()
-        execute({"class": 2, "restart": ["worker"], "move": {}, "catalog_backup": False}, ops, frm, dict(frm),
+        # The same release on both sides: the running worker says whether it can.
+        can = not hibernate and handover_enabled() and (ops.worker_status() or {}).get("worker_handover_v1") is True
+        path = ("handover", "same release") if can else ("hibernate", "hand-over is off or unsupported")
+        say(f"worker restart: {path[0]} ({path[1]})")
+        execute({"class": 2, "restart": ["worker"], "move": {}, "catalog_backup": False,
+                 "worker_path": path[0], "worker_path_why": path[1]}, ops, frm, dict(frm),
                 version_of(frm["worker"]))
         return 0

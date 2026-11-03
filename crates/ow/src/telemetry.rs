@@ -72,7 +72,7 @@ fn now() -> i64 {
 // Controller-held settings (one source; read on every acknowledgement).
 
 /// Allowed keys and their defaults.
-pub const KEYS: [(&str, &str); 9] = [
+pub const KEYS: [(&str, &str); 10] = [
     ("telemetry.enabled", "true"),
     ("telemetry.interval_s", "15"),
     ("telemetry.forward_endpoint", ""),
@@ -85,6 +85,9 @@ pub const KEYS: [(&str, &str); 9] = [
     (crate::dashboard_ui::SETTING, "builtin"),
     // Largest memory one box may be created or resized to; 0 means only the runner's budget limits it.
     ("limits.box_memory_mib", "0"),
+    // A worker upgrade that keeps the VMM and guest kernel hands running boxes to the new
+    // worker instead of hibernating them (docs/adr/0011).
+    ("upgrade.worker_handover", "true"),
 ];
 
 fn typed(key: &str, value: &str) -> Result<Value> {
@@ -98,6 +101,11 @@ fn typed(key: &str, value: &str) -> Result<Value> {
             "true" => Ok(json!(true)),
             "false" => Ok(json!(false)),
             _ => bail!("telemetry.enabled is true or false"),
+        },
+        "upgrade.worker_handover" => match value {
+            "true" => Ok(json!(true)),
+            "false" => Ok(json!(false)),
+            _ => bail!("upgrade.worker_handover is true or false"),
         },
         "telemetry.logs" => match value {
             "true" => Ok(json!(true)),
@@ -149,7 +157,7 @@ fn typed(key: &str, value: &str) -> Result<Value> {
 pub fn settings(db: &Connection) -> Result<Value> {
     // One query: it also runs with every acknowledgement.
     let stored: BTreeMap<String, String> = db
-        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key LIKE 'limits.%' OR key='config_version'")?
+        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key LIKE 'limits.%' OR key LIKE 'upgrade.%' OR key='config_version'")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut out = json!({});
@@ -192,7 +200,7 @@ pub fn set(root: &Path, key: &str, value: &str, actor: &str) -> Result<Value> {
 /// What the acknowledgement carries to agents.
 pub(crate) fn offer(db: &Connection) -> Value {
     settings(db)
-        .map(|s| json!({"enabled":s["telemetry.enabled"],"interval_s":s["telemetry.interval_s"],"version":s["version"]}))
+        .map(|s| json!({"enabled":s["telemetry.enabled"],"interval_s":s["telemetry.interval_s"],"version":s["version"],"worker_handover":s["upgrade.worker_handover"]}))
         .unwrap_or(json!({"enabled":true,"interval_s":15}))
 }
 
@@ -2123,6 +2131,23 @@ mod tests {
             box_id("legacy", SALT),
             "largest first"
         );
+    }
+
+    #[test]
+    fn worker_handover_is_a_controller_setting_offered_to_runners() {
+        let root = std::env::temp_dir().join(format!("ow-t-{}", crate::common::nonce().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let db = crate::nodes::db(&root).unwrap();
+        assert_eq!(
+            settings(&db).unwrap()["upgrade.worker_handover"],
+            json!(true)
+        );
+        assert_eq!(offer(&db)["worker_handover"], json!(true));
+        assert!(set(&root, "upgrade.worker_handover", "maybe", "t").is_err());
+        let s = set(&root, "upgrade.worker_handover", "false", "t").unwrap();
+        assert_eq!(s["upgrade.worker_handover"], json!(false));
+        assert_eq!(offer(&db)["worker_handover"], json!(false));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

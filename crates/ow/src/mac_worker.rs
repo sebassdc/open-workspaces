@@ -1140,6 +1140,9 @@ pub fn run(cli: Cli) -> Result<i32> {
         } => {
             bail!("down --hibernate is not supported on the Mac backend")
         }
+        Action::Down { detach: true, .. } => {
+            bail!("down --detach is not supported on the Mac backend")
+        }
         Action::Down { .. } => json!({"op":"shutdown"}),
         Action::Shell { id } => return crate::local_terminal::local(&root, &id),
         _ => bail!("unsupported Mac capability or local action"),
