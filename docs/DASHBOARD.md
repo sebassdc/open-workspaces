@@ -45,8 +45,10 @@ a machine shared with them) gives the machine to another login email with its
 disk, snapshots and running state; its shares end and the old owner keeps an
 admin share only if chosen. Pool admins get an owner email field in the create
 dialog, and owners and pool admins one in the fork dialog; pool admins also see
-other owners' machines under **Pool machines**, where they can fork, transfer or
-manage an operator-allowed AWS role. **Ownership changes**
+other owners' machines under **Pool machines**, where they can fork, transfer,
+start, stop, hibernate or resize them (against the owner's limits) or manage an
+operator-allowed AWS role, still without a terminal, console, snapshots or sharing;
+each lifecycle action is listed under **Ownership changes** for the owner. **Ownership changes**
 lists every transfer, and every machine made for you or from yours, with who did
 it. **Delete** (owner only, on a
 stopped or hibernated machine) removes it with its disk and every snapshot taken

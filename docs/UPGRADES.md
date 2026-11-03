@@ -180,6 +180,14 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
 - **gate**: again, with the staged kernel's hash and the boxes as they are now.
   Disk-only recovery points hold no RAM state and are not gated.
   With `--accept-cold` and backups configured, `ow-backup` runs first.
+- **timers**: when the journal opens, the upgrader records which of
+  `ow-recovery.timer` and `ow-backup.timer` are active, stops them (stopped, not
+  disabled) and stops a recovery run in flight; a recovery run's capture or hash
+  would otherwise hold the one-request worker during drain, start or verify, and a
+  killed upload is retried on its next run. A backup run in flight finishes: it
+  asks the worker for nothing. Exactly the recorded timers start again when the
+  journal reaches done, aborted or rolled-back. `ow-host apply` enables but does
+  not start them while a journal is open.
 - **hibernate**: the worker is quiesced first (it then refuses starts and wakes),
   so the running boxes read next are exactly the ones the old worker's own
   `down --hibernate` captures; they are recorded in the journal before it acts.
@@ -195,7 +203,10 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   restarts the old worker, which starts unquiesced).
 - **verify** (each unit against its own pin): the unit is active and its
   `/proc/PID/exe` is its pin's `bin/ow`; the worker answers with its pin's
-  version; the runner is online with the agent's and worker's versions; the
+  version (from a release with this note on, the worker answers `status` and
+  `egress-enable` on its own thread: while a long request such as a snapshot hash
+  holds it, `status` is the last answer marked `"busy": true`, with live
+  `internet`); the runner is online with the agent's and worker's versions; the
   controller listens on the tailnet address; the dashboard answers. A class 2
   upgrade with no box to resume runs a canary box.
 - **abort** (any failure before the switch): start the old worker if it is down
@@ -204,7 +215,9 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   verified on the old releases, then as abort. A box that does not resume stays
   hibernated (it wakes on its next connection) and is reported.
 - **recover**: every upgrade and every boot (`open-workspaces-recover.service`)
-  reads the journal first and aborts, rolls back or finishes.
+  reads the journal first and aborts, rolls back or finishes. It first stops the
+  recorded timers and any timer a reboot started again (adding those to the
+  record), so a recovered rollback meets no recovery run either.
 
 Old releases are pruned: every pinned release plus the two newest others stay.
 
@@ -464,3 +477,15 @@ Runner budgets may exceed 65,536 MiB, 64 vCPUs or 8 slots from 0.9.48. A control
 0.9.48 refuses such a heartbeat, so upgrade the controller before any runner whose host is that
 large (the fleet order already does). Snapshot verification is remembered across worker restarts
 (`verified.json`), so a restarted worker answers without re-hashing its snapshots.
+
+The release after 0.9.48 (no version bump in the change itself) adds three things. The upgrader
+pauses the backup and recovery timers while its journal is open (above). The worker answers
+`status` while busy. Box disks are attached with discard and the guest mounts its root with
+`discard`, so blocks a guest frees become holes again and snapshot hashing, copies and uploads skip
+them; each cold boot also runs one `fstrim /` in the background to return space freed before. A box
+gets discard at its next cold boot; a box resumed from a hibernation keeps the device it was
+captured with. The timer pause applies from the upgrade **after** the one that installs this
+release, because an upgrade runs the upgrader of the release it starts from. For the upgrade that
+installs it, stop `ow-recovery.timer` by hand first (`systemctl stop ow-recovery.timer`) and start
+it again after. The runtime string, guest kernel, worker interface and catalog schema are unchanged,
+so no capture is cold.

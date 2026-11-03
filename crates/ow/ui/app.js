@@ -116,11 +116,11 @@ function renderState() {
     const operations=(data.nodes||[]).find(n=>n.id===current.node)?.capabilities?.operations;
     const supports=op=>!operations || operations.includes(op);
     const owned = !current.role, admin = owned || current.role === 'admin', poolOnly = current.role === 'pool-admin';
-    // Pool access permits fork, transfer and AWS settings, without a guest session.
-    if (poolOnly) { if (live) $('detail-actions').append(action('Fork', () => openDialog('fork', current.id), !supports('fork'))); }
+    // Pool access permits fork, transfer, AWS settings and lifecycle, without a guest session.
+    if (poolOnly && live) $('detail-actions').append(action('Fork', () => openDialog('fork', current.id), !supports('fork')), action('Hibernate', () => operate({op: 'hibernate', id: current.id}), !supports('hibernate')), action('Stop', () => openDialog('stop', current.id)));
     else if (live) { $('detail-actions').append(action('Open Terminal', () => openTerminal(current.id))); if (admin) $('detail-actions').append(action('Snapshot', () => openDialog('snapshot', current.id), !supports('snapshot'))); $('detail-actions').append(action('Fork', () => openDialog('fork', current.id), !supports('fork')), action('Hibernate', () => operate({op: 'hibernate', id: current.id}), !supports('hibernate'))); if (admin) $('detail-actions').append(action('Stop', () => openDialog('stop', current.id))); }
     else if (current.state !== 'missing' && !current.unmade) { $('detail-actions').append(action(current.state === 'hibernated' ? 'Resume machine' : 'Start machine', () => operate({op: 'start', id: current.id}))); }
-    if (owned && current.state === 'stopped') $('detail-actions').append(action('Resize', () => openDialog('resize', current.id), !supports('resize')));
+    if ((owned || data.pool_admin) && current.state === 'stopped') $('detail-actions').append(action('Resize', () => openDialog('resize', current.id), !supports('resize')));
     if (owned && data.previews) $('detail-actions').append(action('Publish port', () => openDialog('publish', current.id), !supports('tunnel')));
     if (owned) $('detail-actions').append(action('Rename', () => openDialog('rename', current.id)), action('Share', () => openDialog('share', current.id)));
     if ((admin || data.pool_admin) && data.aws_identity?.enabled) $('detail-actions').append(action('AWS role', () => openDialog('aws-role', current.id)));
@@ -150,7 +150,7 @@ function renderState() {
   if (!data.snapshots.length) $('snapshot-list').append(element('div', 'No checkpoints yet. Select a running machine and capture a snapshot.', 'empty'));
   $('audit-list').replaceChildren(); $('audit-view').hidden = !(data.audit || []).length;
   for (const entry of data.audit || []) {
-    const what = {transfer: `transferred ${entry.machine} from ${entry.from} to ${entry.to}${entry.keep_access ? '; the old owner kept access' : ''}`, create: `created ${entry.machine} for ${entry.to}`, fork: `forked ${entry.from}/${entry.source} into ${entry.to}/${entry.machine}`}[entry.action];
+    const what = {transfer: `transferred ${entry.machine} from ${entry.from} to ${entry.to}${entry.keep_access ? '; the old owner kept access' : ''}`, create: `created ${entry.machine} for ${entry.to}`, fork: `forked ${entry.from}/${entry.source} into ${entry.to}/${entry.machine}`, start: `started ${entry.to}/${entry.machine}`, stop: `stopped ${entry.to}/${entry.machine}`, hibernate: `hibernated ${entry.to}/${entry.machine}`, resize: `resized ${entry.to}/${entry.machine}`}[entry.action];
     const row = element('p', `${entry.by} ${what} · ${ago(entry.at)}`); row.title = fullTime(entry.at); $('audit-list').append(row);
   }
   $('host-node-list').replaceChildren();

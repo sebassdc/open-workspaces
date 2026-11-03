@@ -1100,10 +1100,13 @@ def services():
     if unit_exists("open-workspaces-images.service"):
         systemctl("enable", "open-workspaces-images.service")
         systemctl("start", "--no-block", "open-workspaces-images.service")
-    if unit_exists("ow-recovery.timer"):
-        systemctl("enable", "--now", "ow-recovery.timer")
-    if unit_exists("ow-backup.timer"):
-        systemctl("enable", "--now", "ow-backup.timer")
+    import upgrade
+
+    # An open upgrade journal keeps them stopped; the upgrade starts them when it ends.
+    upgrading = (read_json(upgrade.JOURNAL) or {}).get("step") not in (None, *upgrade.TERMINAL)
+    for timer in upgrade.TIMERS:
+        if unit_exists(timer):
+            systemctl("enable", *() if upgrading else ("--now",), timer)
 
 
 def act(config, old):

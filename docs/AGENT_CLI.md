@@ -168,8 +168,9 @@ print one JSON value on stdout, without an interactive prompt or progress banner
 - `create NAME --pool POOL`: place it on a runner in that placement pool
   (default `default`). Other pools are for pool admins and workload tokens bound
   to that pool; see [placement pools](USERS.md#placement-pools).
-- `audit`: ownership changes that involve you (as actor, old or new owner), newest
-  first: who, what, when, from and to.
+- `audit`: ownership changes that involve you (as actor, old or new owner), and
+  pool admins' start, stop, hibernate and resize of your boxes, newest first: who,
+  what, when, from and to.
 - `delete-snapshot NAME SNAPSHOT`: delete one of your named snapshots of that
   workspace (the machine it captured). Workspaces forked or restored from it keep
   their own disks, and the snapshot name can be used again. It needs the

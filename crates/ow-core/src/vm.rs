@@ -481,8 +481,10 @@ impl Vm {
             // Dirty tracking lets repeat captures write only the pages that changed.
             json!({"vcpu_count":cpus,"mem_size_mib":memory,"track_dirty_pages":true}),
         )?;
-        self.api("PUT", "/boot-source", json!({"kernel_image_path":kernel,"boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"}))?;
-        self.api("PUT", "/drives/rootfs", json!({"drive_id":"rootfs","path_on_host":"disk.ext4","is_root_device":true,"is_read_only":false}))?;
+        // Discard keeps box disks sparse: blocks the guest frees become holes again, which
+        // snapshot hashing and copies skip. Firecracker supports it on the default Sync engine.
+        self.api("PUT", "/boot-source", json!({"kernel_image_path":kernel,"boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw rootflags=discard init=/init"}))?;
+        self.api("PUT", "/drives/rootfs", json!({"drive_id":"rootfs","path_on_host":"disk.ext4","is_root_device":true,"is_read_only":false,"discard":true}))?;
         self.api(
             "PUT",
             "/network-interfaces/net1",
@@ -491,6 +493,9 @@ impl Vm {
         self.api("PUT", "/actions", json!({"action_type":"InstanceStart"}))?;
         self.read_until(b"OW_GUEST_READY", Duration::from_secs(20))?;
         self.checked("true")?;
+        // Online discard covers blocks freed from now on; one trim in the background returns
+        // what was freed before (a disk that ran without discard). Images without fstrim skip it.
+        self.checked("(fstrim / || /ow/bin/busybox fstrim /) >/dev/null 2>&1 &")?;
         self.memory_base = MemoryBase::Zero;
         Ok(())
     }

@@ -59,7 +59,12 @@ pub(super) fn admission(c: &Catalog, user: i64, request: &Value, kind: Kind) -> 
     } else {
         ensure!(c.db.query_row("SELECT node<>'' AND json_extract(metadata,'$.state') IN ('stopped','hibernated') FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|r.get::<_,bool>(0))?,"park requires a stopped or hibernated placement");
     }
-    c.begin_transfer(user, key, &input)
+    let t = c.begin_transfer(user, key, &input)?;
+    if kind == Kind::Wake {
+        // Waking a parked box starts it: a pool admin's wake of another owner's box is audited.
+        c.audit_lifecycle(t.operation, user, "start", &physical)?;
+    }
+    Ok(t)
 }
 fn join_wake(c: &Catalog, user: i64, request: &Value, t: Transfer) -> Result<Transfer> {
     let cold = request["accept_cold"].as_bool().unwrap_or(false);

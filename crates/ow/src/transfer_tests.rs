@@ -1077,6 +1077,38 @@ fn concurrent_connection_admission_has_one_wake_and_one_reservation() {
     );
 }
 
+#[test]
+fn a_pool_admins_wake_of_a_parked_box_is_audited_for_its_owner() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    let mut c = f.shared.lock().unwrap();
+    c.pool_admins = vec!["admin@example.test".into()];
+    let admin = c
+        .user(&Identity {
+            issuer: "test".into(),
+            subject: "admin".into(),
+            email: "admin@example.test".into(),
+        })
+        .unwrap();
+    let request = json!({"op":"start","id":"owner@example.test/box","operation_key":"admin-wake"});
+    let wake = parking::admission(&c, admin, &request, Kind::Wake).unwrap();
+    // A retry of the same key keeps one row.
+    parking::admission(&c, admin, &request, Kind::Wake).unwrap();
+    let rows: Vec<(i64, String, String, i64, i64)> =
+        c.db.prepare("SELECT operation,action,machine,actor,to_owner FROM audit")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+    assert_eq!(
+        rows,
+        [(wake.operation, "start".into(), "box".into(), admin, f.user)]
+    );
+}
+
 fn wake_call(
     f: &Fixture,
     peers: &RefCell<Peers>,

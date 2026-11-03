@@ -126,6 +126,94 @@ impl<T: Streams> Drop for Awake<T> {
     }
 }
 
+/// What `status` reads: the runtime, or a stand-in in tests.
+trait Status {
+    fn status(&mut self) -> Result<Value>;
+}
+impl Status for Runtime {
+    fn status(&mut self) -> Result<Value> {
+        self.request(&json!({"op":"status"}))
+    }
+}
+
+/// Accepts control connections on its own thread. `status` and `egress-enable` are
+/// answered here, so a long request on the worker thread (a snapshot hash holds the
+/// runtime for minutes) never hides the worker from the upgrader, the agent or the
+/// uplink; every other request goes to the worker thread in arrival order. While the
+/// runtime is held, `status` is the last one it answered, marked `busy`, with live
+/// `internet` (`disk_observed_unix_s` dates its disk figures).
+fn control<T: Status + Send + 'static>(
+    listener: UnixListener,
+    runtime: Arc<Mutex<T>>,
+    stopping: Arc<AtomicBool>,
+    requests: std::sync::mpsc::Sender<(UnixStream, Value)>,
+) {
+    let mut last = runtime.lock().ok().and_then(|mut r| r.status().ok());
+    std::thread::spawn(move || {
+        while !stopping.load(Ordering::SeqCst) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => {
+                    // Dropping `requests` stops the worker thread with this error.
+                    eprintln!("control listener: {error:#}");
+                    return;
+                }
+            };
+            let request = (|| -> Result<Value> {
+                assert_owner(&stream)?;
+                stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+                wire::line(&mut stream)
+            })();
+            let request = match request {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("control request: {error:#}");
+                    continue;
+                }
+            };
+            let response = match request["op"].as_str() {
+                Some("status") => match runtime.try_lock() {
+                    Ok(mut runtime) => {
+                        let status = runtime.status();
+                        if let Ok(value) = &status {
+                            last = Some(value.clone());
+                        }
+                        Some(wire::response(status))
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => last.clone().map(|mut value| {
+                        value["busy"] = json!(true);
+                        value["internet"] = json!(network::enabled());
+                        wire::response(Ok(value))
+                    }),
+                    Err(std::sync::TryLockError::Poisoned(_)) => Some(wire::response(Err(
+                        anyhow::anyhow!("runtime lock poisoned"),
+                    ))),
+                },
+                Some("egress-enable") => Some(wire::response(
+                    network::enable(&request["host_addresses"]).map(|_| json!({"enabled":true})),
+                )),
+                _ => None,
+            };
+            match response {
+                Some(response) => {
+                    if let Err(error) = wire::send(&mut stream, &response) {
+                        eprintln!("control reply: {error:#}");
+                    }
+                }
+                None => {
+                    if requests.send((stream, request)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn worker(root: PathBuf) -> Result<()> {
     unsafe {
         libc::umask(0o077);
@@ -159,6 +247,8 @@ fn worker(root: PathBuf) -> Result<()> {
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     let stopping = Arc::new(AtomicBool::new(false));
+    let (requests, incoming) = std::sync::mpsc::channel();
+    control(listener, runtime.clone(), stopping.clone(), requests);
     let terminals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut idle_check = Instant::now();
     // Live forks whose capture a sealing thread finished: (reply, parent, child, capture).
@@ -188,14 +278,11 @@ fn worker(root: PathBuf) -> Result<()> {
                 }
             }
         }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
+        match incoming.recv_timeout(Duration::from_millis(10)) {
+            Ok((mut stream, mut request)) => {
                 let runtime = runtime.clone();
                 let stopping = stopping.clone();
                 let result = (|| -> Result<()> {
-                    assert_owner(&stream)?;
-                    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
-                    let mut request = wire::line(&mut stream)?;
                     let operation = request["op"].as_str().unwrap_or("");
                     if operation == "ssh" {
                         let connection = (|| -> Result<_> {
@@ -299,10 +386,6 @@ fn worker(root: PathBuf) -> Result<()> {
                                 wire::send(&mut stream, &wire::response(Err(error)))?;
                             }
                         }
-                    } else if operation == "egress-enable" {
-                        let result = network::enable(&request["host_addresses"])
-                            .map(|_| json!({"enabled":true}));
-                        wire::send(&mut stream, &wire::response(result))?;
                     } else if operation == "shutdown" {
                         runtime
                             .lock()
@@ -365,10 +448,10 @@ fn worker(root: PathBuf) -> Result<()> {
                     eprintln!("control request: {error:#}");
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10))
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("the control listener stopped")
             }
-            Err(error) => return Err(error.into()),
         }
     }
     fs::remove_file(socket)?;
@@ -1087,6 +1170,66 @@ pub fn run(cli: Cli) -> Result<i32> {
         serde_json::to_string_pretty(&wire::request(&root, request)?)?
     );
     Ok(0)
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    struct Fake(u64);
+    impl Status for Fake {
+        fn status(&mut self) -> Result<Value> {
+            self.0 += 1;
+            Ok(json!({"version":"fixture","answered":self.0}))
+        }
+    }
+
+    #[test]
+    fn status_answers_while_a_long_request_holds_the_runtime() {
+        let root = std::env::temp_dir().join(format!("ow-control-{}", vm::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let runtime = Arc::new(Mutex::new(Fake(0)));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (requests, incoming) = std::sync::mpsc::channel();
+        control(listener, runtime.clone(), stopping.clone(), requests);
+        let idle = wire::request(&root, json!({"op":"status"})).unwrap();
+        assert_eq!(
+            (idle["answered"].clone(), idle.get("busy")),
+            (json!(2), None)
+        );
+
+        let hashing = runtime.lock().unwrap(); // the worker thread inside a long request
+        let started = Instant::now();
+        let busy = wire::request(&root, json!({"op":"status"})).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            (
+                busy["answered"].clone(),
+                busy["busy"].clone(),
+                busy["version"].clone()
+            ),
+            (json!(2), json!(true), json!("fixture")),
+            "the last answer, marked busy"
+        );
+        assert!(busy["internet"].is_boolean());
+
+        let queued = {
+            let root = root.clone();
+            std::thread::spawn(move || wire::request(&root, json!({"op":"list"})))
+        };
+        let (mut stream, request) = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            request["op"], "list",
+            "other requests go to the worker thread"
+        );
+        drop(hashing);
+        wire::send(&mut stream, &json!({"ok":true,"result":["box"]})).unwrap();
+        assert_eq!(queued.join().unwrap().unwrap(), json!(["box"]));
+        stopping.store(true, Ordering::SeqCst);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]
