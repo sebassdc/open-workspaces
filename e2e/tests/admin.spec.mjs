@@ -70,8 +70,8 @@ test('pool admin sees and transfers another owner\'s unshared machine', async ({
   const box = card(admin, `${user}@example.test/team-box`);
   await expect(box).toContainText(`Owned by ${user}@example.test`);
   await box.click();
-  // Pool admin reaches it only to fork or transfer it.
-  for (const name of ['Open Terminal', 'Stop', 'Share', 'Rename', 'Delete', 'Hibernate']) await expect(detailAction(admin, name)).toHaveCount(0);
+  // Pool admin reaches it without a guest session, shares, its name or deletion.
+  for (const name of ['Open Terminal', 'Snapshot', 'Share', 'Rename', 'Delete']) await expect(detailAction(admin, name)).toHaveCount(0);
   await detailAction(admin, 'Transfer').click();
   await admin.getByLabel('New owner email').fill(`${next}@example.test`);
   await admin.getByRole('button', {name: 'Transfer machine'}).click();
@@ -86,4 +86,27 @@ test('pool admin sees and transfers another owner\'s unshared machine', async ({
   await expect(card(heir.page, 'team-box')).toBeVisible();
   await deleteMachines(heir.context);
   await heir.context.close();
+});
+
+test('pool admin stops, resizes and starts another owner\'s machine, audited for the owner', async ({dashboard: page, browser, user}) => {
+  await machines(page, 'ops-box');
+  const address = `${user}@example.test/ops-box`;
+  const {context, page: admin} = await as(browser, 'pooladmin');
+  await card(admin, address).click();
+  await detailAction(admin, 'Stop').click();
+  await admin.getByRole('button', {name: 'Stop machine'}).click();
+  await expect(notice(admin)).toHaveText('Machine stopped. Disk changes retained.');
+  await detailAction(admin, 'Resize').click();
+  await admin.getByLabel('Root disk (GiB)').fill('64');
+  await admin.getByRole('button', {name: 'Resize machine'}).click();
+  await expect(notice(admin)).toHaveText('Machine resized. Start it to grow the filesystem.');
+  await detailAction(admin, 'Start machine').click();
+  await expect(notice(admin)).toHaveText('Machine started.');
+  for (const name of ['Open Terminal', 'Snapshot', 'Share', 'Rename', 'Delete']) await expect(detailAction(admin, name)).toHaveCount(0);
+  await context.close();
+
+  await page.reload();
+  await expect(card(page, 'ops-box')).toContainText('64.0 GiB disk');
+  await expect(card(page, 'ops-box')).toContainText('running');
+  for (const what of ['stopped', 'resized', 'started']) await expect(page.locator('#audit-list')).toContainText(`pooladmin@example.test ${what} ${address}`);
 });

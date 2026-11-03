@@ -165,8 +165,9 @@ print one JSON value on stdout, without an interactive prompt or progress banner
   (the machine's owner or a pool admin; works with `--node` too): the new box is made in
   that owner's name space and counts against their limits. A fork inherits no
   shares or SSH keys.
-- `audit`: ownership changes that involve you (as actor, old or new owner), newest
-  first: who, what, when, from and to.
+- `audit`: ownership changes that involve you (as actor, old or new owner), and
+  pool admins' start, stop, hibernate and resize of your boxes, newest first: who,
+  what, when, from and to.
 - `delete-snapshot NAME SNAPSHOT`: delete one of your named snapshots of that
   workspace (the machine it captured). Workspaces forked or restored from it keep
   their own disks, and the snapshot name can be used again. It needs the

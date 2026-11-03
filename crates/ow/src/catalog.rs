@@ -356,12 +356,18 @@ pub fn share_unlocked(root: &Path, identity: &Identity, request: &Value) -> Resu
     share_on(&mut db, user, op, request)
 }
 
+const AUDIT_COLUMNS: &str = "(id INTEGER PRIMARY KEY, operation INTEGER NOT NULL UNIQUE, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, actor INTEGER NOT NULL REFERENCES users(id), action TEXT NOT NULL CHECK(action IN ('transfer','create','fork','start','stop','hibernate','resize')), machine TEXT NOT NULL, source TEXT, from_owner INTEGER REFERENCES users(id), to_owner INTEGER NOT NULL REFERENCES users(id), keep_access INTEGER NOT NULL DEFAULT 0)";
+
 /// What a grantee may do on a machine shared with them. Resize, delete, rename, transfer and
-/// sharing stay with the owner. A pool admin reaches any box to transfer, fork or manage its AWS role.
+/// sharing stay with the owner. A pool admin reaches any box to transfer, fork, manage its AWS
+/// role, and start, stop, hibernate or resize it; never its guest data, shares, name or deletion.
 fn permitted(role: &str, op: &str) -> bool {
     match role {
         "owner" => true,
-        "pool-admin" => matches!(op, "transfer" | "fork" | "aws-role"),
+        "pool-admin" => matches!(
+            op,
+            "transfer" | "fork" | "aws-role" | "start" | "stop" | "hibernate" | "resize"
+        ),
         "admin" => !matches!(op, "resize" | "delete" | "rename" | "transfer"),
         "use" => matches!(
             op,
@@ -440,10 +446,24 @@ impl Catalog {
           -- Never reassign an origin to another box/port: browser storage and service workers persist.
           CREATE TABLE IF NOT EXISTS publications(https_port INTEGER PRIMARY KEY CHECK(https_port BETWEEN 11000 AND 65535),physical TEXT NOT NULL,guest_port INTEGER NOT NULL CHECK(guest_port BETWEEN 1 AND 65535),active INTEGER NOT NULL DEFAULT 0,UNIQUE(physical,guest_port));
           CREATE TABLE IF NOT EXISTS grants(physical TEXT NOT NULL, grantee INTEGER NOT NULL REFERENCES users(id), role TEXT NOT NULL CHECK(role IN ('use','admin')), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(physical,grantee));
-          -- Additive too: ownership changes (transfer, create or fork for another owner), shown to
-          -- the actor and both owners. An older binary neither writes nor shows it.
-          CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, operation INTEGER NOT NULL UNIQUE, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, actor INTEGER NOT NULL REFERENCES users(id), action TEXT NOT NULL CHECK(action IN ('transfer','create','fork')), machine TEXT NOT NULL, source TEXT, from_owner INTEGER REFERENCES users(id), to_owner INTEGER NOT NULL REFERENCES users(id), keep_access INTEGER NOT NULL DEFAULT 0);
           ")?;
+        // Additive too: ownership changes (transfer, create or fork for another owner) and pool
+        // admins' lifecycle actions on others' boxes, shown to the actor and the owners. An older
+        // binary neither writes nor shows it. SQLite widens a CHECK only by rebuilding the table.
+        db.execute_batch(&format!("CREATE TABLE IF NOT EXISTS audit{AUDIT_COLUMNS};"))?;
+        let audit: String = db.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !audit.contains("'resize'") {
+            db.execute_batch(&format!(
+                "CREATE TABLE audit_v2{AUDIT_COLUMNS};
+              INSERT INTO audit_v2 SELECT * FROM audit;
+              DROP TABLE audit;
+              ALTER TABLE audit_v2 RENAME TO audit;"
+            ))?;
+        }
         if version == 1 {
             // Machine and snapshot IDs occupy separate worker directories and may match.
             db.execute_batch("CREATE TABLE resources_v2(owner INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL CHECK(kind IN ('machine','snapshot')), name TEXT NOT NULL, physical TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(owner,kind,name), UNIQUE(kind,physical));
@@ -605,8 +625,9 @@ impl Catalog {
         Ok(self
             .db
             .query_row(
-                "SELECT CASE WHEN r.owner=?1 THEN r.name ELSE u.email||'/'||r.name END FROM resources r JOIN users u ON u.id=r.owner WHERE r.kind=?2 AND r.physical=?3 AND (r.owner=?1 OR (r.kind='machine' AND EXISTS(SELECT 1 FROM grants g WHERE g.physical=r.physical AND g.grantee=?1)))",
-                params![user, kind, physical],
+                "SELECT CASE WHEN r.owner=?1 THEN r.name ELSE u.email||'/'||r.name END FROM resources r JOIN users u ON u.id=r.owner WHERE r.kind=?2 AND r.physical=?3 AND (r.owner=?1 OR (r.kind='machine' AND (?4 OR EXISTS(SELECT 1 FROM grants g WHERE g.physical=r.physical AND g.grantee=?1))))",
+                // Pool admins already see every box by its owner's address in the pool list.
+                params![user, kind, physical, kind == "machine" && self.pool_admin(user)?],
                 |r| r.get(0),
             )
             .optional()?)
@@ -679,7 +700,8 @@ impl Catalog {
             .db
             .query_row("SELECT email FROM users WHERE id=?1", [user], |r| r.get(0))?)
     }
-    /// Record an ownership change for the actor and both owners to see. A replay keeps one row.
+    /// Record an ownership change, or a pool admin's lifecycle action, for the actor and the
+    /// owners to see. A replay keeps one row.
     #[allow(clippy::too_many_arguments)]
     fn audit(
         &self,
@@ -693,6 +715,28 @@ impl Catalog {
         keep_access: bool,
     ) -> Result<()> {
         self.db.execute("INSERT INTO audit(operation,actor,action,machine,source,from_owner,to_owner,keep_access) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(operation) DO NOTHING",params![operation,actor,action,machine,source,from,to,keep_access])?;
+        Ok(())
+    }
+    /// Audit a pool admin's start, stop, hibernate or resize of another owner's box when it is
+    /// dispatched, so an effect whose outcome is lost is still on record. `operation` is the actor's.
+    pub(crate) fn audit_lifecycle(
+        &self,
+        operation: i64,
+        actor: i64,
+        action: &str,
+        physical: &str,
+    ) -> Result<()> {
+        if !matches!(action, "start" | "stop" | "hibernate" | "resize") {
+            return Ok(());
+        }
+        let (owner, name): (i64, String) = self.db.query_row(
+            "SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1",
+            [physical],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if owner != actor && self.pool_admin(actor)? {
+            self.audit(operation, actor, action, &name, None, None, owner, false)?;
+        }
         Ok(())
     }
     /// Only a machine's owner or a pool admin forks it into someone else's name space.
@@ -3070,11 +3114,13 @@ impl Catalog {
                 &name
             };
             self.db.execute("INSERT INTO operations(owner,op,resource,state,node,retry_key,request) VALUES(?1,?2,?3,'pending',?4,?5,?6)",params![owner,op,resource,node,key,fingerprint])?;
+            let operation = self.db.last_insert_rowid();
+            self.audit_lifecycle(operation, user, &op, &physical)?;
             if op == "snapshot" {
                 // A new capture supersedes a failed reservation, not a known sealed artifact.
                 self.db.execute("UPDATE resources SET metadata=json_set(metadata,'$.state','pending'),updated_at=CURRENT_TIMESTAMP WHERE owner=?1 AND kind='snapshot' AND physical=?2 AND json_extract(metadata,'$.state')='failed'",params![user,request["name"].as_str().context("snapshot ID")?])?;
             }
-            Ok((physical, node, target, self.db.last_insert_rowid(), None))
+            Ok((physical, node, target, operation, None))
         })();
         let (physical, node, target, operation, cached) = match prepared {
             Ok(p) => {
