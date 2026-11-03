@@ -3030,15 +3030,16 @@ impl Catalog {
                         ))
                         .into());
                     }
+                    // A fork's child stays on its runner; outside `default` that needs a pool admin,
+                    // also for a retry of someone else's earlier attempt.
+                    let pool = self.node_pool(&node)?;
+                    if pool != "default" && !self.pool_admin(user)? {
+                        return Err(limits::Rejection(format!(
+                            "machine '{name}' is on a runner in pool '{pool}'; only a pool admin can fork there"
+                        ))
+                        .into());
+                    }
                     if !existing && new_child {
-                        // A fork's child stays on its runner; outside `default` that needs a pool admin.
-                        let pool = self.node_pool(&node)?;
-                        if pool != "default" && !self.pool_admin(user)? {
-                            return Err(limits::Rejection(format!(
-                                "machine '{name}' is on a runner in pool '{pool}'; only a pool admin can fork there"
-                            ))
-                            .into());
-                        }
                         self.db.execute(
                             "UPDATE resources SET node=?1 WHERE kind='machine' AND physical=?2",
                             params![node, target],

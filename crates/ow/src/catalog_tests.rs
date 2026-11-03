@@ -4864,6 +4864,17 @@ fn pools_take_only_creates_that_ask_from_admins_or_a_grant() {
     )
     .unwrap();
     assert_eq!(node(&c, p, "admin-copy"), "beta");
+    // Nor can the owner retry a pool admin's failed fork made for them.
+    *fake.reject.lock().unwrap() = Some("fork".into());
+    assert!(
+        c.operation(p, json!({"op":"fork","id":"alice@example.test/gift","child":"retried","owner":"alice@example.test"}))
+            .is_err()
+    );
+    *fake.reject.lock().unwrap() = None;
+    let retry = c
+        .operation(a, json!({"op":"fork","id":"gift","child":"retried"}))
+        .unwrap_err();
+    assert!(retry.to_string().contains("only a pool admin"), "{retry:#}");
     // A pending create keeps its runner only for a retry that asks for the same pool.
     *fake.reject.lock().unwrap() = Some("create".into());
     let mut stuck = create("stuck");
