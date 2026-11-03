@@ -2,6 +2,45 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.50",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard",
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Pool admins start, stop, hibernate and resize any owner's box (resize checked against the owner's limits), each audited for the owner; the audit table is rebuilt once to accept the new actions (older readers keep working). Upgrades pause ow-recovery.timer and ow-backup.timer while the journal is open and restore them when it closes; recover() pauses them too; apply leaves them stopped during an open upgrade. The worker answers status (marked busy, live internet) and egress-enable on a separate control thread while a long request such as a snapshot hash holds it. Box disks get virtio-blk discard with rootflags=discard and one background fstrim per cold boot, so freed guest blocks become holes again. developer-images keeps the local image when the store pins none. Class 2: the worker restarts (running boxes hibernate and resume). The upgrade that installs this still runs the previous upgrader: stop ow-recovery.timer by hand first."
+    },
+    {
       "version": "0.9.49",
       "class": 1,
       "changes": [
