@@ -580,10 +580,25 @@ fn unpublish(root: &Path, id: &str, port: u16) -> Result<()> {
 /// A service stop: whatever stays running after the stop command is killed, so retry
 /// until every machine is hibernated (a busy machine, e.g. one still resuming, frees
 /// its lock; a failed capture is tried again) instead of giving up. Starts stay refused.
+/// The control socket is missing or nobody listens on it: the worker is gone.
+fn no_worker(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            )
+        })
+    })
+}
+
 fn hibernate_all_waiting(root: &Path) {
     loop {
         match hibernate_round(root, Duration::from_secs(24 * 3600)) {
             Ok(()) => return,
+            // It died (before or during the stop): nothing is left for it to hibernate,
+            // and its VMMs wait for the next worker (ADR 0011).
+            Err(e) if no_worker(&e) => return eprintln!("no worker answers: {e:#}"),
             Err(e) => eprintln!("{e:#}; retrying in 5 s, starts stay refused"),
         }
         std::thread::sleep(Duration::from_secs(5));
@@ -1060,7 +1075,7 @@ pub fn run(cli: Cli) -> Result<i32> {
                 return Ok(0);
             }
             // A socket nobody listens on is a worker that died: nothing to hibernate.
-            if hibernate && UnixStream::connect(root.join("control.sock")).is_ok() {
+            if hibernate && root.join("control.sock").exists() {
                 if wait {
                     hibernate_all_waiting(&root);
                 } else {
@@ -1079,8 +1094,12 @@ pub fn run(cli: Cli) -> Result<i32> {
             } else {
                 unpublish_all(&root, None)?;
             }
-            if UnixStream::connect(root.join("control.sock")).is_ok() {
-                wire::request(&root, json!({"op":"shutdown"}))?;
+            if root.join("control.sock").exists() {
+                match wire::request(&root, json!({"op":"shutdown"})) {
+                    // A socket left by a worker that died: nothing to shut down.
+                    Err(e) if no_worker(&e) => fs::remove_file(root.join("control.sock"))?,
+                    other => drop(other?),
+                }
                 let started = Instant::now();
                 while root.join("control.sock").exists() {
                     ensure!(
@@ -1399,6 +1418,18 @@ mod down_tests {
             .iter()
             .map(|r| r["op"].as_str().unwrap().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn a_service_stop_finds_no_worker_behind_a_dead_workers_socket() {
+        // A worker that crashed leaves its socket; the stop hook must not retry forever.
+        let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        drop(UnixListener::bind(root.join("control.sock")).unwrap());
+        let started = Instant::now();
+        hibernate_all_waiting(&root);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

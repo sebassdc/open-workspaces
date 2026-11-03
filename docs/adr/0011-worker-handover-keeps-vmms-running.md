@@ -87,9 +87,9 @@ unknown, so its next capture is a full one.
 An adopted VMM is not this process's child: liveness and kill go through its
 pidfd (poll for exit, `pidfd_send_signal`), never a PID read from disk.
 
-### 4. A failed adoption falls back to hibernation, never to a lost box
+### 4. A failed adoption falls back to hibernation or a cold boot, never to a lost disk
 
-No VMM is ever left running that no worker manages. Per box:
+No VMM is left running that no worker manages, except where noted below. Per box:
 
 - check 1 fails: the recorded process is gone (a PID that now names another
   process is never signalled). Its TAP and record are cleaned; the box keeps its
@@ -104,9 +104,23 @@ No VMM is ever left running that no worker manages. Per box:
 - checks 4-5 (or re-attaching its network) fail on an adopted VMM: it stays
   adopted and running, reported `unresponsive`. The worker does not hibernate it
   while starting (that would hold the new worker, and the upgrader's quiesce, for
-  as long as its RAM takes to write); the upgrader hibernates it after verify and
-  its resume step wakes it. If that hibernation fails too, the box keeps running
-  under the new worker and is reported.
+  as long as its RAM takes to write); after verify the upgrader asks the worker
+  (`hibernate-unresponsive`) to hibernate it with its placement authority, without
+  the guest `sync` a dead console cannot answer (RAM and disk are saved paused
+  together), and its resume step wakes it. If that hibernation fails too, the box
+  keeps running under the new worker and is reported.
+
+After a hand-over the upgrader's resume step also boots again, cold, every box
+that was running and came back `stopped` (its VMM gone or ended): its RAM state
+is lost, its disk and its uptime as a box are not.
+
+Not covered: an unreadable record, a `pidfd_open` failing for lack of fds or
+memory, or a kill that fails leave that VMM running with its record and TAP (the
+box cannot start a second VMM on its disk, and the next worker tries again); a
+worker that dies between spawning a VMM and writing its record leaves that VMM
+unrecorded. An adopted box keeps the in-guest setup it was started with (network,
+tools bundle): a worker release that changes that setup reaches it at its next
+cold boot or wake.
 
 Checks 2-3 are kept out of an upgrade's way before it starts (§5): the upgrader
 compares the Firecracker and guest kernel bytes of both releases, and hands over
@@ -129,7 +143,8 @@ these holds, and otherwise hibernate exactly as today:
 - the controller setting `upgrade.worker_handover` is on (the default) and
   `--hibernate` was not passed.
 
-The plan prints which path it takes and why. Just before the hand-over the
+The plan prints which path it takes and why. Idle hibernation stops while the
+worker is quiesced, so nothing new holds the worker in front of the detach. Just before the hand-over the
 upgrader checks once more on the host itself: the running worker advertises
 `worker_handover_v1`, and the staged release's Firecracker binary and guest
 kernels hash the same as the running one's (the manifest's runtime label alone
@@ -141,9 +156,12 @@ forgets its VMMs without killing them and exits its loop), the unit stops, the
 pin switches, the new worker starts and adopts. **verify** is unchanged; after
 it the journal's `adoption` says per box whether it was kept (adopted with its
 recorded VMM PID) or what happened instead, and the journal's error names every
-box not kept. A box not kept never rolls the upgrade back: a rollback would
-hibernate every other box. **abort** before the switch: the old worker restarts
-and adopts its own VMMs. **rollback** after the switch takes today's path: the
+box not kept. The report is its own journal step (`adoption`), so an upgrader
+interrupted there finishes the upgrade on recover instead of rolling it back. A box
+not kept never rolls the upgrade back: a rollback would hibernate every other box.
+**abort** after the hand-over began restarts the worker unit: its stop hibernates
+whatever is still attached (a detach still queued) and its start adopts whatever
+was handed over. **rollback** after the switch takes today's path: the
 new worker hibernates the boxes on stop and the old one wakes them.
 
 ### 6. Switch and advertisement
@@ -166,8 +184,10 @@ advertises it with every heartbeat, and `ow nodes` shows it per node.
 - Published HTTP ports (`ow publish` gateways) stop with the old worker, as on any
   worker stop; the boxes keep running.
 - A reboot or instance stop in the seconds between the old worker's detach and the
-  new worker's start finds no worker to hibernate the boxes: they boot cold from
-  their disks.
+  new worker's start finds no worker to hibernate the boxes: their RAM state is
+  lost, and the boot's recovery of the open journal boots them again, cold.
+- Consoles are close-on-exec, so no VMM inherits another box's console (before,
+  every later VMM held the consoles of the boxes already running).
 - Firecracker, guest kernel and host-layout changes keep paying the full
   hibernate cost.
 - Not decided here: keeping `slirp4netns` across the switch so outbound

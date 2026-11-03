@@ -280,7 +280,12 @@ class Fake:
             # The new worker adopts what was handed over; one it cannot is hibernated.
             self.report = []
             for box in self.handed:
-                if f"adopt:{box}" in self.fail:
+                if f"gone:{box}" in self.fail:
+                    # Its VMM died while no worker ran: stopped with its disk.
+                    self.box[box] = "stopped"
+                    self.pids.pop(box)
+                    self.report.append({"id": box, "result": "gone", "detail": None})
+                elif f"adopt:{box}" in self.fail:
                     # Adopted, but its guest does not answer: it keeps running, reported.
                     self.report.append({"id": box, "result": "unresponsive", "detail": "guest did not answer"})
                 else:
@@ -302,10 +307,20 @@ class Fake:
     def handover_blocker(self, frm, to):
         return self.blocker
 
-    def hibernate_box(self, box):
-        self._hit(f"hibernate-box:{box}")
-        self.box[box] = "hibernated"
-        self.pids.pop(box, None)
+    def hibernate_unresponsive(self):
+        out = {}
+        for entry in self.report:
+            box = entry["id"]
+            if entry["result"] != "unresponsive":
+                continue
+            if f"hibernate-box:{box}" in self.fail:
+                out[box] = "injected capture failure"
+                continue
+            self._hit(f"hibernate-box:{box}")
+            self.box[box] = "hibernated"
+            self.pids.pop(box, None)
+            out[box] = "hibernated"
+        return out
 
     def handover(self, release):
         self._hit("handover")
@@ -486,6 +501,24 @@ class Machine(unittest.TestCase):
         self.assertLess(ops.calls.index("verify"), ops.calls.index("hibernate-box:b"))
         self.assertIn("resume:b", ops.calls)
         self.assertEqual(ops.box, {"a": "running", "b": "running"})
+
+    def test_a_box_whose_vmm_was_lost_boots_again_cold(self):
+        ops = Fake({"a": "running", "b": "running"}, fail={"gone:b"})
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual(j["adoption"], {"a": "kept", "b": "gone: no report"})
+        self.assertIn("resume:b", ops.calls)
+        self.assertEqual(ops.box, {"a": "running", "b": "running"})
+
+    def test_killed_while_reporting_the_adoption_finishes_never_rolls_back(self):
+        ops = Fake({"a": "running", "b": "running"}, fail={"adopt:b"}, kill={"hibernate-box:b"})
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        self.assertEqual(self.journal()["step"], "adoption")
+        ops.kill.clear()
+        u.recover(ops)
+        self.assertEqual((self.journal()["step"], h.pin("worker")), ("done", self.new))
+        self.assertEqual(ops.box["a"], "running")
 
     def test_an_unresponsive_box_that_cannot_be_hibernated_keeps_running_reported(self):
         ops = Fake({"a": "running"}, fail={"adopt:a", "hibernate-box:a"})

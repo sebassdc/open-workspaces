@@ -524,7 +524,7 @@ class HostOps:
         # The old worker's own binary: it forgets its VMMs, which keep running, and exits;
         # the unit's stop then finds no worker and leaves them (KillMode=process).
         h.run([str(p(f"{h.SRV}/releases/{release}/bin/ow")), "--data-dir", h.RUNNER, "down", "--detach"],
-              user="ow", capture=False, timeout=120,
+              user="ow", capture=False, timeout=1800,
               env={"HOME": "/srv/ow", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
                    "OW_ASSET_DIR": f"{h.SRV}/run/worker/assets"})
         h.systemctl("stop", h.UNITS["worker"])
@@ -544,8 +544,13 @@ class HostOps:
             return "the staged Firecracker binary or guest kernel differs from the running one"
         return None
 
-    def hibernate_box(self, box):
-        h.ow("hibernate", box, timeout=1800)
+    def hibernate_unresponsive(self):
+        """The new worker hibernates the boxes it adopted unresponsive (with their placement
+        authority, which `ow hibernate` would not send): {box: "hibernated" or the error}."""
+        script = ("import json,socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(7200); "
+                  "s.connect(sys.argv[1]); s.sendall(b'{\"op\":\"hibernate-unresponsive\"}\\n'); "
+                  "r=json.loads(s.makefile().readline()); print(json.dumps(r.get('result') or {})); sys.exit(0 if r.get('ok') else 1)")
+        return json.loads(h.run(["python3", "-c", script, str(p(f"{h.RUNNER}/control.sock"))], user="ow", timeout=7300))
 
     def vmm_pids(self, boxes):
         """The VMM PID each box's record names (machines/ID/vmm.json), for boxes that have one."""
@@ -757,6 +762,8 @@ def execute(plan_, ops, frm, to, target_name):
         rollback(j, ops)
         raise
     if j.value.get("handover"):
+        # Past verify: an interrupted report finishes the upgrade, never rolls it back.
+        j.step("adoption")
         j.value["adoption"] = adoption(j["handover"], ops)
     finish(j, ops)
 
@@ -773,6 +780,13 @@ def adoption(handed, ops, wait=300):
     now = ops.vmm_pids(list(handed))
     report = {e.get("id"): e for e in status.get("adoption") or []}
     out = {}
+    saved = {}
+    if any((report.get(box) or {}).get("result") == "unresponsive" for box in handed):
+        # Adopted but its API or guest did not answer: save its RAM; finish() wakes it.
+        try:
+            saved = ops.hibernate_unresponsive()
+        except Exception as e:  # noqa: BLE001 - they stay adopted and running
+            saved = {box: f"{e}" for box in handed}
     for box, pid in handed.items():
         entry = report.get(box) or {}
         if entry.get("result") == "adopted" and now.get(box) == pid:
@@ -780,12 +794,8 @@ def adoption(handed, ops, wait=300):
             continue
         out[box] = f"{entry.get('result', 'not adopted')}: {entry.get('detail') or 'no report'}"
         if entry.get("result") == "unresponsive":
-            # Adopted but its API or guest did not answer: save its RAM; finish() wakes it.
-            try:
-                ops.hibernate_box(box)
-                out[box] += "; hibernated"
-            except Exception as e:  # noqa: BLE001 - it stays adopted and running
-                out[box] += f"; hibernating failed: {e}"
+            done = saved.get(box, "not hibernated")
+            out[box] += "; hibernated" if done == "hibernated" else f"; hibernating failed: {done}"
         say(f"{box} was not kept running ({out[box]})")
     return out
 
@@ -818,8 +828,11 @@ def finish(j, ops):
 def resume(j, ops):
     failed = []
     states = ops.boxes()
+    # After a hand-over, a box whose VMM was lost (gone, ended, a reboot in between) is
+    # stopped with its disk: it was running, so it boots again, cold.
+    wake = ("hibernated", "stopped") if j.value.get("handover") else ("hibernated",)
     for box in j["resume"]:
-        if states.get(box) == "hibernated":
+        if states.get(box) in wake:
             try:
                 ops.start_box(box)
                 say(f"resumed {box}")
@@ -832,7 +845,14 @@ def resume(j, ops):
 def abort(j, ops):
     """Before the switch: no pin moved. The old worker runs again, every box recorded
     as running is resumed, stopped units start again, the drain is lifted."""
-    if "worker" in ops.units() and not ops.active("worker"):
+    if j.value.get("handover") is not None and "worker" in ops.units():
+        # A detach may still be queued: restart the unit, whose stop hibernates whatever
+        # is still attached and whose start adopts whatever was handed over.
+        if ops.active("worker"):
+            ops.stop("worker")
+        ops.start("worker")
+        wait_worker(ops, limit=1800)
+    elif "worker" in ops.units() and not ops.active("worker"):
         ops.start("worker")
         wait_worker(ops, limit=1800)
     elif not ops.quiesce_off():

@@ -395,6 +395,10 @@ impl Vm {
                 )
             };
             ensure!(rc == 0, "openpty failed");
+            // Never inherited by later VMMs or helpers: each console reaches one guest only.
+            for fd in [master_fd, slave_fd] {
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            }
             let master = unsafe { File::from_raw_fd(master_fd) };
             let slave = unsafe { File::from_raw_fd(slave_fd) };
             let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -929,7 +933,13 @@ impl Vm {
     /// are saved (a `Diff` snapshot), and after the guest runs again they are laid over a
     /// reflink of that earlier image, so `memory` is still a complete image.
     pub fn capture(&mut self, directory: &Path, disk: &Path, resume: bool) -> Result<Duration> {
-        self.checked("sync")?;
+        // A hibernation saves RAM and disk paused together, consistent without a sync, so a
+        // guest whose console does not answer (an adoption that failed its check) still
+        // hibernates; a capture the guest keeps running after needs its disk synced first.
+        if let Err(error) = self.checked("sync") {
+            ensure!(!resume, error);
+            eprintln!("hibernating without a guest sync: {error:#}");
+        }
         let memory = directory.join("memory");
         let diff = !matches!(self.memory_base, MemoryBase::Unknown);
         let saved = if diff {

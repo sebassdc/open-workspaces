@@ -941,7 +941,8 @@ impl Runtime {
     /// Hibernates running machines that have been idle for the configured
     /// timeout (`OW_IDLE_HIBERNATE_SECS`). Returns each attempt's result.
     pub fn hibernate_idle(&mut self) -> Vec<(String, Result<Value>)> {
-        if !self.idle.enabled() {
+        // A quiesced worker is going down or handing over: nothing new may hold it.
+        if !self.idle.enabled() || self.closing {
             return Vec::new();
         }
         let net = fs::read_to_string("/proc/self/net/dev").unwrap_or_default();
@@ -2084,6 +2085,7 @@ impl Runtime {
                     .map(|id| self.placement_summary(id))
                     .collect::<Result<Vec<_>>>()?
             )),
+            "hibernate-unresponsive" => Ok(self.hibernate_unresponsive()),
             "quiesce" => {
                 // `"closing": false` lifts it again (a shutdown that was called off).
                 self.closing = request["closing"].as_bool().unwrap_or(true);
@@ -2515,6 +2517,30 @@ impl Runtime {
         }
     }
 
+    /// Hibernates each box adopted `unresponsive` that still runs, with its placement
+    /// authority, as the upgrader asks once the new worker is verified (ADR 0011).
+    fn hibernate_unresponsive(&mut self) -> Value {
+        let ids: Vec<String> = self
+            .adoption
+            .iter()
+            .filter(|e| e["result"] == "unresponsive")
+            .filter_map(|e| e["id"].as_str().map(str::to_owned))
+            .filter(|id| self.machines.contains_key(id))
+            .collect();
+        let mut out = json!({});
+        for id in ids {
+            let mut request = json!({"op":"hibernate","id":id});
+            if let Some(managed) = self.state.placements.get(&id) {
+                request["placement"] = json!(managed.authority);
+            }
+            out[&id] = match self.request(&request) {
+                Ok(_) => json!("hibernated"),
+                Err(e) => json!(format!("{e:#}")),
+            };
+        }
+        out
+    }
+
     /// Hands every running VMM to the next worker (ADR 0011): forgets them without
     /// stopping them; their records stay for `adopt`. Nothing may start afterwards.
     pub fn detach(&mut self) -> Value {
@@ -2636,6 +2662,22 @@ mod adoption_tests {
         assert!(child.wait().unwrap().code().is_none(), "killed");
         assert_eq!(runtime.workspace("legacy").unwrap().state, "hibernated");
         assert!(runtime.machines.is_empty());
+    }
+
+    #[test]
+    fn only_boxes_adopted_unresponsive_and_still_running_are_hibernated_on_request() {
+        let mut runtime = super::disk_tests::fixture();
+        runtime.adoption = vec![
+            json!({"id":"legacy","result":"unresponsive","detail":"guest did not answer"}),
+            json!({"id":"other","result":"adopted","detail":null}),
+        ];
+        // `legacy` no longer runs (stopped since), so nothing is captured.
+        assert_eq!(
+            runtime
+                .request(&json!({"op":"hibernate-unresponsive"}))
+                .unwrap(),
+            json!({})
+        );
     }
 
     #[test]

@@ -492,8 +492,11 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
   the worker restarts through hibernation as before. `ow-host restart --worker`
   hands over when the running worker advertises `worker_handover_v1`.
 - **Journal**: the `hibernate` step becomes `handover`; it records each running
-  box's VMM PID, and after verify the journal's `adoption` says per box `kept`
-  (adopted, same PID) or what the new worker did instead.
+  box's VMM PID, and after verify a step `adoption` records per box `kept`
+  (adopted, same PID) or what happened instead. Recovering at `adoption`
+  finishes the upgrade. Aborting after `handover` began restarts the worker unit
+  (its stop hibernates what is still attached, its start adopts the rest). Idle
+  hibernation pauses while the worker is quiesced.
 - **Per box fallback**: a VMM that is gone leaves its box stopped with its disk
   (as a worker crash did). One this worker cannot keep (another binary or guest
   kernel, its fds not taken, or a box that is not stopped) is ended: the box
@@ -501,9 +504,12 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
   by comparing the staged Firecracker and kernel bytes and requiring the running
   worker's `worker_handover_v1` (only where `pidfd_getfd` works) before it hands
   over. An adopted VMM whose API or guest does not answer stays running,
-  reported `unresponsive`; the upgrader hibernates it after verify and its resume
-  step wakes it. The journal error names every box not kept running; none of
-  these rolls the upgrade back.
+  reported `unresponsive`; after verify the upgrader has the worker hibernate it
+  (with its placement authority, without a guest sync) and its resume step wakes
+  it. A box that was running and came back stopped boots again, cold. The
+  journal error names every box not kept running; none of these rolls the
+  upgrade back. An adopted box keeps its in-guest setup (network, tools) until
+  its next cold boot or wake.
 - **Abort and rollback**: before the switch, the old worker starts again and
   adopts its own VMMs. After it, rollback stops the new worker, which
   hibernates every box (the unit's `ExecStop`), and the old one wakes them.
@@ -518,7 +524,9 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
   0.9.51 on, `ow-host restart --worker` and worker-only upgrades hand over.
 
 A worker that crashes no longer takes its VMMs with it: its supervisor exits with
-an error, systemd restarts the unit, and the new worker adopts them the same way. The host check below records timings. A reboot in the seconds between detach and
+an error, systemd restarts the unit, and the new worker adopts them the same way.
+A reboot in the seconds between detach and the new worker's start loses those
+boxes' RAM state; the boot's journal recovery boots them again, cold. The host check below records timings. A reboot in the seconds between detach and
 the new worker's start boots those boxes cold from their disks.
 
 ### Sandbox EC2 check: hand-over (2026-11-03)
