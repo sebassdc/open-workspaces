@@ -84,7 +84,8 @@ part of implementing this feature.
 `ow exec`, `ow shell` and lifecycle operations use that account's logical names.
 The local operator CLI/socket remains trusted maintenance access to all physical
 worker IDs. Local host access is not a restricted tenant login. Machine sharing
-and pool admins are below; teams and workload tokens are not implemented.
+pool admins, placement pools and workload tokens are below; teams are not
+implemented.
 
 ## Sharing a machine
 
@@ -211,6 +212,99 @@ and `catalog::multinode_tests::pool_admins_create_and_fork_for_others_and_owners
 box keeps running with no worker call; name collisions; streams closed; restart),
 and the dashboard tests in `e2e/tests/admin.spec.mjs` against a fake worker.
 No real VM or second real login was used.
+
+## Placement pools
+
+Every runner is in one placement pool, `default` unless the operator puts it in
+another one on the controller host:
+
+```sh
+ow --local --data-dir CONTROLLER_DIR node-pool RUNNER POOL   # e.g. node-pool runner-3 jobs
+ow --local --data-dir CONTROLLER_DIR node-pool RUNNER default
+```
+
+The pool is a controller setting (`node_placement_policy`), effective for the
+next create; `ow nodes` shows each runner's `pool`. Boxes already on a runner stay
+there. A create lands only on runners of the pool it asks for: `ow create NAME
+--pool POOL`, or `"pool"` on the `create` operation of `POST /api/operation`.
+Without one it asks for `default`, so ordinary owners never land on a runner in
+another pool, even with `--node`.
+
+| Who | `default` | Another pool |
+| --- | --- | --- |
+| Any owner | yes | no |
+| Pool admin | yes | yes, any pool |
+| Workload token bound to that pool | only if bound to `default` | yes, its pool only |
+
+Forks (whose child stays on its parent's runner), moves, forks with `--node`,
+wakes and artifact restores follow the same rule: a runner outside `default` is
+refused unless the person starting it is a pool admin. A box made in another pool
+for an ordinary owner can be used, stopped and deleted by them, but not forked
+there. A wake does not remember a box's pool: a parked box of an ordinary owner
+(or a token's) wakes only on a `default` runner. A retried create keeps the runner
+its first attempt chose only when it asks for that runner's pool. A pool with no
+runner that fits refuses the create; it never falls back to `default`.
+
+## Workload tokens
+
+A workload token is a scoped API credential for a program, not a person. It is
+bound to one owner and one pool, and allows only `create`, `put`, `exec`, `stop`
+and `delete`, on boxes that owner owns (`stop` because a running box must be
+stopped before it is deleted). The pool binds where it creates; `put`, `exec`,
+`stop` and `delete` reach every box of its owner, in any pool, so give each
+program an owner of its own. Everything else is refused before any worker
+contact: other operations, `OWNER@example.com/BOX` addresses (shares included),
+`owner` on create, another pool, the dashboard and `/api/state`. Owner limits
+apply to its creates as to the owner's own.
+
+Issue, list and revoke them on the controller host:
+
+```sh
+ow --local --data-dir CONTROLLER_DIR token issue NAME --owner EMAIL --pool POOL
+ow --local --data-dir CONTROLLER_DIR token list
+ow --local --data-dir CONTROLLER_DIR token revoke NAME
+```
+
+`issue` prints the token (`owt_` and 64 hex digits) once, with the owner's
+catalog `owner_id` for [owner limits](LIMITS.md); the catalog keeps only its
+SHA-256 (`workload_tokens`, an additive table: an older controller ignores it, so
+tokens stop working rather than gain access). The gateway never logs it. `revoke`
+deletes it; the next request with it is refused. Requests it already started
+finish. Use an owner email of its own: one nobody has signed in with becomes a
+program-only owner (its catalog subject is set to `workload:EMAIL`), so no later
+login can claim its boxes. That includes an email someone reserved by sharing or
+transferring a box to it: that person can then never sign in with it, and the
+token reaches the boxes transferred to it, so pick a new email. A token for an owner who has signed in acts as that
+person, within the scope above. The controller must have had one sign-in before
+the first program-only owner, so it knows its identity provider.
+
+A program sends it as a bearer token to the gateway's operation API, on the
+gateway's loopback listener or wherever the gateway is published:
+
+```sh
+curl -sS http://127.0.0.1:8787/api/operation \
+  -H 'Host: GATEWAY_HOSTNAME' -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"op":"create","id":"job-1","image":"ubuntu","memory_mib":4096,"vcpu_count":2}'
+```
+
+`Host` must be the gateway's configured hostname and `Content-Type`
+`application/json` (a `charset` parameter is fine). `put` copies a file into the box
+without putting its contents on a command line, e.g. a one-time setup file:
+`{"op":"put","id":"job-1","path":"/run/setup.json","data":"BASE64"}` (256 KiB at
+most), then `{"op":"exec","id":"job-1","command":"..."}`, `{"op":"stop","id":"job-1"}`
+and `{"op":"delete","id":"job-1"}`. A token reaches only `POST /api/operation`;
+other paths answer 403, an unknown or revoked token 401. An `Authorization`
+header without the `owt_` prefix is not a workload token and is handled as before.
+
+Evidence (2026-11-02): `tokens::tests` (scope allow/deny per operation, hash-only
+storage, program-only owners, immediate revoke),
+`catalog::multinode_tests::pools_take_only_creates_that_ask_from_admins_or_a_grant`,
+`catalog::multinode_tests::transfers_onto_a_pool_runner_need_a_pool_admin` and
+`remote::tests::workload_token_scope_pool_limits_and_revocation` (create placed in
+the token's pool, put, exec, stop and delete through the gateway; every other
+operation and another owner's shared box refused without worker contact; owner
+limits; revoke) against a fake worker. No real VM was used.
 
 ## Acceptance evidence
 

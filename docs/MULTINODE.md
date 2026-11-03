@@ -24,7 +24,9 @@ replaced.
 Selected or automatic create reserves a fixed node, physical runtime ID, RAM,
 vCPUs and running slot in SQLite before dispatch. Automatic placement chooses
 an online x86-64 Firecracker v1.17.0 node with the requested prepared image and
-capacity; ties use node ID. New multi-node creates use the enrolled shared pool.
+capacity; ties use node ID. New multi-node creates use the enrolled shared pool:
+runners in the `default` placement pool, unless a pool admin or a workload token
+asks for another pool (`ow node-pool`, see [placement pools](USERS.md#placement-pools)).
 When there are no enrolled nodes, the old local worker remains the default.
 Existing local resources keep the `local` route. Local `create --node` is rejected.
 

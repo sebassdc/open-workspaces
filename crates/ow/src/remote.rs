@@ -540,6 +540,9 @@ async fn handle(app: &App, mut request: Request) -> Response {
         )
         .await;
     }
+    if let Some(presented) = bearer(request.headers()) {
+        return workload(app, presented, request).await;
+    }
     let Some((expires, identity)) = authorized_until(app, request.headers()).await else {
         let login = match app.config.auth {
             Auth::Access => "Cloudflare Access login required",
@@ -720,6 +723,7 @@ async fn handle(app: &App, mut request: Request) -> Response {
             pool_owner,
             (app.config.previews && app.config.auth == Auth::Tailscale)
                 .then(|| app.config.hostname.clone()),
+            None,
         )
         .await;
     }
@@ -783,6 +787,72 @@ async fn handle(app: &App, mut request: Request) -> Response {
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     response
+}
+
+/// A workload token presented as `Authorization: Bearer owt_...`; other schemes are not ours.
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all("authorization").iter();
+    let value = values.next()?.to_str().ok()?;
+    let token = value.strip_prefix("Bearer ")?;
+    (values.next().is_none() && token.starts_with(crate::tokens::PREFIX)).then(|| token.to_owned())
+}
+
+/// A program's request: only the operation API, scoped to the token's owner and pool. A bearer
+/// token is never sent by a browser on its own, so the dashboard's same-origin guard is not needed.
+async fn workload(app: &App, presented: String, mut request: Request) -> Response {
+    let (Some(root), Some(catalog)) = (app.dashboard.clone(), app.catalog.clone()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if request.uri().path() != "/api/operation"
+        || request.method() != Method::POST
+        || request.uri().query().is_some()
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "Workload tokens reach only POST /api/operation",
+        )
+            .into_response();
+    }
+    let lookup = catalog.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let c = lookup.lock().map_err(|_| anyhow::anyhow!("catalog lock"))?;
+        crate::tokens::verify(&c.db, &presented)
+    })
+    .await;
+    let Ok(Ok(Some((identity, pool)))) = found else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Invalid or revoked workload token",
+        )
+            .into_response();
+    };
+    // Programs often add a charset; the operation API itself checks the JSON.
+    let json = request
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        });
+    let headers = request.headers_mut();
+    headers.insert("x-ow-request", HeaderValue::from_static("dashboard"));
+    if json {
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+    }
+    crate::dashboard::handle(
+        Some(catalog),
+        Some(root),
+        identity,
+        request,
+        None,
+        None,
+        Some(pool),
+    )
+    .await
 }
 
 fn designated_owner(app: &App, identity: &crate::catalog::Identity) -> bool {
@@ -3009,6 +3079,218 @@ mod tests {
         );
         drop(app);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workload_token_scope_pool_limits_and_revocation() {
+        use crate::catalog::{
+            Catalog, Identity,
+            multinode_tests::{Fake, quota_node},
+        };
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut fake = Fake::new();
+        let root = fake.root.clone();
+        let issuer = "https://test-team.cloudflareaccess.com";
+        let mut catalog = Catalog::open(&root, issuer, None).unwrap();
+        fake.worker("alpha");
+        fake.worker("beta");
+        quota_node(&fake);
+        crate::nodes::set_pool(&root, "beta", "jobs").unwrap();
+        let alice = catalog
+            .user(&Identity {
+                issuer: issuer.into(),
+                subject: "alice-subject".into(),
+                email: "alice@example.test".into(),
+            })
+            .unwrap();
+        catalog
+            .operation(
+                alice,
+                json!({"op":"create","id":"private","memory_mib":256,"vcpu_count":1}),
+            )
+            .unwrap();
+        let issued = crate::tokens::run(
+            &catalog.db,
+            crate::TokenAction::Issue {
+                name: "runner".into(),
+                owner: "jobs@example.test".into(),
+                pool: "jobs".into(),
+            },
+        )
+        .unwrap();
+        let token = issued["token"].as_str().unwrap().to_owned();
+        let owner = issued["owner_id"].as_i64().unwrap();
+        // Even a share does not let the token reach another owner's box.
+        catalog
+            .operation(
+                alice,
+                json!({"op":"share","id":"private","with":"jobs@example.test"}),
+            )
+            .unwrap();
+        let (_, set) = signing_key();
+        let app = App {
+            dashboard: Some(root.clone()),
+            catalog: Some(Arc::new(std::sync::Mutex::new(catalog))),
+            config: config("http://127.0.0.1:1".into()),
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set,
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        };
+        let send = |bearer: &str, method: Method, path: &str, body: Value| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "app.example.test")
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json; charset=utf-8")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let call = |body: Value| send(&token, Method::POST, "/api/operation", body);
+        async fn answer(app: &App, request: Request) -> (StatusCode, Value) {
+            let response = handle(app, request).await;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            )
+        }
+        let node = |name: &str| -> String {
+            app.catalog
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .db
+                .query_row(
+                    "SELECT node FROM resources WHERE owner=?1 AND kind='machine' AND name=?2",
+                    rusqlite::params![owner, name],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        // Allowed: create (in the token's pool), put, exec, stop, delete on its own box.
+        let (status, body) = answer(
+            &app,
+            call(json!({"op":"create","id":"job","memory_mib":256,"vcpu_count":1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(node("job"), "beta");
+        let registration = base64::engine::general_purpose::STANDARD.encode(b"{\"one-time\":true}");
+        for op in [
+            json!({"op":"put","id":"job","path":"/run/registration.json","data":registration}),
+            json!({"op":"exec","id":"job","command":"true"}),
+        ] {
+            let (status, body) = answer(&app, call(op.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{op} {body}");
+        }
+        // Denied, with no worker contact: other operations, other owners' boxes, other pools.
+        let calls = fake.calls.load(std::sync::atomic::Ordering::SeqCst);
+        for op in [
+            json!({"op":"start","id":"job"}),
+            json!({"op":"get","id":"job","path":"/etc/hostname"}),
+            json!({"op":"resize","id":"job","memory_mib":512}),
+            json!({"op":"snapshot","id":"job","name":"s"}),
+            json!({"op":"fork","id":"job","child":"copy"}),
+            json!({"op":"rename","id":"job","name":"other"}),
+            json!({"op":"share","id":"job","with":"bob@example.test"}),
+            json!({"op":"transfer","id":"job","to":"bob@example.test"}),
+            json!({"op":"hibernate","id":"job"}),
+            json!({"op":"aws-role","id":"job"}),
+            json!({"op":"exec","id":"alice@example.test/private","command":"true"}),
+            json!({"op":"create","id":"elsewhere","pool":"default"}),
+            json!({"op":"create","id":"gift","owner":"bob@example.test"}),
+        ] {
+            let (status, body) = answer(&app, call(op.clone())).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{op} {body}");
+        }
+        let (status, _) = answer(
+            &app,
+            call(json!({"op":"exec","id":"private","command":"true"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        for (method, path) in [
+            (Method::GET, "/api/state"),
+            (Method::POST, "/api/hosts/revoke"),
+            (Method::GET, "/"),
+        ] {
+            let (status, _) = answer(&app, send(&token, method, path, json!({}))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+        assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+        // Unknown tokens and other bearer schemes get no access.
+        let (status, _) = answer(
+            &app,
+            send(
+                "owt_0000",
+                Method::POST,
+                "/api/operation",
+                json!({"op":"exec","id":"job","command":"true"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = answer(
+            &app,
+            send(
+                "secret",
+                Method::POST,
+                "/api/operation",
+                json!({"op":"exec","id":"job","command":"true"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Owner limits apply to the token's owner.
+        let mut limits = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(root.join("limits.json"))
+            .unwrap();
+        limits.write_all(json!({"owners":{owner.to_string():{"cpus":16,"memory_mib":32768,"disk_gib":256,"boxes":1}}}).to_string().as_bytes()).unwrap();
+        drop(limits);
+        let (status, body) = answer(
+            &app,
+            call(json!({"op":"create","id":"second","memory_mib":256,"vcpu_count":1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("boxes"),
+            "{body}"
+        );
+        for op in [
+            json!({"op":"stop","id":"job"}),
+            json!({"op":"delete","id":"job"}),
+        ] {
+            let (status, body) = answer(&app, call(op.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{op} {body}");
+        }
+        // Revocation takes effect on the next request.
+        let lock = app.catalog.as_ref().unwrap().lock().unwrap();
+        crate::tokens::run(
+            &lock.db,
+            crate::TokenAction::Revoke {
+                name: "runner".into(),
+            },
+        )
+        .unwrap();
+        drop(lock);
+        let (status, _) = answer(
+            &app,
+            call(json!({"op":"create","id":"after","memory_mib":256,"vcpu_count":1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        drop(app);
     }
 }
 

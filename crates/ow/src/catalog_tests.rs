@@ -6,9 +6,9 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
-struct Fake {
-    root: PathBuf,
-    calls: Arc<AtomicUsize>,
+pub(crate) struct Fake {
+    pub(crate) root: PathBuf,
+    pub(crate) calls: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
     reject: Arc<Mutex<Option<String>>>,
     diagnostic: Arc<Mutex<String>>,
@@ -16,7 +16,7 @@ struct Fake {
     _thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Fake {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let root = std::env::temp_dir().join(format!("ow-c-{}", common::nonce().unwrap()));
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -32,7 +32,7 @@ impl Fake {
             _thread: None,
         }
     }
-    fn worker(&mut self, node: &str) {
+    pub(crate) fn worker(&mut self, node: &str) {
         // `local`: the controller's own worker, in its data directory.
         let path = if node == "local" {
             self.root.clone()
@@ -231,6 +231,7 @@ async fn missing_machine_delete_is_not_found_without_worker_contact() {
                 .unwrap(),
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{name}");
@@ -307,6 +308,7 @@ async fn known_rejections_give_safe_actions_without_worker_details() {
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(request.to_string()))
                 .unwrap(),
+            None,
             None,
             None,
         )
@@ -511,6 +513,7 @@ async fn failed_snapshot_dashboard_response_preserves_safe_cause() {
             Some(fake.root.clone()),
             identity("alice"),
             request,
+            None,
             None,
             None,
         )
@@ -1652,7 +1655,7 @@ fn quota_config(root: &Path, caps: Value) {
     )
     .unwrap();
 }
-fn quota_node(fake: &Fake) {
+pub(crate) fn quota_node(fake: &Fake) {
     nodes::db(&fake.root).unwrap().execute("UPDATE nodes SET memory_mib=4096,slots=8,capabilities=json_set(capabilities,'$.memory_mib',4096,'$.slots',8,'$.vcpus',8,'$.disk_resize_v1',json('true'),'$.available_disk_bytes',70368744177664,'$.disk_observed_unix_s',CAST(strftime('%s','now') AS INTEGER))",[]).unwrap();
 }
 #[test]
@@ -2053,6 +2056,7 @@ async fn owner_quota_dashboard_error_names_the_resource_and_cap() {
         request,
         None,
         None,
+        None,
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -2094,6 +2098,7 @@ async fn dashboard_rename_answers_the_new_name_and_explains_a_taken_one() {
                 Some(root),
                 identity("alice"),
                 request,
+                None,
                 None,
                 None,
             )
@@ -3816,7 +3821,7 @@ fn controller_without_worker_has_no_local_fallback_or_capacity() {
     assert_eq!(before["stats"]["limit_memory_mib"], 0);
     assert_eq!(before["discovery"]["nodes"], json!([]));
     assert!(
-        c.choose(None, 256, "alpine", 1, &json!({}), None)
+        c.choose(None, "default", 256, "alpine", 1, &json!({}), None)
             .unwrap_err()
             .to_string()
             .contains("no online node")
@@ -4760,4 +4765,152 @@ fn controller_local_box_lifecycle_is_reported_as_operation_events() {
         assert!(e["ow.box.id"].as_str().unwrap().starts_with(['m', 'h']));
         assert!(!e.to_string().contains("alice") && !e.to_string().contains("demo"));
     }
+}
+
+#[test]
+fn pools_take_only_creates_that_ask_from_admins_or_a_grant() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    fake.worker("beta");
+    quota_node(&fake);
+    // Placement prefers the fullest runner that fits: without the pool filter, beta would win.
+    nodes::db(&fake.root)
+        .unwrap()
+        .execute("UPDATE nodes SET memory_mib=2048,capabilities=json_set(capabilities,'$.memory_mib',2048) WHERE id='beta'", [])
+        .unwrap();
+    assert!(nodes::set_pool(&fake.root, "missing", "jobs").is_err());
+    assert!(nodes::set_pool(&fake.root, "beta", "bad pool").is_err());
+    assert_eq!(
+        nodes::set_pool(&fake.root, "beta", "jobs").unwrap(),
+        json!({"node":"beta","pool":"jobs"})
+    );
+    let pool_of = |id: &str| {
+        nodes::inventory(&fake.root)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == id)
+            .unwrap()["capabilities"]["pool"]
+            .clone()
+    };
+    assert_eq!(
+        (pool_of("alpha"), pool_of("beta")),
+        (json!("default"), json!("jobs"))
+    );
+    c.pool_admins = vec!["admin@example.test".into()];
+    let a = c.user(&identity("alice")).unwrap();
+    let p = c.user(&identity("admin")).unwrap();
+    let node = |c: &Catalog, owner: i64, name: &str| -> String {
+        c.db.query_row(
+            "SELECT node FROM resources WHERE owner=?1 AND kind='machine' AND name=?2",
+            params![owner, name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let create = |id: &str| json!({"op":"create","id":id,"memory_mib":256,"vcpu_count":1});
+    // Ordinary creates stay on `default` runners, even when they name the pool's runner.
+    for i in 0..3 {
+        c.operation(a, create(&format!("mine-{i}"))).unwrap();
+        assert_eq!(node(&c, a, &format!("mine-{i}")), "alpha");
+    }
+    let mut named = create("named");
+    named["node"] = json!("beta");
+    assert!(c.operation(a, named).is_err());
+    let mut explicit = create("explicit");
+    explicit["pool"] = json!("default");
+    c.operation(a, explicit).unwrap();
+    assert_eq!(node(&c, a, "explicit"), "alpha");
+    // Asking for another pool needs a pool admin or a matching grant.
+    let mut asked = create("asked");
+    asked["pool"] = json!("jobs");
+    let refused = c.operation(a, asked.clone()).unwrap_err();
+    assert!(
+        refused
+            .downcast_ref::<limits::Rejection>()
+            .is_some_and(|r| r.0.contains("only a pool admin")),
+        "{refused:#}"
+    );
+    let mut wrong = asked.clone();
+    wrong["pool_grant"] = json!("other");
+    assert!(c.operation(a, wrong).is_err());
+    assert!(c.physical(a, "machine", "asked").is_err());
+    let mut granted = asked.clone();
+    granted["pool_grant"] = json!("jobs");
+    c.operation(a, granted).unwrap();
+    assert_eq!(node(&c, a, "asked"), "beta");
+    c.operation(p, asked.clone()).unwrap();
+    assert_eq!(node(&c, p, "asked"), "beta");
+    // A fork's child stays on its parent's runner, so outside `default` it needs a pool admin,
+    // even for the box's owner or a teammate it is shared with.
+    let mut gift = create("gift");
+    gift["pool"] = json!("jobs");
+    gift["owner"] = json!("alice@example.test");
+    c.operation(p, gift).unwrap();
+    assert_eq!(node(&c, a, "gift"), "beta");
+    let refused = c
+        .operation(a, json!({"op":"fork","id":"gift","child":"copy"}))
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("only a pool admin"),
+        "{refused:#}"
+    );
+    assert!(c.physical(a, "machine", "copy").is_err());
+    c.operation(
+        p,
+        json!({"op":"fork","id":"alice@example.test/gift","child":"admin-copy"}),
+    )
+    .unwrap();
+    assert_eq!(node(&c, p, "admin-copy"), "beta");
+    // Nor can the owner retry a pool admin's failed fork made for them.
+    *fake.reject.lock().unwrap() = Some("fork".into());
+    assert!(
+        c.operation(p, json!({"op":"fork","id":"alice@example.test/gift","child":"retried","owner":"alice@example.test"}))
+            .is_err()
+    );
+    *fake.reject.lock().unwrap() = None;
+    let retry = c
+        .operation(a, json!({"op":"fork","id":"gift","child":"retried"}))
+        .unwrap_err();
+    assert!(retry.to_string().contains("only a pool admin"), "{retry:#}");
+    // A pending create keeps its runner only for a retry that asks for the same pool.
+    *fake.reject.lock().unwrap() = Some("create".into());
+    let mut stuck = create("stuck");
+    stuck["pool"] = json!("jobs");
+    stuck["owner"] = json!("alice@example.test");
+    assert!(c.operation(p, stuck).is_err());
+    *fake.reject.lock().unwrap() = None;
+    assert_eq!(node(&c, a, "stuck"), "beta");
+    let retry = c.operation(a, create("stuck")).unwrap_err();
+    assert!(retry.to_string().contains("another pool"), "{retry:#}");
+    // A pool with no runner fails rather than falling back to `default`.
+    let mut empty = create("empty");
+    empty["pool"] = json!("nowhere");
+    assert!(c.operation(p, empty).is_err());
+    // Only create takes a pool.
+    assert!(
+        c.operation(a, json!({"op":"stop","id":"mine-0","pool":"default"}))
+            .is_err()
+    );
+}
+
+#[test]
+fn transfers_onto_a_pool_runner_need_a_pool_admin() {
+    let (_fake, mut c, user, _physical, intent) = transfer_fixture();
+    nodes::set_pool(&c.root, "beta", "jobs").unwrap();
+    let refused = c.begin_transfer(user, "to-pool", &intent).unwrap_err();
+    assert!(
+        refused.to_string().contains("only a pool admin"),
+        "{refused:#}"
+    );
+    assert!(
+        !c.db
+            .query_row("SELECT EXISTS(SELECT 1 FROM transfers)", [], |r| r
+                .get::<_, bool>(0))
+            .unwrap()
+    );
+    c.pool_admins = vec!["owner@example.test".into()];
+    c.begin_transfer(user, "to-pool", &intent).unwrap();
 }

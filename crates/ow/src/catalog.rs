@@ -576,6 +576,7 @@ impl Catalog {
         }
         catalog.db.execute("UPDATE resources SET reserved_mib=MAX(reserved_mib,COALESCE(json_extract(metadata,'$.memory_mib'),0)),reserved_cpus=MAX(reserved_cpus,COALESCE(json_extract(metadata,'$.vcpu_count'),1)) WHERE kind='machine' AND placement_managed=0 AND json_extract(metadata,'$.state')='running'",[])?;
         limits::initialize(&catalog.db)?;
+        crate::tokens::initialize(&catalog.db)?;
         Ok(catalog)
     }
 
@@ -974,6 +975,21 @@ impl Catalog {
         intent: &crate::transfers::Intent,
     ) -> Result<()> {
         let c = self;
+        // Moves, forks, wakes and restores keep ordinary owners on `default` runners.
+        let pool = c.node_pool(target)?;
+        if pool != "default" {
+            let actor: i64 = c.db.query_row(
+                "SELECT owner FROM operations WHERE id=?1",
+                [t.operation],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                c.pool_admin(actor)?,
+                limits::Rejection(format!(
+                    "Runner {target} is in pool '{pool}'; only a pool admin places boxes there."
+                ))
+            );
+        }
         ensure!(
             !crate::drain::blocked(&c.db, target)?,
             limits::Rejection(format!("Runner {target} is draining."))
@@ -2248,9 +2264,19 @@ impl Catalog {
             extra.2 + pending.2,
         ))
     }
+    /// A runner's placement pool; the controller's own worker is in `default`.
+    fn node_pool(&self, node: &str) -> Result<String> {
+        Ok(self.db.query_row(
+            "SELECT COALESCE((SELECT pool FROM node_placement_policy WHERE node=?1),'default')",
+            [node],
+            |r| r.get(0),
+        )?)
+    }
+    #[allow(clippy::too_many_arguments)]
     fn choose(
         &self,
         requested: Option<&str>,
+        pool: &str,
         memory: u64,
         image: &str,
         cpus: u64,
@@ -2260,6 +2286,7 @@ impl Catalog {
         let inventory = nodes::inventory(&self.root)?;
         if inventory.as_array().unwrap().is_empty()
             && requested.is_none()
+            && pool == "default"
             && self.root.join("control.sock").exists()
         {
             common::guest_shape(local_status, memory, cpus)?;
@@ -2365,7 +2392,7 @@ impl Catalog {
             .or_else(|| crate::image_catalog::resolve(&self.db, image).ok());
         let demand = crate::placement::Demand {
             requested,
-            pool: "default",
+            pool,
             memory_mib: memory,
             cpus,
             disk_bytes: u64::from(disk.unwrap_or(common::DEFAULT_DISK_GIB)) * common::GIB,
@@ -2599,6 +2626,30 @@ impl Catalog {
                     "memory {memory} MiB is over this pool's per-box limit of {cap} MiB (limits.box_memory_mib)"
                 );
             }
+        }
+        // Runners outside the `default` pool take only creates that ask for their pool, from a
+        // pool admin or a workload token bound to that pool (`pool_grant`, set by the gateway).
+        let grant = request
+            .as_object_mut()
+            .context("request")?
+            .remove("pool_grant");
+        let pool = match request.as_object_mut().unwrap().remove("pool") {
+            None | Some(Value::Null) => "default".to_owned(),
+            Some(pool) => {
+                let pool = pool.as_str().context("pool")?.to_owned();
+                ensure!(op == "create", "only create takes a pool");
+                common::identifier(&pool)?;
+                pool
+            }
+        };
+        if pool != "default"
+            && grant.as_ref().and_then(Value::as_str) != Some(pool.as_str())
+            && !self.pool_admin(user)?
+        {
+            return Err(limits::Rejection(format!(
+                "only a pool admin can place a machine in pool '{pool}'"
+            ))
+            .into());
         }
         let name = request["id"].as_str().context("id")?.to_owned();
         common::address(&name)?;
@@ -2881,6 +2932,7 @@ impl Catalog {
                 if !chosen {
                     node = self.choose(
                         request["node"].as_str(),
+                        &pool,
                         request["memory_mib"].as_u64().unwrap_or(256),
                         request["image"].as_str().unwrap_or("alpine"),
                         request["vcpu_count"].as_u64().unwrap_or(1),
@@ -2893,6 +2945,13 @@ impl Catalog {
                     )?;
                     self.save("machine",&physical,&json!({"state":"pending","image":request["image"].as_str().unwrap_or("alpine"),"memory_mib":request["memory_mib"].as_u64().unwrap_or(256),"vcpu_count":request["vcpu_count"].as_u64().unwrap_or(1)}))?;
                 }
+            }
+            // A retried create keeps its first runner only when that runner is in the pool asked for.
+            if op == "create" && self.node_pool(&node)? != pool {
+                return Err(limits::Rejection(format!(
+                    "machine '{name}' is already being created in another pool; delete it or ask for that pool"
+                ))
+                .into());
             }
             if let Some(chosen) = request["node"].as_str() {
                 ensure!(chosen == node, "placement is fixed");
@@ -2968,6 +3027,15 @@ impl Catalog {
                     {
                         return Err(limits::Rejection(format!(
                             "machine '{name}' is {state}; start the box first (ow start {name}), or fork from one of its snapshots (--snapshot)"
+                        ))
+                        .into());
+                    }
+                    // A fork's child stays on its runner; outside `default` that needs a pool admin,
+                    // also for a retry of someone else's earlier attempt.
+                    let pool = self.node_pool(&node)?;
+                    if pool != "default" && !self.pool_admin(user)? {
+                        return Err(limits::Rejection(format!(
+                            "machine '{name}' is on a runner in pool '{pool}'; only a pool admin can fork there"
                         ))
                         .into());
                     }
@@ -3580,25 +3648,25 @@ mod tests {
         assert!(!output.to_string().contains("bob-private"));
         assert!(!output.to_string().contains(&physical));
         assert_eq!(
-            c.choose(None, 2048, "ubuntu", 2, &json!({}), Some(32))
+            c.choose(None, "default", 2048, "ubuntu", 2, &json!({}), Some(32))
                 .unwrap(),
             "runner"
         );
         assert!(
-            c.choose(None, 4096, "ubuntu", 2, &json!({}), Some(32))
+            c.choose(None, "default", 4096, "ubuntu", 2, &json!({}), Some(32))
                 .unwrap_err()
                 .to_string()
                 .contains("capacity exhausted")
         );
         assert!(
-            c.choose(None, 256, "arch", 1, &json!({}), Some(32))
+            c.choose(None, "default", 256, "arch", 1, &json!({}), Some(32))
                 .unwrap_err()
                 .to_string()
                 .contains("lacks prepared image")
         );
         c.db.execute("UPDATE nodes SET heartbeat=0", []).unwrap();
         assert!(
-            c.choose(None, 256, "ubuntu", 1, &json!({}), Some(32))
+            c.choose(None, "default", 256, "ubuntu", 1, &json!({}), Some(32))
                 .unwrap_err()
                 .to_string()
                 .contains("no online node")
@@ -3940,4 +4008,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "catalog_tests.rs"]
-mod multinode_tests;
+pub(crate) mod multinode_tests;

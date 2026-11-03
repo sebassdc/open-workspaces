@@ -58,6 +58,8 @@ mod telemetry;
 #[cfg(target_os = "linux")]
 mod terminal;
 #[cfg(target_os = "linux")]
+mod tokens;
+#[cfg(target_os = "linux")]
 mod transfers;
 mod wire;
 
@@ -77,6 +79,25 @@ enum ConfigAction {
     Get { key: String },
     /// Change one setting; runners receive it within seconds.
     Set { key: String, value: String },
+}
+
+#[derive(Subcommand)]
+enum TokenAction {
+    /// Issue a token for one owner and one pool; prints it once.
+    Issue {
+        /// A unique label for the token, e.g. the program that uses it.
+        name: String,
+        /// Owner login email; its boxes, limits and name space are the token's.
+        #[arg(long)]
+        owner: String,
+        /// The pool its creates are placed in.
+        #[arg(long)]
+        pool: String,
+    },
+    /// Revoke a token now; its next request is refused.
+    Revoke { name: String },
+    /// Tokens with their owner and pool (never the token itself).
+    List,
 }
 
 #[derive(Subcommand)]
@@ -218,6 +239,13 @@ enum Action {
     },
     /// Host-only: revoke this controller's node enrollment.
     NodeRevoke { node: String },
+    /// Host-only: put a runner in a placement pool; only creates that ask for the pool land there.
+    NodePool { node: String, pool: String },
+    /// Host-only: workload tokens, scoped API credentials for a program (see docs/USERS.md).
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
     /// JSON placement resources on the selected server (or local node inventory).
     Nodes,
     /// Host-only: fleet health as JSON (alerts, latest node telemetry); exits 1 on an alert.
@@ -286,6 +314,9 @@ enum Action {
         /// Create it for this login email, in their name space and limits (pool admins only).
         #[arg(long)]
         owner: Option<String>,
+        /// Place it on a runner in this pool (default: `default`; others: pool admins only).
+        #[arg(long)]
+        pool: Option<String>,
     },
     /// Change a stopped workspace's resources; next start is a cold boot.
     Resize {
@@ -1016,6 +1047,8 @@ fn main_result() -> anyhow::Result<i32> {
         Action::NodeController { .. }
             | Action::NodeJoin { .. }
             | Action::NodeRevoke { .. }
+            | Action::NodePool { .. }
+            | Action::Token { .. }
             | Action::NodeAgent { .. }
             | Action::Health
             | Action::Config { .. }
