@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -192,6 +192,17 @@ test("dashboard logins and developer images are validated", () => {
     assert.ok(!file("developer-images").includes("systemctl restart"), "a new image restarts nothing");
     // Build VMs' sockets must fit Linux's limit: their roots stay out of the long release path.
     assert.ok(file("developer-images").includes("ln -s /srv/ow/build/dev-images data/dev-images"));
+    // A store that pins no image for the profile (a backup-only store) keeps the local image.
+    const dir = mkdtempSync(join(tmpdir(), "devimg-"));
+    mkdirSync(join(dir, "data/runtime-spike/guest"), { recursive: true });
+    writeFileSync(join(dir, "store.json"), JSON.stringify({ url: "s3://example/store", images: {} }));
+    writeFileSync(join(dir, "data/runtime-spike/guest/ubuntu.json"), JSON.stringify({ developer_user: "dev" }));
+    const script = file("developer-images")
+        .replaceAll("/etc/open-workspaces/store.json", join(dir, "store.json"))
+        .replace("cd /srv/ow/run/worker/src", `cd ${dir}`);
+    const out = execFileSync("bash", ["-s", "ubuntu"], { input: script, env: { ...process.env, OW_ASSET_DIR: dir } }).toString();
+    assert.match(out, /the store pins no image; using the local one\nubuntu: developer image present/);
+    rmSync(dir, { recursive: true });
 });
 
 test("backup URLs are checked and the host role can never delete a backup", () => {
