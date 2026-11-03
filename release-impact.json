@@ -2,6 +2,45 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.48",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "dashboard",
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Snapshot verification survives restarts and skips holes: the worker keeps the fingerprints of verified snapshots in verified.json (any change to a file changes its fingerprint and forces a new hash) and hashes in process, feeding sparse holes as zeros instead of reading them, so a restarted worker no longer re-reads every snapshot before it answers (issue 90). The upgrader's verify and worker wait allow 1800 s. Caps lifted: a box may have up to 32 vCPUs (Firecracker's limit) on runners that advertise max_guest_vcpus_v2, older peers still see at most 16; host budgets are no longer clamped to 64 GiB, 64 vCPUs or 8 slots (three quarters of RAM, every vCPU, 32 slots); dashboard UI 1.0.2 offers up to 256 GiB and 32 vCPUs. Protocol, catalog schema 7, runtime and guest kernel unchanged. Class 2: the worker restarts behind the capture gate; the budget change re-renders the worker and agent units."
+    },
+    {
       "version": "0.9.47",
       "class": 2,
       "changes": [

@@ -70,10 +70,12 @@ pub fn nonce() -> Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-// Shared admission ceilings; defaults remain deliberately smaller.
-pub const HOST_MEMORY_MIB: u32 = 65536;
-pub const HOST_CPUS: u32 = 64;
-pub const HOST_SLOTS: u32 = 8;
+// Sanity bounds for configured budgets, not product limits: a host's real RAM and CPUs bound it.
+pub const HOST_MEMORY_MIB: u32 = 4 << 20;
+pub const HOST_CPUS: u32 = 1024;
+pub const HOST_SLOTS: u32 = 256;
+/// Firecracker's own vCPU limit per microVM.
+pub const GUEST_MAX_VCPUS: u32 = 32;
 /// Admission budget, not a CPU quota or a guarantee of dedicated cores.
 pub fn vcpu_budget(host_cpus: u32, ratio: u32) -> Result<u32> {
     ensure!(matches!(ratio, 1 | 2), "vCPU overcommit must be 1 or 2");
@@ -89,8 +91,8 @@ mod overcommit_tests {
     fn ratio_scales_only_cpu_and_keeps_the_protocol_ceiling() {
         assert_eq!(vcpu_budget(8, 1).unwrap(), 8);
         assert_eq!(vcpu_budget(8, 2).unwrap(), 16);
-        assert_eq!(vcpu_budget(48, 2).unwrap(), 64);
-        assert_eq!(vcpu_budget(u32::MAX, 2).unwrap(), 64);
+        assert_eq!(vcpu_budget(48, 2).unwrap(), 96);
+        assert_eq!(vcpu_budget(u32::MAX, 2).unwrap(), HOST_CPUS);
         for ratio in [0, 3, u32::MAX] {
             assert!(vcpu_budget(8, ratio).is_err());
         }
@@ -132,13 +134,15 @@ pub fn requested_disk(request: &serde_json::Value) -> Result<Option<u32>> {
         .transpose()
 }
 /// Suggested sizes for menus; any 256 MiB step up to the worker's budget is accepted.
-pub const SHAPES_MIB: [u32; 9] = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+pub const SHAPES_MIB: [u32; 11] = [
+    256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144,
+];
 pub fn host_limits(memory: u32, slots: u32, cpus: u32) -> Result<()> {
     ensure!(
         (256..=HOST_MEMORY_MIB).contains(&memory)
             && (1..=HOST_SLOTS).contains(&slots)
             && (1..=HOST_CPUS).contains(&cpus),
-        "host limits out of range (256–65536 MiB, 1–8 slots, 1–64 vCPU)"
+        "host limits out of range (256–{HOST_MEMORY_MIB} MiB, 1–{HOST_SLOTS} slots, 1–{HOST_CPUS} vCPU)"
     );
     Ok(())
 }
@@ -147,7 +151,10 @@ pub fn resources(memory: u32, cpus: u32) -> Result<()> {
         (256..=HOST_MEMORY_MIB).contains(&memory) && memory % 256 == 0,
         "memory must be a multiple of 256 MiB from 256 to {HOST_MEMORY_MIB}"
     );
-    ensure!((1..=16).contains(&cpus), "CPU count must be 1–16");
+    ensure!(
+        (1..=GUEST_MAX_VCPUS).contains(&cpus),
+        "CPU count must be 1–{GUEST_MAX_VCPUS}"
+    );
     Ok(())
 }
 /// Missing fields use defaults; explicitly invalid/null fields fail before durable intent.
@@ -169,6 +176,8 @@ pub fn requested_resources(request: &serde_json::Value) -> Result<(u32, u32)> {
 /// Workers that size boxes in any 256 MiB step report their ceiling here; older peers keep
 /// reading `max_guest_memory_mib`, which such workers cap at the old 16384 MiB.
 pub const GUEST_MEMORY_V2: &str = "max_guest_memory_v2_mib";
+/// The same for vCPUs: above 16 only workers that report this capability.
+pub const GUEST_VCPUS_V2: &str = "max_guest_vcpus_v2";
 /// Protocol v1 peers without optional shape fields retain the original worker ceiling.
 pub fn guest_limits(v: &serde_json::Value) -> Result<(u64, u64)> {
     fn limit(v: &serde_json::Value, key: &str, fallback: u64, ceiling: u64) -> Result<u64> {
@@ -185,7 +194,11 @@ pub fn guest_limits(v: &serde_json::Value) -> Result<(u64, u64)> {
         } else {
             limit(v, "max_guest_memory_mib", 2048, 16384)?
         },
-        limit(v, "max_guest_vcpus", 4, 16)?,
+        if v.get(GUEST_VCPUS_V2).is_some() {
+            limit(v, GUEST_VCPUS_V2, 4, u64::from(GUEST_MAX_VCPUS))?
+        } else {
+            limit(v, "max_guest_vcpus", 4, 16)?
+        },
     ))
 }
 pub fn guest_shape(v: &serde_json::Value, memory: u64, cpus: u64) -> Result<()> {
@@ -226,36 +239,43 @@ mod capacity_tests {
         assert!(guest_shape(&new, 3072, 2).is_ok());
         assert!(guest_shape(&new, 32768, 16).is_ok());
         assert!(guest_shape(&new, 65536, 16).is_err());
+        assert!(guest_shape(&new, 4096, 17).is_err());
+        let wide = json!({"max_guest_memory_mib":16384,"max_guest_memory_v2_mib":98304,"max_guest_vcpus":16,"max_guest_vcpus_v2":32});
+        assert_eq!(guest_limits(&wide).unwrap(), (98304, 32));
+        assert!(guest_shape(&wide, 65536, 32).is_ok());
+        assert!(guest_shape(&wide, 65536, 33).is_err());
         for bad in [
             json!({"max_guest_memory_mib":null}),
             json!({"max_guest_vcpus":"16"}),
             json!({"max_guest_vcpus":17}),
             json!({"max_guest_memory_mib":16385}),
-            json!({"max_guest_memory_v2_mib":65537}),
+            json!({"max_guest_memory_v2_mib":(HOST_MEMORY_MIB as u64) + 1}),
+            json!({"max_guest_vcpus_v2":33}),
         ] {
             assert!(guest_limits(&bad).is_err());
         }
     }
     #[test]
     fn ceilings_and_shapes_are_bounded() {
-        for memory in SHAPES_MIB.into_iter().chain([24576, 49152]) {
-            assert!(resources(memory, 16).is_ok());
+        for memory in SHAPES_MIB.into_iter().chain([24576, 49152, 98304]) {
+            assert!(resources(memory, 32).is_ok());
         }
         for (ram, cpu) in [
             (0, 1),
-            (65792, 1),
+            (HOST_MEMORY_MIB + 256, 1),
             (4097, 1),
             (4096, 0),
-            (4096, 17),
+            (4096, 33),
             (u32::MAX, 1),
         ] {
             assert!(resources(ram, cpu).is_err());
         }
-        assert!(host_limits(65536, 8, 64).is_ok());
+        assert!(host_limits(131072, 32, 64).is_ok());
+        assert!(host_limits(HOST_MEMORY_MIB, HOST_SLOTS, HOST_CPUS).is_ok());
         for (ram, slots, cpu) in [
-            (65537, 8, 64),
-            (65536, 9, 64),
-            (65536, 8, 65),
+            (HOST_MEMORY_MIB + 1, 8, 64),
+            (65536, HOST_SLOTS + 1, 64),
+            (65536, 8, HOST_CPUS + 1),
             (u32::MAX, 1, 1),
         ] {
             assert!(host_limits(ram, slots, cpu).is_err());

@@ -277,7 +277,7 @@ start). Each measurement is a single run (n = 1), so no p50/p95.
 | Class 1 (controller, agent, dashboard) | worker PID and Firecracker PID unchanged, counter PID 293 kept counting; control plane and dashboard on the new release. Journal: stop 1.0 s, switch 0.1 s, start 0.1 s, verify 3.1 s. Whole command 266 s, of which staging (build on the host) about 250 s. |
 | Dashboard-only release | only the dashboard restarted; the agent stayed on the previous release (same PID) and verify passed against the per-unit pins |
 | Class 2 (worker) | drain, hibernate 2.1 s, switch/start/verify 3.2 s, resume 0.4 s; new worker and Firecracker PIDs, counter PID 293 continued; the agent kept its PID (it waits for the worker) |
-| Injected rollback (worker exits at start) | verify failed after its 180 s deadline, pins went back, the old worker started, the box resumed with its process |
+| Injected rollback (worker exits at start) | verify failed after its deadline (180 s then; 1800 s since 0.9.48), pins went back, the old worker started, the box resumed with its process |
 | Upgrader killed (`SIGKILL`) at verify | `ow-host recover` rolled back (6.7 s) and resumed the box with its process |
 | Step back to 0.5.0 (`ow-host upgrade v0.5.0`) | class 2, all three units back to 0.5.0, box process kept |
 | `ow-aws restart` / `restart --worker` | 5 s / 9 s end to end, box process kept |
@@ -458,3 +458,9 @@ on worker status, cache inventory or status-file writes. Protocol windows, worke
 interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are
 unchanged.
 
+## Order for 0.9.48 and later
+
+Runner budgets may exceed 65,536 MiB, 64 vCPUs or 8 slots from 0.9.48. A controller older than
+0.9.48 refuses such a heartbeat, so upgrade the controller before any runner whose host is that
+large (the fleet order already does). Snapshot verification is remembered across worker restarts
+(`verified.json`), so a restarted worker answers without re-hashing its snapshots.

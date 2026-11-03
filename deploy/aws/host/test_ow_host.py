@@ -55,7 +55,7 @@ class Render(unittest.TestCase):
             self.assertIn("OW_MAX_MEMORY_MIB=11776\n", files["/etc/open-workspaces/worker.env"])
             self.assertIn("OW_MAX_RUNNING=8\n", files["/etc/open-workspaces/worker.env"])
         files = h.render(config(vcpuOvercommit=2), {**BUDGET, "cpus": 48})
-        self.assertIn("OW_MAX_VCPUS=64\n", files["/etc/open-workspaces/worker.env"][0])
+        self.assertIn("OW_MAX_VCPUS=94\n", files["/etc/open-workspaces/worker.env"][0])  # no 64 vCPU ceiling
         self.assertEqual(config()["vcpuOvercommit"], 1)
         for ratio in [0, 3, 1.5, "2", None, True]:
             with self.assertRaisesRegex(Refused, "vcpuOvercommit"):
@@ -234,7 +234,8 @@ class HostReserve(unittest.TestCase):
         self.assertEqual(h.effective(config(hostReserve={"cpuMillis": 0, "memoryMib": 0}), physical), physical)
         tiny = {"memory": 768, "cpus": 1, "slots": 8, "hostMemory": 1024}
         self.assertEqual(h.effective(host, tiny), {**tiny, "memory": 0, "cpus": 0}, "never below zero")
-        self.assertEqual(h.effective({**host, "vcpuOvercommit": 2}, {**physical, "cpus": 64})["cpus"], 64)
+        self.assertEqual(h.effective({**host, "vcpuOvercommit": 2}, {**physical, "cpus": 64})["cpus"], 126, "no 64 vCPU ceiling")
+        self.assertEqual(h.effective({**host, "vcpuOvercommit": 2}, {**physical, "cpus": 896})["cpus"], h.MAX_CPUS, "worker sanity bound")
         self.assertEqual(config(hostReserve={"memoryMib": 4096})["hostReserve"], {"cpuMillis": 1000, "memoryMib": 4096})
         for bad in [{"cpuMillis": -1}, {"cpuMillis": 64001}, {"memoryMib": 1.5}, {"memoryMib": True}, {"other": 1}, []]:
             with self.assertRaisesRegex(Refused, "hostReserve"):

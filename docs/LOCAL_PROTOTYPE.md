@@ -269,7 +269,7 @@ limits](GUEST_IMAGES.md). Existing workspaces keep their original Alpine profile
 
 CPU count is stored per workspace and in RAM checkpoint metadata. Existing
 records/checkpoints without the field default to one vCPU. New machines accept
-`--cpus 1` through `16` and memory in 256 MiB steps up to the worker's memory budget.
+`--cpus 1` through `32` (Firecracker's limit) and memory in 256 MiB steps up to the worker's memory budget.
 Worker defaults remain 4 GiB memory, 16 vCPU and eight running machines; explicit
 validated budgets can reach 64 GiB / 64 vCPU / eight slots. Invited hosts require
 separate owner caps and stopped-host operator consent; see [host budgets](HOSTS.md). These are

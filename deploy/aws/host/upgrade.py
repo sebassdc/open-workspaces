@@ -521,7 +521,7 @@ class HostOps:
         h.run(["python3", "-I", str(p(f"{h.SRV}/releases/{to['current']}/src/deploy/aws/host/ow_host.py")), "setup"],
               capture=False)
 
-    def verify(self, expected, deadline=180):
+    def verify(self, expected, deadline=1800):
         """Health per pin: each unit runs its own pin's binary, the worker answers with its
         release, the runner is online with the agent's and worker's releases, the controller
         listens on the tailnet, the dashboard answers."""
@@ -696,7 +696,7 @@ def abort(j, ops):
     as running is resumed, stopped units start again, the drain is lifted."""
     if "worker" in ops.units() and not ops.active("worker"):
         ops.start("worker")
-        wait_worker(ops)
+        wait_worker(ops, limit=1800)
     elif not ops.quiesce_off():
         j.value["error"] = f"{j.value.get('error')}; the worker did not lift its quiesce (restart it)"
     failed = resume(j, ops)
@@ -740,7 +740,7 @@ def start_quiesced(ops, restart):
         if name in restart:
             ops.start(name)
         if name == "worker" and name in restart:
-            wait_worker(ops, limit=180)
+            wait_worker(ops, limit=1800)
             ops.quiesce()
 
 
