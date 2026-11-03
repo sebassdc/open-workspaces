@@ -1131,7 +1131,7 @@ fn enrolled_budget_is_durable_preserves_identity_and_reclamps_stale_heartbeat() 
             .unwrap(),
         before
     );
-    assert!(budget(&root, "friend", 65537, 8, 64).is_err());
+    assert!(budget(&root, "friend", common::HOST_MEMORY_MIB + 1, 8, 64).is_err());
     assert!(budget(&root, "local", 65536, 8, 64).is_err());
     assert!(budget(&root, "missing", 65536, 8, 64).is_err());
     // Offline demand remains unknown, even with a large owner ceiling.

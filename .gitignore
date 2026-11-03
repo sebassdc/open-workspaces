@@ -20,3 +20,6 @@ __pycache__/
 # Dashboard browser test output.
 /e2e/test-results/
 /e2e/playwright-report/
+
+# Local crabbox run captures
+.crabbox/

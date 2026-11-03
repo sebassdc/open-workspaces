@@ -2924,7 +2924,15 @@ mod tests {
         let s = set(&root, "telemetry.log_level", "WARN", "t").unwrap();
         assert_eq!(s["telemetry.log_level"], "warn");
         assert_eq!(s["limits.box_memory_mib"], 0);
-        assert!(set(&root, "limits.box_memory_mib", "65537", "t").is_err());
+        assert!(
+            set(
+                &root,
+                "limits.box_memory_mib",
+                &(crate::common::HOST_MEMORY_MIB as u64 + 1).to_string(),
+                "t"
+            )
+            .is_err()
+        );
         assert_eq!(
             set(&root, "limits.box_memory_mib", "16384", "t").unwrap()["limits.box_memory_mib"],
             16384

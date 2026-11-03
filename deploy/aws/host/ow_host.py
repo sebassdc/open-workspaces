@@ -64,7 +64,9 @@ UNITS = {
 }
 # Releases' own pins: each unit runs from /srv/ow/run/<pin>; current is the CLI and ow-host.
 PINS = ("worker", "agent", "dashboard")
-SLOTS = 8
+SLOTS = 32
+MAX_MEMORY_MIB = 4 << 20
+MAX_CPUS = 1024
 # CPU and RAM box admission never claims, kept for the controller and node agent.
 RESERVE = {"host": {"cpuMillis": 1000, "memoryMib": 2048},
            "controller": {"cpuMillis": 1000, "memoryMib": 2048},
@@ -300,13 +302,14 @@ def validate(config):
 
 
 def budgets(config=None):
-    """Local runner budget: three quarters of RAM (cap 64 GiB), every vCPU (cap 64), 8 slots,
+    """Local runner budget: three quarters of RAM, every vCPU, the slot count,
     and the host's RAM (MiB) for the host reserve. Physical: effective() applies the reserve."""
     if config and config["role"] == "controller":
         return {"memory": 0, "cpus": 0, "slots": 0}
     meminfo = p("/proc/meminfo").read_text()
     kib = int(re.search(r"^MemTotal:\s+(\d+)", meminfo, re.M).group(1))
-    return {"memory": min(kib * 3 // 4 // 1024, 65536), "cpus": min(os.cpu_count() or 1, 64), "slots": SLOTS,
+    # The worker refuses budgets above its sanity bounds (HOST_MEMORY_MIB, HOST_CPUS).
+    return {"memory": min(kib * 3 // 4 // 1024, MAX_MEMORY_MIB), "cpus": min(os.cpu_count() or 1, MAX_CPUS), "slots": SLOTS,
             "hostMemory": kib // 1024}
 
 
@@ -318,7 +321,7 @@ def effective(config, budget):
     if "hostMemory" in budget:
         memory = min(memory, budget["hostMemory"] - reserve["memoryMib"])
     cpus = (budget["cpus"] * 1000 - reserve["cpuMillis"]) * config["vcpuOvercommit"] // 1000
-    return {**budget, "memory": max(memory, 0), "cpus": max(min(cpus, 64), 0)}
+    return {**budget, "memory": max(memory, 0), "cpus": max(min(cpus, MAX_CPUS), 0)}
 
 
 # ---------------------------------------------------------------- rendering

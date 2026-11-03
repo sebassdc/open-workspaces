@@ -1700,7 +1700,7 @@ pub fn agent(
     };
     let (guest_ram, guest_cpus) = common::guest_limits(&status)?;
     #[cfg(target_os = "linux")]
-    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram.min(16384),"max_guest_vcpus":guest_cpus,"guest_ssh_v1":status["guest_ssh_v1"]==true,"disk_resize_v1":status["disk_resize_v1"]==true,"snapshot_delete_v1":status["snapshot_delete_v1"]==true,"telemetry_v1":true,"telemetry_logs_v1":true});
+    let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"firecracker","arch":std::env::consts::ARCH,"runtime":common::RUNTIME,"memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram.min(16384),"max_guest_vcpus":guest_cpus.min(16),"guest_ssh_v1":status["guest_ssh_v1"]==true,"disk_resize_v1":status["disk_resize_v1"]==true,"snapshot_delete_v1":status["snapshot_delete_v1"]==true,"telemetry_v1":true,"telemetry_logs_v1":true});
     #[cfg(target_os = "macos")]
     let hello = json!({"type":"heartbeat","ready_ack":true,"protocol":common::PROTOCOL,"backend":"apple-virtualization","arch":"aarch64","runtime":"apple-vz-v1","memory_mib":status["max_memory_mib"],"slots":status["max_running"],"vcpus":status["max_vcpus"],"images":images,"max_guest_memory_mib":guest_ram,"max_guest_vcpus":guest_cpus,"guest_ssh_v1":false,"operations":common::MAC_OPERATIONS,"telemetry_v1":true,"telemetry_logs_v1":true});
     // Older controllers read only the 16384 MiB field; the full ceiling travels in its own capability.
@@ -1709,6 +1709,9 @@ pub fn agent(
         let mut hello = hello;
         if status.get(common::GUEST_MEMORY_V2).is_some() {
             hello[common::GUEST_MEMORY_V2] = json!(guest_ram);
+        }
+        if status.get(common::GUEST_VCPUS_V2).is_some() {
+            hello[common::GUEST_VCPUS_V2] = json!(guest_cpus);
         }
         hello
     };

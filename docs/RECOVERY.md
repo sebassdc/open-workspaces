@@ -283,3 +283,11 @@ one-hour recovery result. Use `scripts/recovery-acceptance.py` with two dedicate
 workers and a private authorized store for that acceptance; it verifies a disk
 marker, cold restore and compatible RAM continuation separately. Keep live gates
 and evidence distinct from source/test completion.
+
+## Snapshot verification cost
+
+A snapshot is checked against its manifest's SHA-256 before it is resumed, restored, forked or
+accepted as a recovery point. The worker hashes in process and feeds sparse holes as zeros
+without reading them, and it keeps the fingerprints (device, inode, size, times, mode) of
+verified snapshots in `verified.json` in its data directory, so a restarted worker does not
+hash them again; any change to a file changes its fingerprint and forces a new hash.

@@ -236,6 +236,7 @@ impl Runtime {
                     File::open(self.root.join("snapshots"))?.sync_all()?;
                     self.verified
                         .insert(point.snapshot.clone(), fingerprints(&destination)?);
+                    self.save_verified();
                     Ok(())
                 })();
                 if copied.is_err() {

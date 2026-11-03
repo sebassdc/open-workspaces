@@ -89,8 +89,8 @@ invalidates older secrets; editing an enrolled budget preserves its ID/credentia
 
 ## Adjusting saved participation
 
-Ceilings: worker 65,536 MiB / 64 vCPU / 8 running slots. Workspace shapes:
-any 256 MiB step up to the worker's memory budget and 1–16 vCPU. Existing conservative
+Ceilings: none beyond the host itself (three quarters of RAM, every vCPU, 32 running slots by default).
+Workspace shapes: any 256 MiB step up to the worker's memory budget and 1–32 vCPU (Firecracker's limit). Existing conservative
 defaults remain. Owner caps and local operator consent both bound admission;
 raising one never raises the other. Doctor reports logical CPU availability and
 optional `lscpu` topology; it does not select or promise a physical capacity budget.
@@ -259,7 +259,7 @@ cost; large-bundle header latency on the deployed host needs separate measuremen
 Mixed worker versions use protocol-v1 optional `max_guest_memory_mib` and
 `max_guest_vcpus` capabilities. Missing fields mean the legacy per-guest ceiling
 of 2048 MiB / 4 CPU, even when the enrolled host advertises a larger total budget.
-New workers report their whole memory budget (older workers: 16384 MiB) and 16 CPU. The controller setting `limits.box_memory_mib` can cap it pool-wide. Placement and owning-route create, resize,
+New workers report their whole memory budget (older workers: 16384 MiB) and vCPU budget up to 32 in `max_guest_vcpus_v2` (older workers: 16). The controller setting `limits.box_memory_mib` can cap it pool-wide. Placement and owning-route create, resize,
 start, fork and restore admission enforce both the guest ceiling and host budget
 before durable intent. Upgrade the worker before requesting larger shapes.
 

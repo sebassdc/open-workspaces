@@ -12,7 +12,6 @@ use std::{
     io::Write,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 #[path = "runtime_recovery.rs"]
@@ -430,7 +429,7 @@ pub enum Step {
     Seal(Staged),
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 struct Fingerprint {
     device: u64,
     inode: u64,
@@ -440,6 +439,11 @@ struct Fingerprint {
     mode: u32,
 }
 
+/// Verified snapshot fingerprints survive worker restarts: any change to a file (inode, size,
+/// times, mode) changes its fingerprint, so a stale entry only means one more hash.
+fn root_verified(root: &Path) -> PathBuf {
+    root.join("verified.json")
+}
 fn fingerprints(directory: &Path) -> Result<Vec<Fingerprint>> {
     let snapshot: Snapshot = serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
     std::iter::once("manifest.json")
@@ -477,14 +481,64 @@ pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// SHA-256 of a file's bytes, as `sha256sum` prints it. Holes of sparse disks and RAM files
+/// are hashed as zeros without being read.
 fn hash(path: &Path) -> Result<String> {
-    let output = Command::new("sha256sum").arg(path).output()?;
-    ensure!(output.status.success(), "hash failed");
-    Ok(String::from_utf8(output.stdout)?
-        .split_whitespace()
-        .next()
-        .context("missing hash")?
-        .to_owned())
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::FileExt;
+    let file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    let zeros = vec![0u8; 1 << 20];
+    let zero_fill = |hasher: &mut Sha256, mut n: u64| {
+        while n > 0 {
+            let k = n.min(zeros.len() as u64) as usize;
+            hasher.update(&zeros[..k]);
+            n -= k as u64;
+        }
+    };
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+    let mut at = 0u64;
+    while at < length {
+        let data = unsafe { libc::lseek(fd, at as i64, libc::SEEK_DATA) };
+        // ENXIO: only a hole remains; any other failure falls back to reading everything.
+        let (start, end) = if data < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO) {
+                (length, length)
+            } else {
+                (at, length)
+            }
+        } else {
+            let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+            (
+                data as u64,
+                if hole < data {
+                    length
+                } else {
+                    (hole as u64).min(length)
+                },
+            )
+        };
+        zero_fill(&mut hasher, start - at);
+        let mut cursor = start;
+        while cursor < end {
+            let want = (end - cursor).min(buffer.len() as u64) as usize;
+            let n = file.read_at(&mut buffer[..want], cursor)?;
+            ensure!(n > 0, "file ended early while hashing");
+            hasher.update(&buffer[..n]);
+            cursor += n as u64;
+        }
+        at = end.max(start);
+        if start == length {
+            break;
+        }
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 fn install_file(machine: &mut Vm, binary: &Path, guest: &str, digest: &str) -> Result<()> {
@@ -618,6 +672,34 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Best effort: a lost write costs one more hash after the next restart. Entries whose
+    /// files changed in the last 2 s stay in memory only: a write within the same timestamp
+    /// tick could leave the fingerprint unchanged.
+    fn save_verified(&self) {
+        let settled = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 - 2)
+            .unwrap_or(0);
+        let durable: BTreeMap<&String, &Vec<Fingerprint>> = self
+            .verified
+            .iter()
+            .filter(|(_, prints)| {
+                prints
+                    .iter()
+                    .all(|f| f.changed.0 < settled && f.modified.0 < settled)
+            })
+            .collect();
+        let path = root_verified(&self.root);
+        let saved = atomic_json(&path, &durable).and_then(|()| {
+            Ok(fs::set_permissions(
+                &path,
+                fs::Permissions::from_mode(0o600),
+            )?)
+        });
+        if let Err(e) = saved {
+            eprintln!("could not persist verified snapshots: {e:#}");
+        }
+    }
     pub fn ssh(&mut self, id: &str) -> Result<(std::net::TcpStream, String)> {
         self.require_unmanaged(id)?;
         self.ssh_request(&json!({"op":"ssh","id":id}))
@@ -739,6 +821,10 @@ impl Runtime {
             fs::read_to_string("/proc/sys/kernel/osrelease")?.trim()
         );
         let kernel_hash = hash(&assets.join("downloads/vmlinux-6.1.186"))?;
+        let verified = fs::read(root_verified(&root))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         let runtime = Self {
             root,
             assets,
@@ -746,7 +832,7 @@ impl Runtime {
             machines: BTreeMap::new(),
             cpu,
             kernel_hash,
-            verified: BTreeMap::new(),
+            verified,
             idle: crate::idle::Idle::from_env()?,
             closing: false,
             capture_ready: BTreeMap::new(),
@@ -1541,6 +1627,7 @@ impl Runtime {
             File::open(self.root.join("snapshots"))?.sync_all()?;
             self.verified
                 .insert(name.clone(), fingerprints(&destination)?);
+            self.save_verified();
             let mut summary = staged.snapshot.summary();
             if let Some(stats) = stats {
                 summary["chunks"] = json!(stats);
@@ -1758,6 +1845,7 @@ impl Runtime {
             "snapshot changed during integrity verification"
         );
         self.verified.insert(name.into(), before);
+        self.save_verified();
         Ok(directory)
     }
 
@@ -1979,7 +2067,7 @@ impl Runtime {
                 "worker_pid":std::process::id(),"placement_fencing_v1":true,"move_fork_v1":true,"recovery_points_v1":true,"recovery_client_seal_v1":true,"recovery_disk_only_v1":true,"snapshot_delete_v1":true,"managed_lifecycle_v1":true,"guest_ssh_v1":true,"aws_identity_v1":true,"aws_metadata_v1":true,"disk_resize_v1":true,"max_disk_gib":max_disk_gib()?,"reserved_disk_bytes":self.disk_reserved()?,"unwritten_disk_bytes":crate::cache::unwritten_disks(&self.root)?,"free_disk_bytes":self.storage_available()?,
                 "available_disk_bytes":self.disk_headroom().ok(),"disk_observed_unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"workspace_count":self.workspace_count(),
                 "cache_eviction_v1":true,"image_store_v1":true,"image_digests":crate::cache::inventory(&self.root)?.iter().map(|i| json!({"name":i.name,"digest":i.digest})).collect::<Vec<_>>(),
-                "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":max_memory().min(16384),"max_guest_memory_v2_mib":max_memory(),"max_guest_vcpus":16,
+                "host_managed":std::env::var("OW_HOST_MANAGED").as_deref()==Ok("1"),"host_asset_hash":std::env::var("OW_HOST_ASSET_HASH").unwrap_or_default(),"min_free_gib":minimum_free_gib()?,"host_reserve":{"cpu_millis":host_reserve().0,"memory_mib":host_reserve().1,"vcpu_overcommit":overcommit()},"max_running":max_running(),"max_memory_mib":max_memory(),"max_vcpus":max_cpus(),"max_workspaces":MAX_WORKSPACES,"max_guest_memory_mib":max_memory().min(16384),"max_guest_memory_v2_mib":max_memory(),"max_guest_vcpus":16,"max_guest_vcpus_v2":max_cpus().min(crate::common::GUEST_MAX_VCPUS),
                 "max_snapshots":MAX_SNAPSHOTS,"images":self.images()?.iter().map(|i| i["name"].clone()).collect::<Vec<_>>(),"internet":crate::network::enabled(),"network":"filtered rootless IPv4 Internet egress; LAN, host and peer access blocked","prototype":true}),
             ),
             "list" => Ok(json!(
@@ -2485,6 +2573,19 @@ mod disk_tests {
         // Its disk verifies; there is no RAM to resume, here or on a worker without the flag.
         runtime.verified.clear();
         runtime.verify_snapshot(&name, false).unwrap();
+        // The verification survives a worker restart once its files have settled; a file
+        // changed within the last 2 s stays in memory only.
+        let saved = |runtime: &Runtime| -> BTreeMap<String, Vec<Fingerprint>> {
+            serde_json::from_slice(&fs::read(root_verified(&runtime.root)).unwrap()).unwrap()
+        };
+        assert!(!saved(&runtime).contains_key(&name));
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        runtime.save_verified();
+        assert!(saved(&runtime)[&name] == fingerprints(&directory).unwrap());
+        assert_eq!(
+            fs::metadata(root_verified(&runtime.root)).unwrap().mode() & 0o777,
+            0o600
+        );
         assert!(runtime.verify_snapshot(&name, true).is_err());
         let mut legacy = serde_json::to_value(&manifest).unwrap();
         legacy.as_object_mut().unwrap().remove("disk_only");
@@ -2781,6 +2882,43 @@ mod disk_tests {
             .unwrap_err();
         assert_eq!(error.to_string(), "workspace not found");
         fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn hash_matches_sha256sum_on_sparse_files() {
+        use std::os::unix::fs::FileExt;
+        let dir = std::env::temp_dir().join(format!("ow-hash-{}", vm::nonce().unwrap()));
+        fs::create_dir(&dir).unwrap();
+        for (name, islands) in [
+            ("empty", vec![]),
+            ("holes", vec![]),
+            (
+                "islands",
+                vec![(0u64, 4096usize), (5 << 20, 70_000), ((64 << 20) - 10, 10)],
+            ),
+            ("tail", vec![((64 << 20) - (3 << 20), 3 << 20)]),
+        ] {
+            let path = dir.join(name);
+            let file = File::create(&path).unwrap();
+            if name != "empty" {
+                file.set_len(64 << 20).unwrap();
+            }
+            for (at, len) in islands {
+                file.write_all_at(&vec![0xa5; len], at).unwrap();
+            }
+            drop(file);
+            let expected = std::process::Command::new("sha256sum")
+                .arg(&path)
+                .output()
+                .unwrap();
+            let expected = String::from_utf8(expected.stdout).unwrap();
+            assert_eq!(
+                hash(&path).unwrap(),
+                expected.split_whitespace().next().unwrap(),
+                "{name}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
