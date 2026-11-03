@@ -1,7 +1,7 @@
 # ADR 0011: a worker restart hands running VMMs to the next worker
 
-Status: implemented in 0.9.51; the check on a real host is recorded in
-[UPGRADES.md](../UPGRADES.md#worker-hand-over-keeps-boxes-running) when done. Amends [ADR 0005](0005-change-classes-and-engine-boundary.md),
+Status: implemented in 0.9.51; sandbox EC2 check (hand-over, fallback and a VMM
+change) in [UPGRADES.md](../UPGRADES.md#sandbox-ec2-check-hand-over-2026-11-03). Amends [ADR 0005](0005-change-classes-and-engine-boundary.md),
 which left worker re-adoption of running VMMs out.
 Pattern: ADR 0005's journaled upgrade state machine (abort before the switch,
 rollback after it) and its release-impact manifest; the worker's delegated cgroup

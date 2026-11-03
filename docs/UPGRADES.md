@@ -514,8 +514,43 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
   0.9.51 on, `ow-host restart --worker` and worker-only upgrades hand over.
 
 A worker that exits without hibernating no longer takes its VMMs with it: the next
-worker started adopts them the same way. A reboot in the seconds between detach and
+worker started adopts them the same way. The host check below records timings. A reboot in the seconds between detach and
 the new worker's start boots those boxes cold from their disks.
+
+### Sandbox EC2 check: hand-over (2026-11-03)
+
+Observed on one throwaway m8i-flex.xlarge host in the sandbox account (Ubuntu
+24.04 AMI `ami-0d6dd9e8265d48906`, host kernel 7.0.0-1014-aws, systemd 255,
+4 vCPUs, 16 GiB, Btrfs data volume), destroyed afterwards. The host installed
+0.9.51 from this branch; 0.9.52 (worker only) and 0.9.53 (declaring `vmm`)
+were test releases built from it (version bumps and manifest entries). Two
+Alpine boxes ran throughout: `big` (4096 MiB, 2 GiB of it filled with random
+data in a tmpfs) and `small` (1024 MiB). Each ran a counter (`echo $i > /tmp/t`
+every second) and a heartbeat that appends the guest's `/proc/uptime` every
+0.1 s; the counter's PID, the VMM PID (`vmm.json`) and the largest heartbeat
+gap were read before and after each step. A probe on the host ran
+`ow exec big -- true` once a second. Each measurement is a single run (n = 1),
+so no p50/p95.
+
+| Step | Path | Result |
+| --- | --- | --- |
+| `ow-host restart --worker` on 0.9.51 | hand-over | both kept: same VMM PIDs, same counter PIDs, guest uptime continuous. Command 1.3 s end to end (journal: start 1.1 s); one `ow exec` probe failed (unreachable at most 1 s) |
+| `ow-host upgrade` 0.9.51 → 0.9.52 (worker only) | hand-over (`same VMM and guest kernel`) | both kept with the same VMM and counter PIDs; largest guest heartbeat gap 0.14 s (`big`) and 0.12 s (`small`): the guests never paused. 1 of 530 probes failed (at most 1 s). Journal: handover 0.0 s, start 1.1 s, verify 6.1 s; the command's 556 s were the release build on the host |
+| Forced adoption failure: `small`'s VMM stopped (`SIGSTOP`) across `ow-host restart --worker`, continued 25 s later | hand-over, then fallback | `big` adopted. `small`: its API timed out after 10 s, the new worker hibernated it, and the upgrade's resume step woke it on a new VMM with the same counter PID (RAM state kept). Journal start 52.9 s, resume 0.5 s; error names `small` |
+| `ow-host upgrade` 0.9.52 → 0.9.53 (declares `vmm`) | hibernate (`vmm change`) | both hibernated and woken on new VMMs with the same counter PIDs; journal hibernate 81.7 s, resume 19.6 s; the longest probe outage 81.9 s |
+
+So a worker-only change costs about a second of control-plane outage and no
+guest pause, against 80-100 s of hibernation and wake for 5 GiB of boxes here
+(the ADR cites about 31 minutes for a 16 GiB and a 4 GiB box on another host). Systemd logged both VMMs as "left-over process ... in
+control group while starting unit. Ignoring.", as expected with
+`KillMode=process`. The VMM held its console (`/dev/ptmx`) as fd 3 and its log
+pipe's read end as fd 4 throughout.
+
+Found and fixed during the run: the upgrader read the adoption report from a
+busy worker's last answer, which predated the adoption, and reported every box
+as not kept; it now waits for a fresh answer. A fresh host's build fetched the
+moving `rustup-init` URL against a pinned hash; it now fetches the pinned
+version.
 
 ## Order for 0.9.48 and later
 
