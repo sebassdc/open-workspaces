@@ -5,7 +5,7 @@
       "version": "0.9.51",
       "class": 0,
       "changes": [
-        "config"
+        "component"
       ],
       "protocol": {
         "speaks": 1,
@@ -34,7 +34,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "Fresh hosts bootstrap again: scripts/setup-local.sh downloads the pinned rustup-init 1.29.1 from its versioned archive URL instead of dist/ (always the newest rustup), whose new release no longer matched the pinned hash and failed every new runner's staging. Hosts that already staged a release are unaffected. Class 0: nothing restarts."
+      "notes": "Fresh hosts bootstrap again: scripts/setup-local.sh downloads the pinned rustup-init 1.29.1 from its versioned archive URL instead of dist/ (always the newest rustup), whose new release no longer matched the pinned hash and failed every new runner's staging. The Ubuntu base rootfs comes from its versioned 24.04.5 folder, not the 24.04 folder that drops old point releases. Hosts that already staged a release are unaffected. Class 0: nothing restarts."
     },
     {
       "version": "0.9.50",

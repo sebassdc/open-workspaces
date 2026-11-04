@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / 'data/runtime-spike'
 SOURCES = {
     'ubuntu': ('ubuntu-base-24.04.5-base-amd64.tar.gz',
-               'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/',
+               'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.5/release/',
                'e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86', '', 512),
     'arch': ('archlinux-bootstrap-2026.10.01-x86_64.tar.zst',
              'https://archive.archlinux.org/iso/2026.10.01/',
