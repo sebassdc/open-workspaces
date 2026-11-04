@@ -3,10 +3,10 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export OW_DATA_DIR="${OW_DATA_DIR:-$repo_root/data/prototype}"
 export OW_ASSET_DIR="${OW_ASSET_DIR:-$repo_root/data/runtime-spike}"
+# A host release (RELEASE/src beside RELEASE/bin and RELEASE/assets) uses its own installed
+# ow: published binaries build nothing, and the shared target/ may hold another release's.
 binary=$repo_root/target/release/ow
-# A host release installed from published binaries builds nothing: use its own ow
-# (RELEASE/bin/ow next to RELEASE/src), as its developer-image build does.
-[[ -x $binary ]] || binary=$repo_root/../bin/ow
+if [[ -x $repo_root/../bin/ow && -d $repo_root/../assets ]]; then binary=$repo_root/../bin/ow; fi
 if [[ ! -x $binary ]]; then
   echo 'Build the local prototype first: bash scripts/setup-local.sh' >&2
   exit 1

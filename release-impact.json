@@ -34,7 +34,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "Fresh hosts build their developer images again: the repository's ow wrapper, which experiments/guest-dev/build.py runs, falls back to the release's installed bin/ow when nothing was built from source (target/release/ow), as on every host installed from published binaries. Hosts with a source build keep using it. Class 0: nothing restarts."
+      "notes": "Fresh hosts build their developer images again: the repository's ow wrapper, which experiments/guest-dev/build.py runs, uses the release's own installed bin/ow on a host (RELEASE/src beside RELEASE/bin and RELEASE/assets) instead of target/release/ow, which hosts installed from published binaries never build and which the shared build folder may hold from another release; a developer checkout still uses target/release/ow. Class 0: nothing restarts, and a host upgraded in place keeps its worker's older wrapper until a release moves the worker."
     },
     {
       "version": "0.9.51",
