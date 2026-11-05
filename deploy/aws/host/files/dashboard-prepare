@@ -15,10 +15,11 @@ import json, os, sqlite3, sys
 path = "/srv/ow/.ow/dashboard.json"
 # The admin (docs/ADMIN_API.md): the owner login'"'"'s stable tailnet user ID, bound to the catalog
 # user that ID signed in as. Until they have signed in once, nobody is bound.
+status = sys.stdin.read()  # always drained, so a large status never breaks the pipe
 binding = {}
 owner = os.environ["OWNER"]
 if owner:
-    users = json.loads(sys.stdin.read() or "{}").get("User") or {}
+    users = json.loads(status or "{}").get("User") or {}
     ids = [uid for uid, user in users.items() if str(user.get("LoginName", "")).lower() == owner.lower()]
     issuer = "tailscale://" + os.environ["NAME"].split(".", 1)[1]
     row = None

@@ -854,7 +854,7 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             .map_err(|e| {
                 if e.is::<crate::limits::Rejection>()
                     || e.is::<Failure>()
-                    || e.downcast_ref::<rusqlite::Error>().is_some()
+                    || matches!(e.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(..)))
                 {
                     Failure::from(e)
                 } else {
