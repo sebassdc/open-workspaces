@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The setting: a JSON list of pools.
 pub(crate) const POOLS: &str = "actions.pools";
@@ -231,14 +231,16 @@ pub(crate) fn observe(now: i64, entries: &mut BTreeMap<String, Entry>, runners: 
     }
 }
 
-/// The actions for this pass. `runners` is None when GitHub could not be read: then only
-/// limits that need no GitHub answer apply. `held` pools make no new boxes this pass.
+/// The actions for this pass, for one repository's pools and boxes. `runners` is None when
+/// GitHub could not be read: then only limits that need no GitHub answer apply. `held` pools
+/// make no new boxes this pass; boxes named in `draining` are on a runner being drained.
 pub(crate) fn plan(
     now: i64,
     pools: &[Pool],
     entries: &BTreeMap<String, Entry>,
     runners: Option<&HashMap<String, Runner>>,
     held: &dyn Fn(&str) -> bool,
+    draining: &HashSet<String>,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     let mut removing = std::collections::HashSet::new();
@@ -281,6 +283,10 @@ pub(crate) fn plan(
                             Some(remove("its runner did not come online", false))
                         }
                         Some(_) if e.busy.is_some() => None,
+                        // Its runner can only finish draining once the idle box is gone.
+                        Some(_) if draining.contains(name) => {
+                            Some(remove("its runner is draining", false))
+                        }
                         Some(_) => match pool(&e.pool) {
                             None => Some(remove("its pool was removed", false)),
                             Some(p) if p.spec() != e.spec => {
@@ -393,7 +399,7 @@ mod tests {
         let none = BTreeMap::new();
         let runners = HashMap::new();
         assert_eq!(
-            plan(0, &[p.clone()], &none, Some(&runners), &|_| false),
+            plan(0, &[p.clone()], &none, Some(&runners), &|_| false, &HashSet::new()),
             vec![Action::Launch { pool: "ci".into(), count: 11 }]
         );
         // Busy boxes count against max, not against warm.
@@ -406,11 +412,11 @@ mod tests {
             runners.insert(format!("b{i}"), online(true));
         }
         assert_eq!(
-            plan(10, &[p.clone()], &held, Some(&runners), &|_| false),
+            plan(10, &[p.clone()], &held, Some(&runners), &|_| false, &HashSet::new()),
             vec![Action::Launch { pool: "ci".into(), count: 3 }]
         );
         // A held pool (its node is full) makes nothing until the hold ends.
-        assert!(plan(10, &[p], &held, Some(&runners), &|_| true).is_empty());
+        assert!(plan(10, &[p], &held, Some(&runners), &|_| true, &HashSet::new()).is_empty());
     }
 
     #[test]
@@ -423,7 +429,7 @@ mod tests {
         entries.insert("a".to_string(), e);
         let gone = HashMap::new();
         assert_eq!(
-            plan(20, &[p], &entries, Some(&gone), &|_| false),
+            plan(20, &[p], &entries, Some(&gone), &|_| false, &HashSet::new()),
             vec![
                 Action::Remove { name: "a".into(), why: "its job ended", force: true },
                 Action::Launch { pool: "ci".into(), count: 1 },
@@ -446,7 +452,7 @@ mod tests {
             ("busy".to_string(), online(true)),
         ]);
         assert_eq!(
-            plan(10, &[p], &entries, Some(&runners), &|_| false),
+            plan(10, &[p], &entries, Some(&runners), &|_| false, &HashSet::new()),
             vec![
                 Action::Remove { name: "idle".into(), why: "its pool's settings changed", force: false },
                 Action::Launch { pool: "ci".into(), count: 2 },
@@ -468,10 +474,10 @@ mod tests {
         entries.insert("stuck".to_string(), stuck);
         // No launch: a new box needs a registration from GitHub.
         assert_eq!(
-            plan(cap + 1, &[p.clone()], &entries, None, &|_| false),
+            plan(cap + 1, &[p.clone()], &entries, None, &|_| false, &HashSet::new()),
             vec![Action::Remove { name: "old".into(), why: "over the lifetime limit", force: true }]
         );
-        let later = plan(cap + LIFETIME_S + 1, &[p], &entries, None, &|_| false);
+        let later = plan(cap + LIFETIME_S + 1, &[p], &entries, None, &|_| false, &HashSet::new());
         assert!(later.contains(&Action::Remove { name: "stuck".into(), why: "removal retried", force: true }));
         assert!(later.contains(&Action::Remove { name: "long".into(), why: "its job ran over the time limit", force: true }));
     }
@@ -486,8 +492,24 @@ mod tests {
         entries.insert("busy".to_string(), busy);
         let runners = HashMap::from([("idle".to_string(), online(false)), ("busy".to_string(), online(true))]);
         assert_eq!(
-            plan(IDLE_MAX_S + 1, &[p], &entries, Some(&runners), &|_| false),
+            plan(IDLE_MAX_S + 1, &[p], &entries, Some(&runners), &|_| false, &HashSet::new()),
             vec![Action::Remove { name: "idle".into(), why: "idle too long", force: false }]
+        );
+    }
+
+    #[test]
+    fn idle_boxes_on_a_draining_runner_go_and_busy_ones_finish() {
+        let p = pool(0, 2);
+        let mut entries = BTreeMap::new();
+        entries.insert("idle".to_string(), entry(&p, Phase::Started, 0));
+        let mut busy = entry(&p, Phase::Started, 0);
+        busy.busy = Some(1);
+        entries.insert("busy".to_string(), busy);
+        let runners = HashMap::from([("idle".to_string(), online(false)), ("busy".to_string(), online(true))]);
+        let draining = HashSet::from(["idle".to_string(), "busy".to_string()]);
+        assert_eq!(
+            plan(10, &[p], &entries, Some(&runners), &|_| false, &draining),
+            vec![Action::Remove { name: "idle".into(), why: "its runner is draining", force: false }]
         );
     }
 
@@ -501,9 +523,9 @@ mod tests {
             "offline".to_string(),
             Runner { id: 2, status: "offline".into(), busy: false },
         )]);
-        assert!(plan(30, &[p.clone()], &entries, Some(&runners), &|_| false).is_empty());
+        assert!(plan(30, &[p.clone()], &entries, Some(&runners), &|_| false, &HashSet::new()).is_empty());
         assert_eq!(
-            plan(OFFLINE_S + 1, &[p], &entries, Some(&runners), &|_| false),
+            plan(OFFLINE_S + 1, &[p], &entries, Some(&runners), &|_| false, &HashSet::new()),
             vec![
                 Action::Remove { name: "never".into(), why: "its runner never registered", force: true },
                 Action::Remove { name: "offline".into(), why: "its runner did not come online", force: false },

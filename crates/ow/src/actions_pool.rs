@@ -14,6 +14,7 @@
 use crate::actions::{self, Action, Entry, Phase, Pool, Runner};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -117,27 +118,33 @@ pub(crate) fn start(root: &Path, catalog: Arc<Mutex<crate::catalog::Catalog>>) {
 
 fn db(root: &Path) -> Result<rusqlite::Connection> {
     let db = crate::nodes::db(root)?;
-    db.execute_batch("CREATE TABLE IF NOT EXISTS runner_boxes(name TEXT PRIMARY KEY,entry TEXT NOT NULL);")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS runner_boxes(name TEXT PRIMARY KEY,entry TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS runner_pool_status(id INTEGER PRIMARY KEY CHECK(id=1),body TEXT NOT NULL);")?;
     Ok(db)
 }
 
 /// What a previous process left: anything it was still making or removing is removed now.
 fn load(root: &Path) -> Result<BTreeMap<String, Entry>> {
-    let db = db(root)?;
-    let mut out = BTreeMap::new();
-    let rows: Vec<(String, String)> = db
-        .prepare("SELECT name,entry FROM runner_boxes")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    for (name, text) in rows {
-        let mut entry: Entry = serde_json::from_str(&text)?;
+    let mut out = load_raw(root)?;
+    for entry in out.values_mut() {
         if entry.phase != Phase::Started {
             entry.phase = Phase::Removing;
             entry.retry_at = 0;
         }
-        out.insert(name, entry);
     }
     Ok(out)
+}
+
+/// The boxes as last saved.
+fn load_raw(root: &Path) -> Result<BTreeMap<String, Entry>> {
+    let db = db(root)?;
+    let rows: Vec<(String, String)> = db
+        .prepare("SELECT name,entry FROM runner_boxes")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    rows.into_iter()
+        .map(|(name, text)| Ok((name, serde_json::from_str(&text)?)))
+        .collect()
 }
 
 fn save(shared: &Shared, name: &str, entry: Option<&Entry>) {
@@ -174,11 +181,21 @@ fn pools(root: &Path) -> Result<(Vec<Pool>, u64)> {
     Ok((pools, settings[actions::APP_ID].as_u64().unwrap_or(0)))
 }
 
+/// Names of the boxes on runners being drained (their idle runners must go).
+fn draining(root: &Path) -> Result<std::collections::HashSet<String>> {
+    let db = crate::nodes::db(root)?;
+    let mut stmt = db.prepare("SELECT r.name FROM resources r JOIN runner_drains d ON d.node=r.node WHERE r.kind='machine' AND d.state IN ('soft-draining','draining')")?;
+    Ok(stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 fn pass(shared: &Arc<Shared>) -> Result<()> {
     let (pools, app_id) = pools(&shared.root)?;
     let repos: std::collections::BTreeSet<String> = {
         let entries = shared.entries.lock().unwrap();
         if pools.is_empty() && entries.is_empty() {
+            publish(shared);
             return Ok(());
         }
         pools
@@ -187,25 +204,20 @@ fn pass(shared: &Arc<Shared>) -> Result<()> {
             .chain(entries.values().map(|e| repo_of(&e.spec)))
             .collect()
     };
-    // Every repository's runners, or None when one could not be read.
-    let mut listed = Some(HashMap::new());
-    let mut failure = None;
-    for repo in &repos {
-        match shared.github.runners(app_id, repo) {
-            Ok(found) => {
-                if let Some(all) = listed.as_mut() {
-                    all.extend(found);
-                }
-            }
-            Err(error) => {
-                listed = None;
-                failure = Some(error.context(format!("listing {repo}'s runners")));
-                break;
-            }
-        }
-    }
+    let draining = draining(&shared.root).unwrap_or_default();
     let at = now();
-    let actions = {
+    let mut failure = None;
+    let mut actions = vec![];
+    // Each repository on its own: one GitHub cannot read stops only its own pools.
+    for repo in &repos {
+        let listed = match shared.github.runners(app_id, repo) {
+            Ok(found) => Some(found),
+            Err(error) => {
+                failure = Some(error.context(format!("listing {repo}'s runners")));
+                None
+            }
+        };
+        let repo_pools: Vec<Pool> = pools.iter().filter(|p| &p.repo == repo).cloned().collect();
         let mut entries = shared.entries.lock().unwrap();
         if let Some(listed) = &listed {
             let before = entries.clone();
@@ -222,11 +234,17 @@ fn pass(shared: &Arc<Shared>) -> Result<()> {
                 }
             }
         }
+        let mine: BTreeMap<String, Entry> = entries
+            .iter()
+            .filter(|(_, e)| &repo_of(&e.spec) == repo)
+            .map(|(n, e)| (n.clone(), e.clone()))
+            .collect();
+        drop(entries);
         let holds = shared.holds.lock().unwrap().clone();
-        actions::plan(at, &pools, &entries, listed.as_ref(), &|pool| {
+        actions.extend(actions::plan(at, &repo_pools, &mine, listed.as_ref(), &|pool| {
             holds.get(pool).is_some_and(|until| *until > at)
-        })
-    };
+        }, &draining));
+    }
     for action in actions {
         match action {
             Action::Launch { pool, count } => {
@@ -268,9 +286,34 @@ fn pass(shared: &Arc<Shared>) -> Result<()> {
             }
         }
     }
+    publish(shared);
     match failure {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// Holds, errors and start times, kept in the catalog when they change, so either process
+/// serving the admin API answers `actions.status` (the pools run in the dashboard's).
+fn publish(shared: &Shared) {
+    let body = json!({
+        "holds": *shared.holds.lock().unwrap(),
+        "errors": shared.errors.lock().unwrap().iter().map(|(p, (t, m))| (p.clone(), json!({"unix_s":t,"message":m}))).collect::<serde_json::Map<_, _>>(),
+        "recent": *shared.recent.lock().unwrap(),
+    })
+    .to_string();
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    let mut last = LAST.lock().unwrap();
+    if *last == body {
+        return;
+    }
+    let result = db(&shared.root).and_then(|db| {
+        db.execute("INSERT INTO runner_pool_status(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body", [&body])?;
+        Ok(())
+    });
+    match result {
+        Ok(()) => *last = body,
+        Err(e) => eprintln!("actions pools: saving status: {e:#}"),
     }
 }
 
@@ -314,15 +357,18 @@ fn timing(shared: &Shared, name: &str, key: &str) {
 }
 
 fn error(shared: &Shared, pool: &str, message: String) {
-    let mut errors = shared.errors.lock().unwrap();
-    // A fault that repeats every pass is logged once a minute; status always has the latest.
-    let quiet = errors
-        .get(pool)
-        .is_some_and(|(at, _)| now() - at < 60);
-    if !quiet {
+    // A fault that repeats every pass is logged once a minute; status has the latest.
+    static LOGGED: Mutex<BTreeMap<String, i64>> = Mutex::new(BTreeMap::new());
+    let mut logged = LOGGED.lock().unwrap();
+    if logged.get(pool).is_none_or(|at| now() - at >= 60) {
         eprintln!("actions pools: {pool}: {message}");
-        errors.insert(pool.to_owned(), (now(), message));
+        logged.insert(pool.to_owned(), now());
     }
+    shared
+        .errors
+        .lock()
+        .unwrap()
+        .insert(pool.to_owned(), (now(), message));
 }
 
 // ------------------------------------------------------------------------- boxes
@@ -502,15 +548,19 @@ fn remove(shared: &Shared, name: &str, why: &str, force: bool, release: bool, ap
 // ------------------------------------------------------------------------- admin ops
 
 /// `actions.status`: each pool's boxes and the latest start times.
+/// `actions.status`: each pool's boxes and the latest start times. Read from the catalog, so
+/// it answers in whichever process serves the admin API.
 pub(crate) fn status(root: &Path, only: Option<&str>) -> Result<Value> {
     let (pools, app_id) = pools(root)?;
     let key = key_fingerprint(root)?;
-    let Some(shared) = SHARED.get() else {
-        return Ok(json!({"running":false,"app_id":app_id,"app_key":key,"pools":[]}));
-    };
-    let entries = shared.entries.lock().unwrap().clone();
-    let holds = shared.holds.lock().unwrap().clone();
-    let errors = shared.errors.lock().unwrap().clone();
+    let entries = load_raw(root)?;
+    let published: Option<String> = db(root)?
+        .query_row("SELECT body FROM runner_pool_status WHERE id=1", [], |r| r.get(0))
+        .optional()?;
+    let published: Value = published
+        .map(|b| serde_json::from_str(&b))
+        .transpose()?
+        .unwrap_or_else(|| json!({}));
     let at = now();
     let names: std::collections::BTreeSet<String> = pools
         .iter()
@@ -523,6 +573,7 @@ pub(crate) fn status(root: &Path, only: Option<&str>) -> Result<Value> {
         let pool = pools.iter().find(|p| p.name == name);
         let mine: Vec<_> = entries.iter().filter(|(_, e)| e.pool == name).collect();
         let count = |f: &dyn Fn(&Entry) -> bool| mine.iter().filter(|(_, e)| f(e)).count();
+        let empty = vec![];
         out.push(json!({
             "pool": name,
             "configured": pool.is_some(),
@@ -532,14 +583,14 @@ pub(crate) fn status(root: &Path, only: Option<&str>) -> Result<Value> {
             "idle": count(&|e| e.phase == Phase::Started && e.busy.is_none()),
             "busy": count(&|e| e.phase == Phase::Started && e.busy.is_some()),
             "removing": count(&|e| e.phase == Phase::Removing),
-            "held_s": holds.get(&name).map(|u| (u - at).max(0)).unwrap_or(0),
-            "last_error": errors.get(&name).map(|(t, m)| json!({"unix_s":t,"message":m})),
+            "held_s": published["holds"][name.as_str()].as_i64().map(|u| (u - at).max(0)).unwrap_or(0),
+            "last_error": published["errors"][name.as_str()].clone(),
             "boxes": mine.iter().map(|(n, e)| json!({"box":n,"phase":e.phase,"age_s":at-e.created,
                 "online":e.online.is_some(),"busy":e.busy.is_some()})).collect::<Vec<_>>(),
-            "recent": shared.recent.lock().unwrap().iter().filter(|t| t["pool"] == name.as_str()).cloned().collect::<Vec<_>>(),
+            "recent": published["recent"].as_array().unwrap_or(&empty).iter().filter(|t| t["pool"] == name.as_str()).cloned().collect::<Vec<_>>(),
         }));
     }
-    Ok(json!({"running":true,"app_id":app_id,"app_key":key,"pools":out}))
+    Ok(json!({"running":!published.as_object().is_some_and(|o| o.is_empty()),"app_id":app_id,"app_key":key,"pools":out}))
 }
 
 fn key_fingerprint(root: &Path) -> Result<Value> {
@@ -599,6 +650,8 @@ struct GitHub {
     etags: Mutex<HashMap<String, (String, Value)>>,
     /// Unix s until which GitHub asked us to wait.
     wait_until: Mutex<i64>,
+    /// The key file's modification time the cached tokens were made with.
+    key_stamp: Mutex<Option<std::time::SystemTime>>,
 }
 
 impl GitHub {
@@ -615,6 +668,7 @@ impl GitHub {
             tokens: Mutex::default(),
             etags: Mutex::default(),
             wait_until: Mutex::new(0),
+            key_stamp: Mutex::new(None),
         }
     }
 
@@ -639,6 +693,17 @@ impl GitHub {
     }
 
     fn token(&self, app_id: u64, repo: &str) -> Result<String> {
+        // A key set since (maybe in the other process serving the admin API): start again.
+        let stamp = fs::metadata(self.root.join(KEY_FILE))
+            .and_then(|m| m.modified())
+            .ok();
+        {
+            let mut seen = self.key_stamp.lock().unwrap();
+            if *seen != stamp {
+                *seen = stamp;
+                self.forget_tokens();
+            }
+        }
         let installation = self.installations.lock().unwrap().get(repo).copied();
         if let Some(id) = installation
             && let Some((token, expires)) = self.tokens.lock().unwrap().get(&id)
@@ -651,12 +716,19 @@ impl GitHub {
             Some(id) => id,
             None => {
                 let (_, got) = self.call("GET", &format!("/repos/{repo}/installation"), None, &jwt)?;
-                let id = got["id"].as_u64().context("installation id")?;
+                let id = got["id"]
+                    .as_u64()
+                    .with_context(|| format!("the GitHub App is not installed on {repo}"))?;
                 self.installations.lock().unwrap().insert(repo.to_owned(), id);
                 id
             }
         };
-        let (_, got) = self.call("POST", &format!("/app/installations/{id}/access_tokens"), None, &jwt)?;
+        let (status, got) = self.call("POST", &format!("/app/installations/{id}/access_tokens"), None, &jwt)?;
+        if status == 404 {
+            // Uninstalled (or reinstalled under a new id): look it up again next time.
+            self.installations.lock().unwrap().remove(repo);
+            bail!("the GitHub App's installation on {repo} is gone");
+        }
         let token = got["token"].as_str().context("installation token")?.to_owned();
         // GitHub's are valid for an hour.
         self.tokens
@@ -750,6 +822,9 @@ impl GitHub {
                 None,
                 &token,
             )?;
+            if status == 404 {
+                self.installations.lock().unwrap().remove(repo);
+            }
             ensure!(status == 200, "runner list: HTTP {status}");
             let list = got["runners"].as_array().context("runner list")?;
             for r in list {

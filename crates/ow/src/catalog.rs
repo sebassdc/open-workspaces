@@ -1255,9 +1255,16 @@ impl Catalog {
         Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND physical=?1 AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1))",[physical],|r|r.get(0))?)
     }
     fn legacy_access(&self, physical: &str) -> Result<()> {
-        let (node,state):(String,Option<String>)=self.db.query_row("SELECT node,json_extract(metadata,'$.state') FROM resources WHERE kind='machine' AND physical=?1",[physical],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        self.legacy_access_op(physical, "")
+    }
+    /// As `legacy_access`; a draining runner also lets an ephemeral box be deleted (a drain
+    /// deletes them instead of parking them).
+    fn legacy_access_op(&self, physical: &str, op: &str) -> Result<()> {
+        let (node,state,ephemeral):(String,Option<String>,bool)=self.db.query_row("SELECT node,json_extract(metadata,'$.state'),COALESCE(json_extract(metadata,'$.ephemeral'),0) FROM resources WHERE kind='machine' AND physical=?1",[physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         ensure!(
-            !crate::drain::blocked(&self.db, &node)? || state.as_deref() == Some("running"),
+            !crate::drain::blocked(&self.db, &node)?
+                || state.as_deref() == Some("running")
+                || (op == "delete" && ephemeral),
             "runner draining; waiting for park and wake elsewhere"
         );
         ensure!(
@@ -2767,7 +2774,11 @@ impl Catalog {
         common::address(&name)?;
         // Refused before any row is reserved (the worker refuses them too).
         if matches!(op.as_str(), "snapshot" | "fork" | "restore") {
-            let ephemeral: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND owner=?1 AND name=?2 AND json_extract(metadata,'$.ephemeral')=1)",params![user,name],|r|r.get(0))?;
+            // By physical ID, so a shared address (OWNER/BOX) is checked too.
+            let ephemeral: bool = match self.machine(user, &name, &op) {
+                Ok(physical) => self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND physical=?1 AND json_extract(metadata,'$.ephemeral')=1)",[&physical],|r|r.get(0))?,
+                Err(_) => false, // the usual lookup below reports it
+            };
             if ephemeral {
                 return Err(limits::Rejection(format!(
                     "machine '{name}' is ephemeral: it is never snapshotted, forked or restored; delete it instead"
@@ -2935,7 +2946,7 @@ impl Catalog {
         if op == "delete" {
             // The runner no longer has it: nothing to dispatch, only the row to drop.
             let physical = self.machine(user, &name, &op)?;
-            self.legacy_access(&physical)?;
+            self.legacy_access_op(&physical, &op)?;
             let node = self.placement("machine", &physical)?;
             if self.missing(&physical)? && !self.listed(&node, &physical)? {
                 return self.delete_missing(user, &name, &physical, &input);
@@ -3013,7 +3024,7 @@ impl Catalog {
             } else {
                 self.machine(user, &name, &op)?
             };
-            self.legacy_access(&physical)?;
+            self.legacy_access_op(&physical, &op)?;
             let metadata: String = self.db.query_row(
                 "SELECT metadata FROM resources WHERE kind='machine' AND physical=?1",
                 [&physical],

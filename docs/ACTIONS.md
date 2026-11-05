@@ -82,8 +82,14 @@ start path.
 
 A launch that fails (a full runner, an image missing) removes what it made and
 holds that pool's new boxes until one of its boxes is removed, or for 10 s; other
-pools carry on. While GitHub cannot be read (no App id or key, an outage, a rate
-limit) no box is made; boxes are still removed when they reach a limit. An idle runner that GitHub just gave a job is never removed: a
+pools carry on. While GitHub cannot be read for a repository (no App id or key,
+the App not installed there, an outage, a rate limit) its pools make no box and
+its boxes are removed only when they reach a limit; other repositories' pools
+carry on.
+
+**Drains.** Idle runners on a runner being drained are removed (busy ones finish
+their job), and the drain deletes stopped ephemeral boxes instead of parking
+them, so a drain of a CI runner finishes once its jobs do. An idle runner that GitHub just gave a job is never removed: a
 removal for a settings change or age asks GitHub first, which refuses a busy
 runner.
 

@@ -980,6 +980,23 @@ fn an_ephemeral_box_is_never_snapshotted_forked_or_restored_and_nothing_is_reser
 }
 
 #[test]
+fn a_draining_runner_lets_its_stopped_ephemeral_boxes_be_deleted_only() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    for (id, ephemeral) in [("job", true), ("dev", false)] {
+        c.operation(a, json!({"op":"create","id":id,"node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine","ephemeral":ephemeral})).unwrap();
+        c.operation(a, json!({"op":"stop","id":id})).unwrap();
+    }
+    c.db.execute("INSERT INTO runner_drains(node,eligible,state,generation,seal) VALUES('alpha',1,'draining',1,'fixture')", []).unwrap();
+    let error = c.operation(a, json!({"op":"delete","id":"dev"})).unwrap_err();
+    assert!(format!("{error:#}").contains("runner draining"), "{error:#}");
+    assert!(c.operation(a, json!({"op":"start","id":"job"})).is_err(), "only a delete passes");
+    assert_eq!(c.operation(a, json!({"op":"delete","id":"job"})).unwrap()["deleted"], "job");
+}
+
+#[test]
 fn delete_is_owner_only_drops_snapshots_grants_and_frees_the_name() {
     let mut fake = Fake::new();
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();
