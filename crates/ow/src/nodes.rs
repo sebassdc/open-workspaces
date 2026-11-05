@@ -701,7 +701,9 @@ impl Controller {
             root: root.to_owned(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             jobs: Arc::new(Mutex::new(HashMap::new())),
-            slots: Arc::new(Semaphore::new(32)),
+            // Runner jobs proxied at once, all runners together; under the 128 node
+            // connections, so job sockets leave room for sessions.
+            slots: Arc::new(Semaphore::new(96)),
         })
     }
     /// Catalog work never runs on the two async threads, and no connection or lock is
@@ -834,7 +836,8 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             return;
         }
     };
-    let (tx, mut rx) = mpsc::channel(16);
+    // Job IDs waiting for the agent to read them: a burst for one runner fits.
+    let (tx, mut rx) = mpsc::channel(JOB_SLOTS);
     {
         let mut sessions = c.sessions.lock().unwrap();
         if full(&sessions) {
@@ -1032,59 +1035,80 @@ async fn record(
     };
     let _ = verdicts.send(Err(failure)).await;
 }
+/// What a runner request is answered when the runner never took it: nothing was sent to it.
+pub(crate) const NOT_TAKEN: &str = "runner did not take the operation before dispatch";
 async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) -> Result<()> {
-    let _permit = c
-        .slots
-        .clone()
-        .try_acquire_owned()
-        .context("controller capacity")?;
+    // Up to the runner taking the job, nothing has been sent to it: a failure here is
+    // answered as not dispatched, so the operation is neither uncertain nor stuck.
     // Only the controller Unix peer may submit commands (700 parent, 600 socket plus peer UID).
     ensure!(
         stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
         "unauthorized proxy peer"
     );
-    let db = {
-        let (root, node) = (c.root.clone(), node.clone());
-        tokio::task::spawn_blocking(move || -> Result<_> {
-            let db = db(&root)?;
-            online_in(&db, &node)?;
-            Ok(Arc::new(Mutex::new(db)))
-        })
-        .await??
+    let attached = async {
+        // Never waited for: some callers hold the catalog. Beyond it the job is not taken.
+        let _permit = c
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .context("controller capacity")?;
+        let db = {
+            let (root, node) = (c.root.clone(), node.clone());
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let db = db(&root)?;
+                online_in(&db, &node)?;
+                Ok(Arc::new(Mutex::new(db)))
+            })
+            .await??
+        };
+        ensure!(
+            !STOPPING.load(std::sync::atomic::Ordering::SeqCst),
+            "runner restarting; retry"
+        );
+        let id = common::nonce()?;
+        let (tx, rx) = oneshot::channel();
+        let generation;
+        {
+            let sessions = c.sessions.lock().unwrap();
+            let session = sessions.get(&node).context("node disconnected")?;
+            generation = session.generation.clone();
+            c.jobs.lock().unwrap().insert(
+                id.clone(),
+                Job {
+                    node: node.clone(),
+                    generation: session.generation.clone(),
+                    tx,
+                },
+            );
+            if session.tx.try_send(id.clone()).is_err() {
+                c.jobs.lock().unwrap().remove(&id);
+                anyhow::bail!("node dispatch full");
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(10), rx).await;
+        c.jobs.lock().unwrap().remove(&id);
+        let socket = result
+            .context("node dispatch timeout")?
+            .context("node disconnected")?;
+        Ok::<_, anyhow::Error>((_permit, db, generation, socket))
+    }
+    .await;
+    let (_permit, db, generation, mut socket) = match attached {
+        Ok(attached) => attached,
+        Err(error) => {
+            let reply = json!({"ok":false,"error":NOT_TAKEN});
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                stream.write_all(format!("{reply}\n").as_bytes()),
+            )
+            .await;
+            return Err(error);
+        }
     };
     let admitted = || {
         let node = node.clone();
         blocking(db.clone(), move |db| admitted_in(db, &node))
     };
-    ensure!(
-        !STOPPING.load(std::sync::atomic::Ordering::SeqCst),
-        "runner restarting; retry"
-    );
-    let id = common::nonce()?;
-    let (tx, rx) = oneshot::channel();
-    let generation;
-    {
-        let sessions = c.sessions.lock().unwrap();
-        let session = sessions.get(&node).context("node disconnected")?;
-        generation = session.generation.clone();
-        c.jobs.lock().unwrap().insert(
-            id.clone(),
-            Job {
-                node: node.clone(),
-                generation: session.generation.clone(),
-                tx,
-            },
-        );
-        if session.tx.try_send(id.clone()).is_err() {
-            c.jobs.lock().unwrap().remove(&id);
-            anyhow::bail!("node dispatch full");
-        }
-    }
-    let result = tokio::time::timeout(Duration::from_secs(10), rx).await;
-    c.jobs.lock().unwrap().remove(&id);
-    let mut socket = result
-        .context("node dispatch timeout")?
-        .context("node disconnected")?;
     let (mut reader, mut writer) = stream.split();
     let mut buffer = vec![0; FRAME];
     let mut tick = tokio::time::interval(Duration::from_secs(3));
@@ -1733,6 +1757,70 @@ pub(crate) fn controller_settings(root: &Path, offer: &Value, written: &mut Opti
     }
 }
 
+/// Jobs a runner's agent runs at once. A burst of creates for a pool larger than this
+/// waits for slots instead of being dropped.
+const JOB_SLOTS: usize = 64;
+/// Jobs it holds waiting for a slot, beyond which new ones are left unattached.
+const JOB_QUEUE: usize = 256;
+/// How long a queued job waits for a slot: under the controller's 10 s attach timeout.
+const JOB_ATTACH_WAIT: Duration = Duration::from_secs(8);
+
+/// The agent's job slots: at most [`JOB_SLOTS`] running, [`JOB_QUEUE`] accepted in all.
+#[derive(Default)]
+struct JobSlots {
+    /// (accepted, running)
+    counts: Mutex<(usize, usize)>,
+    freed: std::sync::Condvar,
+    /// Running jobs, for telemetry.
+    running: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl JobSlots {
+    fn counts(&self) -> std::sync::MutexGuard<'_, (usize, usize)> {
+        self.counts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Accepts a job if the queue has room.
+    fn queue(&self) -> bool {
+        let mut counts = self.counts();
+        if counts.0 >= JOB_QUEUE {
+            return false;
+        }
+        counts.0 += 1;
+        true
+    }
+    /// A running slot for an accepted job, or None (and the job given up) after `wait`.
+    fn take(self: &Arc<Self>, wait: Duration) -> Option<JobSlot> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut counts = self.counts();
+        while counts.1 >= JOB_SLOTS {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                counts.0 -= 1;
+                return None;
+            }
+            counts = self
+                .freed
+                .wait_timeout(counts, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        counts.1 += 1;
+        self.running.store(counts.1, std::sync::atomic::Ordering::SeqCst);
+        Some(JobSlot(self.clone()))
+    }
+}
+struct JobSlot(Arc<JobSlots>);
+impl Drop for JobSlot {
+    fn drop(&mut self) {
+        let mut counts = self.0.counts();
+        counts.0 -= 1;
+        counts.1 -= 1;
+        self.0
+            .running
+            .store(counts.1, std::sync::atomic::Ordering::SeqCst);
+        self.0.freed.notify_one();
+    }
+}
+
 pub fn agent(
     root: &Path,
     controller: &str,
@@ -1830,7 +1918,7 @@ pub fn agent(
         hello
     };
     // Jobs are bounded independently of reconnects; no unbounded thread/job queues.
-    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let slots = Arc::new(JobSlots::default());
     use std::sync::atomic::{AtomicBool, Ordering};
     let cache_negotiated = Arc::new(AtomicBool::new(false));
     // Worker status, and the heartbeat built from it, refreshed on their own thread: the
@@ -1870,7 +1958,7 @@ pub fn agent(
             telemetry.clone(),
             root.to_owned(),
             latest.clone(),
-            active.clone(),
+            slots.running.clone(),
             move || {
                 prepared
                     .lock()
@@ -2057,26 +2145,30 @@ pub fn agent(
                         if STOPPING.load(Ordering::SeqCst) {
                             continue;
                         }
-                        if active
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                                (n < 16).then_some(n + 1)
-                            })
-                            .is_err()
-                        {
+                        // Over the queue's bound, the job is left to time out unattached.
+                        if !slots.queue() {
                             continue;
                         }
-                        let (root, origin, node, credential, ca, active, worker, telemetry) = (
+                        let (root, origin, node, credential, ca, slots, worker, telemetry) = (
                             root.to_owned(),
                             origin.clone(),
                             node.clone(),
                             credential.clone(),
                             ca.map(Path::to_owned),
-                            active.clone(),
+                            slots.clone(),
                             latest.clone(),
                             telemetry.clone(),
                         );
                         let busy = Busy::new();
                         std::thread::spawn(move || {
+                            // Waits for a slot only as long as the controller waits to attach.
+                            let Some(_slot) = slots.take(JOB_ATTACH_WAIT) else {
+                                return;
+                            };
+                            // Stopping meanwhile: left unattached, so nothing starts.
+                            if STOPPING.load(Ordering::SeqCst) {
+                                return;
+                            }
                             let _ = agent_job(
                                 &root,
                                 &origin,
@@ -2088,7 +2180,6 @@ pub fn agent(
                                 &worker,
                                 Some(&telemetry),
                             );
-                            active.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
                     Ok(tungstenite::Message::Ping(v)) => ws.send(tungstenite::Message::Pong(v))?,

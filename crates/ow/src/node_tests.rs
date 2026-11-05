@@ -2696,3 +2696,29 @@ fn agent_sends_host_box_and_channel_telemetry_once_offered() {
     );
     let _ = fs::remove_dir_all(worker);
 }
+
+#[test]
+fn jobs_over_the_running_slots_wait_for_one_and_give_up_after_their_wait() {
+    let slots = std::sync::Arc::new(super::JobSlots::default());
+    let mut held: Vec<_> = (0..super::JOB_SLOTS)
+        .map(|_| {
+            assert!(slots.queue());
+            slots.take(std::time::Duration::ZERO).unwrap()
+        })
+        .collect();
+    // Full: a queued job waits, and gets the first slot freed.
+    assert!(slots.queue());
+    let waiter = {
+        let slots = slots.clone();
+        std::thread::spawn(move || slots.take(std::time::Duration::from_secs(5)))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    held.pop();
+    held.push(waiter.join().unwrap().expect("the waiting job got the freed slot"));
+    // Still full: one that waits too long gives up and leaves the queue.
+    assert!(slots.queue());
+    assert!(slots.take(std::time::Duration::from_millis(20)).is_none());
+    assert_eq!(*slots.counts(), (super::JOB_SLOTS, super::JOB_SLOTS));
+    drop(held);
+    assert_eq!(*slots.counts(), (0, 0));
+}
