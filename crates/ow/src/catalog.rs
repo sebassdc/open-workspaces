@@ -386,6 +386,21 @@ fn permitted(role: &str, op: &str) -> bool {
     }
 }
 
+/// One runner's machines and snapshots for `reconcile`; None when it cannot answer now.
+fn inventory_of(root: &Path, node: &str) -> Option<(Value, Value)> {
+    let route = nodes::route(root, node).ok()?;
+    if !route.join("control.sock").exists() {
+        return None;
+    }
+    let machines = wire::request(&route, json!({"op":"list"})).ok()?;
+    let snapshots = if node != "local" && nodes::operation_capable(root, node, "snapshots").is_err() {
+        json!([])
+    } else {
+        wire::request(&route, json!({"op":"snapshots"})).ok()?
+    };
+    Some((machines, snapshots))
+}
+
 impl Catalog {
     pub fn open(root: &Path, issuer: &str, bootstrap: Option<&str>) -> Result<Self> {
         use std::os::fd::AsRawFd;
@@ -1392,25 +1407,27 @@ impl Catalog {
                 pool.push(node["id"].as_str().unwrap().to_owned());
             }
         }
-        for node in pool {
-            let Ok(root) = nodes::route(&self.root, &node) else {
+        // Every runner at once: a pass costs the slowest runner's reply, not their sum.
+        let fetched: Vec<(String, Option<(Value, Value)>)> = std::thread::scope(|scope| {
+            let root = &self.root;
+            let calls: Vec<_> = pool
+                .into_iter()
+                .map(|node| {
+                    let call = scope.spawn({
+                        let node = node.clone();
+                        move || inventory_of(root, &node)
+                    });
+                    (node, call)
+                })
+                .collect();
+            calls
+                .into_iter()
+                .map(|(node, call)| (node, call.join().ok().flatten()))
+                .collect()
+        });
+        for (node, inventory) in fetched {
+            let Some((machines, snapshots)) = inventory else {
                 continue;
-            };
-            if !root.join("control.sock").exists() {
-                continue;
-            }
-            let Ok(machines) = wire::request(&root, json!({"op":"list"})) else {
-                continue;
-            };
-            let snapshots = if node != "local"
-                && nodes::operation_capable(&self.root, &node, "snapshots").is_err()
-            {
-                json!([])
-            } else {
-                let Ok(value) = wire::request(&root, json!({"op":"snapshots"})) else {
-                    continue;
-                };
-                value
             };
             let (mut extra_mib, mut extra_cpus, mut extra_slots) = (0i64, 0i64, 0i64);
             for m in machines.as_array().context("invalid machines")? {

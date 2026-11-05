@@ -166,7 +166,11 @@ fn control<T: Status + Send + 'static>(
             let mut stream = match listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
+                    // Wakes on the next connection (at most 100 ms to see `stopping`).
+                    if let Err(error) = wire::wait_readable([listener.as_raw_fd()]) {
+                        eprintln!("control listener: {error:#}");
+                        return;
+                    }
                     continue;
                 }
                 Err(error) => {
