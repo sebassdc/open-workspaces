@@ -662,9 +662,8 @@ pub async fn handle(
                         }
                     }
                 }
-                let mut c = catalog.lock().unwrap();
-                let user = c.user(&identity)?;
-                c.operation(user, operation)
+                let user = catalog.lock().unwrap().user(&identity)?;
+                crate::catalog::Catalog::operation_shared(&catalog, user, operation)
             })
             .await
             .map_err(anyhow::Error::from)

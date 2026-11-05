@@ -457,6 +457,8 @@ impl Staged {
 pub enum Step {
     Done(Result<Value>),
     Seal(Staged),
+    /// A new box to boot off the worker thread; [`Runtime::create_finish`] records it.
+    Create(Box<Creating>),
 }
 
 #[derive(PartialEq, Eq, Serialize, Deserialize)]
@@ -634,6 +636,78 @@ fn install_file(machine: &mut Vm, binary: &Path, guest: &str, digest: &str) -> R
     Ok(())
 }
 
+/// A booted guest's network, image tools and SSH policy: the end of every start.
+fn settle(
+    root: &Path,
+    assets: &Path,
+    machine: &mut Vm,
+    workspace: &Workspace,
+    fork: bool,
+) -> Result<()> {
+    machine.network(&workspace.id, workspace.index, fork)?;
+    let profile = crate::store::image_name(&workspace.image)?.0;
+    if profile != "alpine" {
+        let bundle = assets.join("guest/network-tools.tar.gz");
+        let digest = hash(&bundle)?;
+        let marker = format!("/ow/.network-{digest}");
+        if machine.command(&format!("test -f {marker}"))?.1 != 0 {
+            let guest = format!("/run/ow-network-{digest}.tar.gz");
+            install_file(machine, &bundle, &guest, &digest)?;
+            machine.checked(&format!("tar -xzf {guest} -C / && mkdir -p /etc/ssl/certs && {{ test -f /etc/ssl/certs/ca-certificates.crt || cp /ow/etc/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt; }} && touch {marker}; rm -f {guest}"))?;
+            if profile == "arch" {
+                machine.checked("if ! grep -q '^Server' /etc/pacman.d/mirrorlist; then printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\\n' >> /etc/pacman.d/mirrorlist; fi")?;
+            }
+        }
+    }
+    if profile != "alpine" {
+        machine.checked("chmod 755 /etc/ssl /etc/ssl/certs /ow /ow/bin /ow/lib /ow/etc; chmod 644 /etc/ssl/certs/ca-certificates.crt")?;
+    }
+    if crate::ssh_guest::path(root, &workspace.id).exists() {
+        let mut policy = crate::ssh_guest::load(root, &workspace.id)?;
+        policy.generation = vm::nonce()?;
+        policy.ready = false;
+        atomic_json(&crate::ssh_guest::path(root, &workspace.id), &json!(policy))?;
+        crate::ssh_guest::apply(machine, &policy)?;
+        policy.ready = true;
+        atomic_json(&crate::ssh_guest::path(root, &workspace.id), &json!(policy))?;
+    }
+    Ok(())
+}
+
+/// A new box between its reservation and its first boot: made by [`Runtime::begin`] (or a
+/// plain `create`) on the worker thread, booted by [`Creating::boot`] off it, recorded by
+/// [`Runtime::create_finish`].
+pub struct Creating {
+    workspace: Workspace,
+    disk: PathBuf,
+    snapshot: Option<PathBuf>,
+    kernel: PathBuf,
+    root: PathBuf,
+    assets: PathBuf,
+    machine: Vm,
+}
+
+impl Creating {
+    /// The slow part: filesystem growth, boot (or restore) and guest setup. Touches only this
+    /// box, so it runs without the runtime.
+    pub fn boot(&mut self) -> Result<()> {
+        let w = &self.workspace;
+        if let Some(snapshot) = &self.snapshot {
+            self.machine.restore(snapshot)?;
+        } else {
+            disk::grow_filesystem(&self.disk)?;
+            self.machine.boot(&self.kernel, w.memory_mib, w.vcpu_count)?;
+        }
+        settle(
+            &self.root,
+            &self.assets,
+            &mut self.machine,
+            w,
+            self.snapshot.is_some(),
+        )
+    }
+}
+
 const SLEEP: &str = "sleep-";
 const RECOVERY: &str = "sleep-recovery-";
 
@@ -689,6 +763,11 @@ pub struct Runtime {
     capture_ready: BTreeMap<String, bool>,
     /// Set by `begin`: a plain capture is staged in `staged` instead of hashed in place.
     defer_seal: bool,
+    /// Set by `begin`: a new box is left in `begun` to boot off the worker thread.
+    defer_create: bool,
+    begun: Option<Creating>,
+    /// Boxes booting off the worker thread: they hold capacity and take no other request.
+    creating: std::collections::BTreeSet<String>,
     staged: Option<Staged>,
     /// Recovery captures whose uploader seals them while sending them (one read),
     /// by snapshot name; `recovery-seal` commits them. Lost on restart, when
@@ -869,6 +948,9 @@ impl Runtime {
             closing: false,
             capture_ready: BTreeMap::new(),
             defer_seal: false,
+            defer_create: false,
+            begun: None,
+            creating: Default::default(),
             staged: None,
             unsealed: BTreeMap::new(),
             aws_delivered: BTreeMap::new(),
@@ -900,17 +982,15 @@ impl Runtime {
 
     fn capacity(&self, memory: u32, cpus: u32) -> Result<()> {
         ensure!(
-            self.machines.len() < max_running(),
+            self.machines.len() + self.creating.len() < max_running(),
             "running workspace limit ({MAX_RUNNING}) reached"
         );
-        let used: u32 = self
-            .machines
-            .keys()
+        // Boxes still booting hold what they will use.
+        let active = || self.machines.keys().chain(&self.creating);
+        let used: u32 = active()
             .map(|id| self.state.workspaces[id].memory_mib)
             .sum();
-        let used_cpus: u32 = self
-            .machines
-            .keys()
+        let used_cpus: u32 = active()
             .map(|id| self.state.workspaces[id].vcpu_count)
             .sum();
         ensure!(
@@ -1016,57 +1096,31 @@ impl Runtime {
         if snapshot.is_none() {
             disk::grow_filesystem(&self.machine_dir(&workspace.id).join("disk.ext4"))?;
         }
-        // What a later worker checks before it adopts this VMM (ADR 0011).
-        let record = json!({"vmm_sha256":hash(&self.binary())?,"kernel_sha256":self.kernel_hash});
-        let mut machine = Vm::spawn(
-            &self.binary(),
-            &self.machine_dir(&workspace.id),
-            workspace.index,
-            record,
-        )?;
-        // Dropping `machine` (any failure below, a stop, a hibernation) detaches it again.
-        crate::metadata::attach(workspace.index, &workspace.id)?;
+        let mut machine = self.vmm(workspace)?;
         if let Some(snapshot) = snapshot {
             machine.restore(snapshot)?;
         } else {
             machine.boot(&self.kernel(), workspace.memory_mib, workspace.vcpu_count)?;
         }
-        machine.network(&workspace.id, workspace.index, fork)?;
-        let profile = crate::store::image_name(&workspace.image)?.0;
-        if profile != "alpine" {
-            let bundle = self.assets.join("guest/network-tools.tar.gz");
-            let digest = hash(&bundle)?;
-            let marker = format!("/ow/.network-{digest}");
-            if machine.command(&format!("test -f {marker}"))?.1 != 0 {
-                let guest = format!("/run/ow-network-{digest}.tar.gz");
-                install_file(&mut machine, &bundle, &guest, &digest)?;
-                machine.checked(&format!("tar -xzf {guest} -C / && mkdir -p /etc/ssl/certs && {{ test -f /etc/ssl/certs/ca-certificates.crt || cp /ow/etc/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt; }} && touch {marker}; rm -f {guest}"))?;
-                if profile == "arch" {
-                    machine.checked("if ! grep -q '^Server' /etc/pacman.d/mirrorlist; then printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\\n' >> /etc/pacman.d/mirrorlist; fi")?;
-                }
-            }
-        }
-        if profile != "alpine" {
-            machine.checked("chmod 755 /etc/ssl /etc/ssl/certs /ow /ow/bin /ow/lib /ow/etc; chmod 644 /etc/ssl/certs/ca-certificates.crt")?;
-        }
-        if crate::ssh_guest::path(&self.root, &workspace.id).exists() {
-            let mut policy = crate::ssh_guest::load(&self.root, &workspace.id)?;
-            policy.generation = vm::nonce()?;
-            policy.ready = false;
-            atomic_json(
-                &crate::ssh_guest::path(&self.root, &workspace.id),
-                &json!(policy),
-            )?;
-            crate::ssh_guest::apply(&mut machine, &policy)?;
-            policy.ready = true;
-            atomic_json(
-                &crate::ssh_guest::path(&self.root, &workspace.id),
-                &json!(policy),
-            )?;
-        }
+        settle(&self.root, &self.assets, &mut machine, workspace, fork)?;
         self.machines.insert(workspace.id.clone(), machine);
         self.idle.touch(&workspace.id, std::time::Instant::now());
         Ok(())
+    }
+
+    /// A box's VMM process, not yet booted. Spawned by the worker thread (parent-death
+    /// signals follow the spawning thread); dropping it detaches it again.
+    fn vmm(&self, workspace: &Workspace) -> Result<Vm> {
+        // What a later worker checks before it adopts this VMM (ADR 0011).
+        let record = json!({"vmm_sha256":hash(&self.binary())?,"kernel_sha256":self.kernel_hash});
+        let machine = Vm::spawn(
+            &self.binary(),
+            &self.machine_dir(&workspace.id),
+            workspace.index,
+            record,
+        )?;
+        crate::metadata::attach(workspace.index, &workspace.id)?;
+        Ok(machine)
     }
 
     fn disk_reserved(&self) -> Result<u64> {
@@ -1173,6 +1227,30 @@ impl Runtime {
             );
             return self.workspace_summary(id);
         }
+        let mut creating =
+            self.create_begin(id, memory, cpus, image, source, snapshot, disk_gib, false)?;
+        let booted = creating.boot();
+        self.create_finish(creating, booted)
+    }
+
+    /// A new box's reservation, disk and stopped VMM, all quick: the worker thread then
+    /// returns to other requests while [`Creating::boot`] runs.
+    #[allow(clippy::too_many_arguments)]
+    fn create_begin(
+        &mut self,
+        id: &str,
+        memory: u32,
+        cpus: u32,
+        image: &str,
+        source: Option<String>,
+        snapshot: Option<&str>,
+        disk_gib: Option<u32>,
+        ephemeral: bool,
+    ) -> Result<Creating> {
+        ensure!(
+            !self.closing,
+            "the worker is shutting down; no machine can start"
+        );
         self.capacity(memory, cpus)?;
         self.storage_headroom(0)?;
         ensure!(
@@ -1258,18 +1336,53 @@ impl Runtime {
             source,
             hibernation: None,
             managed: false,
-            ephemeral: false,
+            ephemeral,
         };
         self.state.next_index += 1;
         self.state.workspaces.insert(id.into(), workspace.clone());
         self.save()?;
-        let snapshot_path = snapshot.map(|name| self.snapshot_dir(name));
-        let result = self.spawn(&workspace, snapshot_path.as_deref(), snapshot.is_some());
-        self.state.workspaces.get_mut(id).unwrap().state =
-            if result.is_ok() { "running" } else { "failed" }.into();
+        // From here the box is registered: a failure leaves it `failed`, as a failed boot does.
+        let machine = match self.vmm(&workspace) {
+            Ok(machine) => machine,
+            Err(error) => {
+                self.state.workspaces.get_mut(id).unwrap().state = "failed".into();
+                self.save()?;
+                return Err(error);
+            }
+        };
+        self.creating.insert(id.to_owned());
+        Ok(Creating {
+            disk: directory.join("disk.ext4"),
+            snapshot: snapshot.map(|name| self.snapshot_dir(name)),
+            kernel: self.kernel(),
+            root: self.root.clone(),
+            assets: self.assets.clone(),
+            workspace,
+            machine,
+        })
+    }
+
+    /// Records a [`Creating`]'s boot: the box runs, or is `failed` with its VMM gone.
+    pub fn create_finish(&mut self, creating: Creating, booted: Result<()>) -> Result<Value> {
+        let Creating {
+            workspace, machine, ..
+        } = creating;
+        let id = workspace.id;
+        self.creating.remove(&id);
+        let state = if booted.is_ok() {
+            self.machines.insert(id.clone(), machine);
+            self.idle.touch(&id, std::time::Instant::now());
+            "running"
+        } else {
+            drop(machine);
+            "failed"
+        };
+        if let Some(workspace) = self.state.workspaces.get_mut(&id) {
+            workspace.state = state.into();
+        }
         self.save()?;
-        result?;
-        self.workspace_summary(id)
+        booted?;
+        self.workspace_summary(&id)
     }
 
     fn stop(&mut self, id: &str) -> Result<Value> {
@@ -1767,6 +1880,18 @@ impl Runtime {
     /// caller hashes it off the worker thread ([`Staged::seal`]) and finishes it with
     /// [`Runtime::finish`], so other machines' requests are not held for the hashing.
     pub fn begin(&mut self, request: &Value) -> Step {
+        if request["op"] == "create" {
+            self.defer_create = true;
+            let result = self.operation(request);
+            self.defer_create = false;
+            return match (result, self.begun.take()) {
+                (Ok(_), Some(creating)) => Step::Create(Box::new(creating)),
+                (result, None) => Step::Done(result),
+                (Err(error), Some(creating)) => {
+                    Step::Done(self.create_finish(creating, Err(error)))
+                }
+            };
+        }
         let deferrable = request["op"] == "snapshot"
             || (request["op"] == "fork" && request["snapshot"].is_null());
         if !deferrable {
@@ -2049,6 +2174,10 @@ impl Runtime {
         let op = request["op"].as_str().context("missing operation")?;
         let id = request["id"].as_str().unwrap_or("");
         ensure!(
+            !self.creating.contains(id),
+            "{id} is being created; retry when its create finishes"
+        );
+        ensure!(
             !(ephemeral_refused(op) && self.state.workspaces.get(id).is_some_and(|w| w.ephemeral)),
             "{id} is ephemeral: it is never snapshotted, forked or moved; delete it instead"
         );
@@ -2181,15 +2310,29 @@ impl Runtime {
                 self.recovery_operation(request)
             }
             "create" => {
-                let summary = self.create(
-                    id,
-                    u32::try_from(request["memory_mib"].as_u64().unwrap_or(256))?,
-                    u32::try_from(request["vcpu_count"].as_u64().unwrap_or(1))?,
-                    request["image"].as_str().unwrap_or("alpine"),
-                    None,
-                    None,
-                    Some(crate::common::requested_disk(request)?.unwrap_or(DEFAULT_DISK_GIB)),
-                )?;
+                let memory = u32::try_from(request["memory_mib"].as_u64().unwrap_or(256))?;
+                let cpus = u32::try_from(request["vcpu_count"].as_u64().unwrap_or(1))?;
+                let image = request["image"].as_str().unwrap_or("alpine");
+                let disk = crate::common::requested_disk(request)?.unwrap_or(DEFAULT_DISK_GIB);
+                if self.defer_create && !self.state.workspaces.contains_key(id) {
+                    identifier(id)?;
+                    image_profile(image)?;
+                    resources(memory, cpus)?;
+                    let ephemeral = request["ephemeral"] == true;
+                    let creating = self.create_begin(
+                        id,
+                        memory,
+                        cpus,
+                        image,
+                        None,
+                        None,
+                        Some(disk),
+                        ephemeral,
+                    )?;
+                    self.begun = Some(creating);
+                    return Ok(Value::Null);
+                }
+                let summary = self.create(id, memory, cpus, image, None, None, Some(disk))?;
                 if request["ephemeral"] != true || self.workspace(id)?.ephemeral {
                     return Ok(summary);
                 }
@@ -2947,12 +3090,31 @@ mod disk_tests {
             closing: false,
             capture_ready: BTreeMap::new(),
             defer_seal: false,
+            defer_create: false,
+            begun: None,
+            creating: Default::default(),
             staged: None,
             unsealed: BTreeMap::new(),
             aws_delivered: BTreeMap::new(),
             adoption: Vec::new(),
             crash: None,
         }
+    }
+
+    #[test]
+    fn a_box_still_booting_holds_capacity_and_takes_no_other_request() {
+        let mut runtime = fixture();
+        // `legacy` (1024 MiB, 2 vCPUs) is booting off the worker thread.
+        runtime.state.workspaces.get_mut("legacy").unwrap().state = "starting".into();
+        runtime.creating.insert("legacy".into());
+        assert!(runtime.capacity(max_memory() - 1024, 1).is_ok());
+        assert!(runtime.capacity(max_memory() - 1023, 1).is_err());
+        let refused = runtime
+            .request(&json!({"op":"stop","id":"legacy"}))
+            .unwrap_err();
+        assert!(format!("{refused:#}").contains("being created"), "{refused:#}");
+        runtime.creating.clear();
+        assert!(runtime.capacity(max_memory(), 1).is_ok());
     }
 
     #[test]

@@ -108,7 +108,9 @@ users through email PIN requires preserving other apps' login behavior first.
   disable caching and framing; worker diagnostics containing host paths stay in
   private operator logs rather than API responses.
 
-The underlying worker still serializes control operations. HTTP timeout does not
+Operations on different boxes run side by side: the catalog is held only for its own
+bookkeeping, and a runner boots new boxes off its worker thread. Operations on one box
+wait for each other. HTTP timeout does not
 cancel an already queued/running VM operation; refresh state before retrying a
 failed request, especially exec. Broader jailer/cgroup and worker recovery gates
 remain open. There is no production hardening or multi-tenant claim.

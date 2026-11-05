@@ -275,6 +275,8 @@ fn worker(root: PathBuf) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
         .adopt();
     let terminals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Creates booting on their own threads; the worker winds down only after they land.
+    let booting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut idle_check = Instant::now();
     // Live forks whose capture a sealing thread finished: (reply, parent, child, capture).
     let (sealed_forks, forks) = std::sync::mpsc::channel::<(UnixStream, String, String, String)>();
@@ -305,6 +307,16 @@ fn worker(root: PathBuf) -> Result<()> {
         }
         match incoming.recv_timeout(Duration::from_millis(10)) {
             Ok((mut stream, mut request)) => {
+                if matches!(
+                    request["op"].as_str(),
+                    Some("detach" | "shutdown" | "quiesce")
+                ) {
+                    // A box mid-boot is in no list these act on: let it land first.
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    while booting.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
                 let runtime = runtime.clone();
                 let stopping = stopping.clone();
                 let result = (|| -> Result<()> {
@@ -435,6 +447,26 @@ fn worker(root: PathBuf) -> Result<()> {
                         match step {
                             runtime::Step::Done(response) => {
                                 wire::send(&mut stream, &wire::response(response))?
+                            }
+                            // Its VMM was spawned here; the boot waits on the guest alone, so
+                            // a thread runs it and this one takes the next request.
+                            runtime::Step::Create(mut creating) => {
+                                let runtime = runtime.clone();
+                                let booting = booting.clone();
+                                booting.fetch_add(1, Ordering::SeqCst);
+                                std::thread::spawn(move || {
+                                    let booted = creating.boot();
+                                    let result = match runtime.lock() {
+                                        Ok(mut runtime) => runtime.create_finish(*creating, booted),
+                                        Err(_) => Err(anyhow::anyhow!("runtime lock poisoned")),
+                                    };
+                                    if let Err(error) =
+                                        wire::send(&mut stream, &wire::response(result))
+                                    {
+                                        eprintln!("create reply: {error:#}");
+                                    }
+                                    booting.fetch_sub(1, Ordering::SeqCst);
+                                });
                             }
                             // The guest already runs again; hashing its capture here would hold
                             // every machine's requests, so a thread seals it.

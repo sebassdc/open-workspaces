@@ -836,13 +836,12 @@ mod tests;
 /// A stopped ephemeral box on a draining runner: deleted as its owner would delete it.
 fn delete_ephemeral(shared: &std::sync::Mutex<crate::catalog::Catalog>, m: &Value) -> Result<()> {
     let physical = m["id"].as_str().context("missing machine ID")?;
-    let mut c = shared.lock().unwrap();
-    let (owner, name): (i64, String) = c.db.query_row(
+    let (owner, name): (i64, String) = shared.lock().unwrap().db.query_row(
         "SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1",
         [physical],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    c.operation(owner, json!({"op":"delete","id":name}))
+    crate::catalog::Catalog::operation_shared(shared, owner, json!({"op":"delete","id":name}))
         .with_context(|| format!("deleting ephemeral {physical} for the drain"))?;
     Ok(())
 }
