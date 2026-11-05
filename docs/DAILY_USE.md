@@ -189,6 +189,13 @@ ow image list
 ow create box --image devtools --memory 1024
 ```
 
+The header may also set the image's root disk, 1 to 32 GiB, `# ow-image:
+base=ubuntu disk_gib=8` (default: the create default, 32 GiB; at least the
+base's disk). Boxes made from it get 32 GiB unless they ask for another size
+from the image's up (`--disk 16GiB`). A runner admits a box only if its free
+space covers what the box's disk may still write, so smaller disks let more
+short-lived boxes fit.
+
 The image is named after the file. `build` creates a builder machine from the
 base (`ubuntu` or `arch`; Alpine is not a base), runs the recipe as root with
 network access and the usual umask, removes it, stops the builder and saves its

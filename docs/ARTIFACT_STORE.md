@@ -99,7 +99,7 @@ ow image publish tools --to s3://BUCKET/PREFIX --base-image ubuntu@1
 ow image pull tools@1 --runner /PATH/TO/RUNNER
 ```
 
-Recipe headers retain `# ow-image: base=ubuntu` or `base=arch`. Recipes run as root
+Recipe headers retain `# ow-image: base=ubuntu` or `base=arch`, optionally with `disk_gib=N` (the image's root disk, 1 to 32 GiB). Recipes run as root
 in a disposable guest. They must not copy credentials or personal state into a
 shared image. Builds are deduplicated by name, recipe SHA-256 and base manifest
 digest. Concurrent identical builds share the same durable intent/runner. Changed
