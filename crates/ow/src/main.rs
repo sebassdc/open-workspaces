@@ -681,7 +681,8 @@ enum NodeAction {
 enum ImageAction {
     /// Build a golden image from a recipe: a shell script, run as root in a fresh
     /// machine with network access, whose header names its base, e.g.
-    /// `# ow-image: base=ubuntu`. The image is named after the file
+    /// `# ow-image: base=ubuntu` (optionally `disk_gib=N`, the image's root
+    /// disk). The image is named after the file
     /// (`node-dev.sh` builds `node-dev`); use it with `ow create --image node-dev`.
     Build {
         recipe: PathBuf,

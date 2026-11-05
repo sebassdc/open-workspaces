@@ -181,16 +181,38 @@ fn parse(path: &Path, text: &str) -> Result<(String, String)> {
         !PROFILES.contains(&name.as_str()) && name != "ubuntu-arm64",
         "{name} is a built-in image; rename the recipe"
     );
-    let base = text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("# ow-image:"))
-        .and_then(|h| h.split_whitespace().find_map(|kv| kv.strip_prefix("base=")))
+    let base = header(text, "base=")
         .context("recipe needs a header line such as `# ow-image: base=ubuntu`")?;
     ensure!(
         GOLDEN_BASES.contains(&base),
         "recipe base must be one of {GOLDEN_BASES:?}"
     );
+    disk_gib(text)?;
     Ok((name, base.to_owned()))
+}
+
+fn header<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("# ow-image:"))
+        .and_then(|h| h.split_whitespace().find_map(|kv| kv.strip_prefix(key)))
+}
+
+/// `disk_gib=N` in the recipe header: the builder's root disk, which becomes the image's.
+/// At most the create default, so a box made from the image without a disk size still fits;
+/// a box can ask for any size from N up.
+fn disk_gib(text: &str) -> Result<Option<u32>> {
+    let Some(n) = header(text, "disk_gib=") else {
+        return Ok(None);
+    };
+    let n: u32 = n
+        .parse()
+        .context("recipe disk_gib must be a whole number of GiB")?;
+    ensure!(
+        (1..=ow_core::common::DEFAULT_DISK_GIB).contains(&n),
+        "recipe disk_gib must be 1 to {} GiB",
+        ow_core::common::DEFAULT_DISK_GIB
+    );
+    Ok(Some(n))
 }
 
 fn build(runner: &Path, recipe: &Path, memory: u32, cpus: u32, timeout: Duration) -> Result<Value> {
@@ -228,11 +250,16 @@ pub(crate) fn build_text(
         .map(str::to_owned)
         .unwrap_or(format!("img-{}", &common::nonce()?[..16]));
     eprintln!("building {name} on {base} in machine {builder}");
-    wire::request(
-        runner,
-        json!({"op":"create","id":builder,"image":base,"memory_mib":memory,"vcpu_count":cpus}),
-    )
-    .context("creating the builder machine")?;
+    let mut create =
+        json!({"op":"create","id":builder,"image":base,"memory_mib":memory,"vcpu_count":cpus});
+    let disk = disk_gib(text)?;
+    if let Some(gib) = disk {
+        create["disk_gib"] = json!(gib);
+    }
+    wire::request(runner, create).with_context(|| match disk {
+        Some(gib) => format!("creating the builder machine (recipe disk_gib={gib})"),
+        None => "creating the builder machine".to_owned(),
+    })?;
     let result = (|| -> Result<Value> {
         execute(
             runner,
@@ -333,6 +360,26 @@ mod tests {
             "alpine base"
         );
         assert!(parse(Path::new("ubuntu.sh"), "# ow-image: base=ubuntu\n").is_err());
+        assert_eq!(
+            disk_gib("# ow-image: base=ubuntu disk_gib=8\n").unwrap(),
+            Some(8)
+        );
+        assert_eq!(disk_gib("# ow-image: base=ubuntu\n").unwrap(), None);
+        for bad in [
+            "disk_gib=0",
+            "disk_gib=8GiB",
+            "disk_gib=33",
+            "disk_gib=99999999",
+        ] {
+            assert!(
+                parse(
+                    Path::new("ci.sh"),
+                    &format!("# ow-image: base=ubuntu {bad}\n")
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
         assert!(parse(Path::new("bad name.sh"), "# ow-image: base=ubuntu\n").is_err());
     }
 }
