@@ -953,6 +953,11 @@ impl Catalog {
         self.transfer_write(|c| {
             // Recheck current ownership/sharing even for a joined operation.
             let source = c.machine(user, &intent.machine, intent.kind.permission())?;
+            // Before anything is reserved: the worker would refuse the export anyway.
+            ensure!(
+                !c.db.query_row("SELECT COALESCE(json_extract(metadata,'$.ephemeral'),0) FROM resources WHERE kind='machine' AND physical=?1",[&source],|r|r.get::<_,bool>(0))?,
+                "an ephemeral box is never moved, parked or copied to another runner; delete it instead"
+            );
             let (owner, source_node, source_epoch, source_capture, policy_generation):(i64,String,i64,Option<String>,i64) = c.db.query_row("SELECT owner,node,placement_epoch,current_capture,ssh_policy_generation FROM resources WHERE kind='machine' AND physical=?1",[&source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
             ensure!(matches!(intent.kind, Kind::Fork | Kind::Wake) || owner == user, "placement changes require the owner");
             if let Some((operation, previous)) = c.db.query_row("SELECT id,request FROM operations WHERE owner=?1 AND retry_key=?2",params![user,key],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).optional()? {
@@ -2760,6 +2765,16 @@ impl Catalog {
         }
         let name = request["id"].as_str().context("id")?.to_owned();
         common::address(&name)?;
+        // Refused before any row is reserved (the worker refuses them too).
+        if matches!(op.as_str(), "snapshot" | "fork" | "restore") {
+            let ephemeral: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND owner=?1 AND name=?2 AND json_extract(metadata,'$.ephemeral')=1)",params![user,name],|r|r.get(0))?;
+            if ephemeral {
+                return Err(limits::Rejection(format!(
+                    "machine '{name}' is ephemeral: it is never snapshotted, forked or restored; delete it instead"
+                ))
+                .into());
+            }
+        }
         // Create or fork for another owner: the new box, its operation and quota are theirs.
         let owner = match request.as_object_mut().context("request")?.remove("owner") {
             None | Some(Value::Null) => user,
