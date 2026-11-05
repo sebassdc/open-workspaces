@@ -221,12 +221,18 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   undrain. **rollback** (switch, start or verify): pins back, units restarted and
   verified on the old releases, then as abort. A box that does not resume stays
   hibernated (it wakes on its next connection) and is reported.
-- **events**: when the journal reaches done, aborted, rolled-back or failed, the
-  upgrader hands its timings to the host's telemetry intake: one
-  `ow.host.upgrade.step` event per step and one `ow.host.upgrade` event (see
-  [telemetry](TELEMETRY.md)). They land in the runner's event log (`ow health`,
-  the admin API's `health.get`) and are forwarded with the other events, so each
-  upgrade's history outlives `upgrade.json`, which keeps only the last journal.
+- **events**: each step that ends while the host's agent (or, on a controller-only
+  host, the controller) listens is handed to its telemetry intake at once as an
+  `ow.host.upgrade.step` event, so the drain's start and the hibernation show up
+  live; when the journal reaches done, aborted or rolled-back, the steps it
+  missed follow, then one `ow.host.upgrade` event (see [telemetry](TELEMETRY.md)).
+  They land in the runner's event log (`ow health`, the admin API's `health.get`)
+  and are forwarded with the other events, so each upgrade's history outlives
+  `upgrade.json`, which keeps only the last journal.
+- **first upgrade to 0.9.55**: it still runs the previous release's upgrader and
+  hibernation (840 s for all boxes, whole-disk sealing). On a host with a box whose
+  hibernation takes longer (about 4 s per GiB of allocated disk), hibernate that
+  box by hand first (`ow hibernate BOX`); it wakes on its next connection.
 - **recover**: every upgrade and every boot (`open-workspaces-recover.service`)
   reads the journal first and aborts, rolls back or finishes. It first stops the
   recorded timers and any timer a reboot started again (adding those to the

@@ -626,6 +626,9 @@ class Journal:
         last = self.value.get("step")
         if last:
             self.value.setdefault("seconds", {})[last] = round(now - self.mark, 1)
+            # Live while the agent runs (drain, hibernate, undrain); what it misses goes at the close.
+            if last not in TERMINAL and name not in TERMINAL and send(step_event(self.value, last)):
+                self.value.setdefault("reported", []).append(last)
         self.mark = now
         self.value.update(step=name, updated=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         h.write_json(JOURNAL, self.value)
@@ -638,37 +641,61 @@ class Journal:
         return self.value[key]
 
 
+def step_event(journal, step):
+    """One finished step as an event (docs/TELEMETRY.md): its time; for hibernate also the
+    boxes it hibernated and the captures that will boot cold."""
+    attrs = {"journal": journal.get("id") or "unknown", "step": step,
+             "duration_ms": int(journal.get("seconds", {}).get(step, 0) * 1000)}
+    if step == "hibernate":
+        if journal.get("hibernated") is not None:
+            attrs["boxes"] = journal["hibernated"]
+        attrs["cold"] = len(journal.get("cold", []))
+    return {"event": "ow.host.upgrade.step", "attrs": attrs}
+
+
 def events(journal):
-    """A closed journal as upgrade events (docs/TELEMETRY.md): one per step with its
-    time, and boxes for the hibernate and resume steps, then the upgrade as a whole."""
-    # A journal an older upgrader left may lack fields: valid placeholders keep the events.
-    jid, seconds = journal.get("id") or "unknown", journal.get("seconds", {})
-    boxes = {"hibernate": len(journal.get("resume", [])), "resume": journal.get("resumed")}
-    out = []
-    for step, s in seconds.items():
-        attrs = {"journal": jid, "step": step, "duration_ms": int(s * 1000)}
-        if boxes.get(step) is not None:
-            attrs["boxes"] = boxes[step]
-        out.append({"event": "ow.host.upgrade.step", "attrs": attrs})
+    """A closed journal as events: each step not yet reported, then the upgrade as a whole.
+    A journal an older upgrader left may lack fields: placeholders keep the events valid."""
+    seconds, sent = journal.get("seconds", {}), set(journal.get("reported", []))
+    out = [step_event(journal, step) for step in seconds if step not in sent]
     out.append({"event": "ow.host.upgrade", "attrs": {
-        "journal": jid, "class": journal.get("class", 0), "from": (journal.get("from") or {}).get("current") or "none",
-        "to": (journal.get("to") or {}).get("current") or "none", "outcome": journal["step"],
-        "duration_ms": int(sum(seconds.values()) * 1000), "cold": len(journal.get("cold", []))}})
+        "journal": journal.get("id") or "unknown", "class": journal.get("class", 0),
+        "from": (journal.get("from") or {}).get("current") or "none",
+        "to": (journal.get("to") or {}).get("current") or "none", "outcome": journal.get("step") or "none",
+        "duration_ms": int(sum(seconds.values()) * 1000), "resumed": journal.get("resumed", 0)}})
     return out
 
 
-def report(journal):
-    """Hands the events to this host's telemetry intake: its node agent (or, on a
-    controller host, the controller) stores them in the runner's event log and forwards
-    them. Best effort: with nothing listening they are lost; upgrade.json keeps the last."""
-    path = str(p(f"{h.RUNNER}/telemetry.sock"))
-    for event in events(journal):
+def send(event, wait=0.0):
+    """Hands one event to this host's telemetry intake: its node agent, or the controller on a
+    host without a worker; they store it in the runner's event log and forward it. False
+    when nothing listens (the agent is stopped or not up yet) after `wait` seconds."""
+    try:
+        root = h.CONTROLLER if h.role() == "controller" else h.RUNNER
+    except Exception:  # noqa: BLE001 - no config: nothing to report to
+        return False
+    path, end = p(f"{root}/telemetry.sock"), time.monotonic() + wait
+    while True:
         try:
             with socket.socket(socket.AF_UNIX) as s:
                 s.settimeout(2)
-                s.connect(path)
+                s.connect(str(path))
                 s.sendall(json.dumps(event).encode() + b"\n")
+            return True
         except OSError:
+            # A restarting agent leaves its socket in place until it binds again; no socket
+            # at all: no agent on this host.
+            if time.monotonic() >= end or not path.exists():
+                return False
+            time.sleep(1)
+
+
+def report(journal):
+    """At the close: every step the live reports missed, then the whole upgrade. The units
+    were just (re)started, so the intake gets up to 30 s to come up. Best effort:
+    upgrade.json keeps the last journal."""
+    for i, event in enumerate(events(journal)):
+        if not send(event, wait=30 if i == 0 else 2):
             return
 
 
@@ -702,6 +729,7 @@ def execute(plan_, ops, frm, to, target_name):
                 j.value["cold"] = gate(plan_["gate"], ops.captures())
             j.step("hibernate")
             ops.hibernate_all(frm["worker"])
+            j.value["hibernated"] = len(j["resume"])
         j.step("stop")
         for name in ("dashboard", "agent"):
             if name in restart and name != "worker":
@@ -752,6 +780,8 @@ def finish(j, ops):
 def resume(j, ops):
     failed = []
     states = ops.boxes()
+    # After a failed hibernation: the ones that went to sleep before it gave up.
+    j.value.setdefault("hibernated", sum(states.get(box) == "hibernated" for box in j["resume"]))
     for box in j["resume"]:
         if states.get(box) == "hibernated":
             try:
@@ -960,9 +990,11 @@ def unchanged(images=()):
                 todo.append(f"pins to move: {', '.join(sorted(result['move']))}")
         if images:
             # An image build waits for the developer image first (a replaced host rebuilds it).
-            if h.run(["systemctl", "show", "-p", "ActiveState", "--value", "open-workspaces-images.service"],
-                     check=False).strip() == "activating":
-                todo.append("the developer image is still building")
+            state = h.run(["systemctl", "show", "-p", "ActiveState", "--value", "open-workspaces-images.service"],
+                          check=False).strip()
+            if state in ("activating", "failed"):
+                # A failed build goes the full path, whose image step reports it.
+                todo.append(f"the developer image build is {state}")
             built = {i.get("name"): i.get("recipe_sha256") for i in h.ow("image", "list", timeout=60)}
             for name, _, digest in (i.partition("=") for i in images):
                 if built.get(name) != digest:

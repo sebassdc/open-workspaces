@@ -552,9 +552,10 @@ fn unpublish(root: &Path, id: &str, port: u16) -> Result<()> {
 /// A service stop: whatever stays running after the stop command is killed, so retry
 /// until every machine is hibernated (a busy machine, e.g. one still resuming, frees
 /// its lock; a failed capture is tried again) instead of giving up. Starts stay refused.
+/// A box that fails does not hold up the others: each round tries every box.
 fn hibernate_all_waiting(root: &Path) {
     loop {
-        match hibernate_round(root) {
+        match hibernate_round(root, false) {
             Ok(()) => return,
             Err(e) => eprintln!("{e:#}; retrying in 5 s, starts stay refused"),
         }
@@ -566,7 +567,7 @@ fn hibernate_all_waiting(root: &Path) {
 /// one that fails or overruns its budget, starts are allowed again and this fails, so
 /// the caller does not shut the worker down under it.
 fn hibernate_all(root: &Path) -> Result<()> {
-    let result = hibernate_round(root);
+    let result = hibernate_round(root, true);
     if result.is_err() {
         // Called off: the worker keeps running, so it must accept starts and wakes again.
         // Sent even when the quiesce itself failed: a timed-out one may still be applied.
@@ -585,7 +586,9 @@ fn hibernate_budget(workspace: &Value) -> Duration {
     Duration::from_secs(120 + 20 * ram + 4 * disk)
 }
 
-fn hibernate_round(root: &Path) -> Result<()> {
+/// With `fail_fast` the first box that fails ends the round (an upgrade gives up at once);
+/// without it every box is tried and the round fails at the end if any still runs.
+fn hibernate_round(root: &Path, fail_fast: bool) -> Result<()> {
     // Any request can queue behind a capture already running, so each waits as long as one.
     let request = |value: Value| {
         wire::connect_waiting(root, &value, wire::reply_wait(&json!({"op":"hibernate"})))
@@ -621,15 +624,19 @@ fn hibernate_round(root: &Path) -> Result<()> {
         }
         let wait = hibernate_budget(workspace);
         let hibernate = wire::workspace_request("hibernate", id, placement.as_ref());
-        // The first failure ends the round: the rest would only queue behind its capture.
-        wire::connect_waiting(root, &hibernate, wait).with_context(|| {
+        // Failing fast, the first failure ends the round: the rest would only queue behind
+        // its capture.
+        match wire::connect_waiting(root, &hibernate, wait).with_context(|| {
             format!(
                 "could not hibernate {id} within its {} s budget; the worker keeps running \
                  (nothing was shut down)",
                 wait.as_secs()
             )
-        })?;
-        println!("hibernated {id}");
+        }) {
+            Ok(_) => println!("hibernated {id}"),
+            Err(e) if fail_fast => return Err(e),
+            Err(e) => eprintln!("{e:#}"),
+        }
     }
     let list = request(json!({"op":"list"}))?;
     let running: Vec<_> = list
@@ -1357,6 +1364,7 @@ mod down_tests {
                 "quiesce",
                 "list",
                 "hibernate",
+                "list",
                 "quiesce",
                 "list",
                 "hibernate",
@@ -1450,6 +1458,40 @@ mod down_tests {
             ]
         );
         drop(seen);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_service_stop_tries_every_box_when_one_fails() {
+        // Box a always fails; b is hibernated anyway: a stop never starves the boxes after it.
+        let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let request = wire::line(&mut stream).unwrap();
+                log.lock().unwrap().push(request.clone());
+                let response = match (request["op"].as_str().unwrap(), request["id"].as_str()) {
+                    ("list", _) => json!({"ok":true,"result":[
+                        {"id":"a","state":"running"},{"id":"b","state":"running"}]}),
+                    ("hibernate", Some("a")) => json!({"ok":false,"error":"timed out"}),
+                    _ => json!({"ok":true,"result":{}}),
+                };
+                wire::send(&mut stream, &response).unwrap();
+            }
+        });
+        assert!(hibernate_round(&root, false).is_err());
+        let ids: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["op"] == "hibernate")
+            .map(|r| r["id"].clone())
+            .collect();
+        assert_eq!(ids, [json!("a"), json!("b")]);
         fs::remove_dir_all(root).unwrap();
     }
 

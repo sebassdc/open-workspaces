@@ -112,8 +112,8 @@ severity:
 | `ow.node.channel.reconnected` | INFO | first acknowledgement after a loss | `reason`, `attempts`, `downtime_s` |
 | `ow.node.worker.restarted` | INFO | the worker answers from a new process | – |
 | `ow.node.worker.unavailable` | WARN | the worker stops answering status (once per outage) | – |
-| `ow.host.upgrade.step` | INFO | an upgrade journal closed: one per step it ran | `journal`, `step`, `duration_ms`, `boxes` (hibernated for `hibernate`, resumed for `resume`) |
-| `ow.host.upgrade` | INFO, WARN unless `done` | an upgrade journal closed | `journal`, `class`, `from`, `to` (releases), `outcome` (done, aborted, rolled-back, failed), `duration_ms`, `cold` |
+| `ow.host.upgrade.step` | INFO | an upgrade step ended (sent as it ends while the agent runs, else when the journal closes) | `journal`, `step` (drain, hibernate, …, undrain), `duration_ms`; for `hibernate` also `boxes` (hibernated) and `cold` |
+| `ow.host.upgrade` | INFO, WARN unless `done` | an upgrade journal closed | `journal`, `class`, `from`, `to` (releases), `outcome` (done, aborted, rolled-back), `duration_ms`, `resumed` |
 | `ow.node.operation` | INFO, WARN on failure | each job the agent runs, except reads, streams and credential refreshes | `op`, `outcome` (ok, error), `duration_ms`, `ow.box.id` when the job names a box, `error` on failure |
 
 `ow.node.operation` covers box lifecycle (create, start, stop, resize, delete,

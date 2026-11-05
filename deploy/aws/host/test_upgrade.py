@@ -369,11 +369,41 @@ class Machine(unittest.TestCase):
             listener.close()
         steps = {e["attrs"]["step"]: e["attrs"] for e in lines if e["event"] == "ow.host.upgrade.step"}
         self.assertTrue({"drain", "hibernate", "switch", "verify", "resume", "undrain"} <= set(steps), steps)
-        self.assertEqual((steps["hibernate"]["boxes"], steps["resume"]["boxes"]), (1, 1))
+        self.assertEqual((steps["hibernate"]["boxes"], steps["hibernate"]["cold"]), (1, 0))
         whole = lines[-1]["attrs"]
-        self.assertEqual((whole["outcome"], whole["class"], whole["journal"]), ("done", 2, self.journal()["id"]))
-        key = lambda e: json.dumps(e, sort_keys=True)  # noqa: E731 - the journal file sorts its keys
-        self.assertEqual(sorted(map(key, lines)), sorted(map(key, u.events(self.journal()))))
+        self.assertEqual((whole["outcome"], whole["class"], whole["journal"], whole["resumed"]),
+                         ("done", 2, self.journal()["id"], 1))
+        # Steps went out live while the intake listened; the close sends the last and the whole.
+        self.assertEqual(set(self.journal()["reported"]), set(steps) - {"undrain"})
+        self.assertEqual(u.events(self.journal()), lines[-2:])
+
+    def test_a_failed_hibernation_counts_only_the_boxes_that_went_to_sleep(self):
+        ops = Fake({"a": "running", "b": "running"})
+        real = ops.hibernate_all
+
+        def first_only(release):  # a hibernated, then b overruns its budget
+            ops.box["a"] = "hibernated"
+            raise RuntimeError("could not hibernate b within its 200 s budget")
+        ops.hibernate_all = first_only
+        with self.assertRaises(RuntimeError):
+            self.run_plan(ops, ["worker"], 2, ["worker"])
+        ops.hibernate_all = real
+        j = self.journal()
+        self.assertEqual((j["step"], j["hibernated"], j["resumed"]), ("aborted", 1, 1))
+        events = {e["attrs"].get("step", "whole"): e["attrs"] for e in u.events({**j, "reported": []})}
+        self.assertEqual((events["hibernate"]["boxes"], events["whole"]["outcome"]), (1, "aborted"))
+
+    def test_every_event_attribute_is_one_the_intake_accepts(self):
+        import re
+        rust = (Path(__file__).resolve().parents[3] / "crates/ow/src/telemetry.rs").read_text()
+        table = rust[rust.index("const HOST_EVENTS"):rust.index("];", rust.index("const HOST_EVENTS"))]
+        accepted = {name: set(re.findall(r'"([a-z_]+)"', keys))
+                    for name, keys in re.findall(r'"(ow\.host\.[a-z.]+)",\s*&\[([^\]]*)\]', table)}
+        journal = {"id": "u-1", "class": 2, "from": {"current": "a"}, "to": {"current": "b"}, "step": "done",
+                   "seconds": {"drain": 1.0, "hibernate": 2.0}, "hibernated": 1, "cold": [], "resumed": 1}
+        for event in u.events(journal):
+            self.assertLessEqual(set(event["attrs"]), accepted[event["event"]], event)
+            self.assertLessEqual(len(event["attrs"]), 7, "with event.name, at most 8 attributes")
 
     def test_without_a_listener_the_upgrade_still_closes(self):
         ops = Fake({"a": "running"})
@@ -894,7 +924,8 @@ class Unchanged(unittest.TestCase):
             "restarts pending": lambda: h.mark_pending({"agent"}, "config changed"),
             "interrupted upgrade": lambda: h.write_json(u.JOURNAL, {"step": "hibernate"}),
             "image team": lambda: self.images[1].update(recipe_sha256="b" * 64),
-            "developer image is still building": lambda: setattr(self, "developer", "activating"),
+            "developer image build is activating": lambda: setattr(self, "developer", "activating"),
+            "developer image build is failed": lambda: setattr(self, "developer", "failed"),
         }
         for what, change in cases.items():
             with self.subTest(what):

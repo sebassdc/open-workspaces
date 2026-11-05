@@ -797,8 +797,9 @@ fn intake_record(line: &str) -> Option<(String, Option<String>, u64, Option<&'st
     };
     Some((op.to_owned(), machine, v["duration_ms"].as_u64()?, error))
 }
-/// Host events other processes hand over through the intake (the upgrader's timings, sent
-/// once its journal closes), each with the only attributes it may carry.
+/// Host events other processes hand over through the intake (the upgrader's timings: each
+/// step as it ends, what the agent missed and the whole once its journal closes), each with
+/// the only attributes it may carry. deploy/aws/host/test_upgrade.py checks the upgrader.
 const HOST_EVENTS: [(&str, &[&str]); 2] = [
     (
         "ow.host.upgrade",
@@ -809,12 +810,12 @@ const HOST_EVENTS: [(&str, &[&str]); 2] = [
             "to",
             "outcome",
             "duration_ms",
-            "cold",
+            "resumed",
         ],
     ),
     (
         "ow.host.upgrade.step",
-        &["journal", "step", "duration_ms", "boxes"],
+        &["journal", "step", "duration_ms", "boxes", "cold"],
     ),
 ];
 type EventSink = Arc<dyn Fn(&'static str, &[(&'static str, String)]) + Send + Sync>;
@@ -3135,7 +3136,7 @@ mod tests {
 
     #[test]
     fn upgrade_events_carry_only_their_own_plain_attributes() {
-        let ok = r#"{"event":"ow.host.upgrade","attrs":{"journal":"u-20261104T034230Z","class":2,"from":"0.9.50","to":"0.9.53","outcome":"aborted","duration_ms":61234,"cold":0}}"#;
+        let ok = r#"{"event":"ow.host.upgrade","attrs":{"journal":"u-20261104T034230Z","class":2,"from":"0.9.50","to":"0.9.53","outcome":"aborted","duration_ms":61234,"resumed":0}}"#;
         let (name, attrs) = intake_event(ok).unwrap();
         assert_eq!(name, "ow.host.upgrade");
         assert_eq!(attrs.len(), 7);
