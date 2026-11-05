@@ -98,10 +98,12 @@ failed check leaves the current client in place.
 If the latest release cannot be found, its assets are not all published yet,
 a check fails or its `status` does, `ow upgrade` falls back to the release the
 controller runs (`GET /api/version`, which can lag the latest release) and says
-why. A latest release that fails any step after its `.sha256` was found is not
-downloaded again for 10 minutes (recorded in `upgrade-refused` beside the
-client's `client.json`), and that refusal prints one line to standard error, so
-a timer's log shows it even with `--json`. Small requests (the latest lookup,
+why. A release, latest or the controller's, that fails any step after its
+`.sha256` was found is not downloaded again for 10 minutes (one line per release
+in `upgrade-refused` beside the client's `client.json`); while the controller's
+release is held back this way, `ow upgrade` is a no-op that says why. Each
+refusal prints one line to standard error, so a timer's log shows it even with
+`--json`. `--version` is never held back. Small requests (the latest lookup,
 `.sha256`, `SHA256SUMS`) time out after 10 seconds; the client download after 5
 minutes. It refuses, before downloading anything, when the client was started
 through a symlink (as the installer does), when it cannot write to the client's
@@ -124,7 +126,9 @@ nothing, so a timer's log grows only when something changed (`--check --json`
 always prints the line). Only an explicit `--version` installs an older release.
 `--check` downloads no client, so it reports the latest release with the
 `reason` that its compatibility is checked on install; it exits 10 only once
-the release's `.sha256` for this platform can be downloaded. Errors exit 1.
+the release's `.sha256` for this platform can be downloaded. A newer controller
+release that is held back is still reported as available (exit 10), with the
+reason. Errors exit 1.
 
 To keep a Mac's client current, run it from a launchd user
 agent every 30 seconds. Save this as

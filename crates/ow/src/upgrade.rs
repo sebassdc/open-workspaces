@@ -211,6 +211,36 @@ fn writable(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The memo's entries still inside `REFUSAL` at `now`: one line per release,
+/// `VERSION UNIX_SECONDS REASON`. An entry dated in the future is treated as expired.
+fn fresh(text: &str, now: u64) -> impl Iterator<Item = (&str, u64, &str)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, ' ');
+            let version = fields.next()?;
+            let at = fields.next()?.parse().ok()?;
+            Some((version, at, fields.next().unwrap_or("")))
+        })
+        .filter(move |(_, at, _)| *at <= now && now - at < REFUSAL.as_secs())
+}
+
+/// The memo with `target` refused at `now`: expired entries and its older entry dropped.
+fn remember(text: &str, now: u64, target: Version, why: &str) -> String {
+    let v = show(target);
+    let mut out: String = fresh(text, now)
+        .filter(|(version, _, _)| *version != v)
+        .map(|(version, at, why)| format!("{version} {at} {why}\n"))
+        .collect();
+    out.push_str(&format!("{v} {now} {}\n", why.replace(['\n', '\r'], " ")));
+    out
+}
+
 /// Standard output of `path args...`, or an error unless it exits 0 within 30 s.
 fn output_of(path: &Path, args: &[OsString]) -> Result<String> {
     let mut child = Command::new(path)
@@ -468,7 +498,10 @@ fn attempt(
     let remember = source == Source::Controller;
     if let Some(why) = releases.refused(target).filter(|_| remember) {
         outcome.reason = Some(format!("v{} was refused recently: {why}", show(target)));
-        return Ok(outcome);
+        // `--check` still reports it as available: it is newer, only held back for now.
+        if !check {
+            return Ok(outcome);
+        }
     }
     if !check {
         releases.replaceable()?;
@@ -573,22 +606,29 @@ impl<F: FnOnce() -> Result<String>, H: FnOnce() -> Result<bool>> Releases for Gi
     }
 
     fn refused(&self, target: Version) -> Option<String> {
-        let path = self.memo.as_ref()?;
-        let age = fs::metadata(path).ok()?.modified().ok()?.elapsed().ok()?;
-        let text = fs::read_to_string(path).ok()?;
-        let (version, why) = text.split_once('\n')?;
-        (age < REFUSAL && version == show(target)).then(|| why.to_owned())
+        let text = fs::read_to_string(self.memo.as_ref()?).ok()?;
+        fresh(&text, unix_now())
+            .find(|(version, _, _)| *version == show(target))
+            .map(|(_, _, why)| why.to_owned())
     }
 
     fn refuse(&mut self, target: Version, why: &str) {
         let v = show(target);
         let saved = match &self.memo {
             None => Err(anyhow!("HOME or XDG_CONFIG_HOME required")),
-            Some(path) => path
-                .parent()
-                .map_or(Ok(()), fs::create_dir_all)
-                .and_then(|()| fs::write(path, format!("{v}\n{why}")))
-                .with_context(|| format!("cannot write {}", path.display())),
+            Some(path) => {
+                let old = fs::read_to_string(path).unwrap_or_default();
+                let text = remember(&old, unix_now(), target, why);
+                let staged = Staged(path.with_file_name(format!(
+                    ".upgrade-refused-{}",
+                    crate::common::nonce().unwrap_or_default()
+                )));
+                path.parent()
+                    .map_or(Ok(()), fs::create_dir_all)
+                    .and_then(|()| fs::write(&staged.0, text))
+                    .and_then(|()| fs::rename(&staged.0, path))
+                    .with_context(|| format!("cannot write {}", path.display()))
+            }
         };
         // `--json` stays quiet on the fallback's no-op; this is the timer log's one trace.
         match saved {
@@ -704,7 +744,7 @@ mod tests {
         /// Installing one of these fails with its message.
         broken: Vec<(Version, &'static str)>,
         installs: usize,
-        refused: Option<(Version, String)>,
+        refused: Vec<(Version, String)>,
         asked_controller: bool,
         installed: Vec<(Version, bool)>,
     }
@@ -717,7 +757,7 @@ mod tests {
             https: true,
             broken: Vec::new(),
             installs: 0,
-            refused: None,
+            refused: Vec::new(),
             asked_controller: false,
             installed: Vec::new(),
         }
@@ -751,12 +791,13 @@ mod tests {
         }
         fn refused(&self, target: Version) -> Option<String> {
             self.refused
-                .as_ref()
-                .filter(|(v, _)| *v == target)
+                .iter()
+                .find(|(v, _)| *v == target)
                 .map(|(_, why)| why.clone())
         }
         fn refuse(&mut self, target: Version, why: &str) {
-            self.refused = Some((target, why.into()));
+            self.refused.retain(|(v, _)| *v != target);
+            self.refused.push((target, why.into()));
         }
         fn https(&mut self) -> Result<bool> {
             Ok(self.https)
@@ -800,12 +841,12 @@ mod tests {
         );
         assert_eq!(r.installed, [((0, 9, 63), false)]);
         assert!(
-            r.refused.is_some(),
+            !r.refused.is_empty(),
             "remembered so a timer does not download it again"
         );
 
         let mut again = fake("v0.9.64", "0.9.62");
-        again.refused = r.refused.take();
+        again.refused = std::mem::take(&mut r.refused);
         let o = select(&mut again, CURRENT, None, false).unwrap();
         assert_eq!((o.source, o.step), (Source::Controller, Step::Current));
         assert!(o.reason.unwrap().contains("refused recently"));
@@ -822,7 +863,7 @@ mod tests {
             r.broken = vec![((0, 9, 64), error)];
             let o = select(&mut r, CURRENT, None, false).unwrap();
             assert_eq!((o.source, o.step), (Source::Controller, Step::Current));
-            assert_eq!(r.refused, Some(((0, 9, 64), error.to_owned())));
+            assert_eq!(r.refused, [((0, 9, 64), error.to_owned())]);
         }
     }
 
@@ -848,7 +889,10 @@ mod tests {
             select(&mut r, CURRENT, None, false).is_err(),
             "the failure is reported"
         );
-        assert_eq!(r.refused.as_ref().map(|(v, _)| *v), Some((0, 9, 63)));
+        assert_eq!(
+            r.refused.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            [(0, 9, 63)]
+        );
 
         let mut again = fake("", "0.9.63");
         again.latest = Err("offline");
@@ -861,6 +905,85 @@ mod tests {
 
         assert!(select(&mut again, CURRENT, Some("v0.9.63"), false).is_err());
         assert_eq!(again.installs, 1, "--version is not held back by the memo");
+    }
+
+    #[test]
+    fn two_failing_releases_are_each_downloaded_once() {
+        let mut r = fake("v0.9.65", "0.9.64");
+        r.broken = vec![
+            (
+                (0, 9, 65),
+                "not compatible with the controller: status is not connected",
+            ),
+            ((0, 9, 64), "download checksum mismatch for ow-darwin-arm64"),
+        ];
+        let client = (0, 9, 63);
+        assert!(
+            select(&mut r, client, None, false).is_err(),
+            "run 1 reports the failure"
+        );
+        for run in 2..=3 {
+            r.asked_controller = false;
+            let o = select(&mut r, client, None, false).unwrap();
+            assert_eq!(
+                (o.to, o.source, o.step),
+                ((0, 9, 64), Source::Controller, Step::Current)
+            );
+            assert!(
+                o.reason.unwrap().contains("v0.9.65 was refused recently"),
+                "run {run}"
+            );
+        }
+        assert_eq!(r.installs, 2, "one download per failing release");
+    }
+
+    #[test]
+    fn check_reports_a_held_back_controller_release_as_available() {
+        let mut r = fake("", "0.9.64");
+        r.latest = Err("offline");
+        r.refused = vec![((0, 9, 64), "download checksum mismatch".into())];
+        let o = select(&mut r, CURRENT, None, true).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            ((0, 9, 64), Source::Controller, Step::Available)
+        );
+        assert!(o.reason.unwrap().contains("v0.9.64 was refused recently"));
+        assert_eq!(r.installs, 0);
+    }
+
+    #[test]
+    fn the_memo_keeps_one_fresh_line_per_release() {
+        let at = 1_000_000;
+        let text = remember("", at, (0, 9, 65), "incompatible");
+        let text = remember(&text, at + 1, (0, 9, 64), "broken\nchecksum");
+        let lines: Vec<_> = fresh(&text, at + 2).collect();
+        assert_eq!(
+            lines,
+            [
+                ("0.9.65", at, "incompatible"),
+                ("0.9.64", at + 1, "broken checksum")
+            ]
+        );
+        let text = remember(&text, at + 3, (0, 9, 65), "again");
+        assert_eq!(
+            fresh(&text, at + 3)
+                .map(|(v, _, why)| (v, why))
+                .collect::<Vec<_>>(),
+            [("0.9.64", "broken checksum"), ("0.9.65", "again")]
+        );
+        let later = at + 1 + REFUSAL.as_secs();
+        assert_eq!(
+            fresh(&text, later).map(|(v, ..)| v).collect::<Vec<_>>(),
+            ["0.9.65"]
+        );
+        assert_eq!(
+            remember(&text, later + 10, (0, 9, 66), "x"),
+            format!("0.9.66 {} x\n", later + 10)
+        );
+        assert_eq!(
+            fresh("0.9.64 9999999999 future\ngarbage\n0.9.63 x y\n", at).count(),
+            0
+        );
     }
 
     #[test]
@@ -910,7 +1033,7 @@ mod tests {
         assert_eq!((o.source, o.step), (Source::Controller, Step::Current));
         assert!(o.reason.unwrap().contains("404"));
         assert!(
-            r.installed.is_empty() && r.refused.is_none(),
+            r.installed.is_empty() && r.refused.is_empty(),
             "retried next run"
         );
     }
