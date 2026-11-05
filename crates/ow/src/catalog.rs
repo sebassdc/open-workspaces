@@ -2877,7 +2877,7 @@ impl Catalog {
             {
                 return Ok(value);
             }
-            self.legacy_access(&physical)?;
+            self.legacy_access_op(&physical, &op)?;
             if let Some(placement) = self.managed_placement(&physical)? {
                 if op == "restore" {
                     return Err(limits::Rejection(format!(
@@ -3225,7 +3225,7 @@ impl Catalog {
                     );
                 }
             }
-            self.legacy_access(&target)?;
+            self.legacy_access_op(&target, &op)?;
             prior_reservation=self.db.query_row("SELECT reserved_mib,reserved_cpus FROM resources WHERE kind='machine' AND physical=?1",[&target],|r|Ok((r.get(0)?,r.get(1)?)))?;
             let key = if let Some(key) = input["operation_key"].as_str() {
                 common::identifier(key)?;

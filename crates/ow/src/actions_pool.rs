@@ -213,7 +213,12 @@ fn pass(shared: &Arc<Shared>) -> Result<()> {
         let listed = match shared.github.runners(app_id, repo) {
             Ok(found) => Some(found),
             Err(error) => {
-                failure = Some(error.context(format!("listing {repo}'s runners")));
+                let error = error.context(format!("listing {repo}'s runners"));
+                // In each of its pools' status, not only the log.
+                for p in pools.iter().filter(|p| &p.repo == repo) {
+                    self::error(shared, &p.name, format!("{error:#}"));
+                }
+                failure = Some(error);
                 None
             }
         };
