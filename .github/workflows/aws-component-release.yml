@@ -188,16 +188,34 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           tag="v$(node -p 'require("./package.json").version')"
-          if ! gh release view "$tag" --json isDraft --jq .isDraft; then
-            gh release create "$tag" --verify-tag --generate-notes --draft
-          fi
+          exists() { gh release view "$tag" --json isDraft --jq .isDraft > /dev/null 2>&1; }
+          # GitHub's generated notes are a convenience: a service error is retried, then the
+          # release is made with the commit message as its notes. A lost answer is read back.
+          for wait in 5 15 30 0; do
+            exists || gh release create "$tag" --verify-tag --generate-notes --draft || exists || {
+              [ "$wait" != 0 ] && { echo "release notes service failed; retrying in $wait s"; sleep "${OW_RELEASE_WAIT:-$wait}"; continue; }
+              echo "::warning::GitHub's release notes service failed; using the commit message"
+              git log -1 --format=%B "$GITHUB_SHA" > "$RUNNER_TEMP/notes.md"
+              gh release create "$tag" --verify-tag --notes-file "$RUNNER_TEMP/notes.md" --draft || exists
+            }
+            break
+          done
+          exists
       - name: Attach clients without replacing published assets
         if: github.event_name == 'push'
         working-directory: .
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: bash scripts/publish-release-clients.sh "v$(node -p 'require("./deploy/aws/package.json").version')" release-clients
+        # Retry-safe: it uploads only missing assets and refuses changed ones; GitHub's upload
+        # API answers 5xx (or a lost-answer 422 "already exists") now and then.
+        run: |
+          tag="v$(node -p 'require("./deploy/aws/package.json").version')"
+          for wait in 10 30 0; do
+            bash scripts/publish-release-clients.sh "$tag" release-clients && exit 0
+            [ "$wait" = 0 ] && exit 1
+            echo "attaching clients failed; retrying in $wait s"; sleep "$wait"
+          done
       - name: Publish complete GitHub release
         if: github.event_name == 'push'
         env:
@@ -205,9 +223,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           tag="v$(node -p 'require("./package.json").version')"
-          if [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true ]; then
-            gh release edit "$tag" --draft=false
-          fi
+          for wait in 5 15 30 0; do
+            draft=$(gh release view "$tag" --json isDraft --jq .isDraft) || draft=unknown
+            [ "$draft" != false ] || exit 0
+            [ "$draft" != true ] || gh release edit "$tag" --draft=false > /dev/null || true
+            [ "$wait" = 0 ] || { sleep "$wait"; continue; }
+          done
+          [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = false ]
       # Downstream deployers listen for this event; a failed dispatch never fails the release.
       - name: Notify downstream repositories
         if: github.event_name == 'push'
