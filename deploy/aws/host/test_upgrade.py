@@ -269,6 +269,18 @@ class HandOverBlocker(unittest.TestCase):
             with mock.patch.object(u.HostOps, "worker_status", return_value={"worker_handover_v1": False}):
                 self.assertIn("cannot hand over on this host", ops.handover_blocker("old", "old"))
 
+    def test_no_firecracker_or_kernel_found_on_either_side_is_not_a_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h.ROOT = Path(tmp)
+            ops = u.HostOps()
+            with mock.patch.object(u.HostOps, "worker_status", return_value={"worker_handover_v1": True}):
+                self.assertIn("not found", ops.handover_blocker("old", "new"))
+                for release in ("old", "new"):  # a kernel on neither side still differs from a match
+                    assets = h.p(f"{h.SRV}/releases/{release}/assets/official/release-v1")
+                    assets.mkdir(parents=True)
+                    (assets / "firecracker-v1").write_bytes(b"vmm")
+                self.assertIn("not found", ops.handover_blocker("old", "new"))
+
 
 class Fake:
     """A host: three units, a worker with boxes, and failures to inject."""

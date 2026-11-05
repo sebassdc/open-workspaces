@@ -309,35 +309,65 @@ fn recorded_runs(record: &Value) -> Option<u32> {
     .then_some(pid)
 }
 
-/// Whether this host lets a later worker take a VMM's fds (`pidfd_getfd`, Linux 5.6+, not
-/// refused by Yama's `ptrace_scope` 3); without it a restart must hibernate (ADR 0011).
+/// Whether this host lets a later worker take a VMM's fds (`pidfd_getfd`, Linux 5.6+);
+/// without it a restart must hibernate (ADR 0011).
 pub fn handover_supported() -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        if std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
-            .is_ok_and(|s| s.trim() == "3")
-        {
-            return false;
-        }
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
-        if raw < 0 {
-            return false;
-        }
-        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
-        let taken = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_getfd,
-                pidfd.as_raw_fd(),
-                pidfd.as_raw_fd(),
-                0,
-            )
-        };
-        if taken < 0 {
-            return false;
-        }
-        drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(taken as i32) });
-        true
-    })
+    *SUPPORTED.get_or_init(|| handover_probe().is_ok())
+}
+
+/// Takes an fd from a process outside this one's tree, as a later worker takes them from a
+/// VMM the worker before it spawned: Yama's `ptrace_scope` 1 and 2 refuse that without
+/// CAP_SYS_PTRACE, though any process may take its own.
+fn handover_probe() -> std::io::Result<()> {
+    // The shell exits once it names its background child, which then is not ours.
+    let out = Command::new("/bin/sh")
+        .args(["-c", "sleep 60 </dev/null >/dev/null 2>&1 & echo $!"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    let pid: libc::pid_t = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .map_err(std::io::Error::other)?;
+    let taken = take_fd(pid, 0);
+    // It started a 60 s sleep just now: its PID cannot have been reused yet.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    taken.map(drop)
+}
+
+/// Opens a pidfd on `pid` and takes, then drops, its fd `fd`, as adoption takes a VMM's
+/// console; returns the pidfd.
+fn take_fd(pid: libc::pid_t, fd: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+    let taken = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+    if taken < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(taken as i32) });
+    Ok(pidfd)
+}
+
+/// Why the adoption tests cannot run here, or None: they take fds from their own children,
+/// which `pidfd_getfd` refuses, for example under Docker's default seccomp profile without
+/// CAP_SYS_PTRACE.
+#[cfg(test)]
+pub(crate) fn fds_untakeable() -> Option<String> {
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let taken = take_fd(child.id() as libc::pid_t, 0);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    taken
+        .err()
+        .map(|e| format!("pidfd_getfd is refused on this host ({e})"))
 }
 
 /// The recorded VMM's PID when that very process still runs.
@@ -1851,6 +1881,10 @@ mod adoption_tests {
 
     #[test]
     fn a_later_worker_takes_the_vmm_fds_and_ends_it_through_its_pidfd() {
+        if let Some(why) = fds_untakeable() {
+            eprintln!("skipped: {why}");
+            return;
+        }
         let directory = scratch();
         let (console_read, console_write) = pipe();
         let mut child = vmm(&console_write, pipe());
@@ -1906,7 +1940,38 @@ mod adoption_tests {
     }
 
     #[test]
+    fn the_handover_probe_needs_what_adoption_needs() {
+        // A later worker takes fds from a VMM it never spawned: Yama's ptrace_scope 1 and 2
+        // refuse that without CAP_SYS_PTRACE, though a process may always take its own.
+        let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+            .unwrap_or_else(|_| "0".into());
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let effective = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .unwrap();
+        // CAP_SYS_PTRACE is capability 19.
+        let ptrace = u64::from_str_radix(effective.trim(), 16).unwrap() & 1 << 19 != 0;
+        let expected = fds_untakeable().is_none()
+            && match scope.trim() {
+                "0" => true,
+                "1" | "2" => ptrace,
+                _ => false,
+            };
+        assert_eq!(
+            handover_supported(),
+            expected,
+            "ptrace_scope {}, CAP_SYS_PTRACE {ptrace}",
+            scope.trim()
+        );
+    }
+
+    #[test]
     fn a_detached_vmm_keeps_running() {
+        if let Some(why) = fds_untakeable() {
+            eprintln!("skipped: {why}");
+            return;
+        }
         let directory = scratch();
         let (_console_read, console_write) = pipe();
         let mut child = vmm(&console_write, pipe());

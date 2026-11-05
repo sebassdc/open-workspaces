@@ -585,7 +585,10 @@ class HostOps:
             files = [*sorted(assets.glob("official/*/firecracker-v*")), *sorted(assets.glob("downloads/vmlinux-*"))]
             return [(f.name, hashlib.sha256(f.read_bytes()).hexdigest()) for f in files if f.is_file()]
 
-        if runtime(frm) != runtime(to):
+        running = runtime(frm)
+        if not all(any(name.startswith(kind) for name, _ in running) for kind in ("firecracker-v", "vmlinux-")):
+            return "the running release's Firecracker binary or guest kernel was not found"
+        if running != runtime(to):
             return "the staged Firecracker binary or guest kernel differs from the running one"
         return None
 
