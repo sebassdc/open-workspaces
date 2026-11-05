@@ -464,8 +464,16 @@ pub async fn handle(
         return secure(Json(json!({"ok":true,"result":result})).into_response());
     }
     if path == "/api/state" && method == Method::GET {
+        // Runners are asked before the catalog is taken: a slow one never holds up operations.
+        let read = catalog.clone();
+        let inventory = tokio::task::spawn_blocking(move || {
+            read.and_then(|c| crate::catalog::Catalog::read_inventory(&c).ok())
+        })
+        .await
+        .ok()
+        .flatten();
         let result = with_catalog(catalog, identity, move |catalog, user| {
-            let mut state = catalog.state(user)?;
+            let mut state = catalog.state_with(user, inventory)?;
             state["previews"] = json!(preview_host.is_some());
             for group in ["workspaces", "shared"] {
                 for item in state[group].as_array_mut().into_iter().flatten() {

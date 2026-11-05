@@ -2526,6 +2526,7 @@ fn transfer_operation_join_conflict_and_atomic_competing_requests() {
             root: c.root.clone(),
             pool_admins: Vec::new(),
             flights: Arc::default(),
+            applied: Default::default(),
             _lock: c._lock.try_clone().unwrap(),
         })
         .collect::<Vec<_>>();
@@ -5291,6 +5292,16 @@ impl Runner {
                         "list" => json!(machines.lock().unwrap().values().collect::<Vec<_>>()),
                         "snapshots" => json!([]),
                         "stats" => json!({"running":{}}),
+                        "stop" => {
+                            let mut machines = machines.lock().unwrap();
+                            let m = machines.get_mut(&id).unwrap();
+                            m["state"] = json!("stopped");
+                            json!({"workspace":m})
+                        }
+                        "delete" => {
+                            machines.lock().unwrap().remove(&id);
+                            json!({"deleted":id,"snapshots":[]})
+                        }
                         "create" => {
                             std::thread::sleep(delay);
                             let m = json!({"id":id,"memory_mib":request["memory_mib"],"vcpu_count":request["vcpu_count"],"image":request["image"],"image_digest":null,"state":"running","source":null,"disk_bytes":8*common::GIB});
@@ -5439,6 +5450,8 @@ fn an_inventory_read_before_a_call_landed_leaves_that_box_alone() {
     // Read unlocked while the runner has no box yet; the create lands before it is applied.
     let stale = Inventory::read(&c.root, &c.flights).unwrap();
     c.operation(a, json!({"op":"create","id":"one","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    // As if the runner's newer reads had not been applied yet.
+    c.applied.clear();
     c.apply(stale).unwrap();
     let physical = c.physical(a, "machine", "one").unwrap();
     let (state, reserved): (String, i64) = c.db.query_row("SELECT json_extract(metadata,'$.state'),reserved_mib FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
@@ -5447,4 +5460,21 @@ fn an_inventory_read_before_a_call_landed_leaves_that_box_alone() {
     let fresh = Inventory::read(&c.root, &c.flights).unwrap();
     c.apply(fresh).unwrap();
     assert_eq!(c.state(a).unwrap()["workspaces"][0]["state"], "running");
+}
+
+#[test]
+fn a_box_deleted_after_an_inventory_was_read_is_not_counted_as_outside_usage() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let a = c.user(&identity("alice")).unwrap();
+    runner_row(&fake.root, "alpha");
+    let _runner = Runner::start(&fake.root, "alpha", 0);
+    c.operation(a, json!({"op":"create","id":"one","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    // Read while the runner still runs it; the box is stopped and deleted before it is applied.
+    let stale = Inventory::read(&c.root, &c.flights).unwrap();
+    c.operation(a, json!({"op":"stop","id":"one"})).unwrap();
+    c.operation(a, json!({"op":"delete","id":"one"})).unwrap();
+    c.applied.clear();
+    c.apply(stale).unwrap();
+    assert_eq!(c.extra_usage("alpha").unwrap(), (0, 0, 0));
 }

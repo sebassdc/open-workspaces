@@ -3121,7 +3121,7 @@ mod disk_tests {
     }
 
     #[test]
-    fn a_box_still_booting_holds_capacity_and_takes_no_other_request() {
+    fn a_box_still_booting_holds_capacity_and_refuses_requests_that_reach_the_runtime() {
         let mut runtime = fixture();
         // `legacy` (1024 MiB, 2 vCPUs) is booting off the worker thread.
         runtime.state.workspaces.get_mut("legacy").unwrap().state = "starting".into();

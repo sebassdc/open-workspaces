@@ -494,7 +494,6 @@ fn worker(root: PathBuf) -> Result<()> {
                                 let landing =
                                     Landing(booting.clone(), landed_tx.clone(), creating.id().into());
                                 std::thread::spawn(move || {
-                                    let _landing = landing;
                                     let booted = std::panic::catch_unwind(
                                         std::panic::AssertUnwindSafe(|| creating.boot()),
                                     )
@@ -504,6 +503,8 @@ fn worker(root: PathBuf) -> Result<()> {
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner())
                                         .create_finish(*creating, booted);
+                                    // Its waiting requests go ahead of any that arrive later.
+                                    drop(landing);
                                     if let Err(error) =
                                         wire::send(&mut stream, &wire::response(result))
                                     {

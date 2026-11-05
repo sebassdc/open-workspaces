@@ -25,6 +25,8 @@ pub struct Catalog {
     pub(crate) pool_admins: Vec<String>,
     /// Boxes with a runner call in flight outside the catalog lock.
     flights: Arc<flights::Flights>,
+    /// When the inventory last applied for each runner was read: an older one is not applied.
+    applied: std::collections::HashMap<String, Instant>,
     _lock: std::fs::File,
 }
 
@@ -764,6 +766,7 @@ impl Catalog {
             root: root.into(),
             pool_admins: Vec::new(),
             flights: Arc::default(),
+            applied: Default::default(),
             _lock: lock,
         };
         let migrated: bool = catalog.db.query_row(
@@ -1627,6 +1630,7 @@ impl Catalog {
             return Ok((json!(all_machines), json!(all_snapshots)));
         }
         let skip = self.flights.since(inventory.seq);
+        let inventory_read = inventory.read;
         let fetched = inventory.runners;
         // Boxes a runner call is changing, or changed after this inventory was read: what it
         // lists for them may be stale, so their rows are left to the call's result.
@@ -1635,6 +1639,10 @@ impl Catalog {
             let Some((machines, snapshots)) = inventory else {
                 continue;
             };
+            if self.applied.get(&node).is_some_and(|newer| *newer > inventory_read) {
+                continue;
+            }
+            self.applied.insert(node.clone(), inventory_read);
             // One commit (one fsync) per runner instead of one per row, all under the lock.
             let own = self.db.is_autocommit();
             if own {
@@ -1672,6 +1680,12 @@ impl Catalog {
         let (mut extra_mib, mut extra_cpus, mut extra_slots) = (0i64, 0i64, 0i64);
         for m in machines.as_array().context("invalid machines")? {
             let physical = m["id"].as_str().context("invalid ID")?;
+            // Boxes in `skip` are the catalog's own (one just deleted may still be listed):
+            // never counted as usage from outside it.
+            if skip.contains(physical) {
+                all_machines.push(m.clone());
+                continue;
+            }
             if matches!(
                 m["state"].as_str(),
                 Some("running" | "starting" | "stopping" | "creating" | "unknown")
@@ -1680,10 +1694,6 @@ impl Catalog {
                 extra_mib += m["memory_mib"].as_i64().unwrap_or(4096);
                 extra_cpus += m["vcpu_count"].as_i64().unwrap_or(16);
                 extra_slots += 1;
-            }
-            if skip.contains(physical) {
-                all_machines.push(m.clone());
-                continue;
             }
             let managed = self.managed_placement(physical)?;
             if !self.legacy_machine(physical)?
@@ -1778,7 +1788,14 @@ impl Catalog {
         Ok(())
     }
     pub fn state(&mut self, user: i64) -> Result<Value> {
-        self.reconcile()?;
+        self.state_with(user, None)
+    }
+    /// [`Self::state`] with runner inventories read beforehand, without the catalog lock.
+    pub(crate) fn state_with(&mut self, user: i64, inventory: Option<Inventory>) -> Result<Value> {
+        match inventory {
+            Some(inventory) => self.apply(inventory)?,
+            None => self.reconcile()?,
+        };
         let mut stmt=self.db.prepare("SELECT kind,physical,metadata,node,reserved_mib,CAST(strftime('%s',created_at) AS INTEGER) FROM resources WHERE owner=?1 ORDER BY created_at,name")?;
         let rows = stmt.query_map([user], |r| {
             Ok((
@@ -2978,6 +2995,16 @@ impl Catalog {
             self.db.execute("UPDATE resources SET reserved_mib=?1,reserved_cpus=?2 WHERE kind='machine' AND physical=?3",params![memory as i64,cpus as i64,target])?;
         }
         Ok(())
+    }
+    /// Every runner's inventory, read with the catalog held only to find the runners.
+    pub(crate) fn read_inventory(shared: &Mutex<Catalog>) -> Result<Inventory> {
+        let (root, flights) = {
+            let c = shared
+                .lock()
+                .map_err(|_| anyhow::anyhow!("catalog lock poisoned"))?;
+            (c.root.clone(), c.flights.clone())
+        };
+        Inventory::read(&root, &flights)
     }
     /// One box operation with the catalog held throughout (tests, and callers that hold it).
     pub fn operation(&mut self, user: i64, request: Value) -> Result<Value> {
