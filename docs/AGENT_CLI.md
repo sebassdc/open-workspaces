@@ -166,9 +166,13 @@ print one JSON value on stdout, without an interactive prompt or progress banner
   that owner's name space and counts against their limits. A fork inherits no
   shares or SSH keys.
 - `create NAME --ephemeral` (the create operation's `"ephemeral": true`): a box
-  that is never hibernated, such as a CI job's. Idle hibernation skips it,
-  `hibernate` refuses it, and a worker restart or upgrade stops it instead. Every
-  box a workload token creates is ephemeral.
+  that is never kept, such as a CI job's. Idle hibernation skips it,
+  `hibernate` refuses it, and a worker restart or upgrade stops it instead.
+  Recovery points skip it, and `snapshot`, `fork`, `restore`, image saves,
+  `move` and `park` refuse it before anything is reserved: delete it instead. A
+  drain deletes a stopped ephemeral box rather than parking it; a running one
+  counts as running, so stop the program that made it before draining. Every box a workload token creates is
+  ephemeral.
 - `create NAME --pool POOL`: place it on a runner in that placement pool
   (default `default`). Other pools are for pool admins and workload tokens bound
   to that pool; see [placement pools](USERS.md#placement-pools).

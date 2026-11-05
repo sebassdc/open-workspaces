@@ -21,6 +21,10 @@ impl Runtime {
     pub(super) fn recovery_operation(&mut self, request: &Value) -> Result<Value> {
         let id = request["id"].as_str().context("missing ID")?;
         let workspace = self.workspace(id)?;
+        if workspace.ephemeral {
+            // Throwaway: never a recovery point. No "snapshot" key means nothing was due.
+            return Ok(json!({"ephemeral":true}));
+        }
         let path = self.root.join("recovery").join(format!("{id}.json"));
         let mut recovery: Recovery = if path.exists() {
             serde_json::from_slice(&fs::read(&path)?)?

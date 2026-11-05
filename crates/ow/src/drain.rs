@@ -501,6 +501,11 @@ pub(crate) fn pass(
             transfers::drain_cleanup(shared, node, m, call)?;
             continue;
         }
+        if m["ephemeral"] == true {
+            // Throwaway: deleted, never parked (its worker refuses the export).
+            delete_ephemeral(shared, m)?;
+            return Ok(());
+        }
         transfers::drain_park(shared, node, generation, m, call)?;
         return Ok(()); // Existing transfer runner owns capture/publication and retries.
     }
@@ -827,3 +832,17 @@ pub(crate) fn agent_inventory(root: &Path, request: &Value) -> Result<Value> {
 #[cfg(test)]
 #[path = "drain_tests.rs"]
 mod tests;
+
+/// A stopped ephemeral box on a draining runner: deleted as its owner would delete it.
+fn delete_ephemeral(shared: &std::sync::Mutex<crate::catalog::Catalog>, m: &Value) -> Result<()> {
+    let physical = m["id"].as_str().context("missing machine ID")?;
+    let mut c = shared.lock().unwrap();
+    let (owner, name): (i64, String) = c.db.query_row(
+        "SELECT owner,name FROM resources WHERE kind='machine' AND physical=?1",
+        [physical],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    c.operation(owner, json!({"op":"delete","id":name}))
+        .with_context(|| format!("deleting ephemeral {physical} for the drain"))?;
+    Ok(())
+}

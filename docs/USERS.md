@@ -265,7 +265,8 @@ program an owner of its own. Everything else is refused before any worker
 contact: other operations, `OWNER@example.com/BOX` addresses (shares included),
 `owner` on create, another pool, the dashboard and `/api/state`. Owner limits
 apply to its creates as to the owner's own. Its boxes are ephemeral: never
-hibernated, and stopped instead when their worker restarts or upgrades.
+hibernated, given recovery points, snapshotted, forked or moved, and stopped
+instead when their worker restarts or upgrades.
 
 Issue, list and revoke them on the controller host:
 

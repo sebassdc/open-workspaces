@@ -957,6 +957,29 @@ fn sharing_roles_owner_addresses_and_revocation() {
 }
 
 #[test]
+fn an_ephemeral_box_is_never_snapshotted_forked_or_restored_and_nothing_is_reserved() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    c.operation(a, json!({"op":"create","id":"job","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine","ephemeral":true})).unwrap();
+    let rows = |c: &Catalog| -> i64 { c.db.query_row("SELECT COUNT(*) FROM resources", [], |r| r.get(0)).unwrap() };
+    let before = (rows(&c), fake.calls.load(Ordering::SeqCst));
+    for request in [
+        json!({"op":"snapshot","id":"job","name":"keep"}),
+        json!({"op":"fork","id":"job","child":"copy"}),
+        json!({"op":"restore","id":"job","name":"keep"}),
+    ] {
+        let error = c.operation(a, request.clone()).unwrap_err();
+        assert!(format!("{error:#}").contains("is ephemeral"), "{request}: {error:#}");
+    }
+    assert_eq!((rows(&c), fake.calls.load(Ordering::SeqCst)), before, "no row, no worker call");
+    // An ordinary box still snapshots.
+    c.operation(a, json!({"op":"create","id":"dev","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    c.operation(a, json!({"op":"snapshot","id":"dev","name":"keep"})).unwrap();
+}
+
+#[test]
 fn delete_is_owner_only_drops_snapshots_grants_and_frees_the_name() {
     let mut fake = Fake::new();
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();

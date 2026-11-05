@@ -149,6 +149,9 @@ fn recover(store: &dyn SnapshotStore, runner: &Path, store_id: &str) -> Result<(
     });
     let mut failed = Vec::new();
     for machine in &machines {
+        if machine["ephemeral"] == true {
+            continue; // throwaway (e.g. a CI job): never a recovery point
+        }
         if machine.get("lifecycle").is_some()
             && (machine["lifecycle"]["phase"] != "active"
                 || !machine["lifecycle"]["intent"].is_null())
