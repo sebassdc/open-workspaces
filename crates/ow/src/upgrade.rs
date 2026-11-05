@@ -476,6 +476,11 @@ fn latest(
     }
 }
 
+/// Why a latest release was refused when its `status` failed against the controller. That
+/// refusal never holds back the controller's own release of the same version: the controller
+/// runs it, so the cause is gone (a client often sees a release before its controller has it).
+const INCOMPATIBLE: &str = "not compatible with the controller";
+
 /// The controller's release or `--version`: no compatibility check. A controller release
 /// that failed after its `.sha256` was found is remembered, like a latest one; `--version`
 /// always tries.
@@ -496,7 +501,10 @@ fn attempt(
         return Ok(outcome);
     }
     let remember = source == Source::Controller;
-    if let Some(why) = releases.refused(target).filter(|_| remember) {
+    let refused = releases
+        .refused(target)
+        .filter(|why| remember && !why.starts_with(INCOMPATIBLE));
+    if let Some(why) = refused {
         outcome.reason = Some(format!("v{} was refused recently: {why}", show(target)));
         // `--check` still reports it as available: it is newer, only held back for now.
         if !check {
@@ -600,7 +608,7 @@ impl<F: FnOnce() -> Result<String>, H: FnOnce() -> Result<bool>> Releases for Gi
                 }
                 output_of(staged, &status)
                     .and_then(|out| compatible(&out))
-                    .context("not compatible with the controller")
+                    .context(INCOMPATIBLE)
             },
         )
     }
@@ -820,6 +828,27 @@ mod tests {
             [((0, 9, 64), true)],
             "checked against the controller"
         );
+    }
+
+    #[test]
+    fn a_compatibility_refusal_never_holds_back_the_controllers_same_release() {
+        // The client saw 0.9.65 before its controller ran it; then the controller moved to it.
+        let mut r = fake("v0.9.65", "0.9.65");
+        r.refused = vec![(
+            (0, 9, 65),
+            format!("{INCOMPATIBLE}: status is not connected"),
+        )];
+        let o = select(&mut r, (0, 9, 64), None, false).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            ((0, 9, 65), Source::Controller, Step::Upgraded)
+        );
+        assert_eq!(r.installed, [((0, 9, 65), false)]);
+        // A broken download of that release still holds it back.
+        let mut r = fake("v0.9.65", "0.9.65");
+        r.refused = vec![((0, 9, 65), "checksum mismatch".into())];
+        let o = select(&mut r, (0, 9, 64), None, false).unwrap();
+        assert_eq!((o.step, r.installs), (Step::Current, 0));
     }
 
     #[test]
