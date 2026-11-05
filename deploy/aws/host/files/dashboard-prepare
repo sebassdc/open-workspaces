@@ -1,20 +1,42 @@
 #!/bin/bash
 # Root: write the dashboard config for this host's tailnet name, then turn on `tailscale serve`.
 set -euo pipefail
-name=$(tailscale status --json 2>/dev/null | python3 -c '
+status=$(tailscale status --json 2>/dev/null || true)
+name=$(printf '%s' "$status" | python3 -c '
 import json, sys
 s = json.load(sys.stdin)
 sys.exit(1) if s.get("BackendState") != "Running" else print(s["Self"]["DNSName"].rstrip("."))') \
   || { echo "tailscale is not up; the dashboard starts once this host is on the tailnet"; exit 1; }
-runuser -u ow -- env NAME="$name" LOGINS="${OW_DASHBOARD_LOGINS:-}" CAPABILITY="${OW_DASHBOARD_CAPABILITY:-}" ADMINS="${OW_POOL_ADMINS:-}" python3 -c '
-import json, os
+runuser -u ow -- env NAME="$name" LOGINS="${OW_DASHBOARD_LOGINS:-}" CAPABILITY="${OW_DASHBOARD_CAPABILITY:-}" ADMINS="${OW_POOL_ADMINS:-}" \
+  OWNER="${OW_DASHBOARD_OWNER:-}" STATUS="$status" python3 -c '
+import json, os, sqlite3, sys
 path = "/srv/ow/.ow/dashboard.json"
+# The admin (docs/ADMIN_API.md): the owner login'"'"'s stable tailnet user ID, bound to the catalog
+# user that ID signed in as. Until they have signed in once, nobody is bound.
+binding = {}
+owner = os.environ["OWNER"]
+if owner:
+    users = json.loads(os.environ["STATUS"]).get("User") or {}
+    ids = [uid for uid, user in users.items() if str(user.get("LoginName", "")).lower() == owner.lower()]
+    issuer = "tailscale://" + os.environ["NAME"].split(".", 1)[1]
+    row = None
+    if len(ids) == 1:
+        try:
+            db = sqlite3.connect("file:/srv/ow/.ow/controller/catalog.sqlite3?mode=ro", uri=True)
+            row = db.execute("SELECT id FROM users WHERE issuer=? AND subject=?", (issuer, str(ids[0]))).fetchone()
+        except sqlite3.Error:
+            row = None
+    if row:
+        binding = {"node_owner_subject": str(ids[0]), "node_owner_user_id": row[0]}
+    else:
+        print(f"dashboard owner {owner} is not bound yet: they sign in to the dashboard once, then restart it", file=sys.stderr)
 fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
     json.dump({"auth": "tailscale", "hostname": os.environ["NAME"], "upstream": "http://127.0.0.1:9/",
                "allowed_emails": list(filter(None, os.environ["LOGINS"].split(","))),
                **({"allowed_capability": os.environ["CAPABILITY"]} if os.environ["CAPABILITY"] else {}),
-               **({"pool_admins": os.environ["ADMINS"].split(",")} if os.environ["ADMINS"] else {})}, f)
+               **({"pool_admins": os.environ["ADMINS"].split(",")} if os.environ["ADMINS"] else {}),
+               **binding}, f)
 os.replace(path + ".tmp", path)'
 tailscale serve --bg http://127.0.0.1:8787 > /dev/null
 echo "dashboard: https://$name/"

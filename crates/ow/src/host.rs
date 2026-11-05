@@ -867,51 +867,12 @@ pub fn run(cli: Cli) -> Result<i32> {
             crate::nodes::controller(&root, listen, tls_cert, tls_key, insecure_loopback_test)?;
             return Ok(0);
         }
-        Action::NodeJoin {
-            node,
-            output,
-            ttl,
-            memory,
-            slots,
-            cpus,
-            controller,
-        } => {
-            if cpus == 16 && controller.is_none() {
-                crate::nodes::mint(&root, &node, &output, ttl, memory, slots)?;
-            } else {
-                let controller = controller
-                    .map(|value| crate::nodes::origin(&value, false))
-                    .transpose()?;
-                crate::nodes::invitation(
-                    &root,
-                    &node,
-                    ttl,
-                    memory,
-                    slots,
-                    cpus,
-                    controller.as_deref(),
-                    |v| crate::nodes::write_private(&output, v),
-                )?;
-            }
-            return Ok(0);
-        }
-        Action::NodeRevoke { node } => {
-            crate::nodes::revoke(&root, &node)?;
-            return Ok(0);
-        }
-        Action::NodePool { node, pool } => {
-            println!("{}", crate::nodes::set_pool(&root, &node, &pool)?);
-            return Ok(0);
-        }
-        Action::Token { action } => return crate::tokens::command(&root, action),
         Action::Nodes => {
             let mut nodes = crate::nodes::inventory(&root)?;
             crate::telemetry::annotate(&mut nodes, &crate::telemetry::health(&root)?);
             println!("{nodes}");
             return Ok(0);
         }
-        Action::Health => return crate::telemetry::health_command(&root),
-        Action::Config { action } => return crate::telemetry::config_command(&root, action),
         Action::DashboardUi { action } => return crate::dashboard_ui::command(&root, action),
         Action::NodeAgent {
             controller,
@@ -972,7 +933,13 @@ pub fn run(cli: Cli) -> Result<i32> {
         | Action::AwsRole { .. }
         | Action::Unshare { .. }
         | Action::Transfer { .. }
-        | Action::Audit => unreachable!(),
+        | Action::Audit
+        | Action::NodeJoin { .. }
+        | Action::NodeRevoke { .. }
+        | Action::NodePool { .. }
+        | Action::Token { .. }
+        | Action::Health
+        | Action::Config { .. } => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;
             return Ok(0);

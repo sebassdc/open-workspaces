@@ -92,6 +92,10 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
       CREATE TABLE IF NOT EXISTS node_seen(node TEXT PRIMARY KEY,unix_s INTEGER NOT NULL,reason TEXT NOT NULL,closed_unix_s INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS node_events(id INTEGER PRIMARY KEY,node TEXT NOT NULL,unix_s INTEGER NOT NULL,severity TEXT NOT NULL,name TEXT NOT NULL,attrs TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS node_events_node ON node_events(node,id);")?;
+    // Admin API (docs/ADMIN_API.md): every admin change, and the operation keys of ops that
+    // hand out a secret once. Additive tables.
+    db.execute_batch("CREATE TABLE IF NOT EXISTS admin_audit(id INTEGER PRIMARY KEY,unix_s INTEGER NOT NULL,op TEXT NOT NULL,actor TEXT NOT NULL,via TEXT NOT NULL CHECK(via IN ('https','local')),request TEXT NOT NULL,result TEXT NOT NULL,config_version INTEGER,change TEXT);
+      CREATE TABLE IF NOT EXISTS admin_operations(key TEXT PRIMARY KEY,op TEXT NOT NULL,request_hash TEXT NOT NULL,unix_s INTEGER NOT NULL);")?;
     health_view(&db, root)?;
     Ok(db)
 }
@@ -1258,6 +1262,13 @@ pub fn controller(
         crate::telemetry::spawn_controller_tasks(c.root.clone());
         crate::telemetry::serve_controller_intake(&c.root);
         tokio::spawn(proxies(c.clone()));
+        // The admin API for this host's root or controller user (docs/ADMIN_API.md).
+        let admin_root = c.root.clone();
+        tokio::spawn(async move {
+            if let Err(error) = crate::admin::serve_socket(admin_root).await {
+                eprintln!("admin socket stopped: {error:#}");
+            }
+        });
         let slots = Arc::new(Semaphore::new(128));
         if let (Some(cert), Some(key)) = (cert, key) {
             let _ = rustls::crypto::ring::default_provider().install_default();

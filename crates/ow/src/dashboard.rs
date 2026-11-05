@@ -454,15 +454,14 @@ pub async fn handle(
         })
         .await
         .unwrap_or(Value::Null);
-        return secure(
-            Json(json!({"ok":true,"result":{
-                "api":crate::dashboard_ui::API_VERSION,
-                "server":env!("CARGO_PKG_VERSION"),
-                "capabilities":[crate::dashboard_ui::CAPABILITY],
-                "ui":ui,
-            }}))
-            .into_response(),
-        );
+        let mut result = json!({
+            "api":crate::dashboard_ui::API_VERSION,
+            "server":env!("CARGO_PKG_VERSION"),
+            "capabilities":[crate::dashboard_ui::CAPABILITY],
+            "ui":ui,
+        });
+        crate::admin::version_fields(&mut result);
+        return secure(Json(json!({"ok":true,"result":result})).into_response());
     }
     if path == "/api/state" && method == Method::GET {
         let result = with_catalog(catalog, identity, move |catalog, user| {

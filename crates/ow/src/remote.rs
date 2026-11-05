@@ -686,6 +686,9 @@ async fn handle(app: &App, mut request: Request) -> Response {
         return crate::terminal::upgrade(&target_root, request, expires, id, placement, revoked)
             .await;
     }
+    if app.dashboard.is_some() && request.uri().path() == "/api/admin" {
+        return admin(app, identity, request).await;
+    }
     if !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
@@ -878,97 +881,12 @@ async fn owner_controls(app: &App, identity: &crate::catalog::Identity) -> bool 
     .await
     .unwrap_or(false)
 }
-async fn host_admin(app: &App, identity: crate::catalog::Identity, request: Request) -> Response {
-    use serde_json::{Value, json};
-    // Identity comes only from verified JWT claims. Never bind authority by email.
-    if !owner_controls(app, &identity).await {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let path = request.uri().path().to_owned();
-    if request.uri().query().is_some()
-        || request.method() != Method::POST
-        || request
-            .headers()
-            .get("x-ow-request")
-            .and_then(|h| h.to_str().ok())
-            != Some("dashboard")
-        || request
-            .headers()
-            .get("content-type")
-            .and_then(|h| h.to_str().ok())
-            != Some("application/json")
-    {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let Ok(bytes) = to_bytes(request.into_body(), 4096).await else {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    };
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Input {
-        node: String,
-        ttl: Option<u64>,
-        memory: Option<u32>,
-        slots: Option<u32>,
-        cpus: Option<u32>,
-    }
-    let Ok(raw) = serde_json::from_slice::<Value>(&bytes) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    if ["memory", "slots", "cpus", "ttl"]
-        .iter()
-        .any(|key| raw.get(key).is_some_and(|v| v.as_u64().is_none()))
-    {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let Ok(input) = serde_json::from_value::<Input>(raw) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let root = app.dashboard.clone().unwrap();
-    let controller = format!("https://{}/_nodes", app.config.hostname);
-    let catalog = app.catalog.clone().context("catalog").unwrap();
-    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
-        let _admission = catalog
-            .lock()
-            .map_err(|_| anyhow::anyhow!("catalog lock"))?;
-        match path.as_str() {
-            "/api/hosts/invite" => crate::nodes::invitation(
-                &root,
-                &input.node,
-                input.ttl.unwrap_or(600),
-                input.memory.unwrap_or(512),
-                input.slots.unwrap_or(2),
-                input.cpus.unwrap_or(2),
-                Some(&controller),
-                |_| Ok(()),
-            ),
-            "/api/hosts/budget" => {
-                ensure!(input.ttl.is_none(), "budget does not accept expiry");
-                crate::nodes::budget(
-                    &root,
-                    &input.node,
-                    input.memory.context("memory required")?,
-                    input.slots.context("slots required")?,
-                    input.cpus.context("cpus required")?,
-                )
-            }
-            "/api/hosts/revoke" => {
-                ensure!(
-                    input.ttl.is_none()
-                        && input.memory.is_none()
-                        && input.slots.is_none()
-                        && input.cpus.is_none(),
-                    "invalid revoke"
-                );
-                crate::common::identifier(&input.node)?;
-                crate::nodes::revoke(&root, &input.node)?;
-                Ok(json!({"revoked":input.node}))
-            }
-            _ => anyhow::bail!("unknown host operation"),
-        }
-    })
-    .await;
-    let mut response=match result { Ok(Ok(value)) => axum::Json(json!({"ok":true,"result":value})).into_response(), Ok(Err(error)) if error.is::<crate::limits::Rejection>() => (StatusCode::CONFLICT, axum::Json(json!({"ok":false,"error":error.to_string()}))).into_response(), _ => (StatusCode::CONFLICT,axum::Json(json!({"ok":false,"error":"Host operation rejected; check node ID, expiry and capacity."}))).into_response() };
+fn admin_reply(status: u16, body: serde_json::Value) -> Response {
+    let mut response = (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        axum::Json(body),
+    )
+        .into_response();
     response
         .headers_mut()
         .insert("cache-control", HeaderValue::from_static("no-store"));
@@ -976,6 +894,119 @@ async fn host_admin(app: &App, identity: crate::catalog::Identity, request: Requ
         .headers_mut()
         .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     response
+}
+
+/// `POST /api/admin` (docs/ADMIN_API.md): the designated pool owner only, verified by its
+/// Access subject or tailnet user ID and the bound catalog user; same-origin JSON.
+async fn admin(app: &App, identity: crate::catalog::Identity, request: Request) -> Response {
+    use crate::admin::{Actor, failure, shape};
+    // Identity comes only from verified claims. Never bind authority by email.
+    if !owner_controls(app, &identity).await {
+        crate::admin::refused(&identity.email);
+        return admin_reply(
+            403,
+            failure(
+                403,
+                "admin_required",
+                "Admin operations need the pool owner's login.",
+            )
+            .body(None),
+        );
+    }
+    let origin = format!("https://{}", app.config.hostname);
+    if request
+        .headers()
+        .get("origin")
+        .and_then(|h| h.to_str().ok())
+        != Some(origin.as_str())
+    {
+        return admin_reply(
+            403,
+            failure(
+                403,
+                "same_origin_required",
+                "Same-origin admin request required.",
+            )
+            .body(None),
+        );
+    }
+    if request.method() != Method::POST {
+        return admin_reply(
+            400,
+            failure(400, "invalid_request", "Invalid request: use POST.").body(None),
+        );
+    }
+    let (parts, body) = request.into_parts();
+    let Ok(bytes) = to_bytes(body, crate::admin::BODY_LIMIT + 1).await else {
+        return admin_reply(
+            413,
+            failure(413, "too_large", "Admin request too large.").body(None),
+        );
+    };
+    if let Some(f) = shape(&parts.headers, parts.uri.query().is_some(), bytes.len()) {
+        return admin_reply(f.status, f.body(None));
+    }
+    let actor = match app.config.auth {
+        Auth::Access => Actor::Access {
+            subject: identity.subject.clone(),
+            email: identity.email.clone(),
+        },
+        Auth::Tailscale => Actor::Tailnet {
+            subject: identity.subject.clone(),
+            email: identity.email.clone(),
+        },
+    };
+    let root = app.dashboard.clone().unwrap();
+    let controller = format!("https://{}/_nodes", app.config.hostname);
+    let catalog = app.catalog.clone();
+    let answer = tokio::task::spawn_blocking(move || {
+        // Admin changes wait for in-flight placements, as host invitations always did.
+        let _admission = catalog.as_ref().map(|c| c.lock());
+        let ctx = crate::admin::Context {
+            root: &root,
+            actor,
+            controller: Some(controller),
+        };
+        crate::admin::handle(&ctx, &bytes)
+    })
+    .await;
+    match answer {
+        Ok((status, body)) => admin_reply(status, body),
+        Err(_) => admin_reply(
+            500,
+            failure(500, "internal", "Internal error; see the controller log.").body(None),
+        ),
+    }
+}
+
+/// `/api/hosts/{invite,budget,revoke}`: kept for one release as aliases of the host.* ops.
+async fn host_admin(app: &App, identity: crate::catalog::Identity, request: Request) -> Response {
+    let op = match request.uri().path() {
+        "/api/hosts/invite" => "host.invite",
+        "/api/hosts/budget" => "host.budget",
+        "/api/hosts/revoke" => "host.revoke",
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let (mut parts, body) = request.into_parts();
+    let Ok(bytes) = to_bytes(body, 4096).await else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_slice(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    fields.insert("op".into(), serde_json::json!(op));
+    if op == "host.invite" {
+        let Ok(key) = crate::common::nonce() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        fields.insert("operation_key".into(), serde_json::json!(key));
+    }
+    parts.uri = "/api/admin".parse().unwrap();
+    let request = Request::from_parts(
+        parts,
+        Body::from(serde_json::Value::Object(fields).to_string()),
+    );
+    admin(app, identity, request).await
 }
 
 fn router(app: App) -> Router {
@@ -3076,6 +3107,155 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM aws_roles", [], |r| r.get::<_, i64>(0))
                 .unwrap()
                 == 0
+        );
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_api_gate_shape_and_same_answer_as_the_socket() {
+        use crate::catalog::{Catalog, Identity};
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("ow-admin-gw-{}", crate::common::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut catalog =
+            Catalog::open(&root, "https://test-team.cloudflareaccess.com", None).unwrap();
+        let identity = Identity {
+            issuer: "https://test-team.cloudflareaccess.com".into(),
+            subject: "test-subject".into(),
+            email: "owner@example.test".into(),
+        };
+        let owner = catalog.user(&identity).unwrap();
+        let (key, set) = signing_key();
+        let mut config = config("http://127.0.0.1:1".into());
+        config.node_owner_subject = Some(identity.subject.clone());
+        config.node_owner_user_id = Some(owner);
+        let app = App {
+            dashboard: Some(root.clone()),
+            catalog: Some(Arc::new(std::sync::Mutex::new(catalog))),
+            config,
+            client: reqwest::Client::new(),
+            keys: Arc::new(RwLock::new(Keys {
+                set,
+                fetched: Instant::now(),
+            })),
+            requests: Arc::new(Semaphore::new(64)),
+        };
+        let make = |claims: &Value, body: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/admin")
+                .header("host", "app.example.test")
+                .header("origin", "https://app.example.test")
+                .header("content-type", "application/json; charset=utf-8")
+                .header("x-ow-request", "dashboard")
+                .header("cf-access-jwt-assertion", token(&key, claims))
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        async fn answer(app: &App, request: Request) -> (StatusCode, Value) {
+            let response = handle(app, request).await;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or_else(
+                    |_| json!({"text":String::from_utf8_lossy(&bytes).to_string()}),
+                ),
+            )
+        }
+        let set = json!({"op":"config.set","key":"alerts.disk_low_gib","value":"30"});
+        let (status, ok) = answer(&app, make(&claims(), set.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{ok}");
+        assert_eq!(ok["result"]["changed"], true);
+        // The same request over the socket path answers the same.
+        let ctx = crate::admin::Context {
+            root: &root,
+            actor: crate::admin::Actor::Host {
+                uid: 0,
+                claimed_user: None,
+            },
+            controller: None,
+        };
+        let get = json!({"op":"config.get","key":"alerts.disk_low_gib"});
+        let (status, local) = crate::admin::handle(&ctx, get.to_string().as_bytes());
+        assert_eq!(status, 200);
+        assert_eq!(
+            answer(&app, make(&claims(), get)).await,
+            (StatusCode::OK, local)
+        );
+        let actor: String = crate::nodes::db(&root)
+            .unwrap()
+            .query_row("SELECT actor FROM admin_audit WHERE via='https'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&actor).unwrap(),
+            json!({"kind":"access","subject":"test-subject","email":"owner@example.test"})
+        );
+        // Another signed-in user: refused with a JSON error, nothing written.
+        let mut other = claims();
+        other["sub"] = json!("other-subject");
+        let (status, refused) = answer(&app, make(&other, json!({"op":"config.list"}))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(refused["error_code"], "admin_required");
+        // Cross-site: no origin.
+        let mut request = make(&claims(), json!({"op":"config.list"}));
+        request.headers_mut().remove("origin");
+        let (status, cross) = answer(&app, request).await;
+        assert_eq!(
+            (status, cross["error_code"].as_str()),
+            (StatusCode::FORBIDDEN, Some("same_origin_required"))
+        );
+        let mut request = make(&claims(), json!({"op":"config.list"}));
+        request.headers_mut().remove("x-ow-request");
+        let (status, cross) = answer(&app, request).await;
+        assert_eq!(
+            (status, cross["error_code"].as_str()),
+            (StatusCode::FORBIDDEN, Some("same_origin_required"))
+        );
+        // A workload token never reaches it.
+        let mut request = make(&claims(), json!({"op":"config.list"}));
+        request
+            .headers_mut()
+            .insert("authorization", HeaderValue::from_static("Bearer owt_0123"));
+        assert_eq!(handle(&app, request).await.status(), StatusCode::FORBIDDEN);
+        let (status, unknown) = answer(&app, make(&claims(), json!({"op":"config.drop"}))).await;
+        assert_eq!(
+            (status, unknown["error_code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("unknown_op"))
+        );
+        let (status, field) =
+            answer(&app, make(&claims(), json!({"op":"config.list","x":1}))).await;
+        assert_eq!(
+            (status, field["error_code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_request"))
+        );
+        let big = json!({"op":"config.get","key":"x".repeat(crate::admin::BODY_LIMIT)});
+        let (status, large) = answer(&app, make(&claims(), big)).await;
+        assert_eq!(
+            (status, large["error_code"].as_str()),
+            (StatusCode::PAYLOAD_TOO_LARGE, Some("too_large"))
+        );
+        let mut version = make(&claims(), json!({}));
+        *version.method_mut() = Method::GET;
+        *version.uri_mut() = "/api/version".parse().unwrap();
+        let (status, version) = answer(&app, version).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            version["result"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("admin_api_v1"))
+        );
+        assert!(
+            version["result"]["admin_ops"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("config.set"))
         );
         drop(app);
         fs::remove_dir_all(root).unwrap();

@@ -224,6 +224,11 @@ def validate(config):
             raise Refused(f"config: invalid pool admin {admin!r}")
     if pool_admins and not (logins or capability):
         raise Refused("config: dashboard.poolAdmins needs a dashboard (logins or capability)")
+    owner = (config.get("dashboard") or {}).get("owner", "")
+    if owner and (not isinstance(owner, str) or not LOGIN.fullmatch(owner) or len(owner) > 254):
+        raise Refused(f"config: invalid dashboard owner {owner!r}")
+    if owner and not (logins or capability):
+        raise Refused("config: dashboard.owner needs a dashboard (logins or capability)")
     images = config.get("developerImages") or []
     if any(image != "ubuntu" for image in images):
         raise Refused(f"config: developerImages takes ubuntu, not {images!r}")
@@ -281,7 +286,7 @@ def validate(config):
             raise Refused("config: runner.joinSecretArn is not a Secrets Manager secret ARN")
         if not tailscale["secretArn"]:
             raise Refused("config: a runner reaches its controller over the tailnet: tailscale.secretArn is required")
-        if logins or capability or pool_admins:
+        if logins or capability or pool_admins or owner:
             raise Refused("config: a runner has no dashboard (it runs no controller): drop dashboard.logins/capability/poolAdmins")
         extra["runner"] = {key: runner[key] for key in ("node", "controller", "joinSecretArn")}
     return {
@@ -290,7 +295,8 @@ def validate(config):
         "release": {"repository": release["repository"], "ref": release["ref"]},
         "tailscale": tailscale,
         "dashboard": {"logins": list(logins), **({"capability": capability} if capability else {}),
-                      **({"poolAdmins": list(pool_admins)} if pool_admins else {})},
+                      **({"poolAdmins": list(pool_admins)} if pool_admins else {}),
+                      **({"owner": owner} if owner else {})},
         "developerImages": sorted(set(images)),
         "backup": backup,
         **({"store": store} if store["url"] else {}),
@@ -519,12 +525,14 @@ profile open-workspaces /srv/ow/{releases/*/bin,build/target/release}/ow flags=(
     logins = config["dashboard"]["logins"]
     capability = config["dashboard"].get("capability", "")
     pool_admins = config["dashboard"].get("poolAdmins", [])
+    owner = config["dashboard"].get("owner", "")
     if logins or capability:
         files["/usr/local/lib/open-workspaces/preview-serve"] = ((HERE / "files/preview-serve").read_text(), 0o755)
         files["/etc/sudoers.d/ow-preview"] = ("ow ALL=(root) NOPASSWD: /usr/local/lib/open-workspaces/preview-serve *\n", 0o440)
         files["/etc/open-workspaces/dashboard.env"] = (
             f"OW_DASHBOARD_LOGINS={','.join(logins)}\nOW_DASHBOARD_CAPABILITY={capability}\n"
-            + (f"OW_POOL_ADMINS={','.join(pool_admins)}\n" if pool_admins else ""), 0o644)
+            + (f"OW_POOL_ADMINS={','.join(pool_admins)}\n" if pool_admins else "")
+            + (f"OW_DASHBOARD_OWNER={owner}\n" if owner else ""), 0o644)
         files["/usr/local/lib/open-workspaces/dashboard-prepare"] = ((HERE / "files/dashboard-prepare").read_text(), 0o755)
         files["/etc/systemd/system/open-workspaces-dashboard.service"] = (
             f"""[Unit]
