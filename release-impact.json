@@ -2,6 +2,49 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.69",
+      "class": 2,
+      "changes": [
+        "worker",
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Worker hand-over hardening. A box whose recorded VMM still runs (a failed adoption leaves it running) refuses to start, so no second VMM opens its disk; the next worker adopts or ends it. A worker advertises worker_handover_v1 only where it can take fds from a process outside its own tree, as adoption does: the probe no longer reads its own fds, which Yama allows at every ptrace_scope. The upgrader treats finding no Firecracker binary or guest kernel on the running release as a mismatch instead of a match. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel, hand-over format and host layout 2 are unchanged. Class 2: the worker hands its boxes over and they keep running; the upgrader change takes effect from the next upgrade."
+    },
+    {
       "version": "0.9.68",
       "class": 1,
       "changes": [
