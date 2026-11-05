@@ -163,7 +163,8 @@ before any change).
   "telemetry.logs": true, "telemetry.log_level": "info",
   "alerts.offline_after_s": 60, "alerts.disk_low_gib": 20,
   "dashboard.ui_bundle": "builtin", "limits.box_memory_mib": 0,
-  "placement.spill": [], "placement.spill_keep_free_mib": 16384, "upgrade.worker_handover": true}}}
+  "placement.spill": [], "placement.spill_keep_free_mib": 16384, "upgrade.worker_handover": true,
+  "upgrade.running_boxes": "hibernate"}}}
 ```
 
 ### config.get

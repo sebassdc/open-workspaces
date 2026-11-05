@@ -156,7 +156,7 @@ worker files need `worker`, dashboard files `dashboard`, `nodes.rs`,
 ## `ow-host upgrade`
 
 ```text
-fetch → plan → stage → gate → [catalog copy] → [drain → hibernate | handover] → stop → [sync images]
+fetch → plan → stage → gate → [catalog copy] → [drain → [stop-boxes →] hibernate | handover] → stop → [sync images]
       → switch → start → verify → [adoption] → [resume] → [undrain] → done
 ```
 
@@ -203,6 +203,17 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate | 
   [the CLI](AGENT_CLI.md)) are stopped instead of hibernated and are not resumed.
   When the plan hands the worker over, this step is `handover` instead
   ([below](#worker-hand-over-keeps-boxes-running)).
+- **stop-boxes**: with the controller setting `upgrade.running_boxes` set to
+  `stop` (`ow config set upgrade.running_boxes stop`; default `hibernate`), a
+  worker restart without hand-over (`worker_path: stop` in `--plan`) first stops
+  each recorded running box (`ow stop`: seconds; RAM state lost, disk kept),
+  then the hibernate step hibernates what is left: managed boxes, which only
+  their controller may start again, and ephemeral boxes are stopped as before.
+  The resume step starts the stopped boxes again after verify (a cold boot);
+  abort, rollback and recover do the same. `--hibernate` forces hibernation.
+  Hand-over, when the plan can take it, still wins. The capture gate still counts
+  the running boxes, so a release whose worker cannot resume them asks for
+  `--accept-cold` even though they are stopped.
 - **start**: the new worker is quiesced as soon as it answers, before the agent
   and the dashboard start, so no wake on connection reaches it until verify passes
   (a large box's resume hashes its hibernation snapshot first and would hold the
@@ -220,7 +231,12 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate | 
   upgrade with no box to resume runs a canary box.
 - **abort** (any failure before the switch): start the old worker if it is down
   (else lift its quiesce), resume every recorded box, start stopped units,
-  undrain. **rollback** (switch, start or verify): pins back, units restarted and
+  undrain. A worker whose unit is active but that does not answer (a
+  `down --hibernate` whose client gave up while the worker finishes shutting down)
+  is waited for, up to 30 min, until it answers or exits; one that exited starts
+  again. Listing or resuming the boxes is tried twice; a failure then is
+  recorded in the journal error, not raised, so the drain, units and timers are
+  restored and the journal reaches `aborted`. **rollback** (switch, start or verify): pins back, units restarted and
   verified on the old releases, then as abort. A box that does not resume stays
   hibernated (it wakes on its next connection) and is reported.
 - **events**: each step that ends while the host's agent (or, on a controller-only
@@ -513,7 +529,9 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
   files render unchanged and no worker config change is pending, the controller setting `upgrade.worker_handover` is
   on (default; the node agent stores it in `runner/controller-settings.json`)
   and `--hibernate` was not passed. `--plan` prints the path and why. Otherwise
-  the worker restarts through hibernation as before. `ow-host restart --worker`
+  the worker restarts through hibernation as before, or by stopping the boxes
+  when `upgrade.running_boxes` is `stop` (`worker_path: stop`; `running_boxes`
+  in the plan is the path a hand-over refused just before it acts falls back to). `ow-host restart --worker`
   hands over when the running worker advertises `worker_handover_v1`.
 - **Journal**: the `hibernate` step becomes `handover`; it records each running
   box's VMM PID, and after verify a step `adoption` records per box `kept`

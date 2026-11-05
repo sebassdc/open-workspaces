@@ -72,7 +72,7 @@ fn now() -> i64 {
 // Controller-held settings (one source; read on every acknowledgement).
 
 /// Allowed keys and their defaults.
-pub const KEYS: [(&str, &str); 14] = [
+pub const KEYS: [(&str, &str); 15] = [
     ("telemetry.enabled", "true"),
     ("telemetry.interval_s", "15"),
     ("telemetry.forward_endpoint", ""),
@@ -95,6 +95,9 @@ pub const KEYS: [(&str, &str); 14] = [
     // A worker upgrade that keeps the VMM and guest kernel hands running boxes to the new
     // worker instead of hibernating them (docs/adr/0011).
     ("upgrade.worker_handover", "true"),
+    // What a worker upgrade without hand-over does with running boxes: hibernate them
+    // (RAM kept) or stop them (fast, cold boot after) (docs/UPGRADES.md).
+    ("upgrade.running_boxes", "hibernate"),
 ];
 
 pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
@@ -113,6 +116,10 @@ pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
             "true" => Ok(json!(true)),
             "false" => Ok(json!(false)),
             _ => bail!("upgrade.worker_handover is true or false"),
+        },
+        "upgrade.running_boxes" => match value {
+            "hibernate" | "stop" => Ok(json!(value)),
+            _ => bail!("upgrade.running_boxes is hibernate or stop"),
         },
         "telemetry.logs" => match value {
             "true" => Ok(json!(true)),
@@ -233,7 +240,7 @@ pub fn set(root: &Path, key: &str, value: &str, actor: &str) -> Result<Value> {
 /// What the acknowledgement carries to agents.
 pub(crate) fn offer(db: &Connection) -> Value {
     settings(db)
-        .map(|s| json!({"enabled":s["telemetry.enabled"],"interval_s":s["telemetry.interval_s"],"version":s["version"],"worker_handover":s["upgrade.worker_handover"]}))
+        .map(|s| json!({"enabled":s["telemetry.enabled"],"interval_s":s["telemetry.interval_s"],"version":s["version"],"worker_handover":s["upgrade.worker_handover"],"running_boxes":s["upgrade.running_boxes"]}))
         .unwrap_or(json!({"enabled":true,"interval_s":15}))
 }
 
@@ -2235,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_handover_is_a_controller_setting_offered_to_runners() {
+    fn upgrade_settings_are_controller_settings_offered_to_runners() {
         let root = std::env::temp_dir().join(format!("ow-t-{}", crate::common::nonce().unwrap()));
         std::fs::create_dir(&root).unwrap();
         let db = crate::nodes::db(&root).unwrap();
@@ -2248,6 +2255,11 @@ mod tests {
         let s = set(&root, "upgrade.worker_handover", "false", "t").unwrap();
         assert_eq!(s["upgrade.worker_handover"], json!(false));
         assert_eq!(offer(&db)["worker_handover"], json!(false));
+        assert_eq!(offer(&db)["running_boxes"], json!("hibernate"));
+        assert!(set(&root, "upgrade.running_boxes", "delete", "t").is_err());
+        let s = set(&root, "upgrade.running_boxes", "stop", "t").unwrap();
+        assert_eq!(s["upgrade.running_boxes"], json!("stop"));
+        assert_eq!(offer(&db)["running_boxes"], json!("stop"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
