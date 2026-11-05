@@ -388,7 +388,9 @@ start times of its latest boxes in ms since the epoch (`create_ms` the create wa
 sent, `ready_ms` the box booted, `registered_ms` its runner registration was
 minted, `started_ms` the runner started, `online_ms` GitHub listed it online,
 `busy_ms` GitHub gave it a job, `removed_ms` it was deleted). `app_key` never
-holds the key, only whether one is stored and its fingerprint.
+holds the key, only whether one is stored and its fingerprint. It is read from the
+catalog, so either process serving the API answers it; `running` is false until
+the pools' first pass.
 
 <!-- admin:example op=actions.status -->
 ```json
