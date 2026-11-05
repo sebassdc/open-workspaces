@@ -219,7 +219,8 @@ jobs:
             exit 0
           fi
           version=$(node -p 'require("./package.json").version')
-          for repo in $REPOS; do
+          read -ra repos <<< "$REPOS"
+          for repo in "${repos[@]}"; do
             jq -n --arg tag "v$version" --arg commit "$GITHUB_SHA" --arg version "$version" \
               '{event_type: "open-workspaces-release", client_payload: {tag: $tag, commit: $commit, version: $version}}' \
               | gh api "repos/$repo/dispatches" --method POST --input - >/dev/null \

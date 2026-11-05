@@ -4,10 +4,10 @@ use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -106,13 +106,90 @@ fn verify(artifact: &str, bytes: &[u8], published: &str, sums: &str) -> Result<(
     Ok(())
 }
 
+/// Largest download accepted; the published clients are far smaller.
+const LIMIT: u64 = 512 << 20;
+
 fn fetch(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>> {
     let response = client
         .get(url)
         .send()
         .and_then(|r| r.error_for_status())
         .with_context(|| format!("download {url}"))?;
-    Ok(response.bytes()?.to_vec())
+    let mut bytes = Vec::new();
+    response.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= LIMIT, "{url} is larger than 512 MiB");
+    Ok(bytes)
+}
+
+/// A host's own release (`<release>/bin/ow` beside its STAGED record, or under a host
+/// layout's `releases/` with `run/` pins): its services run this file, so only the host
+/// upgrader may replace it.
+fn host_managed(exe: &Path) -> bool {
+    let Some(release) = exe.parent().and_then(Path::parent) else {
+        return false;
+    };
+    release.join("STAGED").exists()
+        || release.parent().is_some_and(|releases| {
+            releases.file_name() == Some("releases".as_ref())
+                && releases
+                    .parent()
+                    .is_some_and(|srv| srv.join("run").is_dir())
+        })
+}
+
+/// The path this client was started as: argv[0], looked up in PATH when it is a bare name.
+fn invoked() -> Option<PathBuf> {
+    let argv0 = PathBuf::from(std::env::args_os().next()?);
+    if argv0.components().count() > 1 {
+        return Some(argv0);
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(&argv0))
+        .find(|path| path.is_file())
+}
+
+/// The file to replace: refused when reached through a symlink or owned by a host release.
+fn replaceable() -> Result<PathBuf> {
+    let raw = std::env::current_exe()?;
+    for path in [Some(raw.clone()), invoked()].into_iter().flatten() {
+        ensure!(
+            !fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()),
+            "{} is a symlink; reinstall with install.sh or upgrade the file it names",
+            path.display()
+        );
+    }
+    let exe = raw.canonicalize()?;
+    ensure!(
+        !host_managed(&exe),
+        "{} belongs to this host's release; upgrade the host with ow-host upgrade",
+        exe.display()
+    );
+    Ok(exe)
+}
+
+/// `ow --version` of the staged file, or an error if it does not answer within 30 s.
+fn version_of(path: &Path) -> Result<String> {
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait()?.is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("the downloaded client did not answer --version within 30 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .context("no --version output")?
+        .read_to_string(&mut out)?;
+    Ok(out.trim().to_owned())
 }
 
 /// Removes the staged file unless it was renamed into place.
@@ -123,17 +200,19 @@ impl Drop for Staged {
     }
 }
 
-/// Downloads, verifies and runs `target`, then renames it over `exe`.
-fn install(exe: &Path, artifact: &str, target: Version) -> Result<()> {
-    let base = format!("{RELEASES}/v{}", show(target));
-    let client = reqwest::blocking::Client::builder()
-        .https_only(true)
-        .timeout(Duration::from_secs(300))
-        .build()?;
-    let published = String::from_utf8(fetch(&client, &format!("{base}/{artifact}.sha256"))?)?;
-    let sums = String::from_utf8(fetch(&client, &format!("{base}/SHA256SUMS"))?)?;
-    let bytes = fetch(&client, &format!("{base}/{artifact}"))?;
-    verify(artifact, &bytes, &published, &sums)?;
+/// Downloads and verifies the client whose `.sha256` is `published`, runs it, then renames
+/// it over `exe`.
+fn install(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    exe: &Path,
+    artifact: &str,
+    published: &str,
+    target: Version,
+) -> Result<()> {
+    let sums = String::from_utf8(fetch(client, &format!("{base}/SHA256SUMS"))?)?;
+    let bytes = fetch(client, &format!("{base}/{artifact}"))?;
+    verify(artifact, &bytes, published, &sums)?;
     let dir = exe.parent().context("the client has no directory")?;
     let staged = Staged(dir.join(format!(".ow-upgrade-{}", crate::common::nonce()?)));
     let mut file = fs::OpenOptions::new()
@@ -146,14 +225,19 @@ fn install(exe: &Path, artifact: &str, target: Version) -> Result<()> {
     file.sync_all()?;
     drop(file);
     fs::set_permissions(&staged.0, fs::metadata(exe)?.permissions())?;
-    let out = Command::new(&staged.0).arg("--version").output()?;
     ensure!(
-        String::from_utf8_lossy(&out.stdout).trim() == format!("ow {}", show(target)),
+        version_of(&staged.0)? == format!("ow {}", show(target)),
         "download version mismatch: expected ow {}",
         show(target)
     );
     fs::rename(&staged.0, exe)?;
-    fs::File::open(dir)?.sync_all()?;
+    // The new client is in place; a failed directory sync only weakens crash durability.
+    if let Err(error) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+        eprintln!(
+            "warning: upgraded, but syncing {} failed: {error}",
+            dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -188,13 +272,26 @@ pub(crate) fn run(
             println!("ow {from}, target {to}: upgrade available");
         }
     };
-    if check || !upgrade {
-        report(false);
-        return Ok(if upgrade { AVAILABLE } else { 0 });
+    if !upgrade {
+        // A timer runs `--json` often: a no-op stays silent there.
+        if check || !json {
+            report(false);
+        }
+        return Ok(0);
     }
     let artifact = ARTIFACT.context("no published client for this platform")?;
-    let exe = std::env::current_exe()?.canonicalize()?;
-    install(&exe, artifact, target)?;
+    let exe = if check { None } else { Some(replaceable()?) };
+    let client = reqwest::blocking::Client::builder()
+        .https_only(true)
+        .timeout(Duration::from_secs(300))
+        .build()?;
+    let base = format!("{RELEASES}/v{to}");
+    let published = String::from_utf8(fetch(&client, &format!("{base}/{artifact}.sha256"))?)?;
+    let Some(exe) = exe else {
+        report(false);
+        return Ok(AVAILABLE);
+    };
+    install(&client, &base, &exe, artifact, &published, target)?;
     report(true);
     Ok(0)
 }
@@ -224,19 +321,33 @@ mod tests {
     }
 
     #[test]
-    fn check_and_equal_versions_never_download() {
+    fn equal_and_older_targets_never_download() {
         let ours = env!("CARGO_PKG_VERSION");
         let (a, b, c) = parse(ours).unwrap();
-        let newer = show((a, b, c + 1));
-        assert_eq!(
-            run(None, true, true, || Ok(newer.clone())).unwrap(),
-            AVAILABLE
-        );
         assert_eq!(run(None, false, true, || Ok(ours.into())).unwrap(), 0);
         assert_eq!(run(None, true, false, || Ok(ours.into())).unwrap(), 0);
         let older = show((a, b.saturating_sub(1), c));
         assert_eq!(run(None, false, false, || Ok(older)).unwrap(), 0);
         assert!(run(None, true, false, || Ok("garbage".into())).is_err());
+    }
+
+    #[test]
+    fn a_host_release_is_never_replaced() {
+        let root =
+            std::env::temp_dir().join(format!("ow-upgrade-{}", crate::common::nonce().unwrap()));
+        let staged = root.join("a/releases/0.9.58-abc/bin/ow");
+        let pinned = root.join("b/releases/0.9.58-abc/bin/ow");
+        let user = root.join("c/.local/bin/ow");
+        for exe in [&staged, &pinned, &user] {
+            fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        }
+        fs::write(root.join("a/releases/0.9.58-abc/STAGED"), "{}").unwrap();
+        fs::create_dir_all(root.join("b/run")).unwrap();
+        assert!(host_managed(&staged), "beside a STAGED record");
+        assert!(host_managed(&pinned), "under releases/ with run/ pins");
+        assert!(!host_managed(&user));
+        assert!(!host_managed(Path::new("ow")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
