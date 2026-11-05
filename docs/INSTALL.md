@@ -181,3 +181,14 @@ evidence separately for each tested platform/runtime: version execution does not
 prove user admission, TLS trust or a live authenticated connection. Consumer release
 pins and connection guides are maintained in the consuming project, after this
 evidence.
+
+Once the release is published, the workflow can tell downstream repositories at
+once. Set the repository variable `RELEASE_DISPATCH_REPOS` to a space-separated
+list of `owner/repo` names and the secret `RELEASE_DISPATCH_TOKEN` to a token
+allowed to send `repository_dispatch` events to them (contents write on each).
+Each listed repository then receives event type `open-workspaces-release` with
+`client_payload` `{"tag": "vX.Y.Z", "commit": "<sha>", "version": "X.Y.Z"}`,
+for example to start its own deployment from a
+`on: repository_dispatch: types: [open-workspaces-release]` workflow. When
+either setting is unset the step logs one line and succeeds; a failed dispatch
+is a warning and never fails the release.
