@@ -414,6 +414,7 @@ fn enter(shared: &Shared, pool: &Pool) -> Result<String> {
         online: None,
         busy: None,
         retry_at: 0,
+        made: false,
     };
     shared
         .entries
@@ -444,6 +445,7 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64) {
         let create = json!({"op":"create","id":name,"image":pool.image,"memory_mib":pool.memory_mib,
             "vcpu_count":pool.vcpu_count,"disk_gib":pool.disk_gib.unwrap_or(crate::common::DEFAULT_DISK_GIB),"ephemeral":true});
         box_op(shared, &pool.token, create).context("create")?;
+        update(shared, &name, |e| e.made = true);
         timing(shared, &name, "ready_ms");
         ensure!(launching(shared, &name), "timed out while it was made");
         let data = STANDARD.encode(jit.as_bytes());
