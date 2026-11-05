@@ -2,6 +2,54 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.59",
+      "class": 2,
+      "changes": [
+        "worker",
+        "controller",
+        "agent",
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "waivers": {
+        "dashboard": "dashboard.rs changes only a test: the worker operations the dashboard refuses now list detach and hibernate-unresponsive"
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Worker hand-over (ADR 0011): running VMMs outlive a worker restart and the new worker adopts them, so a worker-only upgrade or `ow-host restart --worker` keeps every box running (seconds of downtime, no RAM capture) instead of hibernating it. A VMM, guest kernel or worker unit change still hibernates, as does a failed adoption (per box: an unresponsive VMM is hibernated after verify, one that is gone boots again, cold). Ephemeral boxes are handed over too; on the hibernate path, and when adopted unresponsive, they are stopped as before and never resumed. The upgrader's journal steps handover and adoption are reported as ow.host.upgrade.step events (handover with the boxes handed over). The controller setting upgrade.worker_handover (default true, config.set over the admin API, delivered to runners with each acknowledgement) turns it off; `--hibernate` forces the old path once; runners advertise worker_handover_v1 (ow nodes). The worker unit gets KillMode=process. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 2: this upgrade itself still hibernates, since the worker it replaces cannot hand over."
+    },
+    {
       "version": "0.9.58",
       "class": 0,
       "changes": [

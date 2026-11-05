@@ -163,7 +163,7 @@ before any change).
   "telemetry.logs": true, "telemetry.log_level": "info",
   "alerts.offline_after_s": 60, "alerts.disk_low_gib": 20,
   "dashboard.ui_bundle": "builtin", "limits.box_memory_mib": 0,
-  "placement.spill": [], "placement.spill_keep_free_mib": 16384}}}
+  "placement.spill": [], "placement.spill_keep_free_mib": 16384, "upgrade.worker_handover": true}}}
 ```
 
 ### config.get
@@ -188,7 +188,7 @@ A value equal to the stored one returns `"changed": false` and the current
 version: no version bump and no `config_changes` row (an `admin_audit` row with
 result `unchanged` is still written), so a retry after an uncertain answer is
 always safe. `effective` says when it applies: `next_create` for `limits.*` and `placement.*`,
-`next_ack` for `telemetry.*` and `alerts.*` (runners get it with the next
+`next_ack` for `telemetry.*`, `alerts.*` and `upgrade.*` (runners get it with the next
 acknowledgement, a few seconds), `next_request` for `dashboard.ui_bundle`.
 `warnings` lists what is valid but will not do what it reads like.
 

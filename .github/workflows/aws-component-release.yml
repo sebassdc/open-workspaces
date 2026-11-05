@@ -130,6 +130,7 @@ jobs:
         working-directory: .
         run: |
           cargo +1.97.0 test --locked -p ow-core snapshot_
+          cargo +1.97.0 test --locked -p ow-core adoption_tests
           cargo +1.97.0 test --locked -p ow --bin ow failed_snapshot
           cargo +1.97.0 test --locked -p ow-core clock_tests
           cargo +1.97.0 test --locked -p ow-core vm::memory_tests
@@ -212,21 +213,24 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
-          REPOS: ${{ vars.RELEASE_DISPATCH_REPOS }}
+          # A secret, not a variable: a public repository's logs print variables in the step header.
+          REPOS: ${{ secrets.RELEASE_DISPATCH_REPOS }}
         run: |
           if [ -z "$REPOS" ] || [ -z "$GH_TOKEN" ]; then
             echo "Release notify skipped: RELEASE_DISPATCH_REPOS or RELEASE_DISPATCH_TOKEN is not set"
             exit 0
           fi
           version=$(node -p 'require("./package.json").version')
-          read -ra repos <<< "$REPOS"
+          read -ra repos <<< "$(printf '%s' "$REPOS" | tr '\n' ' ')"
+          n=0
           for repo in "${repos[@]}"; do
             jq -n --arg tag "v$version" --arg commit "$GITHUB_SHA" --arg version "$version" \
               '{event_type: "open-workspaces-release", client_payload: {tag: $tag, commit: $commit, version: $version}}' \
               | gh api "repos/$repo/dispatches" --method POST --input - >/dev/null \
-              && echo "Notified $repo" \
-              || echo "::warning::Release dispatch to $repo failed"
+              && n=$((n + 1)) \
+              || echo "::warning::Release dispatch to one repository failed"
           done
+          echo "Notified $n of ${#repos[@]} repositories"
   published-clients:
     if: github.event_name == 'push'
     needs: tag

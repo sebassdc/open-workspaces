@@ -54,6 +54,7 @@ pub fn node(inventory: &Value, reserved: Value, now: u64) -> Value {
         "managed_lifecycle_v1",
         "telemetry_v1",
         "telemetry_logs_v1",
+        "worker_handover_v1",
     ] {
         capabilities[key] = json!(cap[key].as_bool());
     }

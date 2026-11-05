@@ -26,13 +26,17 @@ RUNTIME = "firecracker-v1.17.0"
 CPU = "model name: x\nflags: y\nhost-kernel:6.8.0-1"
 
 
-def entry(v, changes, cls, in_place="0.5.0", protocol=(1, 1, 1), schema=(3, 3), kernel=KERNEL, worker=(1, 1, 1)):
-    return {"version": v, "class": cls, "changes": changes,
-            "protocol": {"speaks": protocol[0], "accepts": list(protocol[1:])},
-            "worker_protocol": {"speaks": worker[0], "accepts": list(worker[1:])},
-            "catalog": {"schema": schema[0], "min_reader": schema[1]},
-            "runtime": {"vmm": RUNTIME, "guest_kernel_sha256": kernel, "resumes": [RUNTIME]},
-            "host_layout": 2, "in_place_from": in_place}
+def entry(v, changes, cls, in_place="0.5.0", protocol=(1, 1, 1), schema=(3, 3), kernel=KERNEL, worker=(1, 1, 1),
+          handover=None, vmm=RUNTIME):
+    e = {"version": v, "class": cls, "changes": changes,
+         "protocol": {"speaks": protocol[0], "accepts": list(protocol[1:])},
+         "worker_protocol": {"speaks": worker[0], "accepts": list(worker[1:])},
+         "catalog": {"schema": schema[0], "min_reader": schema[1]},
+         "runtime": {"vmm": vmm, "guest_kernel_sha256": kernel, "resumes": [vmm]},
+         "host_layout": 2, "in_place_from": in_place}
+    if handover:
+        e["runtime"]["handover"] = {"speaks": handover[0], "accepts": list(handover[1:])}
+    return e
 
 
 BASE = entry("0.5.0", ["controller", "agent", "worker", "host-layout", "stage0"], 3, in_place=None)
@@ -155,6 +159,92 @@ class Planner(unittest.TestCase):
         self.assertEqual((plan["class"], plan["move"]), (1, {"agent": "0.5.1"}))
 
 
+class HandOver(unittest.TestCase):
+    """The worker restarts by handing its running VMMs over only when nothing they run changes."""
+
+    def path(self, *entries, at="0.5.1", to=None, **kw):
+        m = manifest(*entries)
+        plan = u.plan(m, {**AT, "worker": at}, to or m["releases"][0]["version"], captures=WARM, compat=COMPAT, **kw)
+        return plan["worker_path"], plan["worker_path_why"]
+
+    def test_a_worker_only_release_hands_over(self):
+        self.assertEqual(self.path(entry("0.5.1", ["worker"], 2, handover=(1, 1, 1)),
+                                   entry("0.5.2", ["worker"], 2, handover=(1, 1, 1)))[0], "handover")
+
+    def test_a_vmm_or_guest_kernel_change_hibernates(self):
+        old = entry("0.5.1", ["worker"], 2, handover=(1, 1, 1))
+        path, why = self.path(old, entry("0.5.2", ["vmm", "worker"], 2, handover=(1, 1, 1), vmm="firecracker-v9"),
+                              accept_cold=True)
+        self.assertEqual((path, why), ("hibernate", "vmm change"))
+        path, why = self.path(old, entry("0.5.2", ["guest-kernel"], 2, handover=(1, 1, 1), kernel="f" * 64),
+                              accept_cold=True)
+        self.assertEqual((path, why), ("hibernate", "guest-kernel change"))
+        # A release in between that changed the VMM counts too, even if the target changed it back.
+        path, _ = self.path(old, entry("0.5.2", ["vmm"], 2, handover=(1, 1, 1)),
+                            entry("0.5.3", ["worker"], 2, handover=(1, 1, 1)))
+        self.assertEqual(path, "hibernate")
+
+    def test_a_worker_that_cannot_detach_or_adopt_hibernates(self):
+        # The release that brings hand-over: the running worker cannot detach yet.
+        path, why = self.path(entry("0.5.1", ["worker"], 2), entry("0.5.2", ["worker"], 2, handover=(1, 1, 1)))
+        self.assertEqual((path, why), ("hibernate", "the 0.5.1 worker cannot hand over its VMMs"))
+        path, why = self.path(entry("0.5.1", ["worker"], 2, handover=(1, 1, 1)),
+                              entry("0.5.2", ["worker"], 2, handover=(2, 2, 2)))
+        self.assertEqual(path, "hibernate")
+        self.assertIn("cannot adopt", why)
+
+    def test_the_switch_the_flag_and_a_unit_change_hibernate(self):
+        entries = (entry("0.5.1", ["worker"], 2, handover=(1, 1, 1)), entry("0.5.2", ["worker"], 2, handover=(1, 1, 1)))
+        self.assertEqual(self.path(*entries, handover=False)[0], "hibernate")
+        self.assertEqual(self.path(*entries, rendered={"worker"}),
+                         ("hibernate", "the worker's unit files or config change"))
+        # `ow-host apply` already wrote them and left the restart pending.
+        self.assertEqual(self.path(*entries, pending={"worker"})[0], "hibernate")
+
+    def test_a_restart_without_a_worker_restart_has_no_path(self):
+        plan = u.plan(manifest(entry("0.5.1", ["dashboard"], 1)), AT, "0.5.1")
+        self.assertNotIn("worker_path", plan)
+
+    def test_the_release_that_brings_hand_over_still_hibernates_and_the_next_hands_over(self):
+        actual = json.loads((Path(__file__).resolve().parents[3] / "release-impact.json").read_text())
+        e = next(e for e in actual["releases"] if e["version"] == "0.9.59")
+        compat = {"runtime": e["runtime"]["vmm"], "cpu": CPU, "kernel_sha256": e["runtime"]["guest_kernel_sha256"]}
+        pins = dict.fromkeys(AT, "0.9.58")
+        plan = u.plan(actual, pins, "0.9.59", captures=[{"name": "a", **compat}], compat=compat)
+        self.assertEqual((plan["worker_path"], plan["worker_path_why"]),
+                         ("hibernate", "the 0.9.58 worker cannot hand over its VMMs"))
+        later = {**json.loads(json.dumps(e)), "version": "0.9.99", "changes": ["worker"]}
+        actual["releases"].insert(0, later)
+        plan = u.plan(actual, dict.fromkeys(AT, "0.9.59"), "0.9.99", captures=[{"name": "a", **compat}], compat=compat)
+        self.assertEqual(plan["worker_path"], "handover")
+
+    def test_the_setting_comes_from_the_agent_copy_and_defaults_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h.ROOT = Path(tmp)
+            self.assertTrue(u.handover_enabled())
+            h.write_json(f"{h.RUNNER}/controller-settings.json", {"upgrade.worker_handover": False})
+            self.assertFalse(u.handover_enabled())
+
+
+class HandOverBlocker(unittest.TestCase):
+    def test_the_bytes_of_firecracker_and_the_kernel_and_the_worker_capability_decide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h.ROOT = Path(tmp)
+            for release in ("old", "new"):
+                assets = h.p(f"{h.SRV}/releases/{release}/assets")
+                (assets / "official/release-v1").mkdir(parents=True)
+                (assets / "downloads").mkdir()
+                (assets / "official/release-v1/firecracker-v1").write_bytes(b"vmm")
+                (assets / "downloads/vmlinux-6").write_bytes(b"kernel")
+            ops = u.HostOps()
+            with mock.patch.object(u.HostOps, "worker_status", return_value={"worker_handover_v1": True}):
+                self.assertIsNone(ops.handover_blocker("old", "new"))
+                h.p(f"{h.SRV}/releases/new/assets/downloads/vmlinux-6").write_bytes(b"another kernel")
+                self.assertIn("guest kernel differs", ops.handover_blocker("old", "new"))
+            with mock.patch.object(u.HostOps, "worker_status", return_value={"worker_handover_v1": False}):
+                self.assertIn("cannot hand over on this host", ops.handover_blocker("old", "old"))
+
+
 class Fake:
     """A host: three units, a worker with boxes, and failures to inject."""
 
@@ -167,6 +257,8 @@ class Fake:
         self.fail, self.kill = set(fail), set(kill)
         self.calls, self.drained, self.quiesced = [], False, False
         self.late = late  # a box someone starts right after the next inventory read
+        self.pids = {box: 100 + n for n, box in enumerate(sorted(boxes))}  # each box's VMM
+        self.handed, self.report = [], []
 
     def _hit(self, what):
         self.calls.append(what)
@@ -186,10 +278,58 @@ class Fake:
         self.up[name] = True
         if name == "worker":
             self.quiesced = False
+            # The new worker adopts what was handed over; one it cannot is hibernated.
+            self.report = []
+            for box in self.handed:
+                if f"gone:{box}" in self.fail:
+                    # Its VMM died while no worker ran: stopped with its disk.
+                    self.box[box] = "stopped"
+                    self.pids.pop(box)
+                    self.report.append({"id": box, "result": "gone", "detail": None})
+                elif f"adopt:{box}" in self.fail:
+                    # Adopted, but its guest does not answer: it keeps running, reported.
+                    self.report.append({"id": box, "result": "unresponsive", "detail": "guest did not answer"})
+                else:
+                    self.report.append({"id": box, "result": "adopted", "detail": None})
+            self.handed = []
 
     def stop(self, name):
         self._hit(f"stop:{name}")
+        if name == "worker" and self.up[name]:
+            # ExecStop: whatever still runs on the worker is hibernated.
+            for box, state in self.box.items():
+                if state == "running":
+                    self.box[box] = "hibernated"
+                    self.pids.pop(box, None)
         self.up[name] = False
+
+    blocker = None
+
+    def handover_blocker(self, frm, to):
+        return self.blocker
+
+    def hibernate_unresponsive(self):
+        out = {}
+        for entry in self.report:
+            box = entry["id"]
+            if entry["result"] != "unresponsive":
+                continue
+            if f"hibernate-box:{box}" in self.fail:
+                out[box] = "injected capture failure"
+                continue
+            self._hit(f"hibernate-box:{box}")
+            self.box[box] = "hibernated"
+            self.pids.pop(box, None)
+            out[box] = "hibernated"
+        return out
+
+    def handover(self, release):
+        self._hit("handover")
+        self.handed = [box for box, state in self.box.items() if state == "running"]
+        self.up["worker"] = False
+
+    def vmm_pids(self, boxes):
+        return {box: self.pids[box] for box in boxes if box in self.pids}
 
     def timers(self):
         return [timer for timer in u.TIMERS if timer in self.ticking]
@@ -205,7 +345,8 @@ class Fake:
     def worker_status(self):
         if not self.up["worker"]:
             return None
-        return {"internet": True, "version": u.version_of(h.pin("worker")), "compat": COMPAT}
+        return {"internet": True, "version": u.version_of(h.pin("worker")), "compat": COMPAT,
+                "worker_handover_v1": True, "adoption": self.report}
 
     def boxes(self):
         snapshot = dict(self.box)
@@ -312,6 +453,173 @@ class Machine(unittest.TestCase):
         # Health expects each unit's own pin: worker and agent stay 0.5.0.
         self.assertIn(("expected", {"worker": "0.5.0", "agent": "0.5.0", "dashboard": "0.5.1"}), ops.calls)
         self.assertEqual(h.pins(), {"worker": self.old, "agent": self.old, "dashboard": self.new, "current": self.new})
+
+    def handover_plan(self):
+        return {"class": 2, "move": {"worker": "0.5.1"}, "restart": ["worker"], "catalog_backup": False,
+                "rollback_auto": True, "worker_path": "handover"}
+
+    def test_a_handover_keeps_every_box_running_with_its_vmm(self):
+        ops = Fake({"a": "running", "b": "running", "c": "stopped"})
+        pids = dict(ops.pids)
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual((j["step"], j["error"]), ("done", None))
+        self.assertEqual(j["adoption"], {"a": "kept", "b": "kept"})
+        self.assertIn("handover", j["seconds"])
+        self.assertNotIn("hibernate", ops.calls)
+        self.assertFalse([c for c in ops.calls if isinstance(c, str) and c.startswith(("resume:", "hibernated:"))])
+        self.assertEqual((ops.box, ops.pids), ({"a": "running", "b": "running", "c": "stopped"}, pids))
+        self.assertEqual(h.pin("worker"), self.new)
+        self.assertNotIn("canary", ops.calls)
+        events = {e["attrs"]["step"]: e["attrs"] for e in u.events({**j, "reported": []})[:-1]}
+        self.assertEqual(events["handover"]["boxes"], 2)
+        self.assertIn("adoption", events)
+
+    def test_an_unresponsive_ephemeral_box_is_handed_to_the_worker_never_resumed(self):
+        # Ephemeral boxes are left out of the upgrader's box list; the worker adopted one unresponsive.
+        ops = Fake({"a": "running"})
+        real = ops.start
+
+        def start(name):
+            real(name)
+            if name == "worker":
+                ops.report.append({"id": "job", "result": "unresponsive", "detail": "guest did not answer"})
+
+        ops.start = start
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual((j["step"], j["adoption"], j["error"]), ("done", {"a": "kept"}, None))
+        self.assertIn("hibernate-box:job", ops.calls, "the worker is asked (it stops an ephemeral box)")
+        self.assertNotIn("resume:job", ops.calls)
+
+    def test_with_only_an_ephemeral_box_the_adoption_still_runs(self):
+        ops = Fake({})
+        real = ops.start
+
+        def start(name):
+            real(name)
+            if name == "worker":
+                ops.report.append({"id": "job", "result": "unresponsive", "detail": "guest did not answer"})
+
+        ops.start = start
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual((j["step"], j["handover"], j["adoption"], j["error"]), ("done", {}, {}, None))
+        self.assertIn("hibernate-box:job", ops.calls, "the worker is asked to stop it")
+
+    def test_the_report_is_read_from_a_worker_that_is_not_busy(self):
+        ops = Fake({"a": "running"})
+        real, answers = ops.worker_status, []
+
+        def worker_status():
+            status = real()
+            if not answers and "verify" in ops.calls:
+                # Still busy right after verify: its last answer predates the adoption.
+                answers.append(1)
+                return {**status, "busy": True, "adoption": []}
+            return status
+
+        ops.worker_status = worker_status
+        with mock.patch.object(u.time, "sleep"):
+            self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        self.assertEqual(answers, [1])
+        self.assertEqual((self.journal()["adoption"], self.journal()["error"]), ({"a": "kept"}, None))
+
+    def test_a_box_the_new_worker_cannot_adopt_is_hibernated_and_woken_not_lost(self):
+        ops = Fake({"a": "running", "b": "running"}, fail={"adopt:b"})
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual(j["step"], "done")
+        self.assertEqual(j["adoption"]["a"], "kept")
+        self.assertEqual(j["adoption"]["b"], "unresponsive: guest did not answer; hibernated")
+        self.assertIn("not kept running through the hand-over: b", j["error"])
+        # The upgrader saved it after verify (the new worker started without waiting on it).
+        self.assertLess(ops.calls.index("verify"), ops.calls.index("hibernate-box:b"))
+        self.assertIn("resume:b", ops.calls)
+        self.assertEqual(ops.box, {"a": "running", "b": "running"})
+
+    def test_a_box_whose_vmm_was_lost_boots_again_cold(self):
+        ops = Fake({"a": "running", "b": "running"}, fail={"gone:b"})
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual(j["adoption"], {"a": "kept", "b": "gone: no report"})
+        self.assertIn("resume:b", ops.calls)
+        self.assertEqual(ops.box, {"a": "running", "b": "running"})
+
+    def test_killed_while_reporting_the_adoption_finishes_never_rolls_back(self):
+        ops = Fake({"a": "running", "b": "running"}, fail={"adopt:b"}, kill={"hibernate-box:b"})
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        self.assertEqual(self.journal()["step"], "adoption")
+        ops.kill.clear()
+        u.recover(ops)
+        self.assertEqual((self.journal()["step"], h.pin("worker")), ("done", self.new))
+        self.assertEqual(ops.box["a"], "running")
+
+    def test_an_unresponsive_box_that_cannot_be_hibernated_keeps_running_reported(self):
+        ops = Fake({"a": "running"}, fail={"adopt:a", "hibernate-box:a"})
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual(j["step"], "done")
+        self.assertIn("hibernating failed", j["adoption"]["a"])
+        self.assertEqual(ops.box["a"], "running")
+
+    def test_the_bytes_decide_when_the_label_hides_a_runtime_change(self):
+        ops = Fake({"a": "running", "b": "running"})
+        ops.blocker = "the staged Firecracker binary or guest kernel differs from the running one"
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual((j["step"], j["handover_refused"]), ("done", ops.blocker))
+        self.assertIn("hibernate", ops.calls)
+        self.assertNotIn("handover", ops.calls)
+        self.assertEqual(ops.box, {"a": "running", "b": "running"})
+
+    def test_a_failed_detach_aborts_and_the_old_worker_keeps_its_boxes(self):
+        ops = Fake({"a": "running"}, fail={"handover"})
+        with self.assertRaisesRegex(RuntimeError, "injected failure at handover"):
+            self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        self.assertEqual((self.journal()["step"], h.pin("worker"), ops.box["a"]), ("aborted", self.old, "running"))
+        self.assertFalse(ops.quiesced or ops.drained)
+
+    def test_killed_after_the_handover_the_old_worker_adopts_on_recover(self):
+        ops = Fake({"a": "running"}, kill={"stop:agent"})
+        pid = ops.pids["a"]
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_plan(ops, ["worker", "agent"], 2, ["agent", "worker"],
+                          plan={**self.handover_plan(), "move": {"worker": "0.5.1", "agent": "0.5.1"},
+                                "restart": ["agent", "worker"]})
+        self.assertEqual(self.journal()["step"], "stop")
+        ops.kill.clear()
+        u.recover(ops)
+        self.assertEqual((self.journal()["step"], ops.box["a"], ops.pids["a"]), ("aborted", "running", pid))
+
+    def test_a_failed_verify_after_a_handover_rolls_back_through_hibernation(self):
+        ops = Fake({"a": "running"}, fail={"verify"})
+        real = ops.verify
+
+        def verify_once(expected):
+            if expected["worker"] == "0.5.0":
+                ops.fail.discard("verify")
+            real(expected)
+
+        ops.verify = verify_once
+        with self.assertRaisesRegex(RuntimeError, "injected failure at verify"):
+            self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        self.assertEqual((self.journal()["step"], h.pin("worker")), ("rolled-back", self.old))
+        # The new worker hibernated it on stop; the old one woke it.
+        self.assertIn("resume:a", ops.calls)
+        self.assertEqual(ops.box["a"], "running")
+
+    def test_a_worker_restart_hands_over_when_the_worker_can(self):
+        ops = Fake({"a": "running"})
+        with mock.patch.object(h, "role", return_value="runner"):
+            u.restart_worker(ops)
+            self.assertEqual(self.journal()["adoption"], {"a": "kept"})
+            self.assertIn("handover", ops.calls)
+            ops = Fake({"a": "running"})
+            u.restart_worker(ops, hibernate=True)
+            self.assertNotIn("handover", ops.calls)
+            self.assertIn("hibernate", ops.calls)
 
     def test_runner_upgrade_hibernates_swaps_and_resumes(self):
         ops = Fake({"a": "running", "b": "running", "c": "stopped"})

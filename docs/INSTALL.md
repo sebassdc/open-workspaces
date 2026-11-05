@@ -190,8 +190,8 @@ pins and connection guides are maintained in the consuming project, after this
 evidence.
 
 Once the release is published, the workflow can tell downstream repositories at
-once. Set the repository variable `RELEASE_DISPATCH_REPOS` to a space-separated
-list of `owner/repo` names and the secret `RELEASE_DISPATCH_TOKEN` to a token
+once. Set the repository secret `RELEASE_DISPATCH_REPOS` to a list of
+`owner/repo` names (spaces or one per line; a secret, so the names stay out of the public logs) and the secret `RELEASE_DISPATCH_TOKEN` to a token
 allowed to send `repository_dispatch` events to them (contents write on each).
 Each listed repository then receives event type `open-workspaces-release` with
 `client_payload` `{"tag": "vX.Y.Z", "commit": "<sha>", "version": "X.Y.Z"}`,
