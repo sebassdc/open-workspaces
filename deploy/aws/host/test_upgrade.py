@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -338,6 +339,90 @@ class Machine(unittest.TestCase):
                          {"workspace": "m-1", "name": name, "runtime": COMPAT["runtime"],
                           "kernel_sha256": COMPAT["kernel_sha256"], **manifest})
         self.assertEqual([c["name"] for c in u.captures(COMPAT)], ["m-1/sleep-b"])
+
+    def test_a_closed_journal_becomes_upgrade_events_on_the_intake(self):
+        import socket
+        import threading
+        ops = Fake({"a": "running", "b": "stopped"})
+        with tempfile.TemporaryDirectory(dir="/tmp") as short:
+            path = f"{short}/telemetry.sock"
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(path)
+            listener.listen(64)
+            lines = []
+
+            def accept():
+                while True:
+                    try:
+                        conn, _ = listener.accept()
+                    except OSError:
+                        return
+                    with conn:
+                        lines.append(json.loads(conn.makefile().readline()))
+            threading.Thread(target=accept, daemon=True).start()
+            with mock.patch.object(u, "p", lambda name: Path(path) if name.endswith("telemetry.sock") else h.p(name)):
+                self.run_plan(ops, ["worker"], 2, ["worker"])
+            for _ in range(100):
+                if lines and lines[-1]["event"] == "ow.host.upgrade":
+                    break
+                time.sleep(0.05)
+            listener.close()
+        steps = {e["attrs"]["step"]: e["attrs"] for e in lines if e["event"] == "ow.host.upgrade.step"}
+        self.assertTrue({"drain", "hibernate", "switch", "verify", "resume", "undrain"} <= set(steps), steps)
+        self.assertEqual((steps["hibernate"]["boxes"], steps["hibernate"]["cold"]), (1, 0))
+        whole = lines[-1]["attrs"]
+        self.assertEqual((whole["outcome"], whole["class"], whole["journal"], whole["resumed"]),
+                         ("done", 2, self.journal()["id"], 1))
+        # Steps went out live while the intake listened; the close sends the last and the whole.
+        self.assertEqual(set(self.journal()["reported"]), set(steps) - {"undrain"})
+        self.assertEqual(u.events(self.journal()), lines[-2:])
+
+    def test_a_failed_hibernation_counts_only_the_boxes_that_went_to_sleep(self):
+        ops = Fake({"a": "running", "b": "running"})
+        real = ops.hibernate_all
+
+        def first_only(release):  # a hibernated, then b overruns its budget
+            ops.box["a"] = "hibernated"
+            raise RuntimeError("could not hibernate b within its 200 s budget")
+        ops.hibernate_all = first_only
+        with self.assertRaises(RuntimeError):
+            self.run_plan(ops, ["worker"], 2, ["worker"])
+        ops.hibernate_all = real
+        j = self.journal()
+        self.assertEqual((j["step"], j["hibernated"], j["resumed"]), ("aborted", 1, 1))
+        events = {e["attrs"].get("step", "whole"): e["attrs"] for e in u.events({**j, "reported": []})}
+        self.assertEqual((events["hibernate"]["boxes"], events["whole"]["outcome"]), (1, "aborted"))
+
+    def test_every_event_attribute_is_one_the_intake_accepts(self):
+        import re
+        rust = (Path(__file__).resolve().parents[3] / "crates/ow/src/telemetry.rs").read_text()
+        table = rust[rust.index("const HOST_EVENTS"):rust.index("];", rust.index("const HOST_EVENTS"))]
+        accepted = {name: set(re.findall(r'"([a-z_]+)"', keys))
+                    for name, keys in re.findall(r'"(ow\.host\.[a-z.]+)",\s*&\[([^\]]*)\]', table)}
+        journal = {"id": "u-1", "class": 2, "from": {"current": "a"}, "to": {"current": "b"}, "step": "done",
+                   "seconds": {"drain": 1.0, "hibernate": 2.0}, "hibernated": 1, "cold": [], "resumed": 1}
+        for event in u.events(journal):
+            self.assertLessEqual(set(event["attrs"]), accepted[event["event"]], event)
+            self.assertLessEqual(len(event["attrs"]), 7, "with event.name, at most 8 attributes")
+
+    def test_without_a_listener_the_upgrade_still_closes(self):
+        ops = Fake({"a": "running"})
+        self.run_plan(ops, ["worker"], 2, ["worker"])
+        self.assertEqual(self.journal()["step"], "done")
+
+    def test_an_ephemeral_box_never_meets_the_capture_gate(self):
+        h.write_json(f"{h.RUNNER}/state.json", {"workspaces": {
+            "m-job": {"id": "m-job", "state": "running", "ephemeral": True},
+            "m-dev": {"id": "m-dev", "state": "running"}}})
+        self.assertEqual([c["name"] for c in u.captures(COMPAT)], ["m-dev"])
+
+    def test_the_hibernate_cap_grows_with_each_running_box(self):
+        gib = 1 << 30
+        self.assertEqual(u.hibernate_budget([]), 600)
+        self.assertEqual(u.hibernate_budget([
+            {"state": "running", "memory_mib": 16384, "disk_allocated_bytes": 256 * gib},
+            {"state": "running", "memory_mib": 4096, "disk_allocated_bytes": None},
+            {"state": "hibernated", "memory_mib": 65536}]), 600 + (120 + 320 + 1024) + (120 + 80))
 
     def test_a_box_started_after_the_last_plan_still_meets_the_capture_gate(self):
         # Planned with no box at all, for a release with another guest kernel.
@@ -797,6 +882,72 @@ class Staging(unittest.TestCase):
                          "https://github.com/o/r/releases/download/v1.2.3")
         self.assertIsNone(u.release_url("/srv/mirror", "v1.2.3"))
         self.assertIsNone(u.release_url("https://example.com/o/r.git", "v1.2.3"))
+
+
+class Unchanged(unittest.TestCase):
+    """ci-post-up's fast path: 0 only when the release, every pin and each image already match."""
+
+    RELEASE = "0.5.1-bbbbbbbbbbbb"
+    SHA = "a" * 64
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        h.ROOT = Path(self.tmp.name)
+        h.write_json(h.CONFIG, {"schema": 1, "release": {"repository": "/srv/seed.bundle", "ref": "main"}})
+        for release, v in (("0.5.0-aaaaaaaaaaaa", "0.5.0"), (self.RELEASE, "0.5.1")):
+            h.write_json(f"{h.SRV}/releases/{release}/STAGED", {"version": v})
+        for name in (*h.PINS, "current"):
+            h.set_pin(name, self.RELEASE)
+        self.target = {"release": self.RELEASE, "version": "0.5.1",
+                       "manifest": manifest(entry("0.5.1", ["worker", "agent"], 2))}
+        self.images = [{"name": "ubuntu"}, {"name": "team", "recipe_sha256": self.SHA}]
+        self.developer = "inactive"  # the developer image unit's ActiveState
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def check(self, images=(f"team={'a' * 64}",)):
+        with mock.patch.object(u, "fetch", return_value=self.target), \
+                mock.patch.object(h, "ow", return_value=self.images), \
+                mock.patch.object(h, "run", side_effect=lambda *a, **k: self.developer + "\n"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            return u.unchanged(list(images)), out.getvalue()
+
+    def test_everything_in_place_is_unchanged(self):
+        self.assertEqual(self.check(), (0, ""))
+
+    def test_each_difference_takes_the_full_path(self):
+        cases = {
+            "release": lambda: h.set_pin("current", "0.5.0-aaaaaaaaaaaa"),
+            # Current is the target, but the worker still runs a release whose change it has not taken.
+            "pins to move: worker": lambda: h.set_pin("worker", "0.5.0-aaaaaaaaaaaa"),
+            "restarts pending": lambda: h.mark_pending({"agent"}, "config changed"),
+            "interrupted upgrade": lambda: h.write_json(u.JOURNAL, {"step": "hibernate"}),
+            "image team": lambda: self.images[1].update(recipe_sha256="b" * 64),
+            "developer image build is activating": lambda: setattr(self, "developer", "activating"),
+            "developer image build is failed": lambda: setattr(self, "developer", "failed"),
+        }
+        for what, change in cases.items():
+            with self.subTest(what):
+                self.tearDown()
+                self.setUp()
+                change()
+                code, out = self.check()
+                self.assertEqual(code, 1)
+                self.assertIn(what, out)
+
+    def test_an_image_never_built_or_a_failed_check_is_never_unchanged(self):
+        self.assertEqual(self.check([f"other={self.SHA}"])[0], 1)
+        with mock.patch.object(u, "fetch", side_effect=RuntimeError("git fetch failed")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(u.unchanged([]), 1)
+        self.assertIn("could not check (git fetch failed)", out.getvalue())
+
+    def test_a_pin_on_an_older_commit_of_the_same_version_is_not_a_change(self):
+        # Only `current` moves to a new commit of the same version; upgrade then has nothing to move.
+        h.write_json(f"{h.SRV}/releases/0.5.1-cccccccccccc/STAGED", {"version": "0.5.1"})
+        h.set_pin("worker", "0.5.1-cccccccccccc")
+        self.assertEqual(self.check()[0], 0)
 
 
 if __name__ == "__main__":

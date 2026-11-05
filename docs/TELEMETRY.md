@@ -112,6 +112,8 @@ severity:
 | `ow.node.channel.reconnected` | INFO | first acknowledgement after a loss | `reason`, `attempts`, `downtime_s` |
 | `ow.node.worker.restarted` | INFO | the worker answers from a new process | – |
 | `ow.node.worker.unavailable` | WARN | the worker stops answering status (once per outage) | – |
+| `ow.host.upgrade.step` | INFO | an upgrade step ended (sent as it ends while the agent runs, else when the journal closes) | `journal`, `step` (drain, hibernate, …, undrain), `duration_ms`; for `hibernate` also `boxes` (hibernated) and `cold` |
+| `ow.host.upgrade` | INFO, WARN unless `done` | an upgrade journal closed | `journal`, `class`, `from`, `to` (releases), `outcome` (done, aborted, rolled-back), `duration_ms`, `resumed` |
 | `ow.node.operation` | INFO, WARN on failure | each job the agent runs, except reads, streams and credential refreshes | `op`, `outcome` (ok, error), `duration_ms`, `ow.box.id` when the job names a box, `error` on failure |
 
 `ow.node.operation` covers box lifecycle (create, start, stop, resize, delete,
@@ -142,7 +144,8 @@ over a local socket, `telemetry.sock` in the worker's data directory (mode
 runner, the node controller for `local`. That process reports it like its own:
 the agent queues an `ow.node.operation` record, the controller stores it in the
 `local` event log and forwards it. The socket takes one line per operation (op,
-box ID, duration, error class) and refuses anything else; the receiver hashes
+box ID, duration, error class), or one `ow.host.upgrade` or `ow.host.upgrade.step`
+event with its own attributes only, and refuses anything else; the receiver hashes
 the box ID. Reads (`status`, `list` and the others above) are not handed over.
 When nothing listens (the agent or controller is down) the record is not
 reported.

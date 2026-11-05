@@ -44,7 +44,8 @@
 #   ci-post-up --stack S [--image RECIPE].. [--max-class N]
 #                                after `pulumi up`: start a stopped host, wait until ready,
 #                                apply and upgrade (hosts with ow-host), build each image; a
-#                                runner is enrolled first. Controller first, then each runner
+#                                runner is enrolled first. One SSM call when the release and
+#                                every image are already in place. Controller first, then each runner
 #
 # NAME is the component name (tag Name). Environment: OW_HOST instead of --host,
 # OW_INSTANCE to skip the lookup, OW_SSH_KEY (default ~/.ssh/id_ed25519; its
@@ -83,7 +84,7 @@ instance_state() { aws ec2 describe-instances --instance-ids "$instance" --query
 # remote TIMEOUT CALL [ARG..]: the host functions, then CALL ARG.. with each
 # argument shell-quoted, as root on the host; prints its output, returns its status.
 remote() {
-  local timeout=$1 script id state deadline
+  local timeout=$1 script id state deadline polls=0
   shift
   script="$(cat "$here/ow-aws-remote.sh")"$'\n'"$(printf '%q ' "$@")"
   deadline=$(( $(date +%s) + 600 + timeout + 60 ))
@@ -91,7 +92,8 @@ remote() {
     --parameters "$(python3 -c 'import base64,json,sys; print(json.dumps({"commands":["echo "+base64.b64encode(sys.argv[1].encode()).decode()+" | base64 -d | bash"],"executionTimeout":[sys.argv[2]]}))' "$script" "$timeout")" \
     --query Command.CommandId --output text)
   while :; do
-    sleep 3
+    # Short commands finish in seconds: poll each second at first, then every 3 s.
+    sleep $(( ++polls <= 10 ? 1 : 3 ))
     state=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$instance" --query Status --output text 2>/dev/null || echo Pending)
     case $state in Pending|InProgress|Delayed) ;; *) break ;; esac
     (( $(date +%s) < deadline )) || { echo "SSM command $id gave no result in time" >&2; return 1; }
@@ -195,6 +197,15 @@ check_recipe() {
 }
 
 image() { remote 3600 build_image "$(basename "$1")" "$(base64 < "$1" | tr -d '\n')"; }
+
+# post_up ARG..: the host's post_up in one SSM call, its output printed; `last` is its last line.
+post_up() {
+  local out rc=0
+  out=$(remote 10800 post_up 3000 "$@") || rc=$?
+  printf '%s\n' "$out"
+  (( rc == 0 )) || exit "$rc"
+  last=$(tail -n 1 <<< "$out")
+}
 
 case $command in
   recovery-status | recovery-freeze)
@@ -394,11 +405,17 @@ sys.exit(0 if any(s.get("op") in ("replace", "create-replacement", "delete-repla
     esac ;;
   ci-post-up)
     stack_arg "$@"
-    stack=$2 recipes=() upgrade_args=()
+    stack=$2 recipes=() upgrade_args=() checks=()
     shift 2
     while (( $# )); do
       case $1 in
-        --image) [[ -n ${2:-} ]] || die "--image takes a recipe"; check_recipe "$2"; recipes+=("$2"); shift 2 ;;
+        --image)
+          [[ -n ${2:-} ]] || die "--image takes a recipe"
+          check_recipe "$2"
+          recipes+=("$2")
+          # The image is named after the file; the worker records the hash of the recipe it was built from.
+          checks+=(--image "$(basename "$2" .sh)=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$2")")
+          shift 2 ;;
         --max-class) [[ ${2:-} =~ ^[0-3]$ ]] || die "--max-class takes 0 to 3"; upgrade_args=(--max-class "$2"); shift 2 ;;
         *) die "unknown option: $1" ;;
       esac
@@ -413,16 +430,22 @@ sys.exit(0 if any(s.get("op") in ("replace", "create-replacement", "delete-repla
     if [[ $(instance_state) == stopped ]]; then echo "$host is stopped; starting it"; start_instance; fi
     wait_ssm
     controller=$(controller_of "$host")
+    last=''
     if [[ -n $controller ]]; then
-      # A runner: ready (a fresh one builds first), enrolled with its controller, then as a host.
-      remote 10800 after_start 3000
-      runner_add "$controller" "$host"
-      remote 3600 ow_host apply
-      remote 3600 ow_host upgrade --controller-version "$(agent_release "$controller")" ${upgrade_args[@]+"${upgrade_args[@]}"}
+      # A runner: ready (a fresh one builds first) and, unless nothing changed, enrolled with its
+      # controller, then as a host with the release its controller runs.
+      post_up --runner ${checks[@]+"${checks[@]}"}
+      if [[ $last != "nothing changed" ]]; then
+        # Never skip the enrolment on doubt: only a runner that said so is enrolled and online.
+        [[ $last == "needs: upgrade" ]] || runner_add "$controller" "$host"
+        post_up --controller-version "$(agent_release "$controller")" ${upgrade_args[@]+"${upgrade_args[@]}"} ${checks[@]+"${checks[@]}"}
+      fi
     else
       # A fresh host builds from source before it is ready.
-      remote 10800 post_up 3000 ${upgrade_args[@]+"${upgrade_args[@]}"}
+      post_up ${upgrade_args[@]+"${upgrade_args[@]}"} ${checks[@]+"${checks[@]}"}
     fi
-    for recipe in ${recipes[@]+"${recipes[@]}"}; do image "$recipe"; done ;;
+    if [[ $last != "nothing changed" ]]; then
+      for recipe in ${recipes[@]+"${recipes[@]}"}; do image "$recipe"; done
+    fi ;;
   *) usage ;;
 esac

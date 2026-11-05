@@ -266,6 +266,15 @@ class Enrolment(unittest.TestCase):
         status.write_text(json.dumps({"online": False, "updated": time.time()}))
         self.assertFalse(h.node_online())
 
+    def test_enrolled_needs_the_credential_and_a_fresh_heartbeat(self):
+        h.write_json(h.CONFIG, runner())
+        h.p(f"{h.RUNNER}/agent.json").write_text(json.dumps({"online": True, "updated": time.time()}))
+        self.assertEqual(h.main(["enrolled"]), 1, "no credential: not enrolled")
+        h.p(f"{h.RUNNER}/node.json").write_text(json.dumps({"node": "ow-big"}))
+        self.assertEqual(h.main(["enrolled"]), 0)
+        h.p(f"{h.RUNNER}/agent.json").write_text(json.dumps({"online": True, "updated": time.time() - 60}))
+        self.assertEqual(h.main(["enrolled"]), 1, "enrolled but offline")
+
 
 def release(version, speaks, accepts, changes=("agent",)):
     return {"version": version, "changes": list(changes), "class": 1, "catalog": {"schema": 3, "min_reader": 3},

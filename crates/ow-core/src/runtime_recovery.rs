@@ -2,6 +2,22 @@ use super::*;
 use crate::recovery::{Point, Recovery, now};
 
 impl Runtime {
+    /// The last durable recovery point of `recovery`, when it has a chunk sidecar to reuse.
+    fn durable_base(&self, recovery: &Recovery) -> Option<PathBuf> {
+        recovery
+            .durable
+            .as_ref()
+            .map(|p| self.snapshot_dir(&p.snapshot))
+            .filter(|p| p.join(crate::snapshot_digest::SIDECAR).is_file())
+    }
+
+    /// `durable_base` for box `id`, read from its recovery record (none without one).
+    pub(super) fn recovery_base(&self, id: &str) -> Option<PathBuf> {
+        let path = self.root.join("recovery").join(format!("{id}.json"));
+        let recovery: Recovery = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+        self.durable_base(&recovery)
+    }
+
     pub(super) fn recovery_operation(&mut self, request: &Value) -> Result<Value> {
         let id = request["id"].as_str().context("missing ID")?;
         let workspace = self.workspace(id)?;
@@ -147,11 +163,7 @@ impl Runtime {
         let client_seal = request["client_seal"] == true;
         let mut unsealed = None;
         // Chunks still in the last durable point's extents are taken from its seal unread.
-        let previous = recovery
-            .durable
-            .as_ref()
-            .map(|p| self.snapshot_dir(&p.snapshot))
-            .filter(|p| p.join(crate::snapshot_digest::SIDECAR).is_file());
+        let previous = self.durable_base(&recovery);
         let mut stats = Value::Null;
         let result = (|| -> Result<()> {
             let destination = self.snapshot_dir(&point.snapshot);

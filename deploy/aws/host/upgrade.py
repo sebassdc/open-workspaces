@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -412,7 +413,7 @@ def captures(compat):
         found.append({"name": f"{m.get('workspace')}/{m.get('name')}", "runtime": m.get("runtime"),
                       "cpu": m.get("cpu"), "kernel_sha256": m.get("kernel_sha256")})
     for box in (h.read_json(f"{h.RUNNER}/state.json") or {}).get("workspaces", {}).values():
-        if box.get("state") == "running":
+        if box.get("state") == "running" and not box.get("ephemeral"):  # ephemeral: stopped, never captured
             found.append({"name": box["id"], **(compat or {})})
     return found
 
@@ -423,6 +424,16 @@ def host_cpu():
     model = next(line for line in info if line.startswith("model name"))
     flags = next(line for line in info if line.startswith("flags"))
     return f"{model}\n{flags}\nhost-kernel:{p('/proc/sys/kernel/osrelease').read_text().strip()}"
+
+
+def hibernate_budget(boxes):
+    """Seconds `ow down --hibernate` may take: each running box's own budget (RAM written,
+    disk sealed; the same formula as the worker's), plus room for its other requests.
+    A fixed cap of 1800 s cut off boxes of 16 GiB on large disks."""
+    def gib(n):
+        return -(-int(n or 0) // (1 << 30))
+    return 600 + sum(120 + 20 * gib((b.get("memory_mib") or 0) << 20) + 4 * gib(b.get("disk_allocated_bytes"))
+                     for b in boxes if b.get("state") == "running")
 
 
 class HostOps:
@@ -472,15 +483,17 @@ class HostOps:
             return None
 
     def boxes(self):
+        """Box -> state; ephemeral boxes (a CI job's) are left out: never hibernated or resumed."""
         if h.role() == "controller":
             return {}
-        return {b["id"]: b["state"] for b in h.ow("list", timeout=1200)}
+        return {b["id"]: b["state"] for b in h.ow("list", timeout=1200) if not b.get("ephemeral")}
 
     def hibernate_all(self, release):
         # The old worker's own binary: it quiesces, hibernates each box and only then
         # shuts the worker down; on a failure it calls the shutdown off (boxes keep running).
+        # It gives up on its own at the first box over budget; this cap is only a backstop.
         h.run([str(p(f"{h.SRV}/releases/{release}/bin/ow")), "--data-dir", h.RUNNER, "down", "--hibernate"],
-              user="ow", capture=False, timeout=1800,
+              user="ow", capture=False, timeout=hibernate_budget(h.ow("list", timeout=1200)),
               env={"HOME": "/srv/ow", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
                    "OW_ASSET_DIR": f"{h.SRV}/run/worker/assets"})
         h.systemctl("stop", h.UNITS["worker"])  # its stop hook finds no worker: a no-op
@@ -613,14 +626,77 @@ class Journal:
         last = self.value.get("step")
         if last:
             self.value.setdefault("seconds", {})[last] = round(now - self.mark, 1)
+            # Live while the agent runs (drain, hibernate, undrain); what it misses goes at the close.
+            if last not in TERMINAL and name not in TERMINAL and send(step_event(self.value, last)):
+                self.value.setdefault("reported", []).append(last)
         self.mark = now
         self.value.update(step=name, updated=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         h.write_json(JOURNAL, self.value)
         if name not in TERMINAL:
             say(f"upgrade: {name}")
+        else:
+            report(self.value)
 
     def __getitem__(self, key):
         return self.value[key]
+
+
+def step_event(journal, step):
+    """One finished step as an event (docs/TELEMETRY.md): its time; for hibernate also the
+    boxes it hibernated and the captures that will boot cold."""
+    attrs = {"journal": journal.get("id") or "unknown", "step": step,
+             "duration_ms": int(journal.get("seconds", {}).get(step, 0) * 1000)}
+    if step == "hibernate":
+        if journal.get("hibernated") is not None:
+            attrs["boxes"] = journal["hibernated"]
+        attrs["cold"] = len(journal.get("cold", []))
+    return {"event": "ow.host.upgrade.step", "attrs": attrs}
+
+
+def events(journal):
+    """A closed journal as events: each step not yet reported, then the upgrade as a whole.
+    A journal an older upgrader left may lack fields: placeholders keep the events valid."""
+    seconds, sent = journal.get("seconds", {}), set(journal.get("reported", []))
+    out = [step_event(journal, step) for step in seconds if step not in sent]
+    out.append({"event": "ow.host.upgrade", "attrs": {
+        "journal": journal.get("id") or "unknown", "class": journal.get("class", 0),
+        "from": (journal.get("from") or {}).get("current") or "none",
+        "to": (journal.get("to") or {}).get("current") or "none", "outcome": journal.get("step") or "none",
+        "duration_ms": int(sum(seconds.values()) * 1000), "resumed": journal.get("resumed", 0)}})
+    return out
+
+
+def send(event, wait=0.0):
+    """Hands one event to this host's telemetry intake: its node agent, or the controller on a
+    host without a worker; they store it in the runner's event log and forward it. False
+    when nothing listens (the agent is stopped or not up yet) after `wait` seconds."""
+    try:
+        root = h.CONTROLLER if h.role() == "controller" else h.RUNNER
+    except Exception:  # noqa: BLE001 - no config: nothing to report to
+        return False
+    path, end = p(f"{root}/telemetry.sock"), time.monotonic() + wait
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX) as s:
+                s.settimeout(2)
+                s.connect(str(path))
+                s.sendall(json.dumps(event).encode() + b"\n")
+            return True
+        except OSError:
+            # A restarting agent leaves its socket in place until it binds again; no socket
+            # at all: no agent on this host.
+            if time.monotonic() >= end or not path.exists():
+                return False
+            time.sleep(1)
+
+
+def report(journal):
+    """At the close: every step the live reports missed, then the whole upgrade. The units
+    were just (re)started, so the intake gets up to 30 s to come up. Best effort:
+    upgrade.json keeps the last journal."""
+    for i, event in enumerate(events(journal)):
+        if not send(event, wait=30 if i == 0 else 2):
+            return
 
 
 def execute(plan_, ops, frm, to, target_name):
@@ -653,6 +729,7 @@ def execute(plan_, ops, frm, to, target_name):
                 j.value["cold"] = gate(plan_["gate"], ops.captures())
             j.step("hibernate")
             ops.hibernate_all(frm["worker"])
+            j.value["hibernated"] = len(j["resume"])
         j.step("stop")
         for name in ("dashboard", "agent"):
             if name in restart and name != "worker":
@@ -703,11 +780,14 @@ def finish(j, ops):
 def resume(j, ops):
     failed = []
     states = ops.boxes()
+    # After a failed hibernation: the ones that went to sleep before it gave up.
+    j.value.setdefault("hibernated", sum(states.get(box) == "hibernated" for box in j["resume"]))
     for box in j["resume"]:
         if states.get(box) == "hibernated":
             try:
                 ops.start_box(box)
                 say(f"resumed {box}")
+                j.value["resumed"] = j.value.get("resumed", 0) + 1
             except Exception as e:  # noqa: BLE001 - every box gets its turn
                 say(f"could not resume {box}: {e}")
                 failed.append(box)
@@ -884,6 +964,46 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
         prune()
         say(f"upgraded to {target['release']} (class {result['class']})")
         return 0
+
+
+def unchanged(images=()):
+    """ci-post-up's fast path, run right after apply: 0 when `upgrade` would find nothing to do
+    and each image (NAME=SHA256) is built from the recipe with that hash; else 1, printing what
+    is left. Any doubt (an error included) counts as something left."""
+    try:
+        config = h.validate(h.read_json(h.CONFIG))
+        frm = h.pins()
+        todo = []
+        if (h.read_json(JOURNAL) or {}).get("step") not in (None, *TERMINAL):
+            todo.append("an interrupted upgrade")
+        if h.pending():
+            todo.append(f"restarts pending: {', '.join(sorted(h.pending()))}")
+        target = fetch(config)
+        if frm["current"] != target["release"]:
+            todo.append(f"release {target['release']} (running {frm['current']})")
+        else:
+            # Apply just rendered the files with this release's ow-host, so no pin moves for them.
+            # A runner's plan without --controller-version also weighs the catalog schema: it only adds moves.
+            pins = {name: version_of(frm[name]) for name in h.role_pins(config)}
+            result = plan(target["manifest"], pins, target["version"])
+            if result["move"] or result["restart"]:
+                todo.append(f"pins to move: {', '.join(sorted(result['move']))}")
+        if images:
+            # An image build waits for the developer image first (a replaced host rebuilds it).
+            state = h.run(["systemctl", "show", "-p", "ActiveState", "--value", "open-workspaces-images.service"],
+                          check=False).strip()
+            if state in ("activating", "failed"):
+                # A failed build goes the full path, whose image step reports it.
+                todo.append(f"the developer image build is {state}")
+            built = {i.get("name"): i.get("recipe_sha256") for i in h.ow("image", "list", timeout=60)}
+            for name, _, digest in (i.partition("=") for i in images):
+                if built.get(name) != digest:
+                    todo.append(f"image {name} (not built from this recipe)")
+    except Exception as e:
+        todo = [f"could not check ({e})"]
+    for line in todo:
+        say(f"to do: {line}")
+    return 1 if todo else 0
 
 
 def restart_worker(ops=None):

@@ -405,6 +405,7 @@ sudo ow-host upgrade --plan          # what the configured release would do; cha
 sudo ow-host upgrade                 # the config's release.ref
 sudo ow-host upgrade v0.5.1 --max-class 1
 sudo ow-host status                  # pins per unit, pending restarts, last journal
+sudo ow-host unchanged --image team=SHA256   # after apply: exit 0 when upgrade and image build have nothing to do
 ```
 
 It fetches the ref, plans from its `release-impact.json`, stages it next to the

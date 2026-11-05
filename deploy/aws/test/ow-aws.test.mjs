@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -185,18 +186,73 @@ test("ci-preflight hibernates only when the preview replaces this host's instanc
     f.done();
 });
 
+const RECIPE = "apt-get install -y jq\n";
+const RECIPE_CHECK = `--image team=${createHash("sha256").update(RECIPE).digest("hex")}`;
+
 test("ci-post-up starts a stopped host, waits, then builds each recipe", () => {
     const f = fake({ state: "stopped" });
     const recipe = join(f.dir, "team.sh");
-    writeFileSync(recipe, "apt-get install -y jq\n");
+    writeFileSync(recipe, RECIPE);
     const result = f.run(["ci-post-up", "--stack", "rain", "--image", recipe, "--max-class", "1"]);
     assert.equal(result.status, 0, result.stderr);
     assert.ok(f.calls().some((c) => c[1] === "start-instances"));
     const [post, build] = f.scripts();
-    assert.equal(f.lastLine(post.script), "post_up 3000 --max-class 1");
-    assert.equal(f.lastLine(build.script), `build_image team.sh ${Buffer.from("apt-get install -y jq\n").toString("base64")}`);
+    assert.equal(f.lastLine(post.script), `post_up 3000 --max-class 1 ${RECIPE_CHECK}`);
+    assert.equal(f.lastLine(build.script), `build_image team.sh ${Buffer.from(RECIPE).toString("base64")}`);
     assert.equal(build.timeout, "3600");
     f.done();
+});
+
+test("ci-post-up on a host where nothing changed is one SSM call and builds nothing", () => {
+    const f = fake({ results: [{ stdout: "controller listening on: 100.64.0.1:8790\nnothing changed" }] });
+    const recipe = join(f.dir, "team.sh");
+    writeFileSync(recipe, RECIPE);
+    const result = f.run(["ci-post-up", "--stack", "rain", "--image", recipe]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /nothing changed/);
+    assert.deepEqual(f.scripts().map((s) => f.lastLine(s.script)), [`post_up 3000 ${RECIPE_CHECK}`]);
+    f.done();
+});
+
+test("a failed post_up stops ci-post-up with its output shown", () => {
+    const f = fake({ results: [{ status: "Failed", stdout: "refused: the release is not in the repository" }] });
+    const recipe = join(f.dir, "team.sh");
+    writeFileSync(recipe, RECIPE);
+    const result = f.run(["ci-post-up", "--stack", "rain", "--image", recipe]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /refused: the release/);
+    assert.equal(f.scripts().length, 1, "no image built after a failure");
+    f.done();
+});
+
+// The host side of post_up, run for real with a stand-in ow-host whose `enrolled` and
+// `unchanged` exit with the given codes; returns post_up's last line and the ow-host calls.
+function postUp(args, { enrolled = 0, unchanged = 0 } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), "ow-post-up-"));
+    writeFileSync(join(dir, "ow-host"), `#!/bin/sh\necho "$*" >> ${join(dir, "log")}\ncase $1 in enrolled) exit ${enrolled} ;; unchanged) exit ${unchanged} ;; esac\n`, { mode: 0o755 });
+    const run = spawnSync("bash", ["-c", `. ${remoteLib}; post_up 3000 ${args}`], { encoding: "utf8", env: { PATH: `${dir}:${process.env.PATH}` } });
+    const log = existsSync(join(dir, "log")) ? readFileSync(join(dir, "log"), "utf8").trim().split("\n") : [];
+    rmSync(dir, { recursive: true });
+    assert.equal(run.status, 0, run.stderr);
+    return { last: run.stdout.trim().split("\n").at(-1), log };
+}
+
+test("post_up returns after apply when ow-host finds nothing changed, else upgrades", () => {
+    const check = "unchanged --image team=abc";
+    assert.deepEqual(postUp("--max-class 1 --image team=abc"),
+        { last: "nothing changed", log: ["ready --wait 3000", "apply", check] });
+    assert.deepEqual(postUp("--max-class 1 --image team=abc", { unchanged: 1 }),
+        { last: "", log: ["ready --wait 3000", "apply", check, "upgrade --max-class 1", "apply"] });
+    // An ow-host without `unchanged` (an older release) exits 2: the full path.
+    assert.deepEqual(postUp("--image team=abc", { unchanged: 2 }).log.slice(-2), ["upgrade", "apply"]);
+    // A runner's first pass: enrolment first, and never an upgrade without its controller's release.
+    assert.deepEqual(postUp("--runner --image team=abc", { enrolled: 1 }),
+        { last: "needs: enrol", log: ["ready --wait 3000", "enrolled"] });
+    assert.deepEqual(postUp("--runner --image team=abc", { unchanged: 1 }),
+        { last: "needs: upgrade", log: ["ready --wait 3000", "enrolled", "apply", check] });
+    assert.equal(postUp("--runner --image team=abc").last, "nothing changed");
+    assert.deepEqual(postUp("--controller-version 0.6.0 --image team=abc", { unchanged: 1 }).log.slice(-2),
+        ["upgrade --controller-version 0.6.0", "apply"], "the upgraded ow-host applies settings the old one dropped");
 });
 
 test("ssh-config pins the host and box keys and checks them strictly", () => {
@@ -434,22 +490,38 @@ test("a runner upgrades only to an agent its controller accepts: the controller'
     f.done();
 });
 
-test("ci-post-up on a runner: ready, enrolled with its controller, then apply and upgrade", () => {
+test("ci-post-up on a runner: one call when nothing changed; its controller is asked only when needed", () => {
     const status = JSON.stringify({ role: "runner", node: "ow-big", budget: { memory: 1024, slots: 2, cpus: 2 } });
-    const f = fake({ parameter: RUNNER_CONFIG, instances: { "ow-test": CONTROLLER_ID, "ow-big": RUNNER_ID },
-        results: [{}, {}, { stdout: status }, {}, {}, { stdout: JSON.stringify({ versions: { agent: "0.6.0" } }) }] });
-    const result = f.run(["ci-post-up", "--stack", "s"], { OW_HOST: "ow-big", OW_INSTANCE: RUNNER_ID });
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(f.scripts().map((s) => [s.instance, f.lastLine(s.script)]), [
-        [RUNNER_ID, "after_start 3000"],
-        [RUNNER_ID, "ready 3000 ''"],
-        [RUNNER_ID, "ow_host status"],
-        [CONTROLLER_ID, "node_online ow-big 120"],
-        [RUNNER_ID, "ow_host apply"],
+    const agent = { stdout: JSON.stringify({ versions: { agent: "0.6.0" } }) };
+    const sent = (results) => {
+        const f = fake({ parameter: RUNNER_CONFIG, instances: { "ow-test": CONTROLLER_ID, "ow-big": RUNNER_ID }, results });
+        const recipe = join(f.dir, "team.sh");
+        writeFileSync(recipe, RECIPE);
+        const result = f.run(["ci-post-up", "--stack", "s", "--image", recipe], { OW_HOST: "ow-big", OW_INSTANCE: RUNNER_ID });
+        assert.equal(result.status, 0, result.stderr);
+        const calls = f.scripts().map((s) => [s.instance, f.lastLine(s.script).replace(/^(build_image team\.sh) .*/, "$1")]);
+        f.done();
+        return calls;
+    };
+    assert.deepEqual(sent([{ stdout: "runner ow-big online\nnothing changed" }]), [[RUNNER_ID, `post_up 3000 --runner ${RECIPE_CHECK}`]]);
+    // Enrolled and online with something to do: its controller's release, then one call for the rest.
+    assert.deepEqual(sent([{ stdout: "to do: release 0.6.0\nneeds: upgrade" }, agent]), [
+        [RUNNER_ID, `post_up 3000 --runner ${RECIPE_CHECK}`],
         [CONTROLLER_ID, "ow_host status"],
-        [RUNNER_ID, "ow_host upgrade --controller-version 0.6.0"],
+        [RUNNER_ID, `post_up 3000 --controller-version 0.6.0 ${RECIPE_CHECK}`],
+        [RUNNER_ID, "build_image team.sh"],
     ]);
-    f.done();
+    // Not enrolled, or no answer that says it is: enrolled with its controller first.
+    for (const first of [{ stdout: "needs: enrol" }, {}]) {
+        assert.deepEqual(sent([first, {}, { stdout: status }, {}, agent, { stdout: "nothing changed" }]), [
+            [RUNNER_ID, `post_up 3000 --runner ${RECIPE_CHECK}`],
+            [RUNNER_ID, "ready 3000 ''"],
+            [RUNNER_ID, "ow_host status"],
+            [CONTROLLER_ID, "node_online ow-big 120"],
+            [CONTROLLER_ID, "ow_host status"],
+            [RUNNER_ID, `post_up 3000 --controller-version 0.6.0 ${RECIPE_CHECK}`],
+        ]);
+    }
 });
 
 test("a host with no config parameter (older than 0.5.0) still takes the host path", () => {
@@ -491,14 +563,14 @@ test("in a stack whose instanceId is the controller, runner CI commands act on t
     const instances = { "ow-test": CONTROLLER_ID, "ow-big": RUNNER_ID };
     const status = JSON.stringify({ role: "runner", node: "ow-big", budget: { memory: 1024, slots: 2, cpus: 2 } });
     let f = fake({ parameter: RUNNER_CONFIG, instances, stackInstance: CONTROLLER_ID,
-        results: [{}, {}, { stdout: status }, {}, {}, { stdout: JSON.stringify({ versions: { agent: "0.6.0" } }) }] });
+        results: [{}, {}, { stdout: status }, {}, { stdout: JSON.stringify({ versions: { agent: "0.6.0" } }) }, {}] });
     let result = f.run(["ci-post-up", "--stack", "s"], { OW_HOST: "ow-big" });
     assert.equal(result.status, 0, result.stderr);
     const sent = f.scripts().map((s) => [s.instance, f.lastLine(s.script)]);
     assert.deepEqual(sent.filter(([id]) => id === CONTROLLER_ID).map(([, call]) => call),
         ["node_online ow-big 120", "ow_host status"], "the controller is only asked, never changed");
     assert.deepEqual(sent.filter(([id]) => id === RUNNER_ID).map(([, call]) => call).filter((c) => !c.startsWith("ready") && c !== "ow_host status"),
-        ["after_start 3000", "ow_host apply", "ow_host upgrade --controller-version 0.6.0"]);
+        ["post_up 3000 --runner", "post_up 3000 --controller-version 0.6.0"]);
     assert.ok(!f.calls().some((c) => c[1] === "start-instances" || c[1] === "stop-instances"));
     f.done();
     const urn = "urn:pulumi:s::p::open-workspaces-aws:index:Runner$aws:ec2/instance:Instance::ow-big-host";

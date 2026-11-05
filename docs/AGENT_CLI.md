@@ -165,6 +165,10 @@ print one JSON value on stdout, without an interactive prompt or progress banner
   (the machine's owner or a pool admin; works with `--node` too): the new box is made in
   that owner's name space and counts against their limits. A fork inherits no
   shares or SSH keys.
+- `create NAME --ephemeral` (the create operation's `"ephemeral": true`): a box
+  that is never hibernated, such as a CI job's. Idle hibernation skips it,
+  `hibernate` refuses it, and a worker restart or upgrade stops it instead. Every
+  box a workload token creates is ephemeral.
 - `create NAME --pool POOL`: place it on a runner in that placement pool
   (default `default`). Other pools are for pool admins and workload tokens bound
   to that pool; see [placement pools](USERS.md#placement-pools).

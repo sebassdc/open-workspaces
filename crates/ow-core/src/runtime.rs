@@ -246,6 +246,10 @@ pub struct Workspace {
     pub hibernation: Option<String>,
     #[serde(default)]
     pub managed: bool,
+    /// Never hibernated (a CI job's box, gone when its job ends): idle hibernation,
+    /// worker restarts and upgrades stop it instead.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -386,19 +390,22 @@ pub struct Staged {
 impl Staged {
     /// Hashes the files; needs no runtime, so it may run on any thread.
     pub fn seal(&self) -> Result<Sealed> {
-        if self.snapshot.managed_recovery {
-            // Recovery points are chunk-sealed so unchanged reflinked extents are not reread.
+        if self.snapshot.managed_recovery || self.snapshot.name.starts_with(SLEEP) {
+            // Recovery points and hibernations are chunk-sealed so extents they share with
+            // the previous point are not reread. A whole-file hash rereads the box's entire
+            // disk on one thread: about 17 minutes for a 256 GiB disk.
+            let digest = if self.snapshot.managed_recovery {
+                crate::snapshot_digest::CHUNKS_V1
+            } else {
+                self.previous_digest()
+            };
             let (files, stats) = crate::snapshot_digest::seal_directory(
                 &self.staging,
                 &crate::snapshot_store::DATA_FILES,
                 self.previous.as_deref(),
-                crate::snapshot_digest::CHUNKS_V1,
+                digest,
             )?;
-            return Ok((
-                files,
-                Some(crate::snapshot_digest::CHUNKS_V1.into()),
-                Some(stats),
-            ));
+            return Ok((files, Some(digest.into()), Some(stats)));
         }
         // The three files hash in parallel; whole-file digests stay the snapshot format.
         let hashes = std::thread::scope(|scope| {
@@ -412,6 +419,22 @@ impl Staged {
                 })
         });
         Ok((hashes.into_iter().collect::<Result<_>>()?, None, None))
+    }
+
+    /// The previous point's chunk format (its sidecar is reused only in the same chunk
+    /// size); the larger chunks when there is none.
+    fn previous_digest(&self) -> &'static str {
+        use crate::snapshot_digest::{CHUNKS_V1, CHUNKS_V2};
+        let digest = self
+            .previous
+            .as_ref()
+            .and_then(|p| fs::read(p.join("manifest.json")).ok())
+            .and_then(|m| serde_json::from_slice::<Snapshot>(&m).ok())
+            .and_then(|s| s.digest);
+        match digest.as_deref() {
+            Some(CHUNKS_V1) => CHUNKS_V1,
+            _ => CHUNKS_V2,
+        }
     }
 
     fn discard(&self) {
@@ -945,6 +968,9 @@ impl Runtime {
         let now = std::time::Instant::now();
         let mut due = Vec::new();
         for (id, machine) in &self.machines {
+            if self.state.workspaces.get(id).is_some_and(|w| w.ephemeral) {
+                continue;
+            }
             let (Some(cpu), Some(bytes)) =
                 (cpu_ticks(machine.child.id()), tap_bytes(&net, &machine.tap))
             else {
@@ -1218,6 +1244,7 @@ impl Runtime {
             source,
             hibernation: None,
             managed: false,
+            ephemeral: false,
         };
         self.state.next_index += 1;
         self.state.workspaces.insert(id.into(), workspace.clone());
@@ -1449,7 +1476,12 @@ impl Runtime {
     /// Seals a RAM+disk snapshot. With `hibernate` the paused VM is dropped right after
     /// the capture, so nothing the guest does while the files are hashed is lost.
     fn capture(&mut self, id: &str, name: &str, hibernate: bool) -> Result<Value> {
-        self.capture_inner(id, name, hibernate, false, None)
+        let previous = if hibernate {
+            self.recovery_base(id)
+        } else {
+            None
+        };
+        self.capture_inner(id, name, hibernate, false, previous.as_deref())
     }
 
     fn capture_inner(
@@ -1899,6 +1931,7 @@ impl Runtime {
             source: None,
             hibernation: (!cold).then(|| name.to_owned()),
             managed: false,
+            ephemeral: false,
         };
         self.state.next_index += 1;
         self.state.workspaces.insert(id.clone(), workspace);
@@ -2124,15 +2157,23 @@ impl Runtime {
             "recovery-prepare" | "recovery-result" | "recovery-seal" => {
                 self.recovery_operation(request)
             }
-            "create" => self.create(
-                id,
-                u32::try_from(request["memory_mib"].as_u64().unwrap_or(256))?,
-                u32::try_from(request["vcpu_count"].as_u64().unwrap_or(1))?,
-                request["image"].as_str().unwrap_or("alpine"),
-                None,
-                None,
-                Some(crate::common::requested_disk(request)?.unwrap_or(DEFAULT_DISK_GIB)),
-            ),
+            "create" => {
+                let summary = self.create(
+                    id,
+                    u32::try_from(request["memory_mib"].as_u64().unwrap_or(256))?,
+                    u32::try_from(request["vcpu_count"].as_u64().unwrap_or(1))?,
+                    request["image"].as_str().unwrap_or("alpine"),
+                    None,
+                    None,
+                    Some(crate::common::requested_disk(request)?.unwrap_or(DEFAULT_DISK_GIB)),
+                )?;
+                if request["ephemeral"] != true || self.workspace(id)?.ephemeral {
+                    return Ok(summary);
+                }
+                self.state.workspaces.get_mut(id).unwrap().ephemeral = true;
+                self.save()?;
+                self.workspace_summary(id)
+            }
             "resize" => {
                 let existing = self.workspace(id)?;
                 let mut shape = request.clone();
@@ -2388,6 +2429,10 @@ impl Runtime {
                 if workspace.state == "hibernated" {
                     return Ok(json!(workspace));
                 }
+                ensure!(
+                    !workspace.ephemeral,
+                    "an ephemeral box is never hibernated; stop it instead"
+                );
                 let name = format!("{SLEEP}{}", vm::nonce()?);
                 self.capture(id, &name, true)?;
                 let workspace = self.state.workspaces.get_mut(id).unwrap();
@@ -2941,6 +2986,108 @@ mod disk_tests {
         assert_eq!(status["reserved_disk_bytes"], 8 * GIB);
         assert!(status["unwritten_disk_bytes"].as_u64().unwrap() <= 8 * GIB - (60 << 20));
         assert!(status["free_disk_bytes"].as_u64().unwrap() >= after);
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn an_ephemeral_box_is_never_hibernated_and_lists_as_such() {
+        let mut runtime = fixture();
+        let box_ = runtime.state.workspaces.get_mut("legacy").unwrap();
+        box_.state = "running".into();
+        box_.ephemeral = true;
+        let error = runtime
+            .request(&json!({"op":"hibernate","id":"legacy"}))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("never hibernated"),
+            "{error:#}"
+        );
+        assert_eq!(
+            runtime.workspace_summary("legacy").unwrap()["ephemeral"],
+            true
+        );
+        // Other boxes do not carry the field at all (state and list stay as they were).
+        runtime
+            .state
+            .workspaces
+            .get_mut("legacy")
+            .unwrap()
+            .ephemeral = false;
+        assert!(
+            runtime
+                .workspace_summary("legacy")
+                .unwrap()
+                .get("ephemeral")
+                .is_none()
+        );
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn a_hibernation_is_chunk_sealed_in_its_recovery_points_format_and_verifies() {
+        use crate::snapshot_digest::{CHUNKS_V1, CHUNKS_V2};
+        let runtime = fixture();
+        let snapshot = |name: &str, digest: Option<&str>| Snapshot {
+            managed_recovery: false,
+            captured_at: 0,
+            name: name.into(),
+            workspace: "legacy".into(),
+            managed: false,
+            image_digest: None,
+            memory_mib: 1024,
+            vcpu_count: 2,
+            image: "alpine".into(),
+            runtime: crate::common::RUNTIME.into(),
+            cpu: String::new(),
+            kernel_sha256: String::new(),
+            files: BTreeMap::new(),
+            digest: digest.map(str::to_owned),
+            fork: None,
+            disk_only: false,
+        };
+        let staged = |previous: Option<PathBuf>| {
+            let staging = runtime.snapshot_dir(&format!(".pending-{}", vm::nonce().unwrap()));
+            fs::create_dir(&staging).unwrap();
+            for file in ["state", "memory", "disk.ext4"] {
+                fs::write(staging.join(file), file.repeat(1000)).unwrap();
+            }
+            Staged {
+                snapshot: snapshot("sleep-test", None),
+                staging,
+                previous,
+                started: std::time::Instant::now(),
+                paused_ms: 0,
+                index: 1,
+                fork: None,
+            }
+        };
+        // No recovery point: the larger chunks, never a whole-file hash of the disk.
+        assert_eq!(staged(None).seal().unwrap().1.as_deref(), Some(CHUNKS_V2));
+        // A legacy recovery point in 8 MiB chunks: the same size, so its sidecar is reused.
+        let base = runtime.snapshot_dir("sleep-recovery-base");
+        fs::create_dir(&base).unwrap();
+        atomic_json(
+            &base.join("manifest.json"),
+            &snapshot("sleep-recovery-base", Some(CHUNKS_V1)),
+        )
+        .unwrap();
+        let hibernation = staged(Some(base));
+        let (files, digest, stats) = hibernation.seal().unwrap();
+        assert_eq!(digest.as_deref(), Some(CHUNKS_V1));
+        assert!(stats.is_some());
+        assert!(
+            hibernation
+                .staging
+                .join(crate::snapshot_digest::SIDECAR)
+                .is_file()
+        );
+        // A resume verifies the chunk-sealed files.
+        let mut sealed = snapshot("sleep-test", digest.as_deref());
+        sealed.files = files;
+        atomic_json(&hibernation.staging.join("manifest.json"), &sealed).unwrap();
+        fs::rename(&hibernation.staging, runtime.snapshot_dir("sleep-test")).unwrap();
+        let mut runtime = runtime;
+        runtime.verify_snapshot("sleep-test", true).unwrap();
         fs::remove_dir_all(&runtime.root).unwrap();
     }
 

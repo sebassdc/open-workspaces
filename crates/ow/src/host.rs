@@ -552,9 +552,10 @@ fn unpublish(root: &Path, id: &str, port: u16) -> Result<()> {
 /// A service stop: whatever stays running after the stop command is killed, so retry
 /// until every machine is hibernated (a busy machine, e.g. one still resuming, frees
 /// its lock; a failed capture is tried again) instead of giving up. Starts stay refused.
+/// A box that fails does not hold up the others: each round tries every box.
 fn hibernate_all_waiting(root: &Path) {
     loop {
-        match hibernate_round(root, Duration::from_secs(24 * 3600)) {
+        match hibernate_round(root, false) {
             Ok(()) => return,
             Err(e) => eprintln!("{e:#}; retrying in 5 s, starts stay refused"),
         }
@@ -562,12 +563,11 @@ fn hibernate_all_waiting(root: &Path) {
     }
 }
 
-/// Refuses new starts and wakes, then hibernates every running machine. If one
-/// stays running (its capture failed), starts are allowed again and this fails, so
+/// Refuses new starts and wakes, then hibernates every running machine. On the first
+/// one that fails or overruns its budget, starts are allowed again and this fails, so
 /// the caller does not shut the worker down under it.
 fn hibernate_all(root: &Path) -> Result<()> {
-    // Callers run this under 900-1800 s caps (SSM, the upgrader); one machine at a time.
-    let result = hibernate_round(root, Duration::from_secs(840));
+    let result = hibernate_round(root, true);
     if result.is_err() {
         // Called off: the worker keeps running, so it must accept starts and wakes again.
         // Sent even when the quiesce itself failed: a timed-out one may still be applied.
@@ -576,57 +576,91 @@ fn hibernate_all(root: &Path) -> Result<()> {
     result
 }
 
-fn hibernate_round(root: &Path, limit: Duration) -> Result<()> {
-    let deadline = Instant::now() + limit;
+/// How long one machine's hibernation may take: the worker writes its RAM, then seals
+/// what changed since its last recovery point (all of its disk when it has none).
+/// Measured on EBS: about 4 s per GiB of disk read and up to 12 s per GiB of RAM written.
+fn hibernate_budget(workspace: &Value) -> Duration {
+    let gib = |bytes: u64| bytes.div_ceil(1 << 30);
+    let ram = gib(workspace["memory_mib"].as_u64().unwrap_or(0) << 20);
+    let disk = gib(workspace["disk_allocated_bytes"].as_u64().unwrap_or(0));
+    Duration::from_secs(120 + 20 * ram + 4 * disk)
+}
+
+/// With `fail_fast` the first box that fails ends the round (an upgrade gives up at once);
+/// without it every box is tried and the round fails at the end if any still runs.
+fn hibernate_round(root: &Path, fail_fast: bool) -> Result<()> {
     // Any request can queue behind a capture already running, so each waits as long as one.
     let request = |value: Value| {
         wire::connect_waiting(root, &value, wire::reply_wait(&json!({"op":"hibernate"})))
             .map(|(_, v)| v)
     };
-    let result = (|| -> Result<()> {
-        request(json!({"op":"quiesce"}))?;
-        let list = request(json!({"op":"list"}))?;
-        for workspace in list.as_array().context("workspace list")? {
-            let Some(id) = workspace["id"].as_str() else {
-                continue;
-            };
-            if workspace["state"] != "running" && workspace["vmm_running"] != true {
-                continue;
-            }
-            let wait = deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_secs(1));
-            // A local supervisor may stop its own current copy; this never authorizes a start.
-            let placement = workspace
-                .get("placement")
-                .map(|p| serde_json::from_value::<common::Placement>(p.clone()))
-                .transpose()?;
-            ensure!(
-                workspace["managed"] != true || placement.is_some(),
-                "managed copy is missing placement authority"
-            );
-            let hibernate = wire::workspace_request("hibernate", id, placement.as_ref());
-            match wire::connect_waiting(root, &hibernate, wait) {
-                Ok(_) => println!("hibernated {id}"),
-                Err(e) => eprintln!("could not hibernate {id}: {e:#}"),
-            }
+    request(json!({"op":"quiesce"}))?;
+    let list = request(json!({"op":"list"}))?;
+    let list = list.as_array().context("workspace list")?;
+    // Ephemeral boxes last: an upgrade that gives up on a box has stopped no CI job for nothing.
+    let order = list
+        .iter()
+        .filter(|w| w["ephemeral"] != true)
+        .chain(list.iter().filter(|w| w["ephemeral"] == true));
+    for workspace in order {
+        let Some(id) = workspace["id"].as_str() else {
+            continue;
+        };
+        if workspace["state"] != "running" && workspace["vmm_running"] != true {
+            continue;
         }
-        let list = request(json!({"op":"list"}))?;
-        let running: Vec<_> = list
-            .as_array()
-            .context("workspace list")?
-            .iter()
-            .filter(|w| w["state"] == "running" || w["vmm_running"] == true)
-            .filter_map(|w| w["id"].as_str())
-            .collect();
+        // A local supervisor may stop its own current copy; this never authorizes a start.
+        let placement = workspace
+            .get("placement")
+            .map(|p| serde_json::from_value::<common::Placement>(p.clone()))
+            .transpose()?;
         ensure!(
-            running.is_empty(),
-            "could not hibernate {}; the worker keeps running (nothing was shut down)",
-            running.join(", ")
+            workspace["managed"] != true || placement.is_some(),
+            "managed copy is missing placement authority"
         );
-        Ok(())
-    })();
-    result
+        let result = if workspace["ephemeral"] == true {
+            // Never hibernated: its job cannot go on after a restart anyway.
+            wire::connect(
+                root,
+                &wire::workspace_request("stop", id, placement.as_ref()),
+            )
+            .map(|_| println!("stopped ephemeral {id}"))
+            .with_context(|| format!("could not stop ephemeral {id}"))
+        } else {
+            let wait = hibernate_budget(workspace);
+            let hibernate = wire::workspace_request("hibernate", id, placement.as_ref());
+            wire::connect_waiting(root, &hibernate, wait)
+                .map(|_| println!("hibernated {id}"))
+                .with_context(|| {
+                    format!(
+                        "could not hibernate {id} within its {} s budget; the worker keeps \
+                         running (nothing was shut down)",
+                        wait.as_secs()
+                    )
+                })
+        };
+        // Failing fast, the first failure ends the round: the rest would only queue behind
+        // its capture. A service stop tries every box.
+        match result {
+            Ok(()) => {}
+            Err(e) if fail_fast => return Err(e),
+            Err(e) => eprintln!("{e:#}"),
+        }
+    }
+    let list = request(json!({"op":"list"}))?;
+    let running: Vec<_> = list
+        .as_array()
+        .context("workspace list")?
+        .iter()
+        .filter(|w| w["state"] == "running" || w["vmm_running"] == true)
+        .filter_map(|w| w["id"].as_str())
+        .collect();
+    ensure!(
+        running.is_empty(),
+        "could not hibernate {}; the worker keeps running (nothing was shut down)",
+        running.join(", ")
+    );
+    Ok(())
 }
 
 /// Shut down local HTTP proxies, all of them or only one workspace's.
@@ -1004,12 +1038,13 @@ pub fn run(cli: Cli) -> Result<i32> {
             node,
             owner,
             pool,
+            ephemeral,
         } => {
             ensure!(
                 node.is_none() && owner.is_none() && pool.is_none(),
                 "--node, --owner and --pool require a remote controller"
             );
-            json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"disk_gib":disk.unwrap_or(common::DEFAULT_DISK_GIB)})
+            json!({"op":"create","id":id,"memory_mib":memory,"image":image,"vcpu_count":cpus,"disk_gib":disk.unwrap_or(common::DEFAULT_DISK_GIB),"ephemeral":ephemeral})
         }
         Action::Resize {
             id,
@@ -1357,12 +1392,10 @@ mod down_tests {
         let (root, seen) = worker(false);
         let error = hibernate_all(&root).unwrap_err().to_string();
         assert!(error.contains("could not hibernate a"), "{error}");
+        // Fails at once: no further box or check queues behind the failed capture.
+        assert_eq!(ops(&seen), ["quiesce", "list", "hibernate", "quiesce"]);
         assert_eq!(
-            ops(&seen),
-            ["quiesce", "list", "hibernate", "list", "quiesce"]
-        );
-        assert_eq!(
-            seen.lock().unwrap()[4]["closing"],
+            seen.lock().unwrap()[3]["closing"],
             false,
             "starts are allowed again"
         );
@@ -1388,6 +1421,143 @@ mod down_tests {
         assert_eq!(ops(&seen), ["quiesce", "quiesce"]);
         assert_eq!(seen.lock().unwrap()[1]["closing"], false);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_first_failure_stops_the_round_before_any_ci_box_is_stopped() {
+        // Box a fails: b is never tried, and CI box e (listed first) is not stopped for nothing.
+        let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let request = wire::line(&mut stream).unwrap();
+                log.lock().unwrap().push(request.clone());
+                let response = match request["op"].as_str().unwrap() {
+                    "list" => json!({"ok":true,"result":[
+                        {"id":"e","state":"running","ephemeral":true},
+                        {"id":"a","state":"running"},{"id":"b","state":"running"}]}),
+                    "hibernate" => json!({"ok":false,"error":"timed out"}),
+                    _ => json!({"ok":true,"result":{}}),
+                };
+                wire::send(&mut stream, &response).unwrap();
+            }
+        });
+        let error = format!("{:#}", hibernate_all(&root).unwrap_err());
+        assert!(
+            error.contains("could not hibernate a within its 120 s budget"),
+            "{error}"
+        );
+        let seen = seen.lock().unwrap();
+        let steps: Vec<_> = seen
+            .iter()
+            .map(|r| (r["op"].clone(), r["id"].clone()))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                (json!("quiesce"), json!(null)),
+                (json!("list"), json!(null)),
+                (json!("hibernate"), json!("a")),
+                (json!("quiesce"), json!(null)),
+            ]
+        );
+        drop(seen);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ephemeral_boxes_are_stopped_after_the_others_hibernate() {
+        let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            let mut lists = 0;
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let request = wire::line(&mut stream).unwrap();
+                log.lock().unwrap().push(request.clone());
+                let response = match request["op"].as_str().unwrap() {
+                    "list" => {
+                        lists += 1;
+                        let state = if lists == 1 { "running" } else { "stopped" };
+                        json!({"ok":true,"result":[{"id":"e","state":state,"ephemeral":true},
+                            {"id":"a","state":if lists == 1 {"running"} else {"hibernated"}}]})
+                    }
+                    _ => json!({"ok":true,"result":{}}),
+                };
+                wire::send(&mut stream, &response).unwrap();
+            }
+        });
+        hibernate_all(&root).unwrap();
+        let steps: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r["op"].clone(), r["id"].clone()))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                (json!("quiesce"), json!(null)),
+                (json!("list"), json!(null)),
+                (json!("hibernate"), json!("a")),
+                (json!("stop"), json!("e")),
+                (json!("list"), json!(null)),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_service_stop_tries_every_box_when_one_fails() {
+        // Box a always fails; b is hibernated anyway: a stop never starves the boxes after it.
+        let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let request = wire::line(&mut stream).unwrap();
+                log.lock().unwrap().push(request.clone());
+                let response = match (request["op"].as_str().unwrap(), request["id"].as_str()) {
+                    ("list", _) => json!({"ok":true,"result":[
+                        {"id":"a","state":"running"},{"id":"b","state":"running"}]}),
+                    ("hibernate", Some("a")) => json!({"ok":false,"error":"timed out"}),
+                    _ => json!({"ok":true,"result":{}}),
+                };
+                wire::send(&mut stream, &response).unwrap();
+            }
+        });
+        assert!(hibernate_round(&root, false).is_err());
+        let ids: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["op"] == "hibernate")
+            .map(|r| r["id"].clone())
+            .collect();
+        assert_eq!(ids, [json!("a"), json!("b")]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_budget_grows_with_ram_and_allocated_disk() {
+        let budget = |w: Value| hibernate_budget(&w).as_secs();
+        assert_eq!(budget(json!({})), 120);
+        assert_eq!(budget(json!({"memory_mib":4096})), 200);
+        // 16 GiB of RAM on a fully allocated 256 GiB disk: about 24 minutes.
+        assert_eq!(
+            budget(json!({"memory_mib":16384,"disk_allocated_bytes":256u64 << 30})),
+            120 + 320 + 1024
+        );
     }
 
     #[test]
@@ -1418,7 +1588,7 @@ mod managed_shutdown_tests {
                 let placement = json!({"epoch":7,"node":"alpha","transfer":"move1"});
                 let mut lists = 0;
                 for op in if exporting {
-                    vec!["quiesce", "list", "hibernate", "list", "quiesce"]
+                    vec!["quiesce", "list", "hibernate", "quiesce"]
                 } else {
                     vec!["quiesce", "list", "hibernate", "list"]
                 } {

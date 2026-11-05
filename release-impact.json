@@ -2,6 +2,46 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.56",
+      "class": 2,
+      "changes": [
+        "worker",
+        "agent",
+        "controller",
+        "dashboard",
+        "host-layout",
+        "component"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Upgrades and worker restarts fail fast and hibernate faster. A hibernation was sealed with whole-file hashes, so the worker reread a box's entire disk on one thread (about 17 minutes for a 256 GiB disk); the 840 s budget of ow down --hibernate ran out, the client's read timed out (os error 11, Resource temporarily unavailable), every later box got a 1 s budget and the upgrader waited out its fixed 1800 s cap. Hibernations are now chunk-sealed (sha256-chunks, in the chunk size of the box's last durable recovery point), reusing the chunks whose extents that point shares, on up to eight threads. ow down --hibernate stops at the first box that fails or overruns its own budget (120 s + 20 s per GiB of RAM + 4 s per GiB of allocated disk) and calls the shutdown off; the upgrader's cap is the sum of those budgets plus 600 s. Ephemeral boxes (ow create --ephemeral, the create op's ephemeral flag; every box a workload token creates) are never hibernated: idle hibernation skips them, the hibernate op refuses them, and worker restarts and upgrades stop them instead and leave them out of the capture gate and the resume list. The upgrader hands one ow.host.upgrade.step event per step to the host's telemetry intake as each step ends (those the stopped agent missed at the close) and one ow.host.upgrade event when its journal closes; the agent, or on a controller-only host the controller (shown under controller in health.get), stores and forwards them like its other events. ow-aws ci-post-up answers a deploy that changes nothing in one SSM call per host, and after an upgrade applies the config again with the new release's ow-host, so settings the old one did not know are not dropped. A worker service stop still tries every box; ephemeral boxes are stopped after the others hibernated. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 2: the worker restarts through the upgrade policy, which on this upgrade still runs the previous release's hibernation."
+    },
+    {
       "version": "0.9.55",
       "class": 1,
       "changes": [

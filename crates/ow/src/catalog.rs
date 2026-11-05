@@ -2747,6 +2747,17 @@ impl Catalog {
             ))
             .into());
         }
+        // Ephemeral boxes are never hibernated (worker restarts and upgrades stop them). A
+        // workload token's boxes are a program's jobs: always ephemeral.
+        if let Some(ephemeral) = request.get("ephemeral") {
+            ensure!(
+                op == "create" && ephemeral.is_boolean(),
+                "ephemeral is a create flag: true or false"
+            );
+        }
+        if op == "create" && grant.is_some() {
+            request["ephemeral"] = json!(true);
+        }
         let name = request["id"].as_str().context("id")?.to_owned();
         common::address(&name)?;
         // Create or fork for another owner: the new box, its operation and quota are theirs.
