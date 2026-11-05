@@ -417,17 +417,41 @@ pub(super) fn reserve_wake(shared: &Shared, t: &Transfer) -> Result<bool> {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
     let mut compatible_runner = false;
+    // A runner full only of boxes another pool spilled there (docs/MULTINODE.md#spill).
+    let mut room: Option<(String, crate::catalog::Yield)> = None;
     for (node, caps) in nodes {
         let compatible = compatibility.as_ref().is_none_or(|expected| {
             serde_json::from_str::<Value>(&caps).is_ok_and(|caps| &caps["compat"] == expected)
         });
         compatible_runner |= compatible;
-        if compatible
-            && capable(&c, &node, input.disk_bytes.saturating_mul(2)).is_ok()
-            && c.reserve_wake(t.id, &node, &input).is_ok()
-        {
-            return Ok(true);
+        if compatible && capable(&c, &node, input.disk_bytes.saturating_mul(2)).is_ok() {
+            match c.reserve_wake(t.id, &node, &input) {
+                Ok(()) => return Ok(true),
+                Err(e) if room.is_none() => {
+                    room = e.downcast_ref().cloned().map(|y| (node.clone(), y))
+                }
+                Err(_) => {}
+            }
         }
+    }
+    if let Some((node, crate::catalog::Yield(boxes))) = room {
+        drop(c);
+        let stopped = crate::catalog::Catalog::make_room(shared, &boxes, "a wake");
+        // Reserved right after the stops, before the deletes. Not reserved (a box spilled
+        // while the stops ran took the room, or it was reserved anyway): the next pass
+        // tries again.
+        {
+            let c = shared.lock().unwrap();
+            if c.transfer(t.id).is_ok_and(|now| now.step == Step::Preparing)
+                && let Err(e) = c.reserve_wake(t.id, &node, &input)
+            {
+                eprintln!("placement_yield: wake {} not reserved on {node}: {e:#}", t.id);
+            }
+        }
+        // Off this pass: the wake goes on while they are deleted.
+        let shared = shared.clone();
+        std::thread::spawn(move || crate::catalog::Catalog::delete_stopped(&shared, &stopped));
+        return Ok(true);
     }
     if !compatible_runner && compatibility.is_some() {
         c.advance_transfer(

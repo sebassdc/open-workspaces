@@ -1,7 +1,7 @@
 //! Spill (docs/MULTINODE.md#spill): a pool whose own runners are full may place up to
 //! `max_boxes` boxes on a named runner of another pool, while that runner keeps
-//! `placement.spill_keep_free_mib` of memory for its own pool. Both are controller
-//! settings, changed with `ow config set` and read on every create.
+//! `placement.spill_keep_free_mib` of memory (and `_vcpus`, `_disk_gib`) for its own pool.
+//! All are controller settings, changed with `ow config set` and read on every create.
 use anyhow::{Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,8 @@ use std::path::Path;
 
 pub(crate) const RULES: &str = "placement.spill";
 pub(crate) const KEEP_FREE: &str = "placement.spill_keep_free_mib";
+pub(crate) const KEEP_FREE_VCPUS: &str = "placement.spill_keep_free_vcpus";
+pub(crate) const KEEP_FREE_DISK: &str = "placement.spill_keep_free_disk_gib";
 const MAX_RULES: usize = 8;
 const MAX_BOXES: u64 = 64;
 
@@ -20,6 +22,26 @@ pub(crate) struct Rule {
     pub pool: String,
     pub node: String,
     pub max_boxes: u64,
+}
+
+/// What every spill runner keeps free for its own pool after a spilled box is placed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Reserve {
+    pub memory_mib: u64,
+    pub cpus: u64,
+    pub disk_bytes: u64,
+}
+
+/// The reserve the settings hold.
+pub(crate) fn reserve(settings: &Value) -> Reserve {
+    Reserve {
+        memory_mib: settings[KEEP_FREE].as_u64().unwrap_or(0),
+        cpus: settings[KEEP_FREE_VCPUS].as_u64().unwrap_or(0),
+        disk_bytes: settings[KEEP_FREE_DISK]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_mul(crate::common::GIB),
+    }
 }
 
 /// The string grammar: comma-separated `pool:node:max_boxes`; empty means no rule.
@@ -221,10 +243,18 @@ fn usage(db: &Connection, node: &str, pool: &str) -> Result<(u64, u64, Vec<Strin
     ))
 }
 
-/// A runner's free memory and slots after the boxes and transfers reserved on it.
-fn free(db: &Connection, n: &Value) -> Result<(u64, u64)> {
+/// A runner's free memory, slots, vCPUs and disk after the boxes and transfers reserved on it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Free {
+    memory_mib: u64,
+    slots: u64,
+    cpus: u64,
+    disk_bytes: u64,
+}
+
+fn free(db: &Connection, n: &Value) -> Result<Free> {
     let id = n["id"].as_str().unwrap_or_default();
-    let (mut used, mut count) = (0u64, 0u64);
+    let (mut used, mut count, mut cpus, mut disk) = (0u64, 0u64, 0u64, 0u64);
     if table(db, "resources")?
         && db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('resources') WHERE name='reserved_mib')",
@@ -232,38 +262,47 @@ fn free(db: &Connection, n: &Value) -> Result<(u64, u64)> {
             |r| r.get::<_, bool>(0),
         )?
     {
-        (used, count) = db.query_row(
-            "SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(CASE WHEN reserved_mib>0 THEN 1 ELSE 0 END),0) FROM resources WHERE kind='machine' AND node=?1",
+        (used, count, cpus) = db.query_row(
+            "SELECT COALESCE(SUM(reserved_mib),0),COALESCE(SUM(CASE WHEN reserved_mib>0 THEN 1 ELSE 0 END),0),COALESCE(SUM(reserved_cpus),0) FROM resources WHERE kind='machine' AND node=?1",
             [id],
-            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64)),
         )?;
     }
     if table(db, "node_usage")? {
-        let extra: Option<(i64, i64)> = db
+        let extra: Option<(i64, i64, i64)> = db
             .query_row(
-                "SELECT extra_mib,extra_slots FROM node_usage WHERE node=?1",
+                "SELECT extra_mib,extra_slots,extra_cpus FROM node_usage WHERE node=?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((mib, slots)) = extra {
+        if let Some((mib, slots, extra_cpus)) = extra {
             used += mib as u64;
             count += slots as u64;
+            cpus += extra_cpus as u64;
         }
     }
     if table(db, "transfer_reservations")? {
-        let (mib, slots): (i64, i64) = db.query_row(
-            "SELECT COALESCE(SUM(memory_mib),0),COUNT(*) FROM transfer_reservations WHERE node=?1",
+        let (mib, slots, transfer_cpus, bytes): (i64, i64, i64, i64) = db.query_row(
+            "SELECT COALESCE(SUM(memory_mib),0),COUNT(*),COALESCE(SUM(cpus),0),COALESCE(SUM(disk_bytes),0) FROM transfer_reservations WHERE node=?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         used += mib as u64;
         count += slots as u64;
+        cpus += transfer_cpus as u64;
+        disk += bytes as u64;
     }
-    Ok((
-        n["memory_mib"].as_u64().unwrap_or(0).saturating_sub(used),
-        n["slots"].as_u64().unwrap_or(0).saturating_sub(count),
-    ))
+    let cap = &n["capabilities"];
+    Ok(Free {
+        memory_mib: n["memory_mib"].as_u64().unwrap_or(0).saturating_sub(used),
+        slots: n["slots"].as_u64().unwrap_or(0).saturating_sub(count),
+        cpus: cap["vcpus"].as_u64().unwrap_or(0).saturating_sub(cpus),
+        disk_bytes: cap["available_disk_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(disk),
+    })
 }
 
 fn draining(n: &Value) -> bool {
@@ -289,7 +328,7 @@ pub(crate) fn status(root: &Path, only: Option<&str>) -> Result<Value> {
     let db = crate::nodes::db(root)?;
     let settings = crate::telemetry::settings(&db)?;
     let rules: Vec<Rule> = serde_json::from_value(settings[RULES].clone()).unwrap_or_default();
-    let keep_free = settings[KEEP_FREE].as_u64().unwrap_or(0);
+    let keep = reserve(&settings);
     let inventory = crate::nodes::inventory(root)?;
     let nodes = inventory.as_array().cloned().unwrap_or_default();
     let mut pools: Vec<String> = rules.iter().map(|r| r.pool.clone()).collect();
@@ -310,18 +349,18 @@ pub(crate) fn status(root: &Path, only: Option<&str>) -> Result<Value> {
         {
             let id = n["id"].as_str().unwrap_or_default();
             let (boxes, pending, _) = usage(&db, id, &pool)?;
-            let (memory, slots) = free(&db, n)?;
+            let f = free(&db, n)?;
             homes.push(json!({"node":id,"online":n["online"]==true,"active":n["capabilities"]["active"]!=false,
-                "draining":draining(n),"boxes":boxes,"pending":pending,"free_slots":slots,"free_memory_mib":memory}));
+                "draining":draining(n),"boxes":boxes,"pending":pending,"free_slots":f.slots,"free_memory_mib":f.memory_mib}));
         }
         let live = home_live(&inventory, &pool);
         let mut spill = vec![];
         for rule in rules.iter().filter(|r| r.pool == pool) {
             let n = nodes.iter().find(|n| n["id"] == rule.node.as_str());
             let (boxes, pending, names) = usage(&db, &rule.node, &pool)?;
-            let (memory, slots) = match n {
+            let f = match n {
                 Some(n) => free(&db, n)?,
-                None => (0, 0),
+                None => Free::default(),
             };
             let state = match n {
                 _ if rule.max_boxes == 0 => "off",
@@ -334,15 +373,27 @@ pub(crate) fn status(root: &Path, only: Option<&str>) -> Result<Value> {
                 }
                 _ if !live => "no_home",
                 _ if boxes >= rule.max_boxes => "full",
-                _ if memory <= keep_free || slots < 2 => "reserve",
+                _ if f.memory_mib <= keep.memory_mib
+                    || f.slots < 2
+                    || f.cpus <= keep.cpus
+                    || (keep.disk_bytes > 0 && f.disk_bytes <= keep.disk_bytes) =>
+                {
+                    "reserve"
+                }
                 _ => "available",
             };
             spill.push(json!({"node":rule.node,"max_boxes":rule.max_boxes,"boxes":boxes,"pending":pending,"box_names":names,
-                "free_memory_mib":memory,"free_memory_after_reserve_mib":memory.saturating_sub(keep_free),"state":state}));
+                "free_memory_mib":f.memory_mib,"free_memory_after_reserve_mib":f.memory_mib.saturating_sub(keep.memory_mib),
+                "free_vcpus":f.cpus,"free_vcpus_after_reserve":f.cpus.saturating_sub(keep.cpus),
+                "free_disk_gib":f.disk_bytes / crate::common::GIB,
+                "free_disk_gib_after_reserve":f.disk_bytes.saturating_sub(keep.disk_bytes) / crate::common::GIB,"state":state}));
         }
         out.push(json!({"pool":pool,"home_nodes":homes,"spill":spill}));
     }
-    Ok(json!({"version":settings["version"],"keep_free_mib":keep_free,"pools":out}))
+    Ok(
+        json!({"version":settings["version"],"keep_free_mib":keep.memory_mib,"keep_free_vcpus":keep.cpus,
+        "keep_free_disk_gib":keep.disk_bytes / crate::common::GIB,"pools":out}),
+    )
 }
 
 #[cfg(test)]
