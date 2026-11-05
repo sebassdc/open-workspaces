@@ -67,6 +67,7 @@ mod terminal;
 mod tokens;
 #[cfg(target_os = "linux")]
 mod transfers;
+mod upgrade;
 mod wire;
 
 // Firecracker runtime and shared limits live in ow-core; keep their `crate::` paths.
@@ -258,6 +259,18 @@ enum Action {
         /// The server uses tailnet sign-in (`tailscale serve`); no Cloudflare login.
         #[arg(long)]
         tailnet: bool,
+    },
+    /// Replace this client with the release the controller runs (or --version), verified first.
+    Upgrade {
+        /// Install exactly this release (vX.Y.Z), even an older one.
+        #[arg(long)]
+        version: Option<String>,
+        /// Only compare: exit 0 when current, 10 when an upgrade is available.
+        #[arg(long)]
+        check: bool,
+        /// One JSON line: {"from","to","seconds","upgraded"}.
+        #[arg(long)]
+        json: bool,
     },
     /// Authenticated browser dashboard and scoped workspace API.
     Dashboard {
@@ -1108,6 +1121,16 @@ fn main_result() -> anyhow::Result<i32> {
                 "Host participation requires Linux x86-64; macOS remains a remote client"
             );
         }
+    }
+    if let Action::Upgrade {
+        version,
+        check,
+        json,
+    } = cli.command
+    {
+        return upgrade::run(version, check, json, || {
+            admin_client::server_version(cli.data_dir, cli.server, cli.local_mode)
+        });
     }
     if let Action::Login { url, tailnet } = &cli.command {
         client::login(url, *tailnet)?;

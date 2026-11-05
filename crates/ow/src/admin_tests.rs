@@ -84,6 +84,7 @@ const LOCAL: &[(&str, &str)] = &[
         "disaster recovery with the gateway down",
     ),
     ("login", "client-side sign-in"),
+    ("upgrade", "replaces this machine's own client"),
 ];
 
 /// Admin commands not yet ops; each gets its contract in its own change.
