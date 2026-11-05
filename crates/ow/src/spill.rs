@@ -119,7 +119,7 @@ fn pool_images(inventory: &Value, pool: &str) -> Option<Vec<Value>> {
     )
 }
 
-fn missing_images(inventory: &Value, pool: &str, node: &str) -> Vec<String> {
+fn missing_images(db: &Connection, inventory: &Value, pool: &str, node: &str) -> Vec<String> {
     let Some(wanted) = pool_images(inventory, pool) else {
         return vec![];
     };
@@ -128,18 +128,26 @@ fn missing_images(inventory: &Value, pool: &str, node: &str) -> Vec<String> {
         .into_iter()
         .flatten()
         .find(|n| n["id"] == node);
-    // A runner with the image store pulls a catalog image on demand, as placement allows.
-    if lender.is_some_and(|n| n["capabilities"]["image_store_v1"] == true) {
-        return vec![];
-    }
     let has = lender
         .and_then(|n| n["capabilities"]["images"].as_array().cloned())
         .unwrap_or_default();
+    // A runner with the image store pulls an image the catalog has, as placement allows.
+    let store = lender.is_some_and(|n| n["capabilities"]["image_store_v1"] == true);
     wanted
         .iter()
         .filter(|i| !has.contains(i))
         .filter_map(|i| i.as_str().map(str::to_owned))
+        .filter(|i| !(store && in_catalog(db, i)))
         .collect()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn in_catalog(db: &Connection, image: &str) -> bool {
+    crate::image_catalog::resolve(db, image).is_ok()
+}
+#[cfg(not(any(target_os = "linux", test)))]
+fn in_catalog(_: &Connection, _: &str) -> bool {
+    false
 }
 
 /// Checks a new setting against the runners it names. `Err` is the reason it is refused;
@@ -186,7 +194,7 @@ pub(crate) fn check(
                 rule.node, rule.node
             ));
         }
-        for image in missing_images(inventory, &rule.pool, &rule.node) {
+        for image in missing_images(db, inventory, &rule.pool, &rule.node) {
             warnings.push(format!(
                 "{} does not have image {image}, which pool {}'s runners have",
                 rule.node, rule.pool
@@ -321,7 +329,7 @@ pub(crate) fn status(root: &Path, only: Option<&str>) -> Result<Value> {
                 Some(n) if n["revoked"] == true => "inert_revoked",
                 Some(n) if n["online"] != true => "inert_offline",
                 Some(n) if draining(n) || n["capabilities"]["active"] == false => "inert_draining",
-                Some(_) if !missing_images(&inventory, &pool, &rule.node).is_empty() => {
+                Some(_) if !missing_images(&db, &inventory, &pool, &rule.node).is_empty() => {
                     "inert_image_missing"
                 }
                 _ if !live => "no_home",

@@ -210,8 +210,8 @@ acknowledgement, a few seconds), `next_request` for `dashboard.ui_bundle`.
 ```
 
 `placement.spill` takes the string grammar (`pool:node:max_boxes`, comma-separated)
-or a list of `{"pool", "node", "max_boxes"}`; both store the same value. Its
-runners must be enrolled and in another pool.
+or a list of `{"pool", "node", "max_boxes"}`; both store the same value. The
+pool cannot be `default`; its runners must be enrolled and in another pool.
 
 <!-- admin:example op=config.set -->
 ```json
