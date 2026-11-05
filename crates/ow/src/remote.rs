@@ -959,9 +959,13 @@ async fn admin(app: &App, identity: crate::catalog::Identity, request: Request) 
     let root = app.dashboard.clone().unwrap();
     let controller = format!("https://{}/_nodes", app.config.hostname);
     let catalog = app.catalog.clone();
+    let mutating = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| v["op"].as_str().and_then(crate::admin::spec))
+        .is_none_or(|spec| spec.mutating);
     let answer = tokio::task::spawn_blocking(move || {
         // Admin changes wait for in-flight placements, as host invitations always did.
-        let _admission = catalog.as_ref().map(|c| c.lock());
+        let _admission = catalog.as_ref().filter(|_| mutating).map(|c| c.lock());
         let ctx = crate::admin::Context {
             root: &root,
             actor,
@@ -1107,6 +1111,16 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
                 })),
                 requests: Arc::new(Semaphore::new(64)),
             };
+            // The admin API for this host's root or controller user, if the node controller
+            // does not already serve it (docs/ADMIN_API.md).
+            if let Some(root) = dashboard.clone() {
+                let controller = format!("https://{}/_nodes", app.config.hostname);
+                tokio::spawn(async move {
+                    if let Err(error) = crate::admin::serve_socket(root, Some(controller)).await {
+                        eprintln!("admin socket stopped: {error:#}");
+                    }
+                });
+            }
             let refresh = app.clone();
             // Tailnet sign-in uses no signing keys, so there is nothing to refresh.
             tokio::spawn(async move {

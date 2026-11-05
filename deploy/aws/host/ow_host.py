@@ -229,6 +229,8 @@ def validate(config):
         raise Refused(f"config: invalid dashboard owner {owner!r}")
     if owner and not (logins or capability):
         raise Refused("config: dashboard.owner needs a dashboard (logins or capability)")
+    if owner and not capability and owner.lower() not in (login.lower() for login in logins):
+        raise Refused("config: dashboard.owner must be one of dashboard.logins, or the owner can never sign in")
     images = config.get("developerImages") or []
     if any(image != "ubuntu" for image in images):
         raise Refused(f"config: developerImages takes ubuntu, not {images!r}")

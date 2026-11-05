@@ -179,6 +179,10 @@ class Render(unittest.TestCase):
                 config(dashboard={"logins": ["you@example.com"], "owner": bad})
         with self.assertRaises(h.Refused):
             config(dashboard={"logins": [], "owner": "you@example.com"})
+        with self.assertRaises(h.Refused):
+            config(dashboard={"logins": ["other@example.com"], "owner": "you@example.com"})
+        self.assertEqual(config(dashboard={"logins": [], "capability": "example.test/cap/ow", "owner": "you@example.com"})
+                         ["dashboard"]["owner"], "you@example.com")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             catalog = root / "catalog.sqlite3"

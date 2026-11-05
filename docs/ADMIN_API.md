@@ -23,10 +23,17 @@ flowchart LR
   identity (the gate `/api/hosts/*` has always used). Email never grants
   authority, and pool admins (`pool_admins`, who manage any box) are not admins
   of the controller. Workload tokens reach only `POST /api/operation`.
-- **Over `<controller data dir>/admin.sock`** (mode 0600, served by the
-  controller that `ow host up` starts), a peer whose uid is 0 or the controller's
-  own user. Anyone who passes could already edit the database, so the socket adds
-  no power. Only `GET /api/version` and `POST /api/admin` are served there.
+- **Over `<controller data dir>/admin.sock`** (mode 0600), a peer whose uid is 0
+  or the controller's own user. Anyone who passes could already edit the
+  database, so the socket adds no power. Only `GET /api/version` and
+  `POST /api/admin` are served there. The node controller (`ow host up`) serves
+  it, or the dashboard (`ow dashboard`) on a host without one; whichever holds
+  `admin.lock` serves, and the other takes over if it stops. With neither
+  running, admin commands on the host stop with `controller_unreachable`: there
+  is no direct-database fallback, and none is needed to start them again.
+- **AWS hosts** (`deploy/aws`): the `dashboardOwner` input names the owner's
+  tailnet login; it binds once they have signed in to the dashboard and the
+  dashboard has restarted. It also makes them the dashboard's pool owner.
 
 A signed-in user who is not the owner gets `403 admin_required`; the controller
 logs an `admin_refused` warning (no table row). One admin; more than one is not
@@ -100,12 +107,16 @@ Every mutating op that passed the gate writes one `admin_audit` row, success or
 failure: time, op, actor, `via` (`https` or `local`), the request, the result
 (`ok`, `unchanged` or the error code), the configuration version after a
 `config.set`, and for `config.set` and `node.pool.set` the value and the previous
-one. A change and its row commit in one transaction. Reads write nothing. The
+one. A change and its row commit in one transaction. Reads write nothing.
+`ow config history` and the idempotent `token.revoke` read this table, so they
+know only changes made through the API (from v0.9.53): a token revoked before
+then is `not_found`. The
 actor is the verified identity: `{"kind":"access"|"tailnet","subject","email"}`
 or `{"kind":"host","uid","claimed_user"}`. Tokens and invitation secrets are
-never stored. Each successful change also emits an `admin_change` controller log
-line and OTLP log (`op`, `key` or the name it changed, `actor_email` or
-`actor_uid`, `via`). `config_changes` keeps its rows, with the actor now
+never stored. Each successful change also writes an `admin_change` line to the
+serving process's journal (`op`, `key` or the name it changed, `actor_email` or
+`actor_uid`, `via`); the node controller also forwards it as an OTLP log, the
+dashboard does not yet (the table is the record either way). `config_changes` keeps its rows, with the actor now
 `access:EMAIL`, `tailnet:LOGIN` or `host:CLAIMED_USER_OR_UID`.
 
 Ops that hand out a secret once (`token.issue`, `host.invite`) take an
@@ -349,5 +360,8 @@ These will become ops, each with its contract in its own change: `scaler`,
 build --publish-to` (which need long-running jobs). Until then they run on the
 controller host as before.
 
-A test fails when a command is in none of these lists, or when an op has no
-command.
+A test mirrors these lists: it fails when a command of `ow` is in none of them
+(an op, a workspace command, a local one with its reason, or a planned op), or
+when an op has no command, no documented example, or no CLI case that builds its
+example exactly. `image list` counts as a workspace command; its `--catalog`
+form is one of the planned ops.

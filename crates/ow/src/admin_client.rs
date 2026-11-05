@@ -14,6 +14,8 @@ use std::{
 
 /// Exit status for a usable answer that reports an API error.
 const API_ERROR: i32 = 1;
+/// Exit status for a usage error found before anything is sent.
+const USAGE: i32 = 2;
 /// Exit status when the server cannot be reached or refuses the sign-in.
 const UNREACHABLE: i32 = 3;
 
@@ -121,6 +123,16 @@ fn transport(
     Ok(socket.filter(|s| s.exists()).map(Transport::Socket))
 }
 
+/// No usable sign-in for the server (no cloudflared, or an expired session).
+#[derive(Debug)]
+struct SignIn(String);
+impl std::fmt::Display for SignIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for SignIn {}
+
 /// An answer: HTTP status and body bytes.
 type Reply = (u16, Vec<u8>);
 
@@ -165,7 +177,7 @@ pub(crate) fn socket_call(
 }
 
 fn https_call(url: &str, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
-    let token = crate::client::token(url)?;
+    let token = crate::client::token(url).map_err(|e| anyhow::Error::new(SignIn(e.to_string())))?;
     let client = reqwest::blocking::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -254,7 +266,10 @@ pub(crate) fn run(
         Some(key) => key,
         None => crate::common::nonce()?,
     };
-    crate::common::identifier(&key)?;
+    if let Err(error) = crate::common::identifier(&key) {
+        eprintln!("usage: --operation-key: {error}");
+        return Ok(USAGE);
+    }
     let request = request(&action, &key).context("not an admin command")?;
     let op = request["op"].as_str().unwrap_or_default().to_owned();
     let spec = admin::spec(&op).context("unregistered admin op")?;
@@ -265,12 +280,17 @@ pub(crate) fn run(
         Action::NodeJoin { output, .. } => Some(output.clone()),
         _ => None,
     };
-    let mut staged = output.as_deref().map(stage).transpose()?;
-    if op == "host.invite" && staged.is_none() {
-        ensure!(
-            unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1,
-            "use --output PRIVATE_FILE when stdout is not a terminal"
-        );
+    let mut staged = match output.as_deref().map(stage).transpose() {
+        Ok(staged) => staged,
+        Err(error) => {
+            eprintln!("usage: --output: {error:#}");
+            return Ok(USAGE);
+        }
+    };
+    if op == "host.invite" && staged.is_none() && unsafe { libc::isatty(libc::STDOUT_FILENO) } != 1
+    {
+        eprintln!("usage: use --output PRIVATE_FILE when stdout is not a terminal");
+        return Ok(USAGE);
     }
     let Some(transport) = transport(data_dir, server, local)? else {
         eprintln!("no_server: run ow login <server>, or use --local on the controller host");
@@ -295,6 +315,9 @@ pub(crate) fn run(
                 Transport::Socket(path) => eprintln!(
                     "controller_unreachable: {}: {error:#}; start the controller (ow host up)",
                     path.display()
+                ),
+                Transport::Https(url) if error.is::<SignIn>() => eprintln!(
+                    "authentication_or_admission: run ow login {url} (use --tailnet for a tailnet server): {error}"
                 ),
                 Transport::Https(_) => eprintln!(
                     "server_unreachable: check the selected HTTPS server, network/tailnet connection and TLS trust ({error:#})"

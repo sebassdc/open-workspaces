@@ -93,11 +93,11 @@ function installBundle({version, marker = '', api}) {
   const tarball = execFileSync('python3', args, {encoding: 'utf8'}).trim();
   return owRun(['dashboard-ui', 'install', tarball]);
 }
+// The whole suite can run against the released bundle format instead of the built-in copy:
+// installed now, selected once the dashboard serves the admin API (docs/ADMIN_API.md).
 if (process.env.OW_E2E_UI === 'bundle') {
-  // The whole suite then runs against the released bundle format instead of the built-in copy.
-  for (const result of [installBundle({}), owRun(['config', 'set', 'dashboard.ui_bundle', JSON.parse(fs.readFileSync(path.join(repo, 'crates/ow/ui/ui.json'))).version])]) {
-    if (result.code !== 0) throw Error(`UI bundle setup failed: ${result.output}`);
-  }
+  const installed = installBundle({});
+  if (installed.code !== 0) throw Error(`UI bundle setup failed: ${installed.output}`);
 }
 
 const dashboard = spawn(ow, ['--data-dir', data, 'dashboard', '--config', config, '--listen', `127.0.0.1:${dashboardPort}`], {
@@ -109,6 +109,15 @@ process.on('exit', cleanup);
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => process.exit(0));
 dashboard.on('exit', code => { console.error(`ow dashboard exited (${code})`); process.exit(1); });
 await new Promise(resolve => dashboard.stdout.on('data', chunk => { process.stdout.write(chunk); if (/listening/.test(chunk)) resolve(); }));
+if (process.env.OW_E2E_UI === 'bundle') {
+  let selected;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    selected = owRun(['config', 'set', 'dashboard.ui_bundle', JSON.parse(fs.readFileSync(path.join(repo, 'crates/ow/ui/ui.json'))).version]);
+    if (selected.code === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  if (selected.code !== 0) throw Error(`UI bundle setup failed: ${selected.output}`);
+}
 
 // Like `tailscale serve`: replace client-sent identity headers with the peer's own.
 function identity(headers) {

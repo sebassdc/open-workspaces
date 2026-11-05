@@ -282,6 +282,13 @@ fn the_cli_builds_the_documented_request() {
         let built = admin_client::request(&cli.command, &key).unwrap();
         assert_eq!(built, first(op), "ow {}", args.join(" "));
     }
+    for spec in OPS {
+        assert!(
+            cases.iter().any(|(op, _)| *op == spec.name),
+            "no CLI case builds the documented {} request",
+            spec.name
+        );
+    }
     for args in [
         &["nodes"][..],
         &["list"],
@@ -696,7 +703,7 @@ fn admin_socket_answers_like_the_handler() {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(serve_socket(served))
+            .block_on(serve_socket(served, None))
             .unwrap();
     });
     let socket = root.join(SOCKET);

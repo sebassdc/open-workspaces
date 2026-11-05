@@ -192,7 +192,7 @@ pub(crate) struct Context<'a> {
 }
 
 /// An API error: HTTP status, stable code, one plain sentence and an object of details.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Failure {
     pub status: u16,
     pub code: &'static str,
@@ -235,8 +235,18 @@ fn not_found(kind: &str, name: &str) -> Failure {
     failure(404, "not_found", format!("{kind} {name} not found."))
 }
 
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+impl std::error::Error for Failure {}
+
 impl From<anyhow::Error> for Failure {
     fn from(error: anyhow::Error) -> Self {
+        if let Some(failure) = error.downcast_ref::<Failure>() {
+            return failure.clone();
+        }
         if let Some(rejection) = error.downcast_ref::<crate::limits::Rejection>() {
             return failure(409, "rejected", rejection.to_string());
         }
@@ -279,8 +289,29 @@ pub(crate) fn parse(raw: &Value) -> std::result::Result<AdminRequest, Failure> {
         .map_err(|e| invalid_request(e.to_string().trim_end_matches('.')))
 }
 
+/// The admin tables: every admin change, and the operation keys of ops that hand out a
+/// secret once. Additive; made here, not on every controller database open.
+pub(crate) fn tables(db: &Connection) -> Result<()> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS admin_audit(id INTEGER PRIMARY KEY,unix_s INTEGER NOT NULL,op TEXT NOT NULL,actor TEXT NOT NULL,via TEXT NOT NULL CHECK(via IN ('https','local')),request TEXT NOT NULL,result TEXT NOT NULL,config_version INTEGER,change TEXT);
+      CREATE TABLE IF NOT EXISTS admin_operations(key TEXT PRIMARY KEY,op TEXT NOT NULL,request_hash TEXT NOT NULL,unix_s INTEGER NOT NULL);")?;
+    Ok(())
+}
+
 /// Serves one admin request after the caller passed the admin gate: (HTTP status, body).
 pub(crate) fn handle(ctx: &Context, body: &[u8]) -> (u16, Value) {
+    static READY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    let ready = READY.get_or_init(Default::default);
+    if !ready.lock().is_ok_and(|r| r.contains(ctx.root)) {
+        match crate::nodes::db(ctx.root).and_then(|db| tables(&db)) {
+            Ok(()) => {
+                if let Ok(mut r) = ready.lock() {
+                    r.insert(ctx.root.to_path_buf());
+                }
+            }
+            Err(error) => return (503, Failure::from(error).body(None)),
+        }
+    }
     let raw: Value = match serde_json::from_slice(body) {
         Ok(raw) => raw,
         Err(_) => return (400, invalid_request("body is not JSON").body(None)),
@@ -483,7 +514,6 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             expected_version,
         } => {
             known_key(&key)?;
-            let text = value_text(&key, &value)?;
             let mut db = crate::nodes::db(root)?;
             let tx = immediate(&mut db)?;
             let current = crate::telemetry::settings(&tx)?;
@@ -500,9 +530,12 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 )
                 .with(json!({"expected":expected,"current":version})));
             }
-            let typed = crate::telemetry::typed(&key, &text).map_err(|e| invalid_value(&key, e))?;
+            let text = value_text(&key, &value)?;
+            let typed = crate::telemetry::typed(&key, &text)
+                .map_err(|e| invalid_value(&key, format!("{e:#}")))?;
             if key == crate::dashboard_ui::SETTING {
-                crate::dashboard_ui::selectable(root, &text).map_err(|e| invalid_value(&key, e))?;
+                crate::dashboard_ui::selectable(root, &text)
+                    .map_err(|e| invalid_value(&key, format!("{e:#}")))?;
             }
             let previous = current[key.as_str()].clone();
             let change = json!({"key":key,"value":typed,"previous":previous});
@@ -744,17 +777,39 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 cpus.unwrap_or(2),
             );
             crate::common::identifier(&node).map_err(|e| invalid_value("node", e))?;
+            if node == "local" {
+                return Err(invalid_value("node", "local is reserved"));
+            }
+            if !(1..=3600).contains(&ttl) {
+                return Err(invalid_value("ttl", "must be within 1-3600 seconds"));
+            }
+            crate::common::host_limits(memory, slots, cpus)
+                .map_err(|e| invalid_value("limits", e))?;
             let hash = crate::nodes::digest(&json!([node, ttl, memory, slots, cpus]).to_string());
+            let db = crate::nodes::db(root)?;
+            // Checked again in the invitation's transaction; here for the plainer answer.
             replayed(
-                &crate::nodes::db(root)?,
+                &db,
                 &operation_key,
                 "host.invite",
                 &hash,
                 &node,
                 "invitation for",
             )?;
-            // The invitation commits in its own transaction; the key is remembered right after.
-            let invitation = crate::nodes::invitation(
+            if db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND (credential_hash IS NOT NULL OR revoked=1))",
+                [&node],
+                |r| r.get::<_, bool>(0),
+            )? {
+                return Err(failure(
+                    409,
+                    "already_exists",
+                    format!("node {node} is already enrolled or revoked; use a new node ID."),
+                )
+                .with(json!({"name":node})));
+            }
+            drop(db);
+            let invitation = crate::nodes::invitation_with(
                 root,
                 &node,
                 ttl,
@@ -763,19 +818,20 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 cpus,
                 ctx.controller.as_deref(),
                 |_| Ok(()),
-            )
-            .map_err(|e| match Failure::from(e) {
-                f if f.code == "internal" => invalid_value(
-                    "node",
-                    "invitation refused; check the node ID, expiry and limits",
-                ),
-                f => f,
-            })?;
-            let mut db = crate::nodes::db(root)?;
-            let tx = immediate(&mut db)?;
-            remember(&tx, &operation_key, "host.invite", &hash)?;
-            audit(&tx, "host.invite", &ctx.actor, raw, "ok", None, None)?;
-            tx.commit()?;
+                |tx| {
+                    replayed(
+                        tx,
+                        &operation_key,
+                        "host.invite",
+                        &hash,
+                        &node,
+                        "invitation for",
+                    )?;
+                    remember(tx, &operation_key, "host.invite", &hash)?;
+                    audit(tx, "host.invite", &ctx.actor, raw, "ok", None, None)?;
+                    Ok(())
+                },
+            )?;
             changed("host.invite", &ctx.actor, json!({"node":node}));
             Ok(invitation)
         }
@@ -786,25 +842,26 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             cpus,
         } => {
             crate::common::identifier(&node).map_err(|e| invalid_value("node", e))?;
+            crate::common::host_limits(memory, slots, cpus)
+                .map_err(|e| invalid_value("limits", e))?;
             if !node_known(root, &node)? {
                 return Err(not_found("node", &node));
             }
-            let result = crate::nodes::budget(root, &node, memory, slots, cpus).map_err(|e| {
-                if e.is::<crate::limits::Rejection>() {
+            let result = crate::nodes::budget_with(root, &node, memory, slots, cpus, |tx| {
+                audit(tx, "host.budget", &ctx.actor, raw, "ok", None, None)?;
+                Ok(())
+            })
+            .map_err(|e| {
+                if e.is::<crate::limits::Rejection>()
+                    || e.is::<Failure>()
+                    || e.downcast_ref::<rusqlite::Error>().is_some()
+                {
                     Failure::from(e)
                 } else {
-                    invalid_value("node", format!("{e:#}"))
+                    // The budget's own refusals (an enrolled runner, idle boxes to lower it).
+                    invalid_value("node", e)
                 }
             })?;
-            audit(
-                &crate::nodes::db(root)?,
-                "host.budget",
-                &ctx.actor,
-                raw,
-                "ok",
-                None,
-                None,
-            )?;
             changed("host.budget", &ctx.actor, json!({"node":node}));
             Ok(result)
         }
@@ -892,21 +949,32 @@ fn peer_allowed(uid: u32) -> bool {
 
 /// Serves `GET /api/version` and `POST /api/admin` on `<root>/admin.sock` (mode 0600). The
 /// caller holds the controller's single-instance lock, so a leftover socket is stale.
-pub(crate) async fn serve_socket(root: PathBuf) -> Result<()> {
+pub(crate) async fn serve_socket(root: PathBuf, fallback_controller: Option<String>) -> Result<()> {
     use axum::{
         Router,
-        body::Bytes,
+        body::Body,
         extract::{ConnectInfo, State},
         http::{HeaderMap, StatusCode},
         response::IntoResponse,
         routing::{get, post},
     };
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt, unix::fs::PermissionsExt};
+    // The node controller and the dashboard both offer the socket; whichever holds the lock
+    // serves it, and the other takes over if that one stops.
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(root.join("admin.lock"))?;
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
     let path = root.join(SOCKET);
     let _ = std::fs::remove_file(&path);
     let listener = tokio::net::UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    let controller = saved_controller(&root);
+    let controller = saved_controller(&root).or(fallback_controller);
     let reply = |status: u16, body: Value| {
         (
             StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -942,7 +1010,7 @@ pub(crate) async fn serve_socket(root: PathBuf) -> Result<()> {
                       ConnectInfo(peer): ConnectInfo<Peer>,
                       headers: HeaderMap,
                       uri: axum::http::Uri,
-                      body: Bytes| async move {
+                      body: Body| async move {
                     if !peer_allowed(peer.uid) {
                         return reply(
                             403,
@@ -954,6 +1022,12 @@ pub(crate) async fn serve_socket(root: PathBuf) -> Result<()> {
                             .body(None),
                         );
                     }
+                    let Ok(body) = axum::body::to_bytes(body, BODY_LIMIT + 1).await else {
+                        return reply(
+                            413,
+                            failure(413, "too_large", "Admin request too large.").body(None),
+                        );
+                    };
                     if let Some(f) = shape(&headers, uri.query().is_some(), body.len()) {
                         return reply(f.status, f.body(None));
                     }
@@ -985,13 +1059,13 @@ pub(crate) async fn serve_socket(root: PathBuf) -> Result<()> {
                 },
             ),
         )
-        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state((root, controller));
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<Peer>(),
     )
     .await?;
+    drop(lock);
     Ok(())
 }
 

@@ -68,8 +68,9 @@ export interface HostArgs {
     poolAdmins?: pulumi.Input<pulumi.Input<string>[]>;
     /** The tailnet login of the controller's admin: the one person whose verified tailnet
      * identity may call the admin API (`ow config`, `ow node-pool`, `ow token`, `ow host`)
-     * from their own machine. Bound once they have signed in to the dashboard. Needs a
-     * dashboard. Default: none (admin commands only on the host). */
+     * from their own machine, and the dashboard's pool owner. Bound once they have signed in
+     * to the dashboard. Needs a dashboard that admits them. Default: none (admin commands
+     * only on the host). */
     dashboardOwner?: pulumi.Input<string>;
     /**
      * Developer images (`ubuntu` only for now) to build on the host after boot: the `dev`
@@ -278,6 +279,9 @@ export function hostConfig(c: HostConfigInputs): object {
         dashboardLoginList([owner]);
         if (c.dashboardLogins.length === 0 && !capability) {
             throw new Error("dashboardOwner needs a dashboard: set dashboardLogins or dashboardCapability");
+        }
+        if (!capability && !c.dashboardLogins.some((login) => login.toLowerCase() === owner.toLowerCase())) {
+            throw new Error("dashboardOwner must be one of dashboardLogins, or the owner can never sign in");
         }
     }
     if (c.storeUrl) storeRunnerPolicy("aws", c.storeUrl);

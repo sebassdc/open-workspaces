@@ -101,6 +101,7 @@ test("the config is validated in the component", () => {
         [{ tailscaleAuthKeySecretArn: "arn:x", poolAdmins: ["a@example.com"] }, /poolAdmins needs a dashboard/],
         [{ tailscaleAuthKeySecretArn: "arn:x", dashboardLogins: ["a@example.com"], poolAdmins: ["a@example.com\nX=1"] }, /invalid dashboard login/],
         [{ tailscaleAuthKeySecretArn: "arn:x", dashboardOwner: "a@example.com" }, /dashboardOwner needs a dashboard/],
+        [{ tailscaleAuthKeySecretArn: "arn:x", dashboardLogins: ["b@example.com"], dashboardOwner: "a@example.com" }, /must be one of dashboardLogins/],
         [{ tailscaleAuthKeySecretArn: "arn:x", dashboardLogins: ["a@example.com"], dashboardOwner: "a@example.com\nX=1" }, /invalid dashboard login/],
     ]) {
         assert.throws(() => hostConfig({ ...base, ...bad }), message);
