@@ -120,9 +120,10 @@ that was running and came back `stopped` (its VMM gone or ended): its RAM state
 is lost, its disk and its uptime as a box are not.
 
 Not covered: an unreadable record, a `pidfd_open` failing for lack of fds or
-memory, or a kill that fails leave that VMM running with its record and TAP (the
-box's start refuses while its recorded VMM still runs, so no second VMM opens its
-disk, and the next worker tries again); a
+memory, or a kill that fails leave that VMM running with its record and TAP, and
+the next worker tries again. While a readable record names a VMM that still runs,
+the box's start refuses, so no second VMM opens its disk; with an unreadable
+record only the TAP the VMM still holds stops one; a
 worker that dies between spawning a VMM and writing its record leaves that VMM
 unrecorded. An adopted box keeps the in-guest setup it was started with (network,
 tools bundle): a worker release that changes that setup reaches it at its next

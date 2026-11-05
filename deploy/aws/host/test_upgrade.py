@@ -275,6 +275,11 @@ class HandOverBlocker(unittest.TestCase):
             ops = u.HostOps()
             with mock.patch.object(u.HostOps, "worker_status", return_value={"worker_handover_v1": True}):
                 self.assertIn("not found", ops.handover_blocker("old", "new"))
+                for release in ("old", "new"):  # a kernel on neither side still differs from a match
+                    assets = h.p(f"{h.SRV}/releases/{release}/assets/official/release-v1")
+                    assets.mkdir(parents=True)
+                    (assets / "firecracker-v1").write_bytes(b"vmm")
+                self.assertIn("not found", ops.handover_blocker("old", "new"))
 
 
 class Fake:
