@@ -61,6 +61,19 @@ pub(crate) fn random_secret() -> Result<String> {
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
+/// What a journal keeps of a request: a put's file contents only as their SHA-256, so a file
+/// put into a box (a credential, a runner registration) never stays in a database. Journals
+/// only compare a stored request with a retried one; nothing replays it.
+pub(crate) fn journaled(request: &Value) -> Value {
+    let mut kept = request.clone();
+    if kept["op"] == "put"
+        && let Some(data) = kept.get("data").and_then(Value::as_str)
+    {
+        kept["data"] = json!({"sha256": digest(data)});
+    }
+    kept
+}
+
 pub(crate) fn digest(secret: &str) -> String {
     format!("{:x}", Sha256::digest(secret.as_bytes()))
 }
@@ -2328,7 +2341,7 @@ fn journal_request(root: &Path, request: &Value, fencing_worker: bool) -> Result
         .optional()?;
     if let Some((previous, response)) = previous {
         ensure!(
-            previous == request.to_string(),
+            previous == journaled(request).to_string(),
             "operation key reused with different request"
         );
         if let Some(response) = response {
@@ -2382,7 +2395,7 @@ fn journal_request(root: &Path, request: &Value, fencing_worker: bool) -> Result
     }
     tx.execute(
         "INSERT INTO effects(key,request) VALUES(?1,?2)",
-        params![key, request.to_string()],
+        params![key, journaled(request).to_string()],
     )?;
     tx.commit()?;
     #[cfg(all(test, target_os = "linux"))]
@@ -2440,4 +2453,22 @@ pub(crate) fn drain_inventory(
         Duration::from_secs(10),
     )?
     .1)
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    #[test]
+    fn a_journal_keeps_a_puts_contents_only_as_their_hash() {
+        let put = json!({"op":"put","id":"b","path":"/x","data":"c2VjcmV0"});
+        let kept = journaled(&put);
+        assert_eq!(kept["data"], json!({"sha256": digest("c2VjcmV0")}));
+        assert!(!kept.to_string().contains("c2VjcmV0"));
+        // Same contents, same fingerprint; other contents differ; other ops are untouched.
+        assert_eq!(journaled(&put), kept);
+        assert_ne!(journaled(&json!({"op":"put","id":"b","path":"/x","data":"b3RoZXI="})), kept);
+        let exec = json!({"op":"exec","id":"b","command":"true"});
+        assert_eq!(journaled(&exec), exec);
+    }
 }

@@ -1,9 +1,10 @@
 //! GitHub Actions runner pools on the controller (docs/ACTIONS.md). Every 2 s one thread
 //! reads `actions.pools`, lists each repository's runners on GitHub (an unchanged list costs
 //! no rate limit) and runs `actions::plan`. Each box it makes or removes gets its own thread,
-//! with its own catalog connection, so creates, hand-offs and deletes run side by side and
-//! none waits on the dashboard's catalog lock. A pool whose launch failed (its runners are
-//! full, say) holds until one of its boxes is removed, or for 10 s.
+//! so GitHub calls and waits of different boxes overlap; their box operations go through the
+//! catalog like any other (one at a time, as a runner's worker runs them). A pool whose
+//! launch failed (its runners are full, say) holds until one of its boxes is removed, or for
+//! 10 s.
 //!
 //! A box: create (ephemeral, through the pool's workload token) -> a single-use runner
 //! registration (JIT config) from the GitHub App -> put it in the box -> start the runner.
@@ -52,7 +53,7 @@ fn now_ms() -> i64 {
 
 struct Shared {
     root: PathBuf,
-    pool_admins: Vec<String>,
+    catalog: Arc<Mutex<crate::catalog::Catalog>>,
     entries: Mutex<BTreeMap<String, Entry>>,
     /// Pool -> unix s until which it makes no box.
     holds: Mutex<HashMap<String, i64>>,
@@ -68,7 +69,7 @@ static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
 /// Starts the pools' thread (once per process); with no pool configured it only reads the
 /// setting every pass.
-pub(crate) fn start(root: &Path, pool_admins: Vec<String>) {
+pub(crate) fn start(root: &Path, catalog: Arc<Mutex<crate::catalog::Catalog>>) {
     if SHARED.get().is_some() {
         return;
     }
@@ -81,7 +82,7 @@ pub(crate) fn start(root: &Path, pool_admins: Vec<String>) {
     };
     let shared = Arc::new(Shared {
         root: root.to_path_buf(),
-        pool_admins,
+        catalog,
         entries: Mutex::new(entries),
         holds: Mutex::default(),
         errors: Mutex::default(),
@@ -313,23 +314,39 @@ fn timing(shared: &Shared, name: &str, key: &str) {
 }
 
 fn error(shared: &Shared, pool: &str, message: String) {
-    eprintln!("actions pools: {pool}: {message}");
-    shared
-        .errors
-        .lock()
-        .unwrap()
-        .insert(pool.to_owned(), (now(), message));
+    let mut errors = shared.errors.lock().unwrap();
+    // A fault that repeats every pass is logged once a minute; status always has the latest.
+    let quiet = errors
+        .get(pool)
+        .is_some_and(|(at, _)| now() - at < 60);
+    if !quiet {
+        eprintln!("actions pools: {pool}: {message}");
+        errors.insert(pool.to_owned(), (now(), message));
+    }
 }
 
 // ------------------------------------------------------------------------- boxes
 
 /// One box op as the pool's workload token: its owner, its placement pool, ephemeral.
 fn box_op(shared: &Shared, token: &str, op: Value) -> Result<Value> {
-    let mut catalog = crate::catalog::Catalog::secondary(&shared.root, shared.pool_admins.clone())?;
+    let mut catalog = shared
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("catalog lock poisoned"))?;
     let (identity, pool) = crate::tokens::by_name(&catalog.db, token)?
         .with_context(|| format!("workload token {token} not found (ow token list)"))?;
     let user = catalog.user(&identity)?;
     catalog.operation(user, crate::tokens::scoped(op, &pool)?)
+}
+
+/// Whether a launch still owns its box: the planner may have timed it out meanwhile.
+fn launching(shared: &Shared, name: &str) -> bool {
+    shared
+        .entries
+        .lock()
+        .unwrap()
+        .get(name)
+        .is_some_and(|e| e.phase == Phase::Launching)
 }
 
 /// A new box's entry, in the launching phase: its name.
@@ -366,16 +383,18 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64) {
         recent.push_back(json!({"box":name,"pool":pool.name,"create_ms":now_ms()}));
     }
     let result = (|| -> Result<()> {
-        let create = json!({"op":"create","id":name,"image":pool.image,"memory_mib":pool.memory_mib,
-            "vcpu_count":pool.vcpu_count,"disk_gib":pool.disk_gib.unwrap_or(crate::common::DEFAULT_DISK_GIB),"ephemeral":true});
-        box_op(shared, &pool.token, create).context("create")?;
-        timing(shared, &name, "ready_ms");
+        // The registration first: a GitHub fault then costs no box.
         let (runner_id, jit) = shared
             .github
             .jit_config(app_id, &pool.repo, &name, &pool.labels)
             .context("runner registration")?;
         update(shared, &name, |e| e.runner_id = Some(runner_id));
         timing(shared, &name, "registered_ms");
+        let create = json!({"op":"create","id":name,"image":pool.image,"memory_mib":pool.memory_mib,
+            "vcpu_count":pool.vcpu_count,"disk_gib":pool.disk_gib.unwrap_or(crate::common::DEFAULT_DISK_GIB),"ephemeral":true});
+        box_op(shared, &pool.token, create).context("create")?;
+        timing(shared, &name, "ready_ms");
+        ensure!(launching(shared, &name), "timed out while it was made");
         let data = STANDARD.encode(jit.as_bytes());
         drop(jit);
         // A just-made box answers at once; allow a slow first boot.
@@ -391,6 +410,7 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64) {
             .context("starting the runner")?;
         let code = started["exit_code"].as_i64().or(started["result"]["exit_code"].as_i64());
         ensure!(code == Some(0), "{START} exited {code:?}");
+        ensure!(launching(shared, &name), "timed out while it was started");
         Ok(())
     })();
     match result {
@@ -400,6 +420,19 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64) {
                 e.started = Some(now());
             });
             timing(shared, &name, "started_ms");
+        }
+        Err(_) if !launching(shared, &name) => {
+            // The planner's timeout removal owns it now; the registration it minted is in the
+            // entry (or the entry is gone with the box): unregister it if it was left behind.
+            if let Some(e) = shared.entries.lock().unwrap().get(&name).cloned()
+                && e.runner_id.is_some()
+            {
+                return;
+            }
+            // Its entry is gone with whatever existed then: clean up what was made after.
+            let _ = shared.github.remove_runner_named(app_id, &pool.repo, &name);
+            let _ = box_op(shared, &pool.token, json!({"op":"stop","id":name}));
+            let _ = box_op(shared, &pool.token, json!({"op":"delete","id":name}));
         }
         Err(e) => {
             error(shared, &pool.name, format!("{name}: launch failed: {e:#}"));
@@ -536,6 +569,8 @@ pub(crate) fn set_app_key(root: &Path, pem: &str) -> Result<Value> {
     let changed = fs::read(&path).map_or(true, |old| old != pem.as_bytes());
     if changed {
         let tmp = root.join(format!("{KEY_FILE}.tmp"));
+        // A leftover could keep other permissions: mode applies only to a new file.
+        let _ = fs::remove_file(&tmp);
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -745,6 +780,14 @@ impl GitHub {
                 .context("JIT config")?
                 .to_owned(),
         ))
+    }
+
+    /// Unregisters a runner by name, if GitHub lists it.
+    fn remove_runner_named(&self, app_id: u64, repo: &str, name: &str) -> Result<()> {
+        if let Some(r) = self.runners(app_id, repo)?.get(name) {
+            self.remove_runner(app_id, repo, r.id)?;
+        }
+        Ok(())
     }
 
     /// Unregisters a runner; one already gone is fine. Busy runners are refused by GitHub.

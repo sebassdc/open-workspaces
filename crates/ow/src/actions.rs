@@ -13,7 +13,7 @@ pub(crate) const APP_ID: &str = "actions.github_app_id";
 
 /// A runner that was started but never came online by then failed to start.
 pub(crate) const OFFLINE_S: i64 = 5 * 60;
-/// Hard cap on a box, busy or not.
+/// A job running longer than this is cut off and its box removed.
 pub(crate) const LIFETIME_S: i64 = 3 * 3600;
 /// An idle runner this old is replaced by a fresh one.
 pub(crate) const IDLE_MAX_S: i64 = 6 * 3600;
@@ -90,7 +90,8 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Pool>> {
     ensure!(pools.len() <= 16, "at most 16 pools");
     let mut names = std::collections::HashSet::new();
     for pool in &pools {
-        identifier("name", &pool.name, 20)?;
+        // Its boxes are named NAME-<12 hex>, within a box name's 32 characters.
+        identifier("name", &pool.name, 16)?;
         ensure!(names.insert(&pool.name), "pool {} is listed twice", pool.name);
         let (owner, repo) = pool.repo.split_once('/').unwrap_or_default();
         let part = |s: &str, extra: &[u8]| {
@@ -198,6 +199,7 @@ pub(crate) struct Entry {
 /// What GitHub lists for one runner.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct Runner {
+    pub id: u64,
     pub status: String,
     pub busy: bool,
 }
@@ -251,7 +253,13 @@ pub(crate) fn plan(
         let action = match e.phase {
             Phase::Removing => (now >= e.retry_at).then(|| remove("removal retried", true)),
             Phase::Launching => (age > LAUNCH_TIMEOUT_S).then(|| remove("its start timed out", true)),
-            Phase::Started if age > LIFETIME_S => Some(remove("over the lifetime limit", true)),
+            Phase::Started if e.busy.is_some_and(|b| now - b > LIFETIME_S) => {
+                Some(remove("its job ran over the time limit", true))
+            }
+            // Never longer than an idle life and a job, whatever GitHub says or cannot say.
+            Phase::Started if age > IDLE_MAX_S + LIFETIME_S => {
+                Some(remove("over the lifetime limit", true))
+            }
             Phase::Started => match runners {
                 None => None,
                 Some(runners) => {
@@ -278,7 +286,9 @@ pub(crate) fn plan(
                             Some(p) if p.spec() != e.spec => {
                                 Some(remove("its pool's settings changed", false))
                             }
-                            Some(_) if age > IDLE_MAX_S => Some(remove("idle too long", false)),
+                            Some(_) if now - e.started.unwrap_or(e.created) > IDLE_MAX_S => {
+                                Some(remove("idle too long", false))
+                            }
                             Some(_) => None,
                         },
                     }
@@ -290,7 +300,8 @@ pub(crate) fn plan(
             actions.push(action);
         }
     }
-    for p in pools {
+    // New boxes need a registration from GitHub: none while it cannot be read.
+    for p in pools.iter().filter(|_| runners.is_some()) {
         if held(&p.name) {
             continue;
         }
@@ -347,6 +358,7 @@ mod tests {
 
     fn online(busy: bool) -> Runner {
         Runner {
+            id: 1,
             status: "online".into(),
             busy,
         }
@@ -443,21 +455,39 @@ mod tests {
     }
 
     #[test]
-    fn without_github_only_limits_apply_and_failed_removals_retry() {
-        let p = pool(1, 3);
+    fn without_github_only_limits_apply_nothing_is_made_and_failed_removals_retry() {
+        let p = pool(3, 4);
+        let cap = IDLE_MAX_S + LIFETIME_S;
         let mut entries = BTreeMap::new();
         entries.insert("old".to_string(), entry(&p, Phase::Started, 0));
-        entries.insert("new".to_string(), entry(&p, Phase::Started, LIFETIME_S));
+        let mut long_job = entry(&p, Phase::Started, cap);
+        long_job.busy = Some(cap);
+        entries.insert("long".to_string(), long_job);
         let mut stuck = entry(&p, Phase::Removing, 0);
-        stuck.retry_at = LIFETIME_S + 5;
+        stuck.retry_at = cap + 5;
         entries.insert("stuck".to_string(), stuck);
+        // No launch: a new box needs a registration from GitHub.
         assert_eq!(
-            plan(LIFETIME_S + 1, &[p.clone()], &entries, None, &|_| false),
+            plan(cap + 1, &[p.clone()], &entries, None, &|_| false),
             vec![Action::Remove { name: "old".into(), why: "over the lifetime limit", force: true }]
         );
-        assert!(
-            plan(LIFETIME_S + 6, &[p], &entries, None, &|_| false)
-                .contains(&Action::Remove { name: "stuck".into(), why: "removal retried", force: true })
+        let later = plan(cap + LIFETIME_S + 1, &[p], &entries, None, &|_| false);
+        assert!(later.contains(&Action::Remove { name: "stuck".into(), why: "removal retried", force: true }));
+        assert!(later.contains(&Action::Remove { name: "long".into(), why: "its job ran over the time limit", force: true }));
+    }
+
+    #[test]
+    fn an_idle_runner_is_replaced_after_its_idle_life_and_a_long_job_is_not() {
+        let p = pool(1, 2);
+        let mut entries = BTreeMap::new();
+        entries.insert("idle".to_string(), entry(&p, Phase::Started, 0));
+        let mut busy = entry(&p, Phase::Started, 0);
+        busy.busy = Some(IDLE_MAX_S - 60);
+        entries.insert("busy".to_string(), busy);
+        let runners = HashMap::from([("idle".to_string(), online(false)), ("busy".to_string(), online(true))]);
+        assert_eq!(
+            plan(IDLE_MAX_S + 1, &[p], &entries, Some(&runners), &|_| false),
+            vec![Action::Remove { name: "idle".into(), why: "idle too long", force: false }]
         );
     }
 
@@ -469,7 +499,7 @@ mod tests {
         entries.insert("offline".to_string(), entry(&p, Phase::Started, 0));
         let runners = HashMap::from([(
             "offline".to_string(),
-            Runner { status: "offline".into(), busy: false },
+            Runner { id: 2, status: "offline".into(), busy: false },
         )]);
         assert!(plan(30, &[p.clone()], &entries, Some(&runners), &|_| false).is_empty());
         assert_eq!(

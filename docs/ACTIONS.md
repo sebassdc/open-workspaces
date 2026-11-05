@@ -51,7 +51,7 @@ Each pool:
 
 | Field | Meaning |
 | --- | --- |
-| `name` | 1 to 20 lowercase letters, digits or `-`; it prefixes each box's name. |
+| `name` | 1 to 16 lowercase letters, digits or `-`; it prefixes each box's name. |
 | `repo` | `OWNER/NAME`: runners are registered on this repository. |
 | `labels` | The runners' labels (1 to 16). |
 | `token` | The workload token the pool's boxes are made with (by name). |
@@ -67,11 +67,13 @@ boxes are deleted and its busy ones finish. `[]` turns every pool off.
 
 ## How a box is made and removed
 
-Each box has its own thread and its own catalog connection, so creates,
-hand-offs and deletes run side by side and do not wait on the dashboard.
+Each box has its own thread, so one box's GitHub calls and waits never hold up
+another's. Their box operations go through the catalog like any client's, and a
+runner's worker runs them one at a time; the warm runners keep that off a job's
+start path.
 
-1. **Create** the box through the pool's token (ephemeral, in the token's pool).
-2. **Register**: a single-use runner registration (JIT config) from the App.
+1. **Register**: a single-use runner registration (JIT config) from the App.
+2. **Create** the box through the pool's token (ephemeral, in the token's pool).
 3. **Hand off**: put the registration at `/home/dev/.ow-ci/jitconfig` and run
    `ow-ci-runner-start` in the box.
 4. **Idle** until GitHub assigns a job; **busy** while it runs.
@@ -80,20 +82,24 @@ hand-offs and deletes run side by side and do not wait on the dashboard.
 
 A launch that fails (a full runner, an image missing) removes what it made and
 holds that pool's new boxes until one of its boxes is removed, or for 10 s; other
-pools carry on. An idle runner that GitHub just gave a job is never removed: a
+pools carry on. While GitHub cannot be read (no App id or key, an outage, a rate
+limit) no box is made; boxes are still removed when they reach a limit. An idle runner that GitHub just gave a job is never removed: a
 removal for a settings change or age asks GitHub first, which refuses a busy
 runner.
 
-Limits: a runner not online 5 minutes after it started is removed, as is an idle
-runner after 6 hours (replaced by a fresh one) and any box after 3 hours. A
-controller restart removes the boxes it was still making or removing and keeps
-the started ones.
+Limits: a runner not online 5 minutes after it started is removed; an idle runner
+is replaced by a fresh one after 6 hours; a job still running after 3 hours is
+cut off and its box removed. A controller restart removes the boxes it was still
+making or removing and keeps the started ones. A pool's boxes are removed with
+the workload token they were made with: revoke a token only after its pool's
+boxes are gone.
 
 **GitHub calls.** One list of the repository's runners per pass (`ETag`, so an
 unchanged list costs no rate limit), one registration per box, and one
 unregister only when an idle runner is removed. The App key lives in a 0600 file
 in the controller's data directory and in memory; no key, token or registration
-is logged, returned or put in the catalog.
+is logged, returned or put in the catalog: journals keep a put's contents only as
+their SHA-256.
 
 ## Image
 
