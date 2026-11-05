@@ -2,6 +2,45 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.57",
+      "class": 2,
+      "changes": [
+        "worker",
+        "agent",
+        "controller",
+        "dashboard",
+        "component"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "GitHub Actions runner pools (docs/ACTIONS.md): the controller keeps warm single-use GitHub Actions runners registered and idle, each in its own ephemeral box made through a workload token, so a queued job starts as soon as GitHub assigns it; the box is deleted once GitHub drops its runner after the job. Settings actions.pools and actions.github_app_id (read live every 2 s; idle boxes of an old shape are replaced, busy ones finish); admin ops actions.status and actions.app_key.set (the key is kept 0600, never returned, redacted in the audit log); CLI ow actions status and ow actions app-key set. Ephemeral boxes also never get a recovery point (backup recover skips them), and snapshot, fork, restore, image saves and every transfer (move, park, fork to another runner) refuse one before anything is reserved; a drain deletes a stopped ephemeral box instead of parking it. Journals (the controller's operation journal and the runner agent's effect journal) keep a put's file contents only as their SHA-256. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 2: the worker restarts through the upgrade policy (0.9.56's chunk-sealed hibernation)."
+    },
+    {
       "version": "0.9.56",
       "class": 2,
       "changes": [
