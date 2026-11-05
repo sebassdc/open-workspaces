@@ -1143,12 +1143,14 @@ fn main_result() -> anyhow::Result<i32> {
         if cli.local_mode {
             options.push("--local".into());
         }
+        let https = admin_client::https(cli.data_dir.clone(), cli.server.clone(), cli.local_mode)?;
         return upgrade::run(
             version,
             check,
             json,
             || admin_client::server_version(cli.data_dir, cli.server, cli.local_mode),
             options,
+            https,
         );
     }
     if let Action::Login { url, tailnet } = &cli.command {

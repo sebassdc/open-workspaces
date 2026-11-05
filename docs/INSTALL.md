@@ -86,21 +86,27 @@ platform's executable from that GitHub release and checks it as the installer
 does: the digest must match the asset's `.sha256`, the release's `SHA256SUMS`
 must list that digest for the asset, the header must be this platform's
 executable, and the new binary must report the expected version. The new binary
-then runs its own `ow status` against the same controller, with the same
-`--server`, `--data-dir` or `--local` this command got, within 30 seconds; it
-must report `"connected": true` and `"compatibility": {"next_action": null}`.
+then runs its own `ow status` against the same HTTPS server (the saved login, or
+the `--server` this command got) within 30 seconds; it must report
+`"connected": true` and `"compatibility": {"next_action": null}`. A controller
+reached over this host's local socket (`--local`, or `--data-dir` without
+`--server`) cannot check that, so there `ow upgrade` targets the controller's
+release.
 Only then is it renamed over the running client, keeping its permissions. Any
 failed check leaves the current client in place.
 
 If the latest release cannot be found, its assets are not all published yet,
 a check fails or its `status` does, `ow upgrade` falls back to the release the
 controller runs (`GET /api/version`, which can lag the latest release) and says
-why. A latest release refused by its `status` is not downloaded again for 10
-minutes (recorded in `upgrade-refused` beside the client's `client.json`). It
-refuses, before downloading anything, when the client was started through a
-symlink (as the installer does) and when it is a host's own release (a file in a
-host's `releases/` directory, which the host's services run): upgrade a host
-with `ow-host upgrade`. A newer latest release is only downloaded when the
+why. A latest release that fails any step after its `.sha256` was found is not
+downloaded again for 10 minutes (recorded in `upgrade-refused` beside the
+client's `client.json`), and that refusal prints one line to standard error, so
+a timer's log shows it even with `--json`. Small requests (the latest lookup,
+`.sha256`, `SHA256SUMS`) time out after 10 seconds; the client download after 5
+minutes. It refuses, before downloading anything, when the client was started
+through a symlink (as the installer does), when it cannot write to the client's
+directory, and when it is a host's own release (a file in a host's `releases/`
+directory, which the host's services run): upgrade a host with `ow-host upgrade`. A newer latest release is only downloaded when the
 controller answers `GET /api/version`, since its compatibility cannot be checked
 otherwise.
 
