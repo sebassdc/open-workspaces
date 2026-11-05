@@ -91,7 +91,10 @@ impl Fake {
                         json!({"name":format!("{}@{}",request["image"]["name"].as_str().unwrap(),request["image"]["version"].as_i64().unwrap()),"image_digest":request["image"]["reference"]["digest"]})
                     }
                     "create" => {
-                        let m = json!({"id":id,"memory_mib":request["memory_mib"].as_u64().unwrap_or(256),"vcpu_count":request["vcpu_count"].as_u64().unwrap_or(1),"image":request["image"].as_str().unwrap_or("alpine"),"image_digest":request["image_digest"],"state":"running","source":null,"disk_bytes":request["disk_gib"].as_u64().unwrap_or(8)*common::GIB});
+                        let mut m = json!({"id":id,"memory_mib":request["memory_mib"].as_u64().unwrap_or(256),"vcpu_count":request["vcpu_count"].as_u64().unwrap_or(1),"image":request["image"].as_str().unwrap_or("alpine"),"image_digest":request["image_digest"],"state":"running","source":null,"disk_bytes":request["disk_gib"].as_u64().unwrap_or(8)*common::GIB});
+                        if request["ephemeral"] == true {
+                            m["ephemeral"] = json!(true);
+                        }
                         machines.insert(id.into(), m.clone());
                         m
                     }

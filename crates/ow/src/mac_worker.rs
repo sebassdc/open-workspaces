@@ -1064,6 +1064,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             node,
             owner,
             pool,
+            ephemeral: _,
         } => {
             ensure!(
                 node.is_none() && owner.is_none() && pool.is_none(),

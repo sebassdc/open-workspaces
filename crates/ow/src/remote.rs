@@ -3375,6 +3375,16 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(node("job"), "beta");
+        // A workload token's boxes are a program's jobs: ephemeral, never hibernated.
+        let listed = crate::wire::request(&root.join("nodes/beta"), json!({"op":"list"})).unwrap();
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["ephemeral"] == true),
+            "{listed}"
+        );
         let registration = base64::engine::general_purpose::STANDARD.encode(b"{\"one-time\":true}");
         for op in [
             json!({"op":"put","id":"job","path":"/run/registration.json","data":registration}),

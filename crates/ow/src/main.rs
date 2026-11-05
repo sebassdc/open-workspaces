@@ -349,6 +349,9 @@ enum Action {
         /// Place it on a runner in this pool (default: `default`; others: pool admins only).
         #[arg(long)]
         pool: Option<String>,
+        /// Never hibernate it (a CI job's box): worker restarts and upgrades stop it instead.
+        #[arg(long)]
+        ephemeral: bool,
     },
     /// Change a stopped workspace's resources; next start is a cold boot.
     Resize {

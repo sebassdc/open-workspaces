@@ -698,6 +698,7 @@ impl Runtime {
                 source: intent.fork_source.clone(),
                 hibernation: (ram && !intent.cold).then(|| intent.snapshot.clone()),
                 managed: true,
+                ephemeral: false,
             };
             self.state.next_index += 1;
             self.state.workspaces.insert(id.into(), workspace);
@@ -766,6 +767,7 @@ impl Runtime {
                     source: None,
                     hibernation: None,
                     managed: true,
+                    ephemeral: false,
                 },
             );
             self.state.placements.insert(
