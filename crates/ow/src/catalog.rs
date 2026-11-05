@@ -249,10 +249,10 @@ impl Dispatch {
 }
 
 /// A runner's own box fits only once boxes another pool spilled there are stopped
-/// (docs/MULTINODE.md#spill): their owners and names. Reads as the capacity refusal it
-/// replaces, for any caller that does not make room.
+/// (docs/MULTINODE.md#spill): their owners, names and whether they are ephemeral. Reads as
+/// the capacity refusal it replaces, for any caller that does not make room.
 #[derive(Clone, Debug)]
-pub struct Yield(pub(crate) Vec<(i64, String)>);
+pub struct Yield(pub(crate) Vec<(i64, String, bool)>);
 impl std::fmt::Display for Yield {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("node capacity exhausted")
@@ -2667,9 +2667,10 @@ impl Catalog {
             extra.2 + pending.2,
         ))
     }
-    /// Running boxes another pool spilled onto `node`, newest first: owner, name, MiB, vCPUs.
-    fn borrowed(&self, node: &str, except: &str) -> Result<Vec<(i64, String, u64, u64)>> {
-        let mut stmt = self.db.prepare("SELECT r.owner,r.name,r.reserved_mib,r.reserved_cpus FROM resources r JOIN box_pools b ON b.physical=r.physical AND b.spilled=1 WHERE r.kind='machine' AND r.node=?1 AND r.physical<>?2 AND (r.reserved_mib>0 OR r.reserved_cpus>0) ORDER BY r.rowid DESC")?;
+    /// Running boxes another pool spilled onto `node`, newest first: owner, name, MiB, vCPUs,
+    /// ephemeral.
+    fn borrowed(&self, node: &str, except: &str) -> Result<Vec<(i64, String, u64, u64, bool)>> {
+        let mut stmt = self.db.prepare("SELECT r.owner,r.name,r.reserved_mib,r.reserved_cpus,COALESCE(json_extract(r.metadata,'$.ephemeral'),0) FROM resources r JOIN box_pools b ON b.physical=r.physical AND b.spilled=1 WHERE r.kind='machine' AND r.node=?1 AND r.physical<>?2 AND (r.reserved_mib>0 OR r.reserved_cpus>0) ORDER BY r.rowid DESC")?;
         let rows = stmt
             .query_map([node, except], |r| {
                 Ok((
@@ -2677,6 +2678,7 @@ impl Catalog {
                     r.get(1)?,
                     r.get::<_, i64>(2)? as u64,
                     r.get::<_, i64>(3)? as u64,
+                    r.get(4)?,
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -2692,14 +2694,14 @@ impl Catalog {
     ) -> Result<Option<Yield>> {
         let (mut mib, mut cpus, mut slots) = short;
         let mut chosen = vec![];
-        for (owner, name, m, c) in self.borrowed(node, except)? {
+        for (owner, name, m, c, ephemeral) in self.borrowed(node, except)? {
             if mib == 0 && cpus == 0 && slots == 0 {
                 break;
             }
             mib = mib.saturating_sub(m);
             cpus = cpus.saturating_sub(c);
             slots = slots.saturating_sub(1);
-            chosen.push((owner, name));
+            chosen.push((owner, name, ephemeral));
         }
         Ok((mib == 0 && cpus == 0 && slots == 0 && !chosen.is_empty()).then_some(Yield(chosen)))
     }
@@ -3174,7 +3176,7 @@ impl Catalog {
             let c = lock()?;
             (c.root.clone(), c.flights.clone())
         };
-        let mut yielded = false;
+        let mut yielded = 0;
         loop {
             let asked = Instant::now();
             // Runner inventories are read before the lock is taken, never under it.
@@ -3194,31 +3196,13 @@ impl Catalog {
                         flights.wait(physical);
                         continue;
                     }
-                    // Boxes spilled onto the runner make room for its own (once: a stop that
-                    // did not free it leaves the refusal as it was).
+                    // Boxes spilled onto the runner make room for its own. A few rounds: one
+                    // spilled meanwhile is stopped too; a stop that frees nothing ends it.
                     if let Some(Yield(boxes)) = error.downcast_ref::<Yield>()
-                        && !yielded
+                        && yielded < 3
                     {
-                        yielded = true;
-                        for (owner, name) in boxes {
-                            let stopped = Self::operation_shared(
-                                shared,
-                                *owner,
-                                json!({"op":"stop","id":name}),
-                            );
-                            eprintln!(
-                                "placement_yield: stopped spilled box {name} for a runner's own box: {}",
-                                stopped
-                                    .as_ref()
-                                    .map_or_else(|e| format!("{e:#}"), |_| "ok".into())
-                            );
-                            crate::telemetry::controller_log(
-                                None,
-                                "WARN",
-                                "placement_yield",
-                                &json!({"box":name,"ok":stopped.is_ok()}),
-                            );
-                        }
+                        yielded += 1;
+                        Self::make_room(shared, boxes, "a runner's own box");
                         continue;
                     }
                     return Err(error);
@@ -3253,6 +3237,28 @@ impl Catalog {
                 );
             }
             return result;
+        }
+    }
+
+    /// Stops spilled boxes so a runner's own box fits (docs/MULTINODE.md#spill); an ephemeral
+    /// one is deleted too, freeing its disk and its place under the spill cap.
+    pub(crate) fn make_room(shared: &Mutex<Catalog>, boxes: &[(i64, String, bool)], why: &str) {
+        for (owner, name, ephemeral) in boxes {
+            let mut done = Self::operation_shared(shared, *owner, json!({"op":"stop","id":name}));
+            if done.is_ok() && *ephemeral {
+                done = Self::operation_shared(shared, *owner, json!({"op":"delete","id":name}));
+            }
+            eprintln!(
+                "placement_yield: spilled box {name} stopped for {why}: {}",
+                done.as_ref()
+                    .map_or_else(|e| format!("{e:#}"), |_| "ok".into())
+            );
+            crate::telemetry::controller_log(
+                None,
+                "WARN",
+                "placement_yield",
+                &json!({"box":name,"for":why,"deleted":*ephemeral && done.is_ok(),"ok":done.is_ok()}),
+            );
         }
     }
 
@@ -4443,15 +4449,33 @@ mod tests {
         assert!(!output.to_string().contains("bob-private"));
         assert!(!output.to_string().contains(&physical));
         assert_eq!(
-            c.choose(None, "default", true, 2048, "ubuntu", 2, &json!({}), Some(32))
-                .unwrap(),
+            c.choose(
+                None,
+                "default",
+                true,
+                2048,
+                "ubuntu",
+                2,
+                &json!({}),
+                Some(32)
+            )
+            .unwrap(),
             "runner"
         );
         assert!(
-            c.choose(None, "default", true, 4096, "ubuntu", 2, &json!({}), Some(32))
-                .unwrap_err()
-                .to_string()
-                .contains("capacity exhausted")
+            c.choose(
+                None,
+                "default",
+                true,
+                4096,
+                "ubuntu",
+                2,
+                &json!({}),
+                Some(32)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("capacity exhausted")
         );
         assert!(
             c.choose(None, "default", true, 256, "arch", 1, &json!({}), Some(32))
@@ -4461,10 +4485,19 @@ mod tests {
         );
         c.db.execute("UPDATE nodes SET heartbeat=0", []).unwrap();
         assert!(
-            c.choose(None, "default", true, 256, "ubuntu", 1, &json!({}), Some(32))
-                .unwrap_err()
-                .to_string()
-                .contains("no online node")
+            c.choose(
+                None,
+                "default",
+                true,
+                256,
+                "ubuntu",
+                1,
+                &json!({}),
+                Some(32)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no online node")
         );
         let output = c
             .discovery(alice, &nodes::inventory(&root).unwrap())

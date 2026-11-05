@@ -105,7 +105,7 @@ boxes are gone.
 **GitHub calls.** One list of the repository's runners per pass (`ETag`, so an
 unchanged list costs no rate limit), one registration per box, and one
 unregister only when an idle runner is removed. With spill, the queued-job
-lists above, only while the pool is saturated. The App key lives in a 0600 file
+lists in [Spill](#spill), only while the pool is saturated. The App key lives in a 0600 file
 in the controller's data directory and in memory; no key, token or registration
 is logged, returned or put in the catalog: journals keep a put's contents only as
 their SHA-256.
@@ -122,8 +122,10 @@ without keeping anything warm there:
   counts as warm.
 - **Queued jobs get boxes.** Only while every box of the pool is busy and it is
   under `max`, the controller asks GitHub, at most every 10 s, how many of the
-  repository's queued jobs ask only for the pool's labels (one list of queued
-  and of running workflow runs, and one job list per run). Each queued job no
+  repository's queued jobs ask only for the pool's labels: one list of queued
+  and one of running workflow runs (the newest 10 of each) and one job list per
+  run, at most 22 calls, and none while fewer than 1000 calls of the App's rate
+  limit are left, so the pool's own calls always have room. Each queued job no
   idle or starting runner will take gets a box that may spill, within `max`.
 - **Spilled boxes are single-use and short-lived.** Like every pool box, one is
   deleted when its job ends. One that is online with no job for 60 s (another

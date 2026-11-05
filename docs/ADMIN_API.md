@@ -164,7 +164,7 @@ before any change).
   "alerts.offline_after_s": 60, "alerts.disk_low_gib": 20,
   "dashboard.ui_bundle": "builtin", "limits.box_memory_mib": 0,
   "placement.spill": [], "placement.spill_keep_free_mib": 16384, "placement.spill_keep_free_vcpus": 0,
-  "placement.spill_keep_free_disk_gib": 0, "upgrade.worker_handover": true,
+  "placement.spill_keep_free_disk_gib": 100, "upgrade.worker_handover": true,
   "upgrade.running_boxes": "hibernate"}}}
 ```
 

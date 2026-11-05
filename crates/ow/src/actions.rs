@@ -843,21 +843,54 @@ mod tests {
         }
         assert!(saturated(&p, &entries));
         let none = HashSet::new();
-        let at = |queued: u32, home_held: bool, entries: &BTreeMap<String, Entry>, runners: &HashMap<String, Runner>| {
-            plan(10, &[p.clone()], entries, Some(runners), &|k| home_held && k == "ci/home", &none, &|_| queued)
+        let at = |queued: u32,
+                  home_held: bool,
+                  entries: &BTreeMap<String, Entry>,
+                  runners: &HashMap<String, Runner>| {
+            plan(
+                10,
+                &[p.clone()],
+                entries,
+                Some(runners),
+                &|k| home_held && k == "ci/home",
+                &none,
+                &|_| queued,
+            )
         };
         // Nothing queued: warm boxes only, and they ask not to spill.
-        assert_eq!(at(0, false, &entries, &runners), vec![Action::Launch { pool: "ci".into(), count: 2, spill: false }]);
+        assert_eq!(
+            at(0, false, &entries, &runners),
+            vec![Action::Launch {
+                pool: "ci".into(),
+                count: 2,
+                spill: false
+            }]
+        );
         // Three jobs wait: the two warm boxes will take two, the third gets a box that may spill.
         assert_eq!(
             at(3, false, &entries, &runners),
             vec![
-                Action::Launch { pool: "ci".into(), count: 2, spill: false },
-                Action::Launch { pool: "ci".into(), count: 1, spill: true },
+                Action::Launch {
+                    pool: "ci".into(),
+                    count: 2,
+                    spill: false
+                },
+                Action::Launch {
+                    pool: "ci".into(),
+                    count: 1,
+                    spill: true
+                },
             ]
         );
         // The pool's own runners are full (home hold): queued jobs still get boxes, within max.
-        assert_eq!(at(9, true, &entries, &runners), vec![Action::Launch { pool: "ci".into(), count: 3, spill: true }]);
+        assert_eq!(
+            at(9, true, &entries, &runners),
+            vec![Action::Launch {
+                pool: "ci".into(),
+                count: 3,
+                spill: true
+            }]
+        );
         // A spilled idle box is not warm: warm boxes are still made at home. Once online with no
         // job for SPILL_IDLE_S it goes.
         let mut spilled = entry(&p, Phase::Started, 0);
@@ -866,10 +899,29 @@ mod tests {
         entries.insert("s".into(), spilled);
         runners.insert("s".into(), online(false));
         assert!(!saturated(&p, &entries));
-        assert_eq!(at(0, false, &entries, &runners), vec![Action::Launch { pool: "ci".into(), count: 2, spill: false }]);
         assert_eq!(
-            plan(6 + SPILL_IDLE_S, &[p.clone()], &entries, Some(&runners), &|_| true, &none, &|_| 0),
-            vec![Action::Remove { name: "s".into(), why: "spilled and idle", force: false }]
+            at(0, false, &entries, &runners),
+            vec![Action::Launch {
+                pool: "ci".into(),
+                count: 2,
+                spill: false
+            }]
+        );
+        assert_eq!(
+            plan(
+                6 + SPILL_IDLE_S,
+                &[p.clone()],
+                &entries,
+                Some(&runners),
+                &|_| true,
+                &none,
+                &|_| 0
+            ),
+            vec![Action::Remove {
+                name: "s".into(),
+                why: "spilled and idle",
+                force: false
+            }]
         );
         // A full pool is not saturated: no box can be added.
         let full = pool(0, 2);

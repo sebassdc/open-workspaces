@@ -5287,8 +5287,15 @@ fn a_runners_own_boxes_come_before_boxes_spilled_onto_it() {
     c.pool_admins = vec!["admin@example.test".into()];
     let p = c.user(&identity("admin")).unwrap();
     let a = c.user(&identity("alice")).unwrap();
-    let job =
-        |id: &str| json!({"op":"create","id":id,"memory_mib":256,"vcpu_count":1,"pool":"jobs"});
+    let job = |id: &str| json!({"op":"create","id":id,"memory_mib":256,"vcpu_count":1,"pool":"jobs","ephemeral":true});
+    let names = |c: &Catalog, owner: i64| -> Vec<String> {
+        c.db.prepare("SELECT name FROM resources WHERE owner=?1 AND kind='machine'")
+            .unwrap()
+            .query_map([owner], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
     let state = |c: &Catalog, owner: i64, name: &str| -> (String, String) {
         c.db.query_row(
             "SELECT node,json_extract(metadata,'$.state') FROM resources WHERE owner=?1 AND kind='machine' AND name=?2",
@@ -5321,7 +5328,8 @@ fn a_runners_own_boxes_come_before_boxes_spilled_onto_it() {
     c.operation(p, job("j3")).unwrap();
     assert_eq!(state(&c, p, "j3"), ("beta".into(), "running".into()));
     // Starting alice's box needs 256 MiB the spilled boxes hold. Without making room it is
-    // refused as before; through the shared path the newest spilled box stops and it starts.
+    // refused as before; through the shared path the newest spilled box (ephemeral here: a
+    // workload pool's job) is stopped and deleted, and it starts.
     let refused = c
         .operation(a, json!({"op":"start","id":"mine"}))
         .unwrap_err();
@@ -5330,17 +5338,17 @@ fn a_runners_own_boxes_come_before_boxes_spilled_onto_it() {
     Catalog::operation_shared(&shared, a, json!({"op":"start","id":"mine"})).unwrap();
     let mut c = shared.into_inner().unwrap();
     assert_eq!(state(&c, a, "mine"), ("beta".into(), "running".into()));
-    assert_eq!(state(&c, p, "j3"), ("beta".into(), "stopped".into()));
+    assert!(names(&c, p).iter().all(|n| n != "j3"));
     assert_eq!(state(&c, p, "j2"), ("beta".into(), "running".into()));
-    // A spilled box itself never makes others yield: j3 cannot start again.
+    // A spilled create never makes room: beta is full and j5 is refused, j2 and mine stay.
     let shared = Mutex::new(c);
-    assert!(Catalog::operation_shared(&shared, p, json!({"op":"start","id":"j3"})).is_err());
-    assert_eq!(state(&shared.lock().unwrap(), p, "j2").1, "running");
-    // An automatic create of a default box takes beta once the newest spilled box stops.
+    assert!(Catalog::operation_shared(&shared, p, job("j5")).is_err());
     c = shared.into_inner().unwrap();
+    assert_eq!(state(&c, p, "j2").1, "running");
+    assert_eq!(state(&c, a, "mine").1, "running");
+    // An automatic create of a default box takes beta once the newest spilled box goes.
     c.operation(a, json!({"op":"stop","id":"mine"})).unwrap();
     c.operation(a, json!({"op":"delete","id":"mine"})).unwrap();
-    c.operation(p, json!({"op":"delete","id":"j3"})).unwrap();
     c.operation(p, job("j4")).unwrap();
     let shared = Mutex::new(c);
     Catalog::operation_shared(
@@ -5351,7 +5359,7 @@ fn a_runners_own_boxes_come_before_boxes_spilled_onto_it() {
     .unwrap();
     let c = shared.into_inner().unwrap();
     assert_eq!(state(&c, a, "other"), ("beta".into(), "running".into()));
-    assert_eq!(state(&c, p, "j4").1, "stopped");
+    assert!(names(&c, p).iter().all(|n| n != "j4"));
     assert_eq!(state(&c, p, "j2").1, "running");
 }
 

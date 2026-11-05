@@ -418,7 +418,7 @@ pub(super) fn reserve_wake(shared: &Shared, t: &Transfer) -> Result<bool> {
             .collect::<rusqlite::Result<_>>()?;
     let mut compatible_runner = false;
     // A runner full only of boxes another pool spilled there (docs/MULTINODE.md#spill).
-    let mut room: Option<crate::catalog::Yield> = None;
+    let mut room: Option<(String, crate::catalog::Yield)> = None;
     for (node, caps) in nodes {
         let compatible = compatibility.as_ref().is_none_or(|expected| {
             serde_json::from_str::<Value>(&caps).is_ok_and(|caps| &caps["compat"] == expected)
@@ -427,26 +427,20 @@ pub(super) fn reserve_wake(shared: &Shared, t: &Transfer) -> Result<bool> {
         if compatible && capable(&c, &node, input.disk_bytes.saturating_mul(2)).is_ok() {
             match c.reserve_wake(t.id, &node, &input) {
                 Ok(()) => return Ok(true),
-                Err(e) if room.is_none() => room = e.downcast_ref().cloned(),
+                Err(e) if room.is_none() => {
+                    room = e.downcast_ref().cloned().map(|y| (node.clone(), y))
+                }
                 Err(_) => {}
             }
         }
     }
-    if let Some(crate::catalog::Yield(boxes)) = room {
+    if let Some((node, crate::catalog::Yield(boxes))) = room {
         drop(c);
-        // Stopped, they free the runner: the next pass reserves it for this wake.
-        for (owner, name) in boxes {
-            let stopped = crate::catalog::Catalog::operation_shared(
-                shared,
-                owner,
-                json!({"op":"stop","id":name}),
-            );
-            eprintln!(
-                "placement_yield: stopped spilled box {name} for a wake: {}",
-                stopped
-                    .as_ref()
-                    .map_or_else(|e| format!("{e:#}"), |_| "ok".into())
-            );
+        crate::catalog::Catalog::make_room(shared, &boxes, "a wake");
+        // Reserved in the same pass, before a new spilled box can take the room.
+        let c = shared.lock().unwrap();
+        if c.transfer(t.id)?.step == Step::Preparing {
+            let _ = c.reserve_wake(t.id, &node, &input);
         }
         return Ok(true);
     }

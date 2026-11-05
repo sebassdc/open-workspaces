@@ -91,7 +91,7 @@ pub const KEYS: [(&str, &str); 17] = [
     (crate::spill::RULES, ""),
     (crate::spill::KEEP_FREE, "16384"),
     (crate::spill::KEEP_FREE_VCPUS, "0"),
-    (crate::spill::KEEP_FREE_DISK, "0"),
+    (crate::spill::KEEP_FREE_DISK, "100"),
     // GitHub Actions runner pools (docs/ACTIONS.md) and the GitHub App they register with.
     (crate::actions::POOLS, "[]"),
     (crate::actions::APP_ID, "0"),

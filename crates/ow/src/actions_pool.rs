@@ -37,6 +37,11 @@ const HOLD_S: i64 = 10;
 const HOME_HOLD_S: i64 = 60;
 /// Queued jobs are asked for at most this often per pool, and only while it is saturated.
 const QUEUED_EVERY_S: i64 = 10;
+/// The newest workflow runs read per status: a backlog beyond them is undercounted (safe:
+/// fewer boxes), never overcounted. At most 2 + 2 x this calls per ask.
+const QUEUED_RUNS: u32 = 10;
+/// Below this rate limit left, queued jobs are not asked for.
+const QUEUED_FLOOR: i64 = 1000;
 const REMOVE_RETRY_S: i64 = 10;
 const RECENT: usize = 50;
 /// The image contract (docs/ACTIONS.md#image): the start command reads the registration here.
@@ -450,7 +455,8 @@ fn may_spill(root: &Path, token: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// Whether placement put the box on a runner of another pool.
+/// Whether placement put the box on a runner of another pool. When the catalog cannot say,
+/// yes: a spilled box then goes after its idle minute instead of staying warm.
 fn spilled(root: &Path, name: &str) -> bool {
     crate::nodes::db(root)
         .and_then(|db| {
@@ -460,7 +466,7 @@ fn spilled(root: &Path, name: &str) -> bool {
                 |r| r.get(0),
             )?)
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// One box op as the pool's workload token: its owner, its placement pool, ephemeral.
@@ -608,6 +614,13 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64, spill: bool) {
                     .lock()
                     .unwrap()
                     .insert(format!("{}/home", pool.name), now() + HOME_HOLD_S);
+            } else if message.contains("capacity exhausted") {
+                // Its runners and the ones it may borrow are full: jobs wait on GitHub.
+                shared
+                    .holds
+                    .lock()
+                    .unwrap()
+                    .insert(pool.name.clone(), now() + HOLD_S);
             } else {
                 error(
                     shared,
@@ -809,6 +822,8 @@ struct GitHub {
     etags: Mutex<HashMap<String, (String, Value)>>,
     /// Unix s until which GitHub asked us to wait.
     wait_until: Mutex<i64>,
+    /// The rate limit left after the last answer that said.
+    remaining: Mutex<Option<i64>>,
     /// The key file's modification time the cached tokens were made with.
     key_stamp: Mutex<Option<std::time::SystemTime>>,
 }
@@ -827,6 +842,7 @@ impl GitHub {
             tokens: Mutex::default(),
             etags: Mutex::default(),
             wait_until: Mutex::new(0),
+            remaining: Mutex::new(None),
             key_stamp: Mutex::new(None),
         }
     }
@@ -948,6 +964,9 @@ impl GitHub {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<i64>().ok())
         };
+        if let Some(left) = number("x-ratelimit-remaining") {
+            *self.remaining.lock().unwrap() = Some(left);
+        }
         if matches!(status, 403 | 429) {
             if let Some(retry) = number("retry-after") {
                 *self.wait_until.lock().unwrap() = now() + retry;
@@ -1027,13 +1046,19 @@ impl GitHub {
     /// Jobs queued for runners with `labels`: every label a queued job asks for is one of
     /// them (as GitHub matches), in the repository's queued and running workflow runs.
     fn queued(&self, app_id: u64, repo: &str, labels: &[String]) -> Result<u32> {
+        // Never at the cost of what the pool itself needs (runner lists, registrations).
+        let left = *self.remaining.lock().unwrap();
+        ensure!(
+            left.is_none_or(|n| n >= QUEUED_FLOOR),
+            "GitHub rate limit low ({left:?} left): not asking for queued jobs"
+        );
         let token = self.token(app_id, repo)?;
         let ours: Vec<String> = labels.iter().map(|l| l.to_ascii_lowercase()).collect();
         let mut count = 0;
         for status in ["queued", "in_progress"] {
             let (code, runs) = self.call(
                 "GET",
-                &format!("/repos/{repo}/actions/runs?status={status}&per_page=50"),
+                &format!("/repos/{repo}/actions/runs?status={status}&per_page={QUEUED_RUNS}"),
                 None,
                 &token,
             )?;

@@ -54,7 +54,7 @@ and off with the rule alone.
 ```sh
 ow config set placement.spill_keep_free_mib 32768      # memory every spill runner keeps for its own pool
 ow config set placement.spill_keep_free_vcpus 16       # vCPUs it keeps (default 0)
-ow config set placement.spill_keep_free_disk_gib 200   # disk it keeps (default 0: only the usual disk check)
+ow config set placement.spill_keep_free_disk_gib 200   # disk it keeps (default 100)
 ow config set placement.spill "jobs:runner-2:2"        # on: pool : runner : max boxes (comma-separated rules)
 ow placement status --pool jobs                        # rules, and how full each runner is
 ow config set placement.spill ""                       # off; boxes already placed keep running
@@ -74,11 +74,15 @@ ow config set placement.spill ""                       # off; boxes already plac
   stopped, moved or resized.
 - **A runner's own boxes come first.** A create, start, fork, restore or wake of
   a box of the runner's own pool that does not fit only because of boxes spilled
-  onto it stops the fewest of those (newest first) and then goes ahead, at once;
-  it is never refused or queued for them. Stopping a spilled box ends whatever it
-  was doing (a CI job fails). The controller logs `placement_yield`. A spilled
-  box never makes another box stop. Moves onto the runner and resizes do not make
-  room (a resize needs no free room: its box is stopped).
+  onto it stops the fewest of those (newest first; an ephemeral one is also
+  deleted, freeing its disk and its place under the cap) and then goes ahead: it
+  waits only for those stops, and a wake reserves the freed room in the same
+  pass. Stopping a spilled box ends whatever it was doing (a CI job fails). The
+  controller logs `placement_yield`. A spilled box never makes another box stop.
+  Memory, vCPUs and box slots are made room for; disk is not (stopping frees
+  none), so keep a disk reserve (`placement.spill_keep_free_disk_gib`, default
+  100). Moves onto the runner and resizes do not make room (a resize needs no
+  free room: its box is stopped).
 - A create may ask not to spill: `"spill": false` (create op only) keeps it on
   its pool's own runners and refuses it when they are full.
 - The create still asks for `jobs`, so its token's scope, grant and the owner's
