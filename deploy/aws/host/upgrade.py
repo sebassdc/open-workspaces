@@ -164,7 +164,8 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
             raise Refused(f"the {target} agent cannot drive the {target} worker (worker protocol window)")
     # The dashboard serves the admin API (the controller's settings) and /api/version, which
     # clients upgrade to: it moves with the agent, whose restart already drops its streams.
-    if "agent" in move and "dashboard" in pins:
+    # A runner (one with a controller elsewhere) has no dashboard to move.
+    if controller is None and "agent" in move and "dashboard" in pins:
         move["dashboard"] = target
     # A runner's new agent must be one its controller accepts; else it would sit offline.
     if controller is not None and "agent" in move:
