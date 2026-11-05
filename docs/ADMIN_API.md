@@ -449,7 +449,7 @@ Workspace commands (`create`, `exec`, `list`, ...) use `POST /api/operation`
 | `backup snapshots\|recover\|restore\|list`, `image build\|pull`, `mac-host` | Act on this machine's own runner data and KVM, not controller state. |
 | `backup catalog\|catalog-check` | Disaster-recovery tools that must work with the gateway down; the copy holds every credential hash. |
 | `login` | Client-side sign-in. |
-| `upgrade` | Replaces this machine's own client; it reads the target from `GET /api/version`. |
+| `upgrade` | Replaces this machine's own client with GitHub's latest release, checked by its own `status` against the controller, or the release `GET /api/version` names. |
 
 These will become ops, each with its contract in its own change: `scaler`,
 `dashboard-ui list|install`, `node list|add`, `image publish`, `image list

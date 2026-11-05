@@ -260,7 +260,7 @@ enum Action {
         #[arg(long)]
         tailnet: bool,
     },
-    /// Replace this client with the release the controller runs (or --version), verified first.
+    /// Replace this client with the latest release its controller accepts (or --version), verified first.
     Upgrade {
         /// Install exactly this release (vX.Y.Z), even an older one.
         #[arg(long)]
@@ -268,7 +268,7 @@ enum Action {
         /// Only compare: exit 0 when current, 10 when an upgrade is available.
         #[arg(long)]
         check: bool,
-        /// One JSON line: {"from","to","seconds","upgraded"}.
+        /// One JSON line: {"from","to","seconds","upgraded","source"} and, on a fallback, "reason".
         #[arg(long)]
         json: bool,
     },
@@ -1133,9 +1133,23 @@ fn main_result() -> anyhow::Result<i32> {
         json,
     } = cli.command
     {
-        return upgrade::run(version, check, json, || {
-            admin_client::server_version(cli.data_dir, cli.server, cli.local_mode)
-        });
+        let mut options = Vec::<std::ffi::OsString>::new();
+        if let Some(dir) = &cli.data_dir {
+            options.extend(["--data-dir".into(), dir.into()]);
+        }
+        if let Some(server) = &cli.server {
+            options.extend(["--server".into(), server.into()]);
+        }
+        if cli.local_mode {
+            options.push("--local".into());
+        }
+        return upgrade::run(
+            version,
+            check,
+            json,
+            || admin_client::server_version(cli.data_dir, cli.server, cli.local_mode),
+            options,
+        );
     }
     if let Action::Login { url, tailnet } = &cli.command {
         client::login(url, *tailnet)?;

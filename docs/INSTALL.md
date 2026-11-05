@@ -76,35 +76,51 @@ not the versioned GitHub Release download path.
 
 ## Keeping the CLI current
 
-`ow upgrade` replaces the installed client with the release your controller
-runs, read from the controller's `GET /api/version` over the same login that
-other commands use. It downloads this
+`ow upgrade` replaces the installed client with the newest published release
+that works with your controller. It finds that release from the redirect of
+`https://github.com/sebassdc/open-workspaces/releases/latest` (GitHub sends it
+only to a published release that is not a draft or prerelease), reading the tag
+from the `Location` header without following it, so a timer spends no GitHub API
+quota. It downloads this
 platform's executable from that GitHub release and checks it as the installer
 does: the digest must match the asset's `.sha256`, the release's `SHA256SUMS`
 must list that digest for the asset, the header must be this platform's
-executable, and the new binary must report the expected version. Only then is it
-written next to the running client, synced and renamed over it, keeping its
-permissions. Any failed check leaves the current client in place. It refuses,
-before downloading anything, when the client was started through a symlink (as
-the installer does) and when it is a host's own release (a file in a host's
-`releases/` directory, which the host's services run): upgrade a host with
-`ow-host upgrade`.
+executable, and the new binary must report the expected version. The new binary
+then runs its own `ow status` against the same controller, with the same
+`--server`, `--data-dir` or `--local` this command got, within 30 seconds; it
+must report `"connected": true` and `"compatibility": {"next_action": null}`.
+Only then is it renamed over the running client, keeping its permissions. Any
+failed check leaves the current client in place.
+
+If the latest release cannot be found, its assets are not all published yet,
+a check fails or its `status` does, `ow upgrade` falls back to the release the
+controller runs (`GET /api/version`, which can lag the latest release) and says
+why. A latest release refused by its `status` is not downloaded again for 10
+minutes (recorded in `upgrade-refused` beside the client's `client.json`). It
+refuses, before downloading anything, when the client was started through a
+symlink (as the installer does) and when it is a host's own release (a file in a
+host's `releases/` directory, which the host's services run): upgrade a host
+with `ow-host upgrade`. A newer latest release is only downloaded when the
+controller answers `GET /api/version`, since its compatibility cannot be checked
+otherwise.
 
 ```sh
-ow upgrade                  # to the controller's release; never older than this client
+ow upgrade                  # to the latest compatible release; never older than this client
 ow upgrade --check          # print current and target; exit 0 if current, 10 if an upgrade is available
-ow upgrade --version v0.9.58  # exactly this release, even an older one
-ow upgrade --json           # after an upgrade: {"from":"0.9.57","to":"0.9.58","seconds":2.4,"upgraded":true}
+ow upgrade --version v0.9.58  # exactly this release, even an older one; no latest lookup or status check
+ow upgrade --json           # after an upgrade: {"from":"0.9.62","to":"0.9.64","seconds":2.4,"upgraded":true,"source":"latest"}
 ```
 
-An equal version prints one line and exits 0 without downloading anything; with
-`--json` it prints nothing, so a timer's log grows only when something changed
-(`--check --json` always prints the line). A controller older than this client
-is not a downgrade target; only an explicit `--version` installs an older
-release. `--check` exits 10 only once the release's asset for this platform can
-be downloaded. Errors exit 1.
+`source` says where the target came from: `latest`, `controller` (the
+fallback, with a `reason`) or `version`. An equal or older latest release prints
+one line and exits 0 without downloading anything; with `--json` it prints
+nothing, so a timer's log grows only when something changed (`--check --json`
+always prints the line). Only an explicit `--version` installs an older release.
+`--check` downloads no client, so it reports the latest release with the
+`reason` that its compatibility is checked on install; it exits 10 only once
+the release's `.sha256` for this platform can be downloaded. Errors exit 1.
 
-To keep a Mac's client in step with its controller, run it from a launchd user
+To keep a Mac's client current, run it from a launchd user
 agent every 30 seconds. Save this as
 `~/Library/LaunchAgents/dev.open-workspaces.upgrade.plist`, then load it with
 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.open-workspaces.upgrade.plist`:

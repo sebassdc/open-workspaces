@@ -30,7 +30,7 @@ fn server(url: &str) -> Result<String> {
 pub(crate) fn origin(url: &str) -> Result<String> {
     server(url)
 }
-fn config() -> Result<PathBuf> {
+pub(crate) fn config() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|v| PathBuf::from(v).join(".config")))

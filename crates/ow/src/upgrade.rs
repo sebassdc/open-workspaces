@@ -1,8 +1,10 @@
 //! `ow upgrade`: replace this client with a published release, checked as install.sh checks
 //! it, then renamed over the running binary so a failed check leaves the old one intact.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    ffi::OsString,
     fs,
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
@@ -11,7 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-const RELEASES: &str = "https://github.com/sebassdc/open-workspaces/releases/download";
+const RELEASES: &str = "https://github.com/sebassdc/open-workspaces/releases";
+/// How long a latest release whose `status` failed against the controller is not downloaded
+/// again: a timer runs `ow upgrade` every 30 s.
+const REFUSAL: Duration = Duration::from_secs(600);
 /// `--check` exit status when the target is a different release than this client.
 pub(crate) const AVAILABLE: i32 = 10;
 
@@ -59,6 +64,37 @@ fn parse(text: &str) -> Result<Version> {
 fn show((a, b, c): Version) -> String {
     format!("{a}.{b}.{c}")
 }
+
+/// The release `RELEASES/latest` redirects to. GitHub sends there only for a published
+/// release that is not a draft or prerelease.
+fn tag(location: &str) -> Result<Version> {
+    let tag = location
+        .strip_prefix(RELEASES)
+        .and_then(|rest| rest.strip_prefix("/tag/"))
+        .with_context(|| format!("{RELEASES}/latest redirected to {location}, not a release"))?;
+    parse(tag)
+}
+
+/// The candidate's `status` against the controller: connected and nothing to do first.
+fn compatible(status: &str) -> Result<()> {
+    let status: Value = serde_json::from_str(status).context("status did not print JSON")?;
+    ensure!(status["connected"] == true, "status is not connected");
+    match status["compatibility"].get("next_action") {
+        Some(Value::Null) => Ok(()),
+        Some(action) => bail!("status asks first: {action}"),
+        None => bail!("status has no compatibility.next_action"),
+    }
+}
+
+/// The candidate failed its `status` against the controller.
+#[derive(Debug)]
+struct Incompatible(String);
+impl std::fmt::Display for Incompatible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not compatible with the controller: {}", self.0)
+    }
+}
+impl std::error::Error for Incompatible {}
 
 /// Install `target`? Only a newer one, unless the user named it (the only way to downgrade).
 fn wanted(current: Version, target: Version, explicit: bool) -> bool {
@@ -167,28 +203,42 @@ fn replaceable() -> Result<PathBuf> {
     Ok(exe)
 }
 
-/// `ow --version` of the staged file, or an error if it does not answer within 30 s.
-fn version_of(path: &Path) -> Result<String> {
+/// Standard output of `path args...`, or an error unless it exits 0 within 30 s.
+fn output_of(path: &Path, args: &[OsString]) -> Result<String> {
     let mut child = Command::new(path)
-        .arg("--version")
+        .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    let mut stdout = child.stdout.take().context("no output")?;
+    // Read while it runs: a full pipe would block a large status before it exits.
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        (&mut stdout)
+            .take(LIMIT)
+            .read_to_string(&mut out)
+            .map(|_| out)
+    });
     let deadline = Instant::now() + Duration::from_secs(30);
-    while child.try_wait()?.is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("the downloaded client did not answer --version within 30 s");
+            bail!("the downloaded client did not finish {args:?} within 30 s");
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .context("no --version output")?
-        .read_to_string(&mut out)?;
+    };
+    let out = reader
+        .join()
+        .map_err(|_| anyhow!("reading the downloaded client's output failed"))??;
+    ensure!(
+        status.success(),
+        "the downloaded client's {args:?} exited with {status}"
+    );
     Ok(out.trim().to_owned())
 }
 
@@ -200,8 +250,8 @@ impl Drop for Staged {
     }
 }
 
-/// Downloads and verifies the client whose `.sha256` is `published`, runs it, then renames
-/// it over `exe`.
+/// Downloads and verifies the client whose `.sha256` is `published`, runs it, lets
+/// `accept` judge it, then renames it over `exe`.
 fn install(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -209,6 +259,7 @@ fn install(
     artifact: &str,
     published: &str,
     target: Version,
+    accept: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
     let sums = String::from_utf8(fetch(client, &format!("{base}/SHA256SUMS"))?)?;
     let bytes = fetch(client, &format!("{base}/{artifact}"))?;
@@ -226,10 +277,11 @@ fn install(
     drop(file);
     fs::set_permissions(&staged.0, fs::metadata(exe)?.permissions())?;
     ensure!(
-        version_of(&staged.0)? == format!("ow {}", show(target)),
+        output_of(&staged.0, &["--version".into()])? == format!("ow {}", show(target)),
         "download version mismatch: expected ow {}",
         show(target)
     );
+    accept(&staged.0)?;
     fs::rename(&staged.0, exe)?;
     // The new client is in place; a failed directory sync only weakens crash durability.
     if let Err(error) = fs::File::open(dir).and_then(|d| d.sync_all()) {
@@ -241,59 +293,297 @@ fn install(
     Ok(())
 }
 
-/// Runs `ow upgrade`; `controller` asks the configured controller which release it runs.
+/// Where the target release came from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Source {
+    /// GitHub's latest release; installed only once its own `status` passed against the controller.
+    Latest,
+    /// The controller's `GET /api/version` server release.
+    Controller,
+    /// `--version`.
+    Version,
+}
+impl Source {
+    fn name(self) -> &'static str {
+        match self {
+            Source::Latest => "latest",
+            Source::Controller => "controller",
+            Source::Version => "version",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Step {
+    Current,
+    Available,
+    Upgraded,
+}
+
+#[derive(Debug)]
+struct Outcome {
+    to: Version,
+    source: Source,
+    reason: Option<String>,
+    step: Step,
+}
+
+/// What `ow upgrade` reads and changes outside this process; tests answer it offline.
+trait Releases {
+    /// The `Location` that `RELEASES/latest` redirects to.
+    fn latest(&mut self) -> Result<String>;
+    /// The release the configured controller serves `GET /api/version` from.
+    fn controller(&mut self) -> Result<String>;
+    /// Fails unless this client's file may be replaced; checked before any download.
+    fn replaceable(&mut self) -> Result<()>;
+    /// This platform's `.sha256` in `target`'s release.
+    fn published(&mut self, target: Version) -> Result<String>;
+    /// Installs `target`; with `against_controller`, only once its own `status` is
+    /// compatible (an `Incompatible` error otherwise).
+    fn install(&mut self, target: Version, published: &str, against_controller: bool)
+    -> Result<()>;
+    /// Why `target` was found incompatible within `REFUSAL`, if it was.
+    fn refused(&self, target: Version) -> Option<String>;
+    fn refuse(&mut self, target: Version, why: &str);
+}
+
+/// Picks the target and installs it: the latest release when it is newer than this client
+/// and compatible with the controller, else the controller's release (today's target), or
+/// exactly `--version`.
+fn select(
+    releases: &mut impl Releases,
+    current: Version,
+    version: Option<&str>,
+    check: bool,
+) -> Result<Outcome> {
+    if let Some(version) = version {
+        return attempt(releases, current, parse(version)?, Source::Version, check);
+    }
+    let mut controller = None;
+    let reason = match releases.latest().and_then(|location| tag(&location)) {
+        Err(error) => format!("the latest release is unknown: {error:#}"),
+        Ok(latest) if !wanted(current, latest, false) => {
+            return attempt(releases, current, latest, Source::Latest, check);
+        }
+        Ok(latest) => match releases.refused(latest) {
+            Some(why) => format!("v{} was refused recently: {why}", show(latest)),
+            None => {
+                if !check {
+                    // Its compatibility is checked against the controller: no controller, no download.
+                    releases.replaceable()?;
+                    controller = Some(releases.controller()?);
+                }
+                match attempt(releases, current, latest, Source::Latest, check) {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(error) => {
+                        if error.is::<Incompatible>() {
+                            releases.refuse(latest, &format!("{error:#}"));
+                        }
+                        format!("v{}: {error:#}", show(latest))
+                    }
+                }
+            }
+        },
+    };
+    let controller = match controller {
+        Some(version) => version,
+        None => releases.controller()?,
+    };
+    let target = parse(&controller).context("the controller's /api/version")?;
+    let mut outcome = attempt(releases, current, target, Source::Controller, check)?;
+    outcome.reason = Some(reason);
+    Ok(outcome)
+}
+
+fn attempt(
+    releases: &mut impl Releases,
+    current: Version,
+    target: Version,
+    source: Source,
+    check: bool,
+) -> Result<Outcome> {
+    let mut outcome = Outcome {
+        to: target,
+        source,
+        reason: None,
+        step: Step::Current,
+    };
+    if !wanted(current, target, source == Source::Version) {
+        return Ok(outcome);
+    }
+    if !check {
+        releases.replaceable()?;
+    }
+    let published = releases.published(target)?;
+    if check {
+        if source == Source::Latest {
+            outcome.reason = Some("compatibility with the controller is checked on install".into());
+        }
+        outcome.step = Step::Available;
+    } else {
+        releases.install(target, &published, source == Source::Latest)?;
+        outcome.step = Step::Upgraded;
+    }
+    Ok(outcome)
+}
+
+/// The real network, files and processes.
+struct Github<F> {
+    client: reqwest::blocking::Client,
+    no_redirect: reqwest::blocking::Client,
+    controller: Option<F>,
+    /// Global options this process got (`--data-dir`, `--server`, `--local`), for the
+    /// candidate's `status`.
+    options: Vec<OsString>,
+    exe: Option<PathBuf>,
+    memo: Option<PathBuf>,
+}
+
+impl<F: FnOnce() -> Result<String>> Releases for Github<F> {
+    fn latest(&mut self) -> Result<String> {
+        let url = format!("{RELEASES}/latest");
+        let response = self
+            .no_redirect
+            .get(&url)
+            .send()
+            .with_context(|| format!("look up {url}"))?;
+        ensure!(
+            response.status().is_redirection(),
+            "{url} answered HTTP {}",
+            response.status()
+        );
+        Ok(response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .with_context(|| format!("{url} redirected without a Location"))?
+            .to_str()?
+            .to_owned())
+    }
+
+    fn controller(&mut self) -> Result<String> {
+        (self
+            .controller
+            .take()
+            .context("the controller was already asked")?)()
+    }
+
+    fn replaceable(&mut self) -> Result<()> {
+        if self.exe.is_none() {
+            self.exe = Some(replaceable()?);
+        }
+        Ok(())
+    }
+
+    fn published(&mut self, target: Version) -> Result<String> {
+        let artifact = ARTIFACT.context("no published client for this platform")?;
+        let url = format!("{RELEASES}/download/v{}/{artifact}.sha256", show(target));
+        Ok(String::from_utf8(fetch(&self.client, &url)?)?)
+    }
+
+    fn install(
+        &mut self,
+        target: Version,
+        published: &str,
+        against_controller: bool,
+    ) -> Result<()> {
+        let artifact = ARTIFACT.context("no published client for this platform")?;
+        let exe = self.exe.clone().context("not checked as replaceable")?;
+        let base = format!("{RELEASES}/download/v{}", show(target));
+        let mut status = self.options.clone();
+        status.push("status".into());
+        install(
+            &self.client,
+            &base,
+            &exe,
+            artifact,
+            published,
+            target,
+            |staged| {
+                if !against_controller {
+                    return Ok(());
+                }
+                output_of(staged, &status)
+                    .and_then(|out| compatible(&out))
+                    .map_err(|error| Incompatible(format!("{error:#}")).into())
+            },
+        )
+    }
+
+    fn refused(&self, target: Version) -> Option<String> {
+        let path = self.memo.as_ref()?;
+        let age = fs::metadata(path).ok()?.modified().ok()?.elapsed().ok()?;
+        let text = fs::read_to_string(path).ok()?;
+        let (version, why) = text.split_once('\n')?;
+        (age < REFUSAL && version == show(target)).then(|| why.to_owned())
+    }
+
+    fn refuse(&mut self, target: Version, why: &str) {
+        if let Some(path) = &self.memo {
+            // Best effort: without it the next run downloads the candidate again.
+            let _ = path.parent().map(fs::create_dir_all);
+            let _ = fs::write(path, format!("{}\n{why}", show(target)));
+        }
+    }
+}
+
+/// Runs `ow upgrade`; `controller` asks the configured controller which release it runs,
+/// and `options` are the global options that configured it.
 pub(crate) fn run(
     version: Option<String>,
     check: bool,
     json: bool,
     controller: impl FnOnce() -> Result<String>,
+    options: Vec<OsString>,
 ) -> Result<i32> {
     let started = Instant::now();
     let current = parse(env!("CARGO_PKG_VERSION"))?;
-    let explicit = version.is_some();
-    let target = match version {
-        Some(v) => parse(&v)?,
-        None => parse(&controller()?).context("the controller's /api/version")?,
+    let build = |policy| {
+        reqwest::blocking::Client::builder()
+            .https_only(true)
+            .timeout(Duration::from_secs(300))
+            .redirect(policy)
+            .build()
     };
-    let upgrade = wanted(current, target, explicit);
-    let (from, to) = (show(current), show(target));
-    let report = |upgraded: bool| {
-        let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({"from":from,"to":to,"seconds":seconds,"upgraded":upgraded})
-            );
-        } else if upgraded {
-            println!("ow {from} -> {to} in {seconds} s");
-        } else if !upgrade {
-            println!("ow {from} is current (target {to})");
-        } else {
-            println!("ow {from}, target {to}: upgrade available");
-        }
+    let mut github = Github {
+        client: build(reqwest::redirect::Policy::default())?,
+        no_redirect: build(reqwest::redirect::Policy::none())?,
+        controller: Some(controller),
+        options,
+        exe: None,
+        memo: crate::client::config()
+            .ok()
+            .map(|config| config.with_file_name("upgrade-refused")),
     };
-    if !upgrade {
-        // A timer runs `--json` often: a no-op stays silent there.
-        if check || !json {
-            report(false);
-        }
+    let outcome = select(&mut github, current, version.as_deref(), check)?;
+    // A timer runs `--json` often: a no-op stays silent there.
+    if outcome.step == Step::Current && json && !check {
         return Ok(0);
     }
-    let artifact = ARTIFACT.context("no published client for this platform")?;
-    let exe = if check { None } else { Some(replaceable()?) };
-    let client = reqwest::blocking::Client::builder()
-        .https_only(true)
-        .timeout(Duration::from_secs(300))
-        .build()?;
-    let base = format!("{RELEASES}/v{to}");
-    let published = String::from_utf8(fetch(&client, &format!("{base}/{artifact}.sha256"))?)?;
-    let Some(exe) = exe else {
-        report(false);
-        return Ok(AVAILABLE);
-    };
-    install(&client, &base, &exe, artifact, &published, target)?;
-    report(true);
-    Ok(0)
+    let (from, to) = (show(current), show(outcome.to));
+    let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+    if json {
+        let mut line = serde_json::json!({"from":from,"to":to,"seconds":seconds,
+            "upgraded":outcome.step == Step::Upgraded,"source":outcome.source.name()});
+        if let Some(reason) = &outcome.reason {
+            line["reason"] = reason.as_str().into();
+        }
+        println!("{line}");
+    } else {
+        let source = outcome.source.name();
+        match outcome.step {
+            Step::Upgraded => println!("ow {from} -> {to} in {seconds} s (target from {source})"),
+            Step::Current => println!("ow {from} is current (target {to} from {source})"),
+            Step::Available => println!("ow {from}, target {to} from {source}: upgrade available"),
+        }
+        if let Some(reason) = &outcome.reason {
+            println!("  {reason}");
+        }
+    }
+    Ok(if outcome.step == Step::Available {
+        AVAILABLE
+    } else {
+        0
+    })
 }
 
 #[cfg(test)]
@@ -320,15 +610,221 @@ mod tests {
         assert!(wanted(v, (0, 9, 57), true));
     }
 
+    /// Answers `Releases` from fields and records what was installed.
+    struct Fake {
+        latest: Result<&'static str, &'static str>,
+        controller: &'static str,
+        missing: Option<Version>,
+        incompatible: bool,
+        refused: Option<(Version, String)>,
+        asked_controller: bool,
+        installed: Vec<(Version, bool)>,
+    }
+
+    fn fake(latest: &'static str, controller: &'static str) -> Fake {
+        Fake {
+            latest: Ok(latest),
+            controller,
+            missing: None,
+            incompatible: false,
+            refused: None,
+            asked_controller: false,
+            installed: Vec::new(),
+        }
+    }
+
+    impl Releases for Fake {
+        fn latest(&mut self) -> Result<String> {
+            self.latest
+                .map(|tag| format!("{RELEASES}/tag/{tag}"))
+                .map_err(|e| anyhow!(e))
+        }
+        fn controller(&mut self) -> Result<String> {
+            assert!(!self.asked_controller, "the controller is asked once");
+            self.asked_controller = true;
+            Ok(self.controller.into())
+        }
+        fn replaceable(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn published(&mut self, target: Version) -> Result<String> {
+            ensure!(self.missing != Some(target), "404 for v{}", show(target));
+            Ok("sha".into())
+        }
+        fn install(&mut self, target: Version, _: &str, against_controller: bool) -> Result<()> {
+            if against_controller && self.incompatible {
+                return Err(Incompatible("status is not connected".into()).into());
+            }
+            self.installed.push((target, against_controller));
+            Ok(())
+        }
+        fn refused(&self, target: Version) -> Option<String> {
+            self.refused
+                .as_ref()
+                .filter(|(v, _)| *v == target)
+                .map(|(_, why)| why.clone())
+        }
+        fn refuse(&mut self, target: Version, why: &str) {
+            self.refused = Some((target, why.into()));
+        }
+    }
+
+    const CURRENT: Version = (0, 9, 62);
+
     #[test]
-    fn equal_and_older_targets_never_download() {
-        let ours = env!("CARGO_PKG_VERSION");
-        let (a, b, c) = parse(ours).unwrap();
-        assert_eq!(run(None, false, true, || Ok(ours.into())).unwrap(), 0);
-        assert_eq!(run(None, true, false, || Ok(ours.into())).unwrap(), 0);
-        let older = show((a, b.saturating_sub(1), c));
-        assert_eq!(run(None, false, false, || Ok(older)).unwrap(), 0);
-        assert!(run(None, true, false, || Ok("garbage".into())).is_err());
+    fn a_newer_compatible_latest_release_is_installed() {
+        let mut r = fake("v0.9.64", "0.9.62");
+        let o = select(&mut r, CURRENT, None, false).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            ((0, 9, 64), Source::Latest, Step::Upgraded)
+        );
+        assert_eq!(o.reason, None);
+        assert_eq!(
+            r.installed,
+            [((0, 9, 64), true)],
+            "checked against the controller"
+        );
+    }
+
+    #[test]
+    fn an_incompatible_latest_release_falls_back_to_the_controller() {
+        let mut r = fake("v0.9.64", "0.9.63");
+        r.incompatible = true;
+        let o = select(&mut r, CURRENT, None, false).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            ((0, 9, 63), Source::Controller, Step::Upgraded)
+        );
+        assert!(
+            o.reason
+                .unwrap()
+                .contains("v0.9.64: not compatible with the controller")
+        );
+        assert_eq!(r.installed, [((0, 9, 63), false)]);
+        assert!(
+            r.refused.is_some(),
+            "remembered so a timer does not download it again"
+        );
+
+        let mut again = fake("v0.9.64", "0.9.62");
+        again.refused = r.refused.take();
+        let o = select(&mut again, CURRENT, None, false).unwrap();
+        assert_eq!((o.source, o.step), (Source::Controller, Step::Current));
+        assert!(o.reason.unwrap().contains("refused recently"));
+        assert!(again.installed.is_empty());
+    }
+
+    #[test]
+    fn a_latest_release_without_its_assets_keeps_the_client() {
+        let mut r = fake("v0.9.64", "0.9.62");
+        r.missing = Some((0, 9, 64));
+        let o = select(&mut r, CURRENT, None, false).unwrap();
+        assert_eq!((o.source, o.step), (Source::Controller, Step::Current));
+        assert!(o.reason.unwrap().contains("404"));
+        assert!(
+            r.installed.is_empty() && r.refused.is_none(),
+            "retried next run"
+        );
+    }
+
+    #[test]
+    fn an_unknown_latest_release_falls_back_to_the_controller() {
+        let mut r = fake("", "0.9.63");
+        r.latest = Err("offline");
+        let o = select(&mut r, CURRENT, None, false).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            ((0, 9, 63), Source::Controller, Step::Upgraded)
+        );
+        assert!(o.reason.unwrap().contains("offline"));
+    }
+
+    #[test]
+    fn a_latest_release_not_newer_is_a_no_op() {
+        for latest in ["v0.9.62", "v0.9.61"] {
+            let mut r = fake(latest, "0.9.70");
+            let o = select(&mut r, CURRENT, None, false).unwrap();
+            assert_eq!((o.source, o.step), (Source::Latest, Step::Current));
+            assert!(!r.asked_controller && r.installed.is_empty());
+        }
+    }
+
+    #[test]
+    fn check_reports_the_latest_release_without_downloading_it() {
+        let mut r = fake("v0.9.64", "0.9.62");
+        let o = select(&mut r, CURRENT, None, true).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            ((0, 9, 64), Source::Latest, Step::Available)
+        );
+        assert!(o.reason.unwrap().contains("checked on install"));
+        assert!(!r.asked_controller && r.installed.is_empty());
+    }
+
+    #[test]
+    fn an_explicit_version_never_looks_up_the_latest_release() {
+        let mut r = fake("v0.9.64", "0.9.64");
+        r.latest = Err("not asked");
+        let o = select(&mut r, CURRENT, Some("v0.9.57"), false).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            ((0, 9, 57), Source::Version, Step::Upgraded)
+        );
+        assert_eq!(r.installed, [((0, 9, 57), false)]);
+        let o = select(&mut r, CURRENT, Some("0.9.62"), false).unwrap();
+        assert_eq!(o.step, Step::Current);
+        assert!(select(&mut r, CURRENT, Some("garbage"), false).is_err());
+        assert!(!r.asked_controller);
+    }
+
+    #[test]
+    fn the_latest_tag_comes_from_the_release_redirect() {
+        assert_eq!(tag(&format!("{RELEASES}/tag/v0.9.64")).unwrap(), (0, 9, 64));
+        for bad in [
+            format!("{RELEASES}"),
+            format!("{RELEASES}/tag/"),
+            format!("{RELEASES}/tag/v0.9"),
+            format!("{RELEASES}/tag/v0.9.64-rc1"),
+            format!("{RELEASES}/download/v0.9.64"),
+            "https://github.com/someone/else/releases/tag/v0.9.64".into(),
+            "/sebassdc/open-workspaces/releases/tag/v0.9.64".into(),
+        ] {
+            assert!(tag(&bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn only_a_connected_status_with_nothing_to_do_is_compatible() {
+        compatible(r#"{"connected":true,"compatibility":{"next_action":null}}"#).unwrap();
+        for bad in [
+            r#"{"connected":false,"compatibility":{"next_action":null}}"#,
+            r#"{"connected":true,"compatibility":{"next_action":"unsupported_capability: upgrade"}}"#,
+            r#"{"connected":true,"compatibility":{}}"#,
+            r#"{"connected":true}"#,
+            "not json",
+        ] {
+            assert!(compatible(bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn the_candidate_must_exit_zero_and_its_output_is_read() {
+        let sh = Path::new("/bin/sh");
+        let run = |script: &str| output_of(sh, &["-c".into(), script.into()]);
+        let status = r#"{"connected":true,"compatibility":{"next_action":null}}"#;
+        compatible(&run(&format!("printf '%s\\n' '{status}'")).unwrap()).unwrap();
+        // Larger than a pipe's buffer: read while it runs, not after.
+        assert_eq!(
+            run("head -c 200000 /dev/zero | tr '\\0' x").unwrap().len(),
+            200_000
+        );
+        assert!(
+            run("echo '{}'; exit 3")
+                .unwrap_err()
+                .to_string()
+                .contains("exited")
+        );
     }
 
     #[test]
