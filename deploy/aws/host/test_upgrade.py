@@ -1041,6 +1041,32 @@ class Machine(unittest.TestCase):
             self.assertIn("start:worker", ops.calls)
             self.assertEqual((ops.drained, ops.ticking), (False, set(u.TIMERS)))
 
+    def test_an_abort_whose_old_worker_exits_while_it_resumes_starts_it_and_resumes_again(self):
+        ops = Fake({"a": "running", "b": "running"}, fail={"sync-images"}, timers=u.TIMERS)
+        real = ops.start_box
+        exits = [1]
+
+        def start_box(box):
+            if exits:  # a `down` that outlived its client shuts the worker down now
+                exits.pop()
+                ops.up["worker"] = False
+            real(box)
+        ops.start_box = start_box
+        with mock.patch.object(u.time, "sleep"), self.assertRaisesRegex(RuntimeError, "sync-images"):
+            self.run_plan(ops, ["worker"], 2, ["worker"])
+        self.assertEqual((self.journal()["step"], ops.box, ops.up["worker"]),
+                         ("aborted", {"a": "running", "b": "running"}, True))
+        self.assertEqual((ops.drained, ops.ticking), (False, set(u.TIMERS)))
+
+    def test_an_abort_whose_restores_fail_still_restores_the_rest_and_closes(self):
+        ops = Fake({"a": "running"}, fail={"sync-images", "start:dashboard"}, timers=u.TIMERS)
+        with mock.patch.object(u.time, "sleep"), self.assertRaisesRegex(RuntimeError, "sync-images"):
+            self.run_plan(ops, ["worker", "dashboard"], 2, ["worker", "dashboard"])
+        j = self.journal()
+        self.assertEqual(j["step"], "aborted")
+        self.assertIn("start dashboard failed", j["error"])
+        self.assertEqual((ops.drained, ops.ticking), (False, set(u.TIMERS)))
+
     def test_an_abort_that_cannot_list_the_boxes_records_it_and_still_closes(self):
         ops = Fake({"a": "running"}, fail={"sync-images"}, timers=u.TIMERS)
         real = ops.sync_images

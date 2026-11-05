@@ -987,17 +987,22 @@ def abort(j, ops):
             if not ops.quiesce_off():
                 note("the worker did not lift its quiesce (restart it)")
             failed = resume(j, ops)
+            if attempt == 1 and "worker" in ops.units() and not ops.active("worker"):
+                continue  # it exited while the boxes started (a `down` still running): again
             break
         except Exception as e:  # noqa: BLE001 - once more: the old worker may have exited meanwhile
             if attempt == 2:
                 note(f"boxes not resumed ({e}): start them with ow start")
-    for name in ("agent", "dashboard"):
-        if name in ops.units() and not ops.active(name):
-            ops.start(name)
-    ops.drain(False)
+    restores = [(f"start {name}", lambda name=name: ops.start(name))
+                for name in ("agent", "dashboard") if name in ops.units() and not ops.active(name)]
+    restores += [("undrain", lambda: ops.drain(False)), ("timers", lambda: ops.resume_timers(j["paused"]))]
+    for what, restore in restores:
+        try:
+            restore()
+        except Exception as e:  # noqa: BLE001 - every restore gets its turn; the journal closes
+            note(f"{what} failed ({e})")
     if failed:
         note(f"not resumed: {', '.join(failed)}")
-    ops.resume_timers(j["paused"])
     j.step("aborted")
     say(f"upgrade aborted: {j.value['error']}")
 
