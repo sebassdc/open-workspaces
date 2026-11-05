@@ -75,9 +75,11 @@ ow config set placement.spill ""                       # off; boxes already plac
 - **A runner's own boxes come first.** A create, start, fork, restore or wake of
   a box of the runner's own pool that does not fit only because of boxes spilled
   onto it stops the fewest of those (newest first; an ephemeral one is also
-  deleted, freeing its disk and its place under the cap) and then goes ahead: it
-  waits only for those stops, and a wake reserves the freed room in the same
-  pass. Stopping a spilled box ends whatever it was doing (a CI job fails). The
+  deleted once the box that needed the room has it, freeing its disk and its
+  place under the cap) and then goes ahead: it waits only for those stops, and a
+  wake reserves the freed room in the same pass. A non-ephemeral spilled box
+  stays stopped on the runner, still counted under the cap, until its owner
+  deletes it. Stopping a spilled box ends whatever it was doing (a CI job fails). The
   controller logs `placement_yield`. A spilled box never makes another box stop.
   Memory, vCPUs and box slots are made room for; disk is not (stopping frees
   none), so keep a disk reserve (`placement.spill_keep_free_disk_gib`, default

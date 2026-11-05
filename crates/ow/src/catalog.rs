@@ -3167,6 +3167,21 @@ impl Catalog {
         user: i64,
         request: Value,
     ) -> Result<Value> {
+        let mut stopped = Vec::new();
+        let result = Self::operation_making_room(shared, user, request, &mut stopped);
+        // After the operation, so it never waits for these deletes.
+        Self::delete_stopped(shared, &stopped);
+        result
+    }
+
+    /// [`Self::operation_shared`]; ephemeral spilled boxes it stopped to make room are left in
+    /// `stopped` for the caller to delete.
+    fn operation_making_room(
+        shared: &Mutex<Catalog>,
+        user: i64,
+        request: Value,
+        stopped: &mut Vec<(i64, String)>,
+    ) -> Result<Value> {
         let lock = || {
             shared
                 .lock()
@@ -3196,13 +3211,13 @@ impl Catalog {
                         flights.wait(physical);
                         continue;
                     }
-                    // Boxes spilled onto the runner make room for its own. A few rounds: one
-                    // spilled meanwhile is stopped too; a stop that frees nothing ends it.
+                    // Boxes spilled onto the runner make room for its own: at most three rounds
+                    // (a box spilled meanwhile is stopped too), then the refusal stands.
                     if let Some(Yield(boxes)) = error.downcast_ref::<Yield>()
                         && yielded < 3
                     {
                         yielded += 1;
-                        Self::make_room(shared, boxes, "a runner's own box");
+                        stopped.extend(Self::make_room(shared, boxes, "a runner's own box"));
                         continue;
                     }
                     return Err(error);
@@ -3240,14 +3255,17 @@ impl Catalog {
         }
     }
 
-    /// Stops spilled boxes so a runner's own box fits (docs/MULTINODE.md#spill); an ephemeral
-    /// one is deleted too, freeing its disk and its place under the spill cap.
-    pub(crate) fn make_room(shared: &Mutex<Catalog>, boxes: &[(i64, String, bool)], why: &str) {
+    /// Stops spilled boxes so a runner's own box fits (docs/MULTINODE.md#spill). Returns the
+    /// ephemeral ones it stopped, for [`Self::delete_stopped`] once the box that needed the room
+    /// has it (stopping frees memory, vCPUs and the slot; deleting, the disk and the cap place).
+    pub(crate) fn make_room(
+        shared: &Mutex<Catalog>,
+        boxes: &[(i64, String, bool)],
+        why: &str,
+    ) -> Vec<(i64, String)> {
+        let mut stopped = vec![];
         for (owner, name, ephemeral) in boxes {
-            let mut done = Self::operation_shared(shared, *owner, json!({"op":"stop","id":name}));
-            if done.is_ok() && *ephemeral {
-                done = Self::operation_shared(shared, *owner, json!({"op":"delete","id":name}));
-            }
+            let done = Self::operation_shared(shared, *owner, json!({"op":"stop","id":name}));
             eprintln!(
                 "placement_yield: spilled box {name} stopped for {why}: {}",
                 done.as_ref()
@@ -3257,8 +3275,21 @@ impl Catalog {
                 None,
                 "WARN",
                 "placement_yield",
-                &json!({"box":name,"for":why,"deleted":*ephemeral && done.is_ok(),"ok":done.is_ok()}),
+                &json!({"box":name,"for":why,"ok":done.is_ok()}),
             );
+            if done.is_ok() && *ephemeral {
+                stopped.push((*owner, name.clone()));
+            }
+        }
+        stopped
+    }
+
+    /// Deletes ephemeral spilled boxes [`Self::make_room`] stopped.
+    pub(crate) fn delete_stopped(shared: &Mutex<Catalog>, boxes: &[(i64, String)]) {
+        for (owner, name) in boxes {
+            if let Err(e) = Self::operation_shared(shared, *owner, json!({"op":"delete","id":name})) {
+                eprintln!("placement_yield: deleting stopped spilled box {name}: {e:#}");
+            }
         }
     }
 

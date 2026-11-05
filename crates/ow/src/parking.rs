@@ -436,12 +436,18 @@ pub(super) fn reserve_wake(shared: &Shared, t: &Transfer) -> Result<bool> {
     }
     if let Some((node, crate::catalog::Yield(boxes))) = room {
         drop(c);
-        crate::catalog::Catalog::make_room(shared, &boxes, "a wake");
-        // Reserved in the same pass, before a new spilled box can take the room.
-        let c = shared.lock().unwrap();
-        if c.transfer(t.id)?.step == Step::Preparing {
-            let _ = c.reserve_wake(t.id, &node, &input);
+        let stopped = crate::catalog::Catalog::make_room(shared, &boxes, "a wake");
+        // Reserved right after the stops, before the deletes: a box spilled meanwhile cannot
+        // take the room. Not reserved (it was anyway): the next pass tries again.
+        {
+            let c = shared.lock().unwrap();
+            if c.transfer(t.id)?.step == Step::Preparing
+                && let Err(e) = c.reserve_wake(t.id, &node, &input)
+            {
+                eprintln!("placement_yield: wake {} not reserved on {node}: {e:#}", t.id);
+            }
         }
+        crate::catalog::Catalog::delete_stopped(shared, &stopped);
         return Ok(true);
     }
     if !compatible_runner && compatibility.is_some() {

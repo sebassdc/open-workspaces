@@ -1048,10 +1048,11 @@ impl GitHub {
     fn queued(&self, app_id: u64, repo: &str, labels: &[String]) -> Result<u32> {
         // Never at the cost of what the pool itself needs (runner lists, registrations).
         let left = *self.remaining.lock().unwrap();
-        ensure!(
-            left.is_none_or(|n| n >= QUEUED_FLOOR),
-            "GitHub rate limit low ({left:?} left): not asking for queued jobs"
-        );
+        if left.is_some_and(|n| n < QUEUED_FLOOR) {
+            // Expected under load, not a fault: no spill until the limit refills.
+            eprintln!("actions pools: GitHub rate limit low ({left:?} left): not asking for queued jobs");
+            return Ok(0);
+        }
         let token = self.token(app_id, repo)?;
         let ours: Vec<String> = labels.iter().map(|l| l.to_ascii_lowercase()).collect();
         let mut count = 0;
