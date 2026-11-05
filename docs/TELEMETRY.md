@@ -70,6 +70,8 @@ Infrastructure code carries no telemetry setting.
 | `alerts.offline_after_s` | `60` | 15–86400 | Grace period before an offline runner raises `node_offline`. |
 | `alerts.disk_low_gib` | `20` | 0–100000 | `disk_low` when a runner's free data-volume space is below this. |
 | `limits.box_memory_mib` | `0` | 0–65536 | Largest memory a box may be created or resized to. `0`: only the runner's memory budget limits it. Boxes already over a lowered limit still start. |
+| `placement.spill` | empty | `pool:node:max_boxes`, comma-separated, at most 8; or the typed list over the API | [Spill](MULTINODE.md#spill) rules: a full pool (not `default`) may place up to `max_boxes` boxes on that runner of another pool. Empty is off. Takes effect at the next create. |
+| `placement.spill_keep_free_mib` | `16384` | 0–4194304 | Memory every spill runner keeps for its own pool. |
 | `dashboard.ui_bundle` | `builtin` | `builtin` or an installed bundle version | UI bundle the dashboard serves; see [UI bundles](DASHBOARD.md#ui-bundles). Refused unless installed, intact and API-compatible. |
 
 ## What runners report

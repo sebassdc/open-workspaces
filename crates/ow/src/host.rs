@@ -939,6 +939,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         | Action::NodePool { .. }
         | Action::Token { .. }
         | Action::Health
+        | Action::Placement { .. }
         | Action::Config { .. } => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;

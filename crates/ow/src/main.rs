@@ -51,6 +51,7 @@ mod remote;
 mod scaler;
 #[cfg(target_os = "linux")]
 mod selfhost;
+mod spill;
 mod ssh_client;
 #[cfg(target_os = "linux")]
 mod ssh_gateway;
@@ -92,6 +93,16 @@ enum ConfigAction {
         key: Option<String>,
         #[arg(long)]
         limit: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlacementAction {
+    /// Spill rules and how full each pool's own and borrowed runners are.
+    Status {
+        /// Only this pool.
+        #[arg(long)]
+        pool: Option<String>,
     },
 }
 
@@ -266,6 +277,11 @@ enum Action {
     Nodes,
     /// Admin: fleet health as JSON (alerts, latest node telemetry); exits 1 on an alert.
     Health,
+    /// Admin: placement pools' spill rules and usage (see docs/MULTINODE.md#spill).
+    Placement {
+        #[command(subcommand)]
+        command: PlacementAction,
+    },
     /// Admin: controller-held settings that runners receive (see docs/TELEMETRY.md).
     Config {
         #[command(subcommand)]

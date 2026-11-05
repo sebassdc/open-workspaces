@@ -2,6 +2,45 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.55",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "waivers": {
+        "worker": "host.rs only lists the new admin command among those it never dispatches; the worker's own code is unchanged"
+      },
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Spill: a placement pool whose own runners are full may place up to N boxes on a named runner of another pool, while that runner keeps placement.spill_keep_free_mib of memory for its own pool. Two controller settings, placement.spill (pool:node:max_boxes rules) and placement.spill_keep_free_mib (default 16384), changed with ow config set and read on every create; off by default. Nothing spills while the pool has no live runner of its own. New admin op placement.status (ow placement status) shows each rule's usage and state. Additive catalog table box_pools records each non-default create's pool; catalog schema unchanged. Class 1: the controller and dashboard restart; workers and boxes keep running."
+    },
+    {
       "version": "0.9.54",
       "class": 1,
       "changes": [

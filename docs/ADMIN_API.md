@@ -141,6 +141,7 @@ reissue. Keys live in `admin_operations`.
 | `ow host invite NODE [--ttl S] [--memory M] [--slots N] [--cpus C] [--output FILE]` | `host.invite` |
 | `ow host budget NODE --memory M --slots N --cpus C` | `host.budget` |
 | `ow host revoke NODE` | `host.revoke` |
+| `ow placement status [--pool P]` | `placement.status` |
 
 The examples below are the contract: a test parses every request and response,
 and checks that the CLI builds each request exactly.
@@ -159,7 +160,8 @@ before any change).
   "telemetry.enabled": true, "telemetry.interval_s": 15, "telemetry.forward_endpoint": "",
   "telemetry.logs": true, "telemetry.log_level": "info",
   "alerts.offline_after_s": 60, "alerts.disk_low_gib": 20,
-  "dashboard.ui_bundle": "builtin", "limits.box_memory_mib": 0}}}
+  "dashboard.ui_bundle": "builtin", "limits.box_memory_mib": 0,
+  "placement.spill": [], "placement.spill_keep_free_mib": 16384}}}
 ```
 
 ### config.get
@@ -183,7 +185,7 @@ check order is: admin gate, request shape, `expected_version`, then the value.
 A value equal to the stored one returns `"changed": false` and the current
 version: no version bump and no `config_changes` row (an `admin_audit` row with
 result `unchanged` is still written), so a retry after an uncertain answer is
-always safe. `effective` says when it applies: `next_create` for `limits.*`,
+always safe. `effective` says when it applies: `next_create` for `limits.*` and `placement.*`,
 `next_ack` for `telemetry.*` and `alerts.*` (runners get it with the next
 acknowledgement, a few seconds), `next_request` for `dashboard.ui_bundle`.
 `warnings` lists what is valid but will not do what it reads like.
@@ -205,6 +207,28 @@ acknowledgement, a few seconds), `next_request` for `dashboard.ui_bundle`.
 {"ok": false, "op": "config.set", "error_code": "invalid_value",
   "error": "telemetry.interval_s: telemetry.interval_s must be within 5..=300.",
   "details": {"key": "telemetry.interval_s", "reason": "telemetry.interval_s must be within 5..=300"}}
+```
+
+`placement.spill` takes the string grammar (`pool:node:max_boxes`, comma-separated)
+or a list of `{"pool", "node", "max_boxes"}`; both store the same value. The
+pool cannot be `default`; its runners must be enrolled and in another pool.
+
+<!-- admin:example op=config.set -->
+```json
+{"op": "config.set", "key": "placement.spill", "value": [{"pool": "ci", "node": "n2", "max_boxes": 2}]}
+```
+```json
+{"ok": true, "op": "config.set", "result": {"key": "placement.spill", "value": [{"pool": "ci", "node": "n2", "max_boxes": 2}],
+  "previous": [], "changed": true, "version": 43, "effective": "next_create", "warnings": [], "audit_id": 119}}
+```
+
+<!-- admin:example op=config.set -->
+```json
+{"op": "config.set", "key": "placement.spill", "value": "ci:n9:2"}
+```
+```json
+{"ok": false, "op": "config.set", "error_code": "invalid_value", "error": "placement.spill: node n9 is not enrolled.",
+  "details": {"key": "placement.spill", "reason": "node n9 is not enrolled"}}
 ```
 
 ### config.history
@@ -326,6 +350,30 @@ Durable upper bounds for an enrolled runner; lowering needs its boxes stopped.
 ```json
 {"ok": true, "op": "host.budget", "result": {"node": "n3", "memory": 16384, "slots": 4, "cpus": 4,
   "operator_configuration_required": true}}
+```
+
+### placement.status
+
+[Spill](MULTINODE.md#spill) rules and usage, for every pool with a rule (or the
+one asked for). `home_nodes` are the pool's own runners; `spill` has one entry
+per rule, in rule order; `boxes` and `pending` count that pool's boxes;
+`free_memory_after_reserve_mib` is the most memory one more box of the pool may
+use there (CPU, disk and the usual checks still apply). `state`
+is `available`, `full` (cap reached), `reserve` (only the reserve is left),
+`off` (`max_boxes` 0), `no_home` (no live runner in the pool, so nothing
+spills), `inert_offline`, `inert_draining`, `inert_revoked` or
+`inert_image_missing`.
+
+<!-- admin:example op=placement.status -->
+```json
+{"op": "placement.status", "pool": "ci"}
+```
+```json
+{"ok": true, "op": "placement.status", "result": {"version": 43, "keep_free_mib": 32768, "pools": [{"pool": "ci",
+  "home_nodes": [{"node": "n1", "online": true, "active": true, "draining": false, "boxes": 5, "pending": 0,
+                  "free_slots": 0, "free_memory_mib": 0}],
+  "spill": [{"node": "n2", "max_boxes": 2, "boxes": 1, "pending": 0, "box_names": ["ci-runner-7f3a"],
+             "free_memory_mib": 57344, "free_memory_after_reserve_mib": 24576, "state": "available"}]}]}}
 ```
 
 ### host.revoke

@@ -72,7 +72,7 @@ fn now() -> i64 {
 // Controller-held settings (one source; read on every acknowledgement).
 
 /// Allowed keys and their defaults.
-pub const KEYS: [(&str, &str); 9] = [
+pub const KEYS: [(&str, &str); 11] = [
     ("telemetry.enabled", "true"),
     ("telemetry.interval_s", "15"),
     ("telemetry.forward_endpoint", ""),
@@ -85,6 +85,10 @@ pub const KEYS: [(&str, &str); 9] = [
     (crate::dashboard_ui::SETTING, "builtin"),
     // Largest memory one box may be created or resized to; 0 means only the runner's budget limits it.
     ("limits.box_memory_mib", "0"),
+    // Pools that may borrow room on hosts of another pool when their own are full
+    // (docs/MULTINODE.md#spill), and the memory every spill host keeps for its own pool.
+    (crate::spill::RULES, ""),
+    (crate::spill::KEEP_FREE, "16384"),
 ];
 
 pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
@@ -115,6 +119,8 @@ pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
         "alerts.offline_after_s" => number(15..=86400),
         "alerts.disk_low_gib" => number(0..=100_000),
         "limits.box_memory_mib" => number(0..=u64::from(crate::common::HOST_MEMORY_MIB)),
+        crate::spill::RULES => Ok(json!(crate::spill::parse(value)?)),
+        crate::spill::KEEP_FREE => number(0..=u64::from(crate::common::HOST_MEMORY_MIB)),
         crate::dashboard_ui::SETTING => {
             if value != "builtin" {
                 crate::dashboard_ui::valid_version(value)?;
@@ -149,7 +155,7 @@ pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
 pub fn settings(db: &Connection) -> Result<Value> {
     // One query: it also runs with every acknowledgement.
     let stored: BTreeMap<String, String> = db
-        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key LIKE 'limits.%' OR key='config_version'")?
+        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key LIKE 'limits.%' OR key LIKE 'placement.%' OR key='config_version'")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut out = json!({});
@@ -178,10 +184,11 @@ pub(crate) fn default(key: &str) -> Value {
 /// Writes one already-validated setting inside the caller's transaction, bumps the
 /// configuration version and records it in `config_changes`; the new version.
 pub(crate) fn store_setting(db: &Connection, key: &str, typed: &Value, actor: &str) -> Result<i64> {
-    let stored = typed
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or(typed.to_string());
+    let stored = match typed {
+        Value::String(text) => text.clone(),
+        Value::Array(_) => crate::spill::text(typed),
+        _ => typed.to_string(),
+    };
     db.execute(
         "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![key, stored],

@@ -275,6 +275,7 @@ fn the_cli_builds_the_documented_request() {
         ),
         ("host.revoke", &["host", "revoke", "n3"]),
         ("host.revoke", &["node-revoke", "n3"]),
+        ("placement.status", &["placement", "status", "--pool", "ci"]),
     ];
     for (op, args) in cases {
         let cli = Cli::try_parse_from([&["ow"], *args].concat()).unwrap();
@@ -566,6 +567,18 @@ fn documented_examples_match_real_answers() {
         json!({"op":"host.invite","node":"n1","operation_key":"setup"}),
     );
     assert_eq!(status, 200);
+    // n2: an enrolled runner of another pool, for the spill example.
+    call(
+        &root,
+        json!({"op":"host.invite","node":"n2","operation_key":"setup2"}),
+    );
+    crate::nodes::db(&root)
+        .unwrap()
+        .execute(
+            "UPDATE nodes SET credential_hash='synthetic' WHERE id='n2'",
+            [],
+        )
+        .unwrap();
     let mut seen_issue = false;
     for (op, mut request, documented) in examples() {
         if let Some(r) = request.as_object_mut() {
@@ -777,6 +790,123 @@ fn admin_socket_answers_like_the_handler() {
     assert_eq!(
         shape(&headers, false, BODY_LIMIT + 1).unwrap().code,
         "too_large"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Spill settings: string and typed forms agree, refusals name the rule, warnings say what
+/// will not work, and placement.status reports each rule's state.
+#[cfg(target_os = "linux")]
+#[test]
+fn spill_settings_refuse_warn_and_report() {
+    let root = temp_root();
+    crate::limits::free_pool(&root);
+    for node in ["n1", "n2", "n3"] {
+        call(
+            &root,
+            json!({"op":"host.invite","node":node,"memory":8192,"operation_key":format!("k-{node}")}),
+        );
+    }
+    let db = crate::nodes::db(&root).unwrap();
+    db.execute("UPDATE nodes SET credential_hash='synthetic',capabilities='{\"memory_mib\":8192,\"slots\":2,\"vcpus\":2}' WHERE id IN ('n1','n2')", []).unwrap();
+    db.execute(
+        "INSERT INTO node_placement_policy(node,pool) VALUES('n1','ci')",
+        [],
+    )
+    .unwrap();
+    let set = |value: Value| {
+        call(
+            &root,
+            json!({"op":"config.set","key":"placement.spill","value":value}),
+        )
+    };
+    // n3 was invited but never enrolled; n1 is already in pool ci; n9 does not exist.
+    for (value, reason) in [
+        ("ci:n3:2", "node n3 is not enrolled or is revoked"),
+        ("ci:n1:2", "node n1 is already in pool ci"),
+        ("ci:n9:2", "node n9 is not enrolled"),
+        ("ci:n2:65", "max_boxes must be within 0..=64"),
+    ] {
+        let (status, refused) = set(json!(value));
+        assert_eq!(
+            (status, refused["details"]["reason"].as_str()),
+            (422, Some(reason)),
+            "{value}"
+        );
+    }
+    let (status, ok) = set(json!("ci:n2:2"));
+    assert_eq!(status, 200, "{ok}");
+    assert_eq!(
+        ok["result"]["value"],
+        json!([{"pool":"ci","node":"n2","max_boxes":2}])
+    );
+    assert_eq!(ok["result"]["effective"], "next_create");
+    let (_, same) = set(json!([{"pool":"ci","node":"n2","max_boxes":2}]));
+    assert_eq!(
+        same["result"]["changed"], false,
+        "typed JSON stores the same value"
+    );
+    let (status, bad) = set(json!([{"pool":"ci","node":"n2"}]));
+    assert_eq!(
+        (status, bad["error_code"].as_str()),
+        (422, Some("invalid_value"))
+    );
+    // A reserve above n2's 8192 MiB budget is accepted with a warning.
+    let (_, warned) = call(
+        &root,
+        json!({"op":"config.set","key":"placement.spill_keep_free_mib","value":"9000"}),
+    );
+    assert!(
+        warned["result"]["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("above n2's memory budget 8192"),
+        "{warned}"
+    );
+    let state = |root: &Path| {
+        let (_, status) = call(root, json!({"op":"placement.status","pool":"ci"}));
+        status["result"]["pools"][0]["spill"][0]["state"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // Nobody is online in this fixture: the rule is inert until n2 is.
+    assert_eq!(state(&root), "inert_offline");
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    db.execute("UPDATE nodes SET heartbeat=?1 WHERE id='n2'", [now()])
+        .unwrap();
+    assert_eq!(
+        state(&root),
+        "no_home",
+        "n1, the pool's own runner, is offline"
+    );
+    db.execute("UPDATE nodes SET heartbeat=?1 WHERE id='n1'", [now()])
+        .unwrap();
+    assert_eq!(state(&root), "reserve");
+    call(
+        &root,
+        json!({"op":"config.set","key":"placement.spill_keep_free_mib","value":"1024"}),
+    );
+    assert_eq!(state(&root), "available");
+    set(json!("ci:n2:0"));
+    assert_eq!(state(&root), "off");
+    set(json!("ci:n2:1"));
+    db.execute("UPDATE nodes SET revoked=1 WHERE id='n2'", [])
+        .unwrap();
+    assert_eq!(
+        state(&root),
+        "inert_revoked",
+        "a rule outlives its runner and says so"
+    );
+    let (_, list) = call(&root, json!({"op":"config.list"}));
+    assert_eq!(
+        list["result"]["settings"]["placement.spill"],
+        json!([{"pool":"ci","node":"n2","max_boxes":1}])
     );
     std::fs::remove_dir_all(root).unwrap();
 }
