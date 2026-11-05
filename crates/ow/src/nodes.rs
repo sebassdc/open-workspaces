@@ -82,8 +82,10 @@ pub(crate) fn digest(secret: &str) -> String {
 /// fsyncs (synchronous=FULL), and on a host whose boxes share the catalog's filesystem one
 /// fsync can stall for seconds while a box's disk is flushed (a recovery capture or seal):
 /// the writer then holds the lock that long (about 6 s measured), which a 5 s wait did not
-/// outlast. Still well under the gateway's 45 s request bound.
-pub(crate) const CATALOG_BUSY: Duration = Duration::from_secs(15);
+/// outlast. A heartbeat waits behind the in-process catalog lock a waiting writer holds, so
+/// the wait stays well inside the offline window.
+pub(crate) const CATALOG_BUSY: Duration = Duration::from_secs(10);
+const _: () = assert!((CATALOG_BUSY.as_secs() as i64) < OFFLINE - 3);
 
 pub(crate) fn db(root: &Path) -> Result<Connection> {
     let path = root.join("catalog.sqlite3");
