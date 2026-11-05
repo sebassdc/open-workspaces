@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -630,9 +631,45 @@ class Journal:
         h.write_json(JOURNAL, self.value)
         if name not in TERMINAL:
             say(f"upgrade: {name}")
+        else:
+            report(self.value)
 
     def __getitem__(self, key):
         return self.value[key]
+
+
+def events(journal):
+    """A closed journal as upgrade events (docs/TELEMETRY.md): one per step with its
+    time, and boxes for the hibernate and resume steps, then the upgrade as a whole."""
+    # A journal an older upgrader left may lack fields: valid placeholders keep the events.
+    jid, seconds = journal.get("id") or "unknown", journal.get("seconds", {})
+    boxes = {"hibernate": len(journal.get("resume", [])), "resume": journal.get("resumed")}
+    out = []
+    for step, s in seconds.items():
+        attrs = {"journal": jid, "step": step, "duration_ms": int(s * 1000)}
+        if boxes.get(step) is not None:
+            attrs["boxes"] = boxes[step]
+        out.append({"event": "ow.host.upgrade.step", "attrs": attrs})
+    out.append({"event": "ow.host.upgrade", "attrs": {
+        "journal": jid, "class": journal.get("class", 0), "from": (journal.get("from") or {}).get("current") or "none",
+        "to": (journal.get("to") or {}).get("current") or "none", "outcome": journal["step"],
+        "duration_ms": int(sum(seconds.values()) * 1000), "cold": len(journal.get("cold", []))}})
+    return out
+
+
+def report(journal):
+    """Hands the events to this host's telemetry intake: its node agent (or, on a
+    controller host, the controller) stores them in the runner's event log and forwards
+    them. Best effort: with nothing listening they are lost; upgrade.json keeps the last."""
+    path = str(p(f"{h.RUNNER}/telemetry.sock"))
+    for event in events(journal):
+        try:
+            with socket.socket(socket.AF_UNIX) as s:
+                s.settimeout(2)
+                s.connect(path)
+                s.sendall(json.dumps(event).encode() + b"\n")
+        except OSError:
+            return
 
 
 def execute(plan_, ops, frm, to, target_name):
@@ -720,6 +757,7 @@ def resume(j, ops):
             try:
                 ops.start_box(box)
                 say(f"resumed {box}")
+                j.value["resumed"] = j.value.get("resumed", 0) + 1
             except Exception as e:  # noqa: BLE001 - every box gets its turn
                 say(f"could not resume {box}: {e}")
                 failed.append(box)

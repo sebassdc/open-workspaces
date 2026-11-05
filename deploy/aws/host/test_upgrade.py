@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -338,6 +339,46 @@ class Machine(unittest.TestCase):
                          {"workspace": "m-1", "name": name, "runtime": COMPAT["runtime"],
                           "kernel_sha256": COMPAT["kernel_sha256"], **manifest})
         self.assertEqual([c["name"] for c in u.captures(COMPAT)], ["m-1/sleep-b"])
+
+    def test_a_closed_journal_becomes_upgrade_events_on_the_intake(self):
+        import socket
+        import threading
+        ops = Fake({"a": "running", "b": "stopped"})
+        with tempfile.TemporaryDirectory(dir="/tmp") as short:
+            path = f"{short}/telemetry.sock"
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(path)
+            listener.listen(64)
+            lines = []
+
+            def accept():
+                while True:
+                    try:
+                        conn, _ = listener.accept()
+                    except OSError:
+                        return
+                    with conn:
+                        lines.append(json.loads(conn.makefile().readline()))
+            threading.Thread(target=accept, daemon=True).start()
+            with mock.patch.object(u, "p", lambda name: Path(path) if name.endswith("telemetry.sock") else h.p(name)):
+                self.run_plan(ops, ["worker"], 2, ["worker"])
+            for _ in range(100):
+                if lines and lines[-1]["event"] == "ow.host.upgrade":
+                    break
+                time.sleep(0.05)
+            listener.close()
+        steps = {e["attrs"]["step"]: e["attrs"] for e in lines if e["event"] == "ow.host.upgrade.step"}
+        self.assertTrue({"drain", "hibernate", "switch", "verify", "resume", "undrain"} <= set(steps), steps)
+        self.assertEqual((steps["hibernate"]["boxes"], steps["resume"]["boxes"]), (1, 1))
+        whole = lines[-1]["attrs"]
+        self.assertEqual((whole["outcome"], whole["class"], whole["journal"]), ("done", 2, self.journal()["id"]))
+        key = lambda e: json.dumps(e, sort_keys=True)  # noqa: E731 - the journal file sorts its keys
+        self.assertEqual(sorted(map(key, lines)), sorted(map(key, u.events(self.journal()))))
+
+    def test_without_a_listener_the_upgrade_still_closes(self):
+        ops = Fake({"a": "running"})
+        self.run_plan(ops, ["worker"], 2, ["worker"])
+        self.assertEqual(self.journal()["step"], "done")
 
     def test_an_ephemeral_box_never_meets_the_capture_gate(self):
         h.write_json(f"{h.RUNNER}/state.json", {"workspaces": {

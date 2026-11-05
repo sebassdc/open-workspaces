@@ -1812,6 +1812,13 @@ pub fn agent(
         );
     }
     {
+        let telemetry = telemetry.clone();
+        crate::telemetry::serve_events(
+            root,
+            Arc::new(move |name, attrs| telemetry.host_event(name, attrs)),
+        );
+    }
+    {
         let prepared = prepared.clone();
         crate::telemetry::collector(
             telemetry.clone(),

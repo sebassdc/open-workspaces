@@ -517,6 +517,10 @@ impl Agent {
     fn event(&self, severity: &str, name: &str, attrs: &[(&str, String)]) {
         self.push(encode_event(&self.node, severity, name, attrs));
     }
+    /// A host event handed over on the intake (see `HOST_EVENTS`).
+    pub(crate) fn host_event(&self, name: &str, attrs: &[(&str, String)]) {
+        self.event(event_severity(attrs), name, attrs);
+    }
     /// The controller's acknowledgement: whether it takes telemetry, and its settings.
     pub fn acknowledged(&self, ack: &Value, connected_at: Instant) {
         let offered = ack["extensions"]
@@ -793,6 +797,73 @@ fn intake_record(line: &str) -> Option<(String, Option<String>, u64, Option<&'st
     };
     Some((op.to_owned(), machine, v["duration_ms"].as_u64()?, error))
 }
+/// Host events other processes hand over through the intake (the upgrader's timings, sent
+/// once its journal closes), each with the only attributes it may carry.
+const HOST_EVENTS: [(&str, &[&str]); 2] = [
+    (
+        "ow.host.upgrade",
+        &[
+            "journal",
+            "class",
+            "from",
+            "to",
+            "outcome",
+            "duration_ms",
+            "cold",
+        ],
+    ),
+    (
+        "ow.host.upgrade.step",
+        &["journal", "step", "duration_ms", "boxes"],
+    ),
+];
+type EventSink = Arc<dyn Fn(&'static str, &[(&'static str, String)]) + Send + Sync>;
+static EVENT_SINKS: Mutex<Vec<(PathBuf, EventSink)>> = Mutex::new(Vec::new());
+/// One intake line that is a host event: `{"event": NAME, "attrs": {KEY: VALUE}}`, with
+/// a known name, its own keys only and plain values; anything else is refused.
+fn intake_event(line: &str) -> Option<(&'static str, Vec<(&'static str, String)>)> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    let (name, keys) = HOST_EVENTS.iter().find(|(n, _)| v["event"] == *n)?;
+    let mut attrs = vec![];
+    for (key, value) in v["attrs"].as_object()? {
+        let key = *keys.iter().find(|k| *k == key)?;
+        let value = match value {
+            Value::String(text) => text.clone(),
+            Value::Number(n) if n.is_u64() => n.to_string(),
+            _ => return None,
+        };
+        if !valid_value(&value) {
+            return None;
+        }
+        attrs.push((key, value));
+    }
+    Some((name, attrs))
+}
+/// Reports the host events handed over on `root`'s intake from this process.
+pub(crate) fn serve_events(root: &Path, sink: EventSink) {
+    EVENT_SINKS.lock().unwrap().push((canonical(root), sink));
+}
+fn host_event(root: &Path, line: &str) {
+    let Some((name, attrs)) = intake_event(line) else {
+        return;
+    };
+    let sink = EVENT_SINKS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(r, _)| r == root)
+        .map(|(_, sink)| sink.clone());
+    if let Some(sink) = sink {
+        sink(name, &attrs);
+    }
+}
+/// A host event fails when it names an outcome other than done.
+fn event_severity(attrs: &[(&str, String)]) -> &'static str {
+    match attrs.iter().find(|(k, _)| *k == "outcome") {
+        Some((_, outcome)) if outcome != "done" => "WARN",
+        _ => "INFO",
+    }
+}
 /// Reports operations for `root` from this process, and from others through its intake
 /// socket unless another live process already serves it.
 pub(crate) fn serve_intake(root: &Path, sink: Sink) {
@@ -817,9 +888,12 @@ pub(crate) fn serve_intake(root: &Path, sink: Sink) {
             if std::io::BufReader::new(stream.take(1024))
                 .read_line(&mut line)
                 .is_ok()
-                && let Some((op, machine, ms, error)) = intake_record(&line)
             {
-                sink(&op, machine.as_deref(), Duration::from_millis(ms), error);
+                if let Some((op, machine, ms, error)) = intake_record(&line) {
+                    sink(&op, machine.as_deref(), Duration::from_millis(ms), error);
+                } else {
+                    host_event(&root, &line);
+                }
             }
         }
     });
@@ -827,6 +901,25 @@ pub(crate) fn serve_intake(root: &Path, sink: Sink) {
 /// The node controller reports its own worker's operations as runner `local`: stored in
 /// its event log and forwarded.
 pub(crate) fn serve_controller_intake(root: &Path) {
+    let db_root = root.to_owned();
+    serve_events(
+        root,
+        Arc::new(move |name, attrs| {
+            let map: serde_json::Map<String, Value> = attrs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), json!(v)))
+                .collect();
+            let _ = crate::nodes::db(&db_root).and_then(|db| {
+                record_event(
+                    &db,
+                    "local",
+                    event_severity(attrs),
+                    name,
+                    &Value::Object(map),
+                )
+            });
+        }),
+    );
     let (db_root, salt) = (root.to_owned(), salt(root));
     serve_intake(
         root,
@@ -3038,6 +3131,33 @@ mod tests {
             .unwrap();
         assert!(request.starts_with("POST /v1/metrics"), "{request}");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upgrade_events_carry_only_their_own_plain_attributes() {
+        let ok = r#"{"event":"ow.host.upgrade","attrs":{"journal":"u-20261104T034230Z","class":2,"from":"0.9.50","to":"0.9.53","outcome":"aborted","duration_ms":61234,"cold":0}}"#;
+        let (name, attrs) = intake_event(ok).unwrap();
+        assert_eq!(name, "ow.host.upgrade");
+        assert_eq!(attrs.len(), 7);
+        assert_eq!(
+            event_severity(&attrs),
+            "WARN",
+            "an upgrade that did not finish"
+        );
+        let step = r#"{"event":"ow.host.upgrade.step","attrs":{"journal":"u-1","step":"hibernate","duration_ms":4200,"boxes":3}}"#;
+        assert_eq!(event_severity(&intake_event(step).unwrap().1), "INFO");
+        for bad in [
+            r#"{"event":"ow.host.other","attrs":{}}"#,
+            r#"{"event":"ow.host.upgrade","attrs":{"error":"/home/alice"}}"#,
+            r#"{"event":"ow.host.upgrade.step","attrs":{"step":"a b"}}"#,
+            r#"{"event":"ow.host.upgrade.step","attrs":{"boxes":-1}}"#,
+            r#"{"event":"ow.host.upgrade.step"}"#,
+        ] {
+            assert!(intake_event(bad).is_none(), "{bad}");
+        }
+        // An operation line is not an event, and an event line is not an operation.
+        assert!(intake_event(r#"{"op":"hibernate","duration_ms":1}"#).is_none());
+        assert!(intake_record(ok).is_none());
     }
 
     #[test]
