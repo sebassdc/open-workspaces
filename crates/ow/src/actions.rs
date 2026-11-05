@@ -194,6 +194,14 @@ pub(crate) struct Entry {
     /// Earliest time a failed removal is tried again.
     #[serde(default)]
     pub retry_at: i64,
+    /// Its create succeeded, so a machine may be on a runner (entries saved before this
+    /// field existed count as made).
+    #[serde(default = "made")]
+    pub made: bool,
+}
+
+fn made() -> bool {
+    true
 }
 
 /// What GitHub lists for one runner.
@@ -312,7 +320,13 @@ pub(crate) fn plan(
             continue;
         }
         let mine = entries.iter().filter(|(_, e)| e.pool == p.name);
-        let total = mine.clone().count() as u32;
+        // A box whose create failed holds no machine (an uncertain one may, and the runner's
+        // capacity check then refuses what would not fit); its removal can be refused until
+        // the creation timeout, so while it goes it does not count against max.
+        let total = mine
+            .clone()
+            .filter(|(_, e)| e.phase != Phase::Removing || e.made)
+            .count() as u32;
         // Idle: launching, or started with no job yet, and not about to go.
         let idle = mine
             .filter(|(n, e)| {
@@ -359,6 +373,7 @@ mod tests {
             online: None,
             busy: None,
             retry_at: 0,
+            made: true,
         }
     }
 
@@ -483,6 +498,26 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_create_being_removed_does_not_take_a_slot() {
+        let p = pool(2, 2);
+        let github = HashMap::new();
+        let mut entries = BTreeMap::new();
+        let mut failed = entry(&p, Phase::Removing, 0);
+        failed.started = None;
+        failed.made = false;
+        failed.retry_at = 100;
+        entries.insert("failed".to_string(), failed);
+        let launch = |entries: &BTreeMap<String, Entry>| {
+            plan(10, &[p.clone()], entries, Some(&github), &|_| false, &HashSet::new())
+        };
+        assert_eq!(launch(&entries), vec![Action::Launch { pool: "ci".into(), count: 2 }]);
+        // A made box (here its put or start failed) is on its runner until deleted: it keeps
+        // its slot. So does an entry saved before `made` existed.
+        entries.get_mut("failed").unwrap().made = true;
+        assert_eq!(launch(&entries), vec![Action::Launch { pool: "ci".into(), count: 1 }]);
+    }
+
+    #[test]
     fn an_idle_runner_is_replaced_after_its_idle_life_and_a_long_job_is_not() {
         let p = pool(1, 2);
         let mut entries = BTreeMap::new();
@@ -531,6 +566,14 @@ mod tests {
                 Action::Remove { name: "offline".into(), why: "its runner did not come online", force: false },
             ]
         );
+    }
+
+    #[test]
+    fn an_entry_saved_before_made_existed_counts_as_made() {
+        let p = pool(1, 1);
+        let mut saved = serde_json::to_value(entry(&p, Phase::Removing, 0)).unwrap();
+        saved.as_object_mut().unwrap().remove("made");
+        assert!(serde_json::from_value::<Entry>(saved).unwrap().made);
     }
 
     #[test]
