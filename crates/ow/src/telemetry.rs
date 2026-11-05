@@ -1759,15 +1759,7 @@ pub fn health(root: &Path) -> Result<Value> {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let mut stmt = db.prepare_cached(
-            "SELECT unix_s,severity,name,attrs FROM node_events WHERE node=?1 ORDER BY unix_s DESC,id DESC LIMIT 10",
-        )?;
-        let events = stmt
-            .query_map([&id], |r| {
-                Ok(json!({"unix_s":r.get::<_,i64>(0)?,"severity":r.get::<_,String>(1)?,"name":r.get::<_,String>(2)?,
-                    "attributes":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or_default()}))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let events = recent_events(&db, &id)?;
         // The latest heartbeat the controller stored: live now, or before the last close.
         let heard = n["last_seen_unix_s"].as_i64().unwrap_or(0).max(seen);
         nodes.push(json!({"id":id,"online":n["online"],"revoked":n["revoked"],"last_seen_unix_s":n["last_seen_unix_s"],
@@ -1778,7 +1770,24 @@ pub fn health(root: &Path) -> Result<Value> {
             "events":events}));
     }
     let alerts = alerts(&inventory, &last_seen, &settings, now());
-    Ok(json!({"alerts":alerts,"nodes":nodes,"settings":settings}))
+    // The controller's own worker (`local`) is no enrolled runner: its events (its operations,
+    // a controller-only host's upgrades) are listed apart.
+    let controller = json!({"events": recent_events(&db, "local")?});
+    Ok(json!({"alerts":alerts,"nodes":nodes,"controller":controller,"settings":settings}))
+}
+
+/// A node's newest 10 events.
+fn recent_events(db: &Connection, node: &str) -> Result<Vec<Value>> {
+    let mut stmt = db.prepare_cached(
+        "SELECT unix_s,severity,name,attrs FROM node_events WHERE node=?1 ORDER BY unix_s DESC,id DESC LIMIT 10",
+    )?;
+    let events = stmt
+        .query_map([node], |r| {
+            Ok(json!({"unix_s":r.get::<_,i64>(0)?,"severity":r.get::<_,String>(1)?,"name":r.get::<_,String>(2)?,
+                "attributes":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or_default()}))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(events)
 }
 
 /// Merges health into `ow nodes` output: alerts and latest telemetry per node.

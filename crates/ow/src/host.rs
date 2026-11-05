@@ -596,7 +596,13 @@ fn hibernate_round(root: &Path, fail_fast: bool) -> Result<()> {
     };
     request(json!({"op":"quiesce"}))?;
     let list = request(json!({"op":"list"}))?;
-    for workspace in list.as_array().context("workspace list")? {
+    let list = list.as_array().context("workspace list")?;
+    // Ephemeral boxes last: an upgrade that gives up on a box has stopped no CI job for nothing.
+    let order = list
+        .iter()
+        .filter(|w| w["ephemeral"] != true)
+        .chain(list.iter().filter(|w| w["ephemeral"] == true));
+    for workspace in order {
         let Some(id) = workspace["id"].as_str() else {
             continue;
         };
@@ -612,28 +618,31 @@ fn hibernate_round(root: &Path, fail_fast: bool) -> Result<()> {
             workspace["managed"] != true || placement.is_some(),
             "managed copy is missing placement authority"
         );
-        if workspace["ephemeral"] == true {
+        let result = if workspace["ephemeral"] == true {
             // Never hibernated: its job cannot go on after a restart anyway.
             wire::connect(
                 root,
                 &wire::workspace_request("stop", id, placement.as_ref()),
             )
-            .with_context(|| format!("could not stop ephemeral {id}"))?;
-            println!("stopped ephemeral {id}");
-            continue;
-        }
-        let wait = hibernate_budget(workspace);
-        let hibernate = wire::workspace_request("hibernate", id, placement.as_ref());
+            .map(|_| println!("stopped ephemeral {id}"))
+            .with_context(|| format!("could not stop ephemeral {id}"))
+        } else {
+            let wait = hibernate_budget(workspace);
+            let hibernate = wire::workspace_request("hibernate", id, placement.as_ref());
+            wire::connect_waiting(root, &hibernate, wait)
+                .map(|_| println!("hibernated {id}"))
+                .with_context(|| {
+                    format!(
+                        "could not hibernate {id} within its {} s budget; the worker keeps \
+                         running (nothing was shut down)",
+                        wait.as_secs()
+                    )
+                })
+        };
         // Failing fast, the first failure ends the round: the rest would only queue behind
-        // its capture.
-        match wire::connect_waiting(root, &hibernate, wait).with_context(|| {
-            format!(
-                "could not hibernate {id} within its {} s budget; the worker keeps running \
-                 (nothing was shut down)",
-                wait.as_secs()
-            )
-        }) {
-            Ok(_) => println!("hibernated {id}"),
+        // its capture. A service stop tries every box.
+        match result {
+            Ok(()) => {}
             Err(e) if fail_fast => return Err(e),
             Err(e) => eprintln!("{e:#}"),
         }
@@ -1415,8 +1424,8 @@ mod down_tests {
     }
 
     #[test]
-    fn the_first_failure_stops_the_round_and_ephemeral_boxes_are_stopped() {
-        // Box e is a CI job's box: stopped, never hibernated. Box a fails: b is never tried.
+    fn the_first_failure_stops_the_round_before_any_ci_box_is_stopped() {
+        // Box a fails: b is never tried, and CI box e (listed first) is not stopped for nothing.
         let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
         fs::create_dir(&root).unwrap();
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();
@@ -1452,12 +1461,56 @@ mod down_tests {
             [
                 (json!("quiesce"), json!(null)),
                 (json!("list"), json!(null)),
-                (json!("stop"), json!("e")),
                 (json!("hibernate"), json!("a")),
                 (json!("quiesce"), json!(null)),
             ]
         );
         drop(seen);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ephemeral_boxes_are_stopped_after_the_others_hibernate() {
+        let root = std::env::temp_dir().join(format!("ow-down-{}", vm::nonce().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            let mut lists = 0;
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let request = wire::line(&mut stream).unwrap();
+                log.lock().unwrap().push(request.clone());
+                let response = match request["op"].as_str().unwrap() {
+                    "list" => {
+                        lists += 1;
+                        let state = if lists == 1 { "running" } else { "stopped" };
+                        json!({"ok":true,"result":[{"id":"e","state":state,"ephemeral":true},
+                            {"id":"a","state":if lists == 1 {"running"} else {"hibernated"}}]})
+                    }
+                    _ => json!({"ok":true,"result":{}}),
+                };
+                wire::send(&mut stream, &response).unwrap();
+            }
+        });
+        hibernate_all(&root).unwrap();
+        let steps: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r["op"].clone(), r["id"].clone()))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                (json!("quiesce"), json!(null)),
+                (json!("list"), json!(null)),
+                (json!("hibernate"), json!("a")),
+                (json!("stop"), json!("e")),
+                (json!("list"), json!(null)),
+            ]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

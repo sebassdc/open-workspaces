@@ -223,12 +223,15 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   hibernated (it wakes on its next connection) and is reported.
 - **events**: each step that ends while the host's agent (or, on a controller-only
   host, the controller) listens is handed to its telemetry intake at once as an
-  `ow.host.upgrade.step` event, so the drain's start and the hibernation show up
-  live; when the journal reaches done, aborted or rolled-back, the steps it
-  missed follow, then one `ow.host.upgrade` event (see [telemetry](TELEMETRY.md)).
-  They land in the runner's event log (`ow health`, the admin API's `health.get`)
-  and are forwarded with the other events, so each upgrade's history outlives
-  `upgrade.json`, which keeps only the last journal.
+  `ow.host.upgrade.step` event, so the drain and the hibernation show up while
+  the upgrade runs (each when it ends, with its duration); when the journal
+  reaches done, aborted or rolled-back, the steps it missed follow, then one
+  `ow.host.upgrade` event (see [telemetry](TELEMETRY.md)). A rollback that itself
+  fails leaves the journal open for the next recover and reports nothing yet.
+  They land in the runner's event log (`ow health`, the admin API's `health.get`;
+  a controller-only host's under `controller`) and are forwarded with the other
+  events, so each upgrade's history outlives `upgrade.json`, which keeps only the
+  last journal.
 - **first upgrade to 0.9.55**: it still runs the previous release's upgrader and
   hibernation (840 s for all boxes, whole-disk sealing). On a host with a box whose
   hibernation takes longer (about 4 s per GiB of allocated disk), hibernate that

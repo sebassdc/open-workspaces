@@ -247,7 +247,8 @@ The successful `config.set` changes, newest first; `limit` 1 to 500, default 50.
 
 ### health.get
 
-Fleet health: alerts, and per runner its latest telemetry and recent events
+Fleet health: alerts, per runner its latest telemetry and recent events, and the
+controller's own recent events (its local worker, a controller-only host's upgrades)
 ([TELEMETRY.md](TELEMETRY.md)).
 
 <!-- admin:example op=health.get -->
@@ -257,7 +258,8 @@ Fleet health: alerts, and per runner its latest telemetry and recent events
 ```json
 {"ok": true, "op": "health.get", "result": {"alerts": [], "nodes": [{"id": "n1", "online": true, "revoked": false,
   "last_seen_unix_s": 1793750400, "last_heartbeat_unix_s": 1793750400, "telemetry_v1": true,
-  "telemetry_logs_v1": true, "telemetry": null, "events": []}], "settings": {"version": 42}}}
+  "telemetry_logs_v1": true, "telemetry": null, "events": []}], "controller": {"events": []},
+  "settings": {"version": 42}}}
 ```
 
 ### node.pool.set
