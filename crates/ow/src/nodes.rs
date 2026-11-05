@@ -701,7 +701,9 @@ impl Controller {
             root: root.to_owned(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             jobs: Arc::new(Mutex::new(HashMap::new())),
-            slots: Arc::new(Semaphore::new(32)),
+            // Runner jobs proxied at once, all runners together; under the 128 node
+            // connections, so job sockets leave room for sessions.
+            slots: Arc::new(Semaphore::new(96)),
         })
     }
     /// Catalog work never runs on the two async threads, and no connection or lock is
@@ -1043,11 +1045,11 @@ async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) 
         "unauthorized proxy peer"
     );
     let attached = async {
-        let _permit = c
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .context("controller capacity")?;
+        // A burst waits for a proxy as long as a runner's agent waits for a job slot.
+        let _permit =
+            tokio::time::timeout(JOB_ATTACH_WAIT, c.slots.clone().acquire_owned())
+                .await
+                .context("controller capacity")??;
         let db = {
             let (root, node) = (c.root.clone(), node.clone());
             tokio::task::spawn_blocking(move || -> Result<_> {
@@ -2161,6 +2163,10 @@ pub fn agent(
                             let Some(_slot) = slots.take(JOB_ATTACH_WAIT) else {
                                 return;
                             };
+                            // Stopping meanwhile: left unattached, so nothing starts.
+                            if STOPPING.load(Ordering::SeqCst) {
+                                return;
+                            }
                             let _ = agent_job(
                                 &root,
                                 &origin,

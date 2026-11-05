@@ -3399,6 +3399,12 @@ impl Catalog {
                     &json!({"op":"delete","id":physical}),
                 )
                 .context("runner unreachable; the machine may be back, try again")?;
+                if swept["error"] == nodes::NOT_TAKEN {
+                    return Err(limits::Rejection(format!(
+                        "the runner of machine '{name}' is busy and took nothing; retry the delete"
+                    ))
+                    .into());
+                }
                 if swept["ok"] != true && swept["error"] != "workspace not found" {
                     eprintln!(
                         "delete of never-made {physical} on {node}: {}",
