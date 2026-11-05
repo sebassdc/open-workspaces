@@ -1041,43 +1041,13 @@ pub fn run(cli: Cli) -> Result<i32> {
             nodes::controller(&root, listen, tls_cert, tls_key, insecure_loopback_test)?;
             return Ok(0);
         }
-        Action::NodeJoin {
-            node,
-            output,
-            ttl,
-            memory,
-            slots,
-            cpus,
-            controller,
-        } => {
-            nodes::invitation(
-                &root,
-                &node,
-                ttl,
-                memory,
-                slots,
-                cpus,
-                controller.as_deref(),
-                |v| nodes::write_private(&output, v),
-            )?;
-            return Ok(0);
-        }
-        Action::NodeRevoke { node } => {
-            nodes::revoke(&root, &node)?;
-            return Ok(0);
-        }
         Action::Nodes => {
             let mut nodes = nodes::inventory(&root)?;
             crate::telemetry::annotate(&mut nodes, &crate::telemetry::health(&root)?);
             println!("{nodes}");
             return Ok(0);
         }
-        Action::Health => return crate::telemetry::health_command(&root),
-        Action::Config { action } => return crate::telemetry::config_command(&root, action),
         Action::DashboardUi { action } => return crate::dashboard_ui::command(&root, action),
-        Action::NodePool { .. } | Action::Token { .. } => {
-            bail!("node pools and workload tokens are managed on a Linux controller")
-        }
         _ => {}
     }
     let r = match cli.command {

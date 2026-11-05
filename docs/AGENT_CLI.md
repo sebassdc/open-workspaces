@@ -183,8 +183,10 @@ print one JSON value on stdout, without an interactive prompt or progress banner
 
 Host participation, enrollment, local image build, backup, `node` (singular),
 `up`/`down`, `dashboard`/`serve`, `token` and `node-*` (including `node-pool`) are host/operator commands, not steps
-needed by a remote coworker agent. `host invite/budget/revoke` additionally require
-owner administration. Local image list keeps its existing golden-image JSON
+needed by a remote coworker agent. The admin commands (`config`, `health`,
+`node-pool`, `token`, `host invite/budget/revoke`) are calls to the
+[admin API](ADMIN_API.md): the controller's designated owner runs them from their
+own machine, or root runs them on the controller host. Local image list keeps its existing golden-image JSON
 schema and `--runner` option; remote listing refuses `--runner`.
 
 ## Failures and safe retries

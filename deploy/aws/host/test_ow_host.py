@@ -162,6 +162,60 @@ class Render(unittest.TestCase):
                                 "OW_POOL_ADMINS": "admin@example.com,you@example.com"})
             output = json.loads((root / "dashboard.json").read_text())
             self.assertEqual(output["pool_admins"], ["admin@example.com", "you@example.com"])
+            self.assertNotIn("node_owner_subject", output)
+
+    def test_dashboard_owner_binds_only_a_signed_in_tailnet_user(self):
+        import json
+        import os
+        import sqlite3
+        c = config(dashboard={"logins": ["you@example.com"], "owner": "you@example.com"})
+        self.assertEqual(c["dashboard"], {"logins": ["you@example.com"], "owner": "you@example.com"})
+        files = {k: v[0] for k, v in h.render(c, BUDGET).items()}
+        self.assertTrue(files["/etc/open-workspaces/dashboard.env"].endswith("OW_DASHBOARD_OWNER=you@example.com\n"))
+        changed = {path for path in files if files[path] != self.files[path]}
+        self.assertEqual(h.units_changed(changed), {"dashboard"})
+        for bad in ("not an email", "a@example.com\nX=1", ["a@example.com"]):
+            with self.assertRaises(h.Refused):
+                config(dashboard={"logins": ["you@example.com"], "owner": bad})
+        with self.assertRaises(h.Refused):
+            config(dashboard={"logins": [], "owner": "you@example.com"})
+        with self.assertRaises(h.Refused):
+            config(dashboard={"logins": ["other@example.com"], "owner": "you@example.com"})
+        self.assertEqual(config(dashboard={"logins": [], "capability": "example.test/cap/ow", "owner": "you@example.com"})
+                         ["dashboard"]["owner"], "you@example.com")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog = root / "catalog.sqlite3"
+            script = (self.files["/usr/local/lib/open-workspaces/dashboard-prepare"]
+                      .replace("/srv/ow/.ow/dashboard.json", str(root / "dashboard.json"))
+                      .replace("/srv/ow/.ow/controller/catalog.sqlite3", str(catalog)))
+            status = {"BackendState": "Running", "Self": {"DNSName": "host.example.ts.net."},
+                      "User": {"123": {"LoginName": "You@example.com"}, "456": {"LoginName": "other@example.com"}}}
+            (root / "status.json").write_text(json.dumps(status))
+            (root / "tailscale").write_text(f'#!/bin/sh\n[ "$1" != status ] || cat {root}/status.json\n')
+            (root / "runuser").write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+            for tool in ("tailscale", "runuser"):
+                (root / tool).chmod(0o755)
+            env = {**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "OW_DASHBOARD_LOGINS": "you@example.com",
+                   "OW_DASHBOARD_OWNER": "you@example.com"}
+
+            def prepare():
+                run = subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True, env=env)
+                return json.loads((root / "dashboard.json").read_text()), run.stderr
+
+            output, err = prepare()
+            self.assertNotIn("node_owner_subject", output)
+            self.assertIn("not bound yet", err)
+            db = sqlite3.connect(catalog)
+            db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, issuer TEXT, subject TEXT, email TEXT)")
+            db.execute("INSERT INTO users(id,issuer,subject,email) VALUES(7,'tailscale://example.ts.net','456','other@example.com')")
+            db.commit()
+            output, _ = prepare()
+            self.assertNotIn("node_owner_subject", output, "another user's catalog row binds nothing")
+            db.execute("INSERT INTO users(id,issuer,subject,email) VALUES(9,'tailscale://example.ts.net','123','you@example.com')")
+            db.commit()
+            output, _ = prepare()
+            self.assertEqual((output["node_owner_subject"], output["node_owner_user_id"]), ("123", 9))
 
     def test_optional_features_render_only_when_configured(self):
         bare = h.render(config(dashboard={"logins": []}, developerImages=[], backup={"url": ""}), BUDGET)

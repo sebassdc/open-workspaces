@@ -87,7 +87,7 @@ pub const KEYS: [(&str, &str); 9] = [
     ("limits.box_memory_mib", "0"),
 ];
 
-fn typed(key: &str, value: &str) -> Result<Value> {
+pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
     let number = |range: std::ops::RangeInclusive<u64>| -> Result<Value> {
         let n: u64 = value.parse().context("expected a whole number")?;
         ensure!(range.contains(&n), "{key} must be within {range:?}");
@@ -167,24 +167,44 @@ pub fn settings(db: &Connection) -> Result<Value> {
     Ok(out)
 }
 
-/// `ow config set`: validated, versioned and recorded in `config_changes`.
-pub fn set(root: &Path, key: &str, value: &str, actor: &str) -> Result<Value> {
-    let typed = typed(key, value)?;
+/// A setting's typed default.
+pub(crate) fn default(key: &str) -> Value {
+    KEYS.iter()
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, d)| typed(key, d).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// Writes one already-validated setting inside the caller's transaction, bumps the
+/// configuration version and records it in `config_changes`; the new version.
+pub(crate) fn store_setting(db: &Connection, key: &str, typed: &Value, actor: &str) -> Result<i64> {
     let stored = typed
         .as_str()
         .map(str::to_owned)
         .unwrap_or(typed.to_string());
-    let mut db = crate::nodes::db(root)?;
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute(
+    db.execute(
         "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![key, stored],
     )?;
-    tx.execute("INSERT INTO settings(key,value) VALUES('config_version','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",[])?;
-    tx.execute(
+    db.execute("INSERT INTO settings(key,value) VALUES('config_version','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",[])?;
+    db.execute(
         "INSERT INTO config_changes(key,value,unix_s,actor) VALUES(?1,?2,?3,?4)",
         params![key, stored, now(), actor],
     )?;
+    Ok(db.query_row(
+        "SELECT CAST(value AS INTEGER) FROM settings WHERE key='config_version'",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Validates and stores one setting (the admin API's `config.set` adds audit and checks).
+#[cfg(test)]
+pub fn set(root: &Path, key: &str, value: &str, actor: &str) -> Result<Value> {
+    let typed = typed(key, value)?;
+    let mut db = crate::nodes::db(root)?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    store_setting(&tx, key, &typed, actor)?;
     tx.commit()?;
     settings(&db)
 }
@@ -1680,41 +1700,6 @@ pub fn annotate(inventory: &mut Value, health: &Value) {
             .map(|h| h["telemetry"].clone())
             .unwrap_or(Value::Null);
     }
-}
-
-/// `ow health`: prints fleet health; exit status 1 while any alert is active.
-pub fn health_command(root: &Path) -> Result<i32> {
-    let health = health(root)?;
-    println!("{health:#}");
-    Ok(i32::from(
-        health["alerts"].as_array().is_some_and(|a| !a.is_empty()),
-    ))
-}
-/// `ow config list|get|set` on the controller host.
-pub fn config_command(root: &Path, action: crate::ConfigAction) -> Result<i32> {
-    let value = match action {
-        crate::ConfigAction::List => settings(&crate::nodes::db(root)?)?,
-        crate::ConfigAction::Get { key } => {
-            typed(&key, "").or_else(|_| {
-                typed(
-                    &key,
-                    KEYS.iter().find(|(k, _)| *k == key).map_or("", |(_, d)| d),
-                )
-            })?;
-            settings(&crate::nodes::db(root)?)?[key.as_str()].clone()
-        }
-        crate::ConfigAction::Set { key, value } => {
-            let actor = std::env::var("SUDO_USER")
-                .or_else(|_| std::env::var("USER"))
-                .unwrap_or_else(|_| "local".into());
-            if key == crate::dashboard_ui::SETTING {
-                crate::dashboard_ui::selectable(root, &value)?;
-            }
-            set(root, &key, &value, &actor)?
-        }
-    };
-    println!("{value:#}");
-    Ok(0)
 }
 
 /// Controller-side series for the forwarder: node up and alert state.

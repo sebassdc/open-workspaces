@@ -27,8 +27,9 @@ flowchart LR
 
 ## Commands
 
-Run these on the controller host, the same way you run `ow nodes`. Add `--local`
-if the shell has a saved remote login.
+`ow health` and `ow config` are [admin API](ADMIN_API.md) calls: the controller's
+designated owner runs them from their own machine, or root runs them on the
+controller host with `--local`. `ow nodes` runs on the host as before.
 
 ```sh
 ow health                      # JSON: alerts, per-runner telemetry and recent events; exit 1 on an alert
@@ -53,7 +54,8 @@ On a remote CLI, `ow nodes` shows whether each runner advertises
 
 Settings are stored in the controller's catalog (`settings` table). Every change
 bumps `config_version` and adds a row to `config_changes` (key, value, time,
-`SUDO_USER`/`USER`). The controller reads the settings on every acknowledgement
+the verified actor: `access:EMAIL`, `tailnet:LOGIN` or `host:SUDO_USER`; the
+full record is the admin API's `admin_audit`, read with `ow config history`). The controller reads the settings on every acknowledgement
 it sends a runner, about every 3 s. A change therefore reaches every connected
 runner within seconds, with no redeploy and nothing set per runner.
 Infrastructure code carries no telemetry setting.

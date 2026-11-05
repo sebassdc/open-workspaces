@@ -158,6 +158,7 @@ pub(crate) fn write_private(path: &Path, value: &Value) -> Result<()> {
     result?;
     Ok(())
 }
+#[cfg(test)]
 pub fn mint(
     root: &Path,
     node: &str,
@@ -166,10 +167,9 @@ pub fn mint(
     memory: u32,
     slots: u32,
 ) -> Result<()> {
-    let value = invitation(root, node, ttl, memory, slots, 16, None, |v| {
+    invitation(root, node, ttl, memory, slots, 16, None, |v| {
         write_private(output, v)
     })?;
-    drop(value);
     Ok(())
 }
 pub const POOL_POLICY: &str = "Trusted shared private pool: all admitted workspace users may select this host. The host operator can inspect guest data and stop participation. This invitation grants node participation only, not human workspace management.";
@@ -183,6 +183,32 @@ pub fn invitation(
     cpus: u32,
     controller: Option<&str>,
     publish: impl FnOnce(&Value) -> Result<()>,
+) -> Result<Value> {
+    invitation_with(
+        root,
+        node,
+        ttl,
+        memory,
+        slots,
+        cpus,
+        controller,
+        publish,
+        |_| Ok(()),
+    )
+}
+/// [`invitation`], with `record` run in its transaction before it commits (the admin API's
+/// operation key and audit row).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn invitation_with(
+    root: &Path,
+    node: &str,
+    ttl: u64,
+    memory: u32,
+    slots: u32,
+    cpus: u32,
+    controller: Option<&str>,
+    publish: impl FnOnce(&Value) -> Result<()>,
+    record: impl FnOnce(&Connection) -> Result<()>,
 ) -> Result<Value> {
     common::identifier(node)?;
     ensure!(node != "local", "local is reserved");
@@ -213,6 +239,7 @@ pub fn invitation(
     )?;
     crate::limits::pool(root, &tx, node)?;
     let value = json!({"node":node,"secret":secret,"expires":now()+ttl as i64,"policy":POOL_POLICY,"controller":controller,"memory":memory,"slots":slots,"cpus":cpus});
+    record(&tx)?;
     publish(&value)?;
     tx.commit()?;
     Ok(value)
@@ -268,7 +295,19 @@ fn budget_inventory(root: &Path, node: &str) -> Result<Value> {
     }
 }
 /// Owner authority only. Caller serializes with catalog admission.
+#[cfg(test)]
 pub fn budget(root: &Path, node: &str, memory: u32, slots: u32, cpus: u32) -> Result<Value> {
+    budget_with(root, node, memory, slots, cpus, |_| Ok(()))
+}
+/// Edits an enrolled runner's budget; `record` runs in its transaction before it commits.
+pub(crate) fn budget_with(
+    root: &Path,
+    node: &str,
+    memory: u32,
+    slots: u32,
+    cpus: u32,
+    record: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<Value> {
     common::identifier(node)?;
     common::host_limits(memory, slots, cpus)?;
     let mut db = db(root)?;
@@ -339,6 +378,7 @@ pub fn budget(root: &Path, node: &str, memory: u32, slots: u32, cpus: u32) -> Re
         "UPDATE nodes SET capabilities=?1 WHERE id=?2",
         params![cap.to_string(), node],
     )?;
+    record(&tx)?;
     tx.commit()?;
     Ok(
         json!({"node":node,"memory":memory,"slots":slots,"cpus":cpus,"operator_configuration_required":true}),
@@ -364,6 +404,7 @@ pub fn set_pool(root: &Path, node: &str, pool: &str) -> Result<Value> {
     )?;
     Ok(json!({"node":node,"pool":pool}))
 }
+#[cfg(test)]
 pub fn revoke(root: &Path, node: &str) -> Result<()> {
     ensure!(
         db(root)?.execute("UPDATE nodes SET revoked=1,heartbeat=0 WHERE id=?1", [node])? == 1,
@@ -1258,6 +1299,13 @@ pub fn controller(
         crate::telemetry::spawn_controller_tasks(c.root.clone());
         crate::telemetry::serve_controller_intake(&c.root);
         tokio::spawn(proxies(c.clone()));
+        // The admin API for this host's root or controller user (docs/ADMIN_API.md).
+        let admin_root = c.root.clone();
+        tokio::spawn(async move {
+            if let Err(error) = crate::admin::serve_socket(admin_root, None).await {
+                eprintln!("admin socket stopped: {error:#}");
+            }
+        });
         let slots = Arc::new(Semaphore::new(128));
         if let (Some(cert), Some(key)) = (cert, key) {
             let _ = rustls::crypto::ring::default_provider().install_default();

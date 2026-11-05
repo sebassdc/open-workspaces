@@ -103,7 +103,7 @@ fn owner(db: &Connection, email: &str) -> Result<i64> {
     Ok(db.last_insert_rowid())
 }
 
-fn open(root: &Path) -> Result<Connection> {
+pub(crate) fn open(root: &Path) -> Result<Connection> {
     let db = crate::nodes::db(root)?;
     ensure!(
         db.query_row(
@@ -117,26 +117,40 @@ fn open(root: &Path) -> Result<Connection> {
     Ok(db)
 }
 
-pub fn command(root: &Path, action: crate::TokenAction) -> Result<i32> {
-    println!("{:#}", run(&open(root)?, action)?);
-    Ok(0)
+/// Issues a token inside the caller's transaction; the result shows the token once.
+pub(crate) fn issue(db: &Connection, name: &str, owner: &str, pool: &str) -> Result<Value> {
+    crate::common::identifier(name)?;
+    crate::common::identifier(pool)?;
+    let id = self::owner(db, owner)?;
+    let token = format!("{PREFIX}{}", crate::nodes::random_secret()?);
+    db.execute(
+        "INSERT INTO workload_tokens(name,owner,pool,hash) VALUES(?1,?2,?3,?4)",
+        params![name, id, pool, crate::nodes::digest(&token)],
+    )
+    .with_context(|| format!("token '{name}' already exists; revoke it first"))?;
+    Ok(
+        json!({"name":name,"owner":owner.to_ascii_lowercase(),"owner_id":id,"pool":pool,"token":token,"note":"Shown once; store it now."}),
+    )
 }
 
+/// Tokens with their owner and pool, never the token or its hash.
+pub(crate) fn list(db: &Connection) -> Result<Vec<Value>> {
+    Ok(db
+        .prepare("SELECT t.name,u.email,t.owner,t.pool,t.created_at FROM workload_tokens t JOIN users u ON u.id=t.owner ORDER BY t.name")?
+        .query_map([], |r| {
+            Ok(json!({"name":r.get::<_,String>(0)?,"owner":r.get::<_,String>(1)?,"owner_id":r.get::<_,i64>(2)?,"pool":r.get::<_,String>(3)?,"created_at":r.get::<_,String>(4)?}))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+#[cfg(test)]
 pub(crate) fn run(db: &Connection, action: crate::TokenAction) -> Result<Value> {
     Ok(match action {
         crate::TokenAction::Issue { name, owner, pool } => {
-            crate::common::identifier(&name)?;
-            crate::common::identifier(&pool)?;
             let tx = db.unchecked_transaction()?;
-            let id = self::owner(&tx, &owner)?;
-            let token = format!("{PREFIX}{}", crate::nodes::random_secret()?);
-            tx.execute(
-                "INSERT INTO workload_tokens(name,owner,pool,hash) VALUES(?1,?2,?3,?4)",
-                params![name, id, pool, crate::nodes::digest(&token)],
-            )
-            .with_context(|| format!("token '{name}' already exists; revoke it first"))?;
+            let issued = issue(&tx, &name, &owner, &pool)?;
             tx.commit()?;
-            json!({"name":name,"owner":owner.to_ascii_lowercase(),"owner_id":id,"pool":pool,"token":token,"note":"Shown once; store it now."})
+            issued
         }
         crate::TokenAction::Revoke { name } => {
             ensure!(
@@ -145,15 +159,7 @@ pub(crate) fn run(db: &Connection, action: crate::TokenAction) -> Result<Value> 
             );
             json!({"revoked":name})
         }
-        crate::TokenAction::List => {
-            let rows: Vec<Value> = db
-                .prepare("SELECT t.name,u.email,t.owner,t.pool,t.created_at FROM workload_tokens t JOIN users u ON u.id=t.owner ORDER BY t.name")?
-                .query_map([], |r| {
-                    Ok(json!({"name":r.get::<_,String>(0)?,"owner":r.get::<_,String>(1)?,"owner_id":r.get::<_,i64>(2)?,"pool":r.get::<_,String>(3)?,"created_at":r.get::<_,String>(4)?}))
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            json!(rows)
-        }
+        crate::TokenAction::List => json!(list(db)?),
     })
 }
 

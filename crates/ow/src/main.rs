@@ -1,3 +1,5 @@
+mod admin;
+mod admin_client;
 #[cfg(target_os = "linux")]
 mod aws_identity;
 #[cfg(target_os = "linux")]
@@ -78,7 +80,19 @@ enum ConfigAction {
     /// One setting's current value.
     Get { key: String },
     /// Change one setting; runners receive it within seconds.
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        value: String,
+        /// Refuse the change unless the configuration is still at this version.
+        #[arg(long)]
+        expect_version: Option<i64>,
+    },
+    /// Who changed which setting, newest first.
+    History {
+        key: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -219,7 +233,8 @@ enum Action {
         #[arg(long)]
         insecure_loopback_test: bool,
     },
-    /// Mint a private, expiring, single-use enrollment file.
+    /// Alias of `host invite` with a required output file (admin op host.invite).
+    #[command(hide = true)]
     NodeJoin {
         node: String,
         #[arg(long)]
@@ -233,24 +248,25 @@ enum Action {
         /// Legacy default remains 16; guided invitations normally cap at 2.
         #[arg(long, default_value_t = 16)]
         cpus: u32,
-        /// Include a validated self-contained HTTPS controller endpoint.
-        #[arg(long)]
+        /// Ignored: the controller names its own URL in the invitation.
+        #[arg(long, hide = true)]
         controller: Option<String>,
     },
-    /// Host-only: revoke this controller's node enrollment.
+    /// Alias of `host revoke` (admin op host.revoke).
+    #[command(hide = true)]
     NodeRevoke { node: String },
-    /// Host-only: put a runner in a placement pool; only creates that ask for the pool land there.
+    /// Admin: put a runner in a placement pool; only creates that ask for the pool land there.
     NodePool { node: String, pool: String },
-    /// Host-only: workload tokens, scoped API credentials for a program (see docs/USERS.md).
+    /// Admin: workload tokens, scoped API credentials for a program (see docs/USERS.md).
     Token {
         #[command(subcommand)]
         action: TokenAction,
     },
     /// JSON placement resources on the selected server (or local node inventory).
     Nodes,
-    /// Host-only: fleet health as JSON (alerts, latest node telemetry); exits 1 on an alert.
+    /// Admin: fleet health as JSON (alerts, latest node telemetry); exits 1 on an alert.
     Health,
-    /// Host-only: controller-held settings that runners receive (see docs/TELEMETRY.md).
+    /// Admin: controller-held settings that runners receive (see docs/TELEMETRY.md).
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -826,7 +842,7 @@ enum HostAction {
     Start,
     Status,
     Stop,
-    /// Designated owner only; requires human Access login.
+    /// Admin: a private, expiring, single-use invitation for a new runner.
     Invite {
         node: String,
         #[arg(long)]
@@ -840,7 +856,7 @@ enum HostAction {
         #[arg(long, default_value_t = 2)]
         cpus: u32,
     },
-    /// Designated owner: edit durable upper bounds for an existing enrolled ID.
+    /// Admin: edit durable upper bounds for an existing enrolled ID.
     Budget {
         node: String,
         #[arg(long)]
@@ -850,6 +866,7 @@ enum HostAction {
         #[arg(long)]
         cpus: u32,
     },
+    /// Admin: revoke a runner's enrollment; revoked IDs cannot be reused.
     Revoke {
         node: String,
     },
@@ -865,6 +882,16 @@ fn assets() -> PathBuf {
 
 fn main_result() -> anyhow::Result<i32> {
     let cli = Cli::parse();
+    // Admin commands are one admin API op each, over HTTPS or the controller's admin.sock.
+    if admin_client::request(&cli.command, "k").is_some() {
+        return admin_client::run(
+            cli.data_dir,
+            cli.server,
+            cli.local_mode,
+            cli.operation_key,
+            cli.command,
+        );
+    }
     #[cfg(target_os = "macos")]
     if let Action::MacHost { command } = cli.command {
         anyhow::ensure!(
@@ -1003,22 +1030,6 @@ fn main_result() -> anyhow::Result<i32> {
                 anyhow::bail!("host up requires Linux x86-64 with KVM");
             }
         }
-        if matches!(
-            command,
-            HostAction::Invite { .. } | HostAction::Revoke { .. } | HostAction::Budget { .. }
-        ) {
-            let selected = cli.server.or_else(|| std::env::var("OW_SERVER").ok());
-            let server = match selected {
-                Some(server) => Some(server),
-                None => client::saved_server()?,
-            }
-            .ok_or_else(|| anyhow::anyhow!("owner administration requires ow login <server>"))?;
-            anyhow::ensure!(
-                !cli.local_mode,
-                "owner host administration uses the verified human gateway"
-            );
-            return client::host_admin(&server, command);
-        }
         anyhow::ensure!(
             cli.server.is_none(),
             "host participation is local; omit --server (invitation includes controller)"
@@ -1045,13 +1056,7 @@ fn main_result() -> anyhow::Result<i32> {
     let internal = matches!(
         cli.command,
         Action::NodeController { .. }
-            | Action::NodeJoin { .. }
-            | Action::NodeRevoke { .. }
-            | Action::NodePool { .. }
-            | Action::Token { .. }
             | Action::NodeAgent { .. }
-            | Action::Health
-            | Action::Config { .. }
             | Action::DashboardUi { .. }
             | Action::Worker
             | Action::Supervisor

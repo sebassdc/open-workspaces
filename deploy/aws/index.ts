@@ -66,6 +66,12 @@ export interface HostArgs {
     /** Login emails that may transfer and fork any box and create boxes for others (the
      * gateway config's `pool_admins`). Admits nobody by itself. Needs a dashboard. Default: none. */
     poolAdmins?: pulumi.Input<pulumi.Input<string>[]>;
+    /** The tailnet login of the controller's admin: the one person whose verified tailnet
+     * identity may call the admin API (`ow config`, `ow node-pool`, `ow token`, `ow host`)
+     * from their own machine, and the dashboard's pool owner. Bound once they have signed in
+     * to the dashboard. Needs a dashboard that admits them. Default: none (admin commands
+     * only on the host). */
+    dashboardOwner?: pulumi.Input<string>;
     /**
      * Developer images (`ubuntu` only for now) to build on the host after boot: the `dev`
      * user, SSH server and toolchains that SSH access and golden-image recipes need.
@@ -116,7 +122,7 @@ export interface HostArgs {
 }
 
 /** A runner host: Host inputs except dashboard, role and GC rights, plus the controller it joins. */
-export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability" | "poolAdmins" | "role" | "storeGc" | "boxRoles"> {
+export interface RunnerArgs extends Omit<HostArgs, "dashboardLogins" | "dashboardCapability" | "poolAdmins" | "dashboardOwner" | "role" | "storeGc" | "boxRoles"> {
     // The package analyzer loses optional types inherited through Omit.
     vcpuOvercommit?: pulumi.Input<number>;
     hostReserveCpuMillis?: pulumi.Input<number>;
@@ -221,6 +227,7 @@ export interface HostConfigInputs {
     dashboardLogins: string[];
     dashboardCapability?: string;
     poolAdmins?: string[];
+    dashboardOwner?: string;
     developerImages: string[];
     backupUrl: string;
     storeUrl?: string;
@@ -267,6 +274,16 @@ export function hostConfig(c: HostConfigInputs): object {
     if (poolAdmins.length > 0 && c.dashboardLogins.length === 0 && !capability) {
         throw new Error("poolAdmins needs a dashboard: set dashboardLogins or dashboardCapability");
     }
+    const owner = c.dashboardOwner ?? "";
+    if (owner) {
+        dashboardLoginList([owner]);
+        if (c.dashboardLogins.length === 0 && !capability) {
+            throw new Error("dashboardOwner needs a dashboard: set dashboardLogins or dashboardCapability");
+        }
+        if (!capability && !c.dashboardLogins.some((login) => login.toLowerCase() === owner.toLowerCase())) {
+            throw new Error("dashboardOwner must be one of dashboardLogins, or the owner can never sign in");
+        }
+    }
     if (c.storeUrl) storeRunnerPolicy("aws", c.storeUrl);
     const artifacts = c.imageArtifacts ?? {};
     if (Object.keys(artifacts).length && !c.storeUrl) throw new Error("imageArtifacts needs storeUrl");
@@ -307,7 +324,7 @@ export function hostConfig(c: HostConfigInputs): object {
         if (!c.tailscaleAuthKeySecretArn) {
             throw new Error("a runner needs tailscaleAuthKeySecretArn: its controller listens on the tailnet only");
         }
-        if (c.dashboardLogins.length > 0 || capability || poolAdmins.length > 0) throw new Error("a runner has no dashboard");
+        if (c.dashboardLogins.length > 0 || capability || poolAdmins.length > 0 || owner) throw new Error("a runner has no dashboard");
     }
     return {
         schema: 1,
@@ -315,7 +332,7 @@ export function hostConfig(c: HostConfigInputs): object {
         release: { repository: c.repository, ref: c.ref },
         tailscale: { secretArn: c.tailscaleAuthKeySecretArn, hostname: c.tailscaleHostname, ssh: c.tailscaleSsh,
             ...(c.directMac ? { direct: { mac: c.directMac } } : {}) },
-        dashboard: { logins: c.dashboardLogins, ...(capability ? { capability } : {}), ...(poolAdmins.length ? { poolAdmins } : {}) },
+        dashboard: { logins: c.dashboardLogins, ...(capability ? { capability } : {}), ...(poolAdmins.length ? { poolAdmins } : {}), ...(owner ? { owner } : {}) },
         developerImages: images ? images.split(" ") : [],
         ...(c.storeUrl ? { store: { url: c.storeUrl, images: artifacts } } : {}),
         backup: { url: backup ? `s3://${backup.bucket}/${backup.prefix}` : "", schedule: c.backupSchedule, ...(c.recoveryPoints ? { recovery: true } : {}) },
@@ -562,17 +579,17 @@ function provision(self: pulumi.ComponentResource, name: string, args: HostArgs)
                 .all([
                     pulumi.all([args.repository ?? DEFAULT_REPOSITORY, args.ref ?? `v${require("./package.json").version}`]),
                     pulumi.all([args.tailscaleAuthKeySecretArn ?? "", args.tailscaleHostname ?? name, args.tailscaleSsh ?? false]),
-                    pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? [], args.dashboardCapability ?? "", args.poolAdmins ?? []]),
+                    pulumi.all([args.dashboardLogins ?? [], args.developerImages ?? [], args.dashboardCapability ?? "", args.poolAdmins ?? [], args.dashboardOwner ?? ""]),
                     pulumi.all([backupUrl ?? "", args.backupSchedule ?? "", args.idleMinutes ?? 30, args.vcpuOvercommit ?? 1, args.recoveryPoints ?? false]),
                     runner,
                     directInterface ? directInterface.macAddress : pulumi.output(""),
                     pulumi.all([args.storeUrl ?? "", args.imageArtifacts ?? {}]),
                     pulumi.all([hostRole, args.hostReserveCpuMillis, args.hostReserveMemoryMib]),
                 ])
-                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability, poolAdmins], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints], runner, directMac, [storeUrl, imageArtifacts], [role, hostReserveCpuMillis, hostReserveMemoryMib]]) =>
+                .apply(([[repository, ref], [secretArn, hostname, tailscaleSsh], [logins, images, capability, poolAdmins, dashboardOwner], [backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints], runner, directMac, [storeUrl, imageArtifacts], [role, hostReserveCpuMillis, hostReserveMemoryMib]]) =>
                     JSON.stringify(hostConfig({
                         role, repository, ref, tailscaleAuthKeySecretArn: secretArn, tailscaleHostname: hostname, tailscaleSsh,
-                        dashboardLogins: logins, dashboardCapability: capability, poolAdmins, developerImages: images, backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints, runner, directMac, storeUrl, imageArtifacts,
+                        dashboardLogins: logins, dashboardCapability: capability, poolAdmins, dashboardOwner, developerImages: images, backupUrl, backupSchedule, idleMinutes, vcpuOvercommit, recoveryPoints, runner, directMac, storeUrl, imageArtifacts,
                         hostReserveCpuMillis, hostReserveMemoryMib,
                     })),
                 ),
