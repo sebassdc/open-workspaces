@@ -2,6 +2,50 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.67",
+      "class": 1,
+      "changes": [
+        "controller",
+        "agent",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "A runner's node agent ran at most 16 jobs at once and ignored the rest; with box operations running side by side (0.9.66), a burst of more than 16 left the extra ones unattached, and the controller recorded them uncertain after its 10 s attach wait, so their boxes stayed 'being created' for the 30-minute creation timeout. The agent now runs up to 64 jobs and holds up to 256, each waiting for a slot as long as the controller waits to attach it. A job the runner never took is answered as not dispatched (nothing reached the runner): its operation can be retried with the same key and its box deleted at once. Protocol, worker interface 3, catalog schema 7, runtime and host layout 2 are unchanged. Class 1: the controller, agent and dashboard restart (seconds); boxes keep running."
+    },
+    {
       "version": "0.9.66",
       "class": 2,
       "changes": [
