@@ -68,9 +68,10 @@ boxes are deleted and its busy ones finish. `[]` turns every pool off.
 ## How a box is made and removed
 
 Each box has its own thread, so one box's GitHub calls and waits never hold up
-another's. Their box operations go through the catalog like any client's, and a
-runner's worker runs them one at a time; the warm runners keep that off a job's
-start path.
+another's. Their box operations go through the catalog like any client's: the
+catalog is held only for its own bookkeeping, never during the runner's work, and a
+runner boots new boxes side by side, so a burst of jobs larger than the warm pool
+gets its boxes in parallel.
 
 1. **Register**: a single-use runner registration (JIT config) from the App.
 2. **Create** the box through the pool's token (ephemeral, in the token's pool).

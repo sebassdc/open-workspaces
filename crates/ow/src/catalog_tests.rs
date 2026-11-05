@@ -2525,6 +2525,8 @@ fn transfer_operation_join_conflict_and_atomic_competing_requests() {
             db: nodes::db(&c.root).unwrap(),
             root: c.root.clone(),
             pool_admins: Vec::new(),
+            flights: Arc::default(),
+            applied: Default::default(),
             _lock: c._lock.try_clone().unwrap(),
         })
         .collect::<Vec<_>>();
@@ -5241,4 +5243,238 @@ fn spill_borrows_a_listed_runner_only_while_the_pool_is_full() {
     c.operation(p, json!({"op":"stop","id":"j2"})).unwrap();
     c.operation(p, json!({"op":"delete","id":"j2"})).unwrap();
     assert_eq!(count(&c), 4);
+}
+
+/// A runner that answers each connection on its own thread. `create` takes `delay`
+/// milliseconds; `exec` waits up to `delay` for a second call to be in progress with it, so
+/// whether two calls overlap does not depend on how loaded the test host is. `peak` is the
+/// most `create` and `exec` calls it ever had in progress at once.
+struct Runner {
+    stop: Arc<AtomicBool>,
+    delay: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+impl Runner {
+    fn start(root: &Path, node: &str, delay: usize) -> Self {
+        let path = root.join("nodes").join(node);
+        std::fs::create_dir_all(&path).unwrap();
+        let listener = UnixListener::bind(path.join("control.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let runner = Self {
+            stop: Arc::default(),
+            delay: Arc::new(AtomicUsize::new(delay)),
+            peak: Arc::default(),
+        };
+        let (stop, delay, peak) = (
+            runner.stop.clone(),
+            runner.delay.clone(),
+            runner.peak.clone(),
+        );
+        let busy = Arc::new(AtomicUsize::new(0));
+        let machines = Arc::new(Mutex::new(BTreeMap::<String, Value>::new()));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let (machines, busy, peak) = (machines.clone(), busy.clone(), peak.clone());
+                let delay = Duration::from_millis(delay.load(Ordering::SeqCst) as u64);
+                std::thread::spawn(move || {
+                    let request = wire::line(&mut stream).unwrap();
+                    let id = request["id"].as_str().unwrap_or("").to_owned();
+                    let counted = matches!(request["op"].as_str(), Some("create" | "exec"));
+                    if counted {
+                        peak.fetch_max(busy.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    }
+                    let result = match request["op"].as_str().unwrap() {
+                        "list" => json!(machines.lock().unwrap().values().collect::<Vec<_>>()),
+                        "snapshots" => json!([]),
+                        "stats" => json!({"running":{}}),
+                        "stop" => {
+                            let mut machines = machines.lock().unwrap();
+                            let m = machines.get_mut(&id).unwrap();
+                            m["state"] = json!("stopped");
+                            json!({"workspace":m})
+                        }
+                        "delete" => {
+                            machines.lock().unwrap().remove(&id);
+                            json!({"deleted":id,"snapshots":[]})
+                        }
+                        "create" => {
+                            std::thread::sleep(delay);
+                            let m = json!({"id":id,"memory_mib":request["memory_mib"],"vcpu_count":request["vcpu_count"],"image":request["image"],"image_digest":null,"state":"running","source":null,"disk_bytes":8*common::GIB});
+                            machines.lock().unwrap().insert(id.clone(), m.clone());
+                            m
+                        }
+                        "exec" => {
+                            let begun = Instant::now();
+                            while busy.load(Ordering::SeqCst) < 2 && begun.elapsed() < delay {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            json!({"output":"ok","exit_code":0})
+                        }
+                        op => panic!("unexpected runner op {op}"),
+                    };
+                    if counted {
+                        busy.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    wire::send(&mut stream, &json!({"ok":true,"result":result})).unwrap();
+                });
+            }
+        });
+        runner
+    }
+    /// Whether two calls were ever in progress on the runner at the same time.
+    fn overlapped(&self) -> bool {
+        self.peak.load(Ordering::SeqCst) >= 2
+    }
+}
+impl Drop for Runner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+fn runner_row(root: &Path, node: &str) {
+    nodes::db(root).unwrap().execute("INSERT INTO nodes(id,memory_mib,slots,heartbeat,capabilities) VALUES(?1,8192,16,?2,?3)",params![node,nodes_now(),json!({"memory_mib":8192,"slots":16,"vcpus":16,"images":["alpine"]}).to_string()]).unwrap();
+}
+
+#[test]
+fn creates_overlap_and_reconcile_leaves_the_ones_in_flight_alone() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let a = c.user(&identity("alice")).unwrap();
+    runner_row(&fake.root, "alpha");
+    // Long enough that six creates overlap even when the test host is busy.
+    let runner = Runner::start(&fake.root, "alpha", 2500);
+    let shared = Arc::new(Mutex::new(c));
+    let creates: Vec<_> = (0..6)
+        .map(|i| {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                Catalog::operation_shared(&shared, a, json!({"op":"create","id":format!("box-{i}"),"node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"}))
+            })
+        })
+        .collect();
+    // Mid-flight, with every pending create past the creation timeout and none listed by the
+    // runner yet: reconcile must neither fail them nor mark them missing.
+    let asked = Instant::now();
+    loop {
+        let mut c = shared.lock().unwrap();
+        let pending: i64 = c
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE op='create' AND state='pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if pending == 0 {
+            assert!(asked.elapsed() < Duration::from_secs(10), "no create in flight");
+            drop(c);
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        c.db.execute(
+            "UPDATE operations SET created_at=datetime('now','-2 hours')",
+            [],
+        )
+        .unwrap();
+        c.state(a).unwrap();
+        // Creates that already landed succeeded; none may have failed or gone uncertain.
+        let settled: i64 = c
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE state NOT IN ('pending','succeeded')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(settled, 0, "reconcile settled a create in flight");
+        break;
+    }
+    for create in creates {
+        assert_eq!(create.join().unwrap().unwrap()["state"], "running");
+    }
+    assert!(runner.overlapped(), "creates ran one at a time");
+    let mut c = shared.lock().unwrap();
+    let state = c.state(a).unwrap();
+    let machines = state["workspaces"].as_array().unwrap();
+    assert_eq!(machines.len(), 6);
+    assert!(machines.iter().all(|m| m["state"] == "running"));
+    assert!(c.flights.since(u64::MAX).is_empty(), "a call is still marked in flight");
+}
+
+#[test]
+fn calls_on_one_box_wait_for_each_other_and_other_boxes_do_not() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let a = c.user(&identity("alice")).unwrap();
+    runner_row(&fake.root, "alpha");
+    let runner = Runner::start(&fake.root, "alpha", 0);
+    for name in ["one", "two"] {
+        c.operation(a, json!({"op":"create","id":name,"node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    }
+    // A lone exec waits this long for a partner; two calls on one box never find one.
+    runner.delay.store(1500, Ordering::SeqCst);
+    let shared = Arc::new(Mutex::new(c));
+    let run = |names: [&'static str; 2]| {
+        runner.peak.store(0, Ordering::SeqCst);
+        let calls: Vec<_> = names
+            .into_iter()
+            .map(|name| {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    Catalog::operation_shared(&shared, a, json!({"op":"exec","id":name,"command":"true"}))
+                })
+            })
+            .collect();
+        for call in calls {
+            call.join().unwrap().unwrap();
+        }
+        runner.overlapped()
+    };
+    assert!(run(["one", "two"]), "calls on two boxes ran one at a time");
+    assert!(!run(["one", "one"]), "two calls on one box ran at once");
+}
+
+#[test]
+fn an_inventory_read_before_a_call_landed_leaves_that_box_alone() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let a = c.user(&identity("alice")).unwrap();
+    runner_row(&fake.root, "alpha");
+    let _runner = Runner::start(&fake.root, "alpha", 0);
+    // Read unlocked while the runner has no box yet; the create lands before it is applied.
+    let stale = Inventory::read(&c.root, &c.flights).unwrap();
+    c.operation(a, json!({"op":"create","id":"one","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    // As if the runner's newer reads had not been applied yet.
+    c.applied.clear();
+    c.apply(stale).unwrap();
+    let physical = c.physical(a, "machine", "one").unwrap();
+    let (state, reserved): (String, i64) = c.db.query_row("SELECT json_extract(metadata,'$.state'),reserved_mib FROM resources WHERE kind='machine' AND physical=?1",[&physical],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!((state.as_str(), reserved), ("running", 256));
+    // A fresh read applies to it as usual.
+    let fresh = Inventory::read(&c.root, &c.flights).unwrap();
+    c.apply(fresh).unwrap();
+    assert_eq!(c.state(a).unwrap()["workspaces"][0]["state"], "running");
+}
+
+#[test]
+fn a_box_deleted_after_an_inventory_was_read_is_not_counted_as_outside_usage() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let a = c.user(&identity("alice")).unwrap();
+    runner_row(&fake.root, "alpha");
+    let _runner = Runner::start(&fake.root, "alpha", 0);
+    c.operation(a, json!({"op":"create","id":"one","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
+    // Read while the runner still runs it; the box is stopped and deleted before it is applied.
+    let stale = Inventory::read(&c.root, &c.flights).unwrap();
+    c.operation(a, json!({"op":"stop","id":"one"})).unwrap();
+    c.operation(a, json!({"op":"delete","id":"one"})).unwrap();
+    c.applied.clear();
+    c.apply(stale).unwrap();
+    assert_eq!(c.extra_usage("alpha").unwrap(), (0, 0, 0));
 }

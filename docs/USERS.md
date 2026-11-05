@@ -53,8 +53,9 @@ An operation spans SQLite and the worker, so it is not one atomic transaction
 across both. A gateway crash after dispatch may leave `pending` work with an
 unknown outcome. Reconciliation and stable create/snapshot IDs prevent a missing
 ownership mapping, but exactly-once exec and comprehensive operation recovery
-remain open. The current gateway serializes catalog operations; it is not a
-multi-worker scheduler. Per-owner controller admission is described in [limits](LIMITS.md).
+remain open. The gateway holds the catalog only for an operation's bookkeeping, not
+for the runner's work, so operations on different boxes overlap; operations on one box
+wait for each other. It is not a multi-worker scheduler. Per-owner controller admission is described in [limits](LIMITS.md).
 PostgreSQL, fair scheduling, audit
 retention and full database/artifact backup recovery remain tracked follow-ups.
 

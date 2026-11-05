@@ -1213,6 +1213,9 @@ where
         >,
     >;
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        // Each runner request is a few small frames; Nagle plus the peer's delayed ACK held
+        // every reply about 40 ms.
+        let _ = stream.set_nodelay(true);
         let permit = self.slots.clone().try_acquire_owned();
         let inner = self.inner.clone();
         Box::pin(async move {

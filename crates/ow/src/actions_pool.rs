@@ -380,14 +380,17 @@ fn error(shared: &Shared, pool: &str, message: String) {
 
 /// One box op as the pool's workload token: its owner, its placement pool, ephemeral.
 fn box_op(shared: &Shared, token: &str, op: Value) -> Result<Value> {
-    let mut catalog = shared
-        .catalog
-        .lock()
-        .map_err(|_| anyhow!("catalog lock poisoned"))?;
-    let (identity, pool) = crate::tokens::by_name(&catalog.db, token)?
-        .with_context(|| format!("workload token {token} not found (ow token list)"))?;
-    let user = catalog.user(&identity)?;
-    catalog.operation(user, crate::tokens::scoped(op, &pool)?)
+    let (user, op) = {
+        let mut catalog = shared
+            .catalog
+            .lock()
+            .map_err(|_| anyhow!("catalog lock poisoned"))?;
+        let (identity, pool) = crate::tokens::by_name(&catalog.db, token)?
+            .with_context(|| format!("workload token {token} not found (ow token list)"))?;
+        (catalog.user(&identity)?, crate::tokens::scoped(op, &pool)?)
+    };
+    // Unlocked for the runner call: the pool's boxes are made side by side.
+    crate::catalog::Catalog::operation_shared(&shared.catalog, user, op)
 }
 
 /// Whether a launch still owns its box: the planner may have timed it out meanwhile.
