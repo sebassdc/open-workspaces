@@ -234,6 +234,10 @@ impl Dispatch {
             self.request["operation_key"] = json!(format!("op-{}", self.operation));
         }
         match wire::request_envelope(&route, &self.request) {
+            // Its runner never took it (busy, restarting, reconnecting): nothing ran.
+            Ok(envelope) if envelope["ok"] != true && envelope["error"] == nodes::NOT_TAKEN => {
+                Sent::Unprepared(nodes::NOT_TAKEN, anyhow::anyhow!(nodes::NOT_TAKEN))
+            }
             Ok(envelope) => Sent::Answered(route, envelope),
             Err(e) => Sent::Lost(e),
         }
@@ -377,6 +381,9 @@ fn public_operation_error<'a>(op: &str, diagnostic: &'a str) -> &'a str {
         }
         (_, "incomplete snapshot exists; preserve and inspect it") => diagnostic,
         (_, "guest command timed out after 30s") => COMMAND_TIMEOUT,
+        (_, crate::nodes::NOT_TAKEN) => {
+            "Runner did not take the operation; nothing was dispatched. Retry with the same operation key."
+        }
         (_, "node route unavailable before dispatch") => {
             "Node is unavailable; no operation was dispatched. Retry with the same operation key when it reconnects."
         }
