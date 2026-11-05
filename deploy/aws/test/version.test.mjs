@@ -42,25 +42,57 @@ test("main stages a release only after tagging; retries preserve published relea
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.OW_RELEASE_LOG, JSON.stringify(args) + String.fromCharCode(10));
+const stateFile = process.env.OW_RELEASE_STATE_FILE;
+const state = fs.readFileSync(stateFile, "utf8");
 if (args[1] === "view") {
-  if (process.env.OW_RELEASE_STATE === "missing") process.exit(1);
-  process.stdout.write(String(process.env.OW_RELEASE_STATE === "draft"));
+  if (state === "missing") process.exit(1);
+  process.stdout.write(String(state === "draft"));
+}
+if (args[1] === "create") {
+  const failures = Number(fs.readFileSync(stateFile + ".fail", "utf8"));
+  if (args.includes("--generate-notes") && failures > 0) {
+    fs.writeFileSync(stateFile + ".fail", String(failures - 1));
+    process.exit(1);
+  }
+  fs.writeFileSync(stateFile, "draft");
 }
 `);
     chmodSync(gh, 0o700);
     const tag = `v${JSON.parse(read("../package.json")).version}`;
     try {
-        for (const state of ["missing", "draft", "published"]) {
+        const stateFile = join(directory, "state");
+        const view = ["release", "view", tag, "--json", "isDraft", "--jq", ".isDraft"];
+        const generated = ["release", "create", tag, "--verify-tag", "--generate-notes", "--draft"];
+        // [state, notes service failures, calls]: a draft or published release is left as it is;
+        // a failing notes service is retried (no sleeps here), then the commit message is the notes.
+        const cases = [
+            ["missing", 0, [view, generated, view]],
+            ["draft", 0, [view, view]],
+            ["published", 0, [view, view]],
+            ["missing", 2, [view, generated, view, view, generated, view, view, generated, view]],
+        ];
+        for (const [state, failures, expected] of cases) {
             writeFileSync(log, "");
+            writeFileSync(stateFile, state);
+            writeFileSync(stateFile + ".fail", String(failures));
             execFileSync("bash", ["-e", "-c", script], {
                 cwd: new URL("../", import.meta.url),
-                env: { ...process.env, PATH: `${directory}:${process.env.PATH}`, GH_TOKEN: "test-only", GH_REPO: "fixture/repo", OW_RELEASE_STATE: state, OW_RELEASE_LOG: log },
+                env: { ...process.env, PATH: `${directory}:${process.env.PATH}`, GH_TOKEN: "test-only", GH_REPO: "fixture/repo", OW_RELEASE_STATE_FILE: stateFile, OW_RELEASE_LOG: log, OW_RELEASE_WAIT: "0" },
             });
             const calls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-            const expected = [["release", "view", tag, "--json", "isDraft", "--jq", ".isDraft"]];
-            if (state === "missing") expected.push(["release", "create", tag, "--verify-tag", "--generate-notes", "--draft"]);
-            assert.deepEqual(calls, expected, state);
+            assert.deepEqual(calls, expected, `${state}, ${failures} notes failures`);
         }
+        // The notes service never answers: the release is made with the commit message.
+        writeFileSync(log, "");
+        writeFileSync(stateFile, "missing");
+        writeFileSync(stateFile + ".fail", "99");
+        execFileSync("bash", ["-e", "-c", script], {
+            cwd: new URL("../", import.meta.url),
+            env: { ...process.env, PATH: `${directory}:${process.env.PATH}`, GH_TOKEN: "test-only", GH_REPO: "fixture/repo", OW_RELEASE_STATE_FILE: stateFile, OW_RELEASE_LOG: log, OW_RELEASE_WAIT: "0", GITHUB_SHA: "HEAD", RUNNER_TEMP: directory },
+        });
+        const fallback = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        assert.deepEqual(fallback.filter((c) => c[1] === "create").at(-1), ["release", "create", tag, "--verify-tag", "--notes-file", join(directory, "notes.md"), "--draft"]);
+        assert.equal(readFileSync(stateFile, "utf8"), "draft");
     } finally {
         rmSync(directory, { recursive: true, force: true });
     }
