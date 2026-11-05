@@ -59,17 +59,30 @@ class Planner(unittest.TestCase):
     def test_class_is_the_highest_restart_and_skips_unchanged_units(self):
         plan = u.plan(manifest(entry("0.5.1", ["controller"], 1), entry("0.5.2", ["guest-agent", "component"], 0)),
                       AT, "0.5.2")
-        self.assertEqual((plan["class"], sorted(plan["move"])), (1, ["agent"]))
+        self.assertEqual((plan["class"], sorted(plan["move"])), (1, ["agent", "dashboard"]))
         plan = u.plan(manifest(entry("0.5.1", ["component", "config"], 0)), AT, "0.5.1")
         self.assertEqual((plan["class"], plan["restart"]), (0, []))
         plan = u.plan(manifest(entry("0.5.1", ["worker"], 2)), AT, "0.5.1", captures=WARM, compat=COMPAT)
         self.assertEqual((plan["class"], plan["restart"], plan["cold"]), (2, ["worker"], []))
 
     def test_each_unit_counts_the_releases_it_has_not_run(self):
-        # The dashboard already runs 0.5.1, so 0.5.1's dashboard change does not move it again.
-        m = manifest(entry("0.5.1", ["dashboard"], 1), entry("0.5.2", ["agent"], 1))
-        plan = u.plan(m, {**AT, "dashboard": "0.5.1"}, "0.5.2")
-        self.assertEqual(plan["move"], {"agent": "0.5.2"})
+        # The worker already runs 0.5.1, so 0.5.1's worker change does not move it again.
+        m = manifest(entry("0.5.1", ["worker"], 2), entry("0.5.2", ["agent"], 1))
+        plan = u.plan(m, {**AT, "worker": "0.5.1"}, "0.5.2")
+        self.assertEqual(plan["move"], {"agent": "0.5.2", "dashboard": "0.5.2"})
+
+    def test_the_dashboard_moves_with_the_agent(self):
+        # It serves the admin API (controller settings) and /api/version, which clients follow;
+        # the agent's restart already drops its streams, so it adds no disconnect.
+        plan = u.plan(manifest(entry("0.5.1", ["controller"], 1)), {"agent": "0.5.0", "dashboard": "0.5.0"}, "0.5.1")
+        self.assertEqual(plan["move"], {"agent": "0.5.1", "dashboard": "0.5.1"})
+        plan = u.plan(manifest(entry("0.5.1", ["component"], 0)), AT, "0.5.1")
+        self.assertEqual((plan["move"], plan["restart"]), ({}, []))
+        # A worker-only release keeps the dashboard's streams.
+        plan = u.plan(manifest(entry("0.5.1", ["worker"], 2)), AT, "0.5.1", captures=WARM, compat=COMPAT)
+        self.assertEqual(plan["move"], {"worker": "0.5.1"})
+        plan = u.plan(manifest(entry("0.5.1", ["agent"], 1)), {"worker": "0.5.0", "agent": "0.5.0"}, "0.5.1")
+        self.assertEqual(plan["move"], {"agent": "0.5.1"})
 
     def test_placement_release_requires_backup_without_moving_the_worker(self):
         actual = json.loads((Path(__file__).resolve().parents[3] / "release-impact.json").read_text())
@@ -142,13 +155,13 @@ class Planner(unittest.TestCase):
         # The new agent drives worker protocol 2 only: the old worker (1) must move with it.
         m = manifest(entry("0.5.1", ["agent"], 1, worker=(2, 2, 2)))
         plan = u.plan(m, AT, "0.5.1", captures=WARM, compat=COMPAT)
-        self.assertEqual((plan["class"], sorted(plan["move"])), (2, ["agent", "worker"]))
+        self.assertEqual((plan["class"], sorted(plan["move"])), (2, ["agent", "dashboard", "worker"]))
         # A worker speaking 2 cannot run under the old agent (1..1): the agent moves too.
         m = manifest(entry("0.5.1", ["worker"], 2, worker=(2, 2, 2)))
-        self.assertEqual(sorted(u.plan(m, AT, "0.5.1", captures=WARM, compat=COMPAT)["move"]), ["agent", "worker"])
+        self.assertEqual(sorted(u.plan(m, AT, "0.5.1", captures=WARM, compat=COMPAT)["move"]), ["agent", "dashboard", "worker"])
         # Additive: an agent accepting 1..2 next to the old worker stays class 1.
         m = manifest(entry("0.5.1", ["agent"], 1, worker=(2, 1, 2)))
-        self.assertEqual(u.plan(m, AT, "0.5.1")["move"], {"agent": "0.5.1"})
+        self.assertEqual(u.plan(m, AT, "0.5.1")["move"], {"agent": "0.5.1", "dashboard": "0.5.1"})
         with self.assertRaisesRegex(Refused, "worker protocol window"):
             u.plan(manifest(entry("0.5.1", ["worker"], 2, worker=(3, 1, 2))), AT, "0.5.1", captures=WARM, compat=COMPAT)
 
@@ -156,7 +169,7 @@ class Planner(unittest.TestCase):
         plan = u.plan(manifest(), AT, "0.5.0", pending={"worker"})
         self.assertEqual((plan["class"], plan["move"], plan["restart"]), (2, {}, ["worker"]))
         plan = u.plan(manifest(entry("0.5.1", ["host-layout"], 0)), AT, "0.5.1", rendered={"agent"})
-        self.assertEqual((plan["class"], plan["move"]), (1, {"agent": "0.5.1"}))
+        self.assertEqual((plan["class"], plan["move"]), (1, {"agent": "0.5.1", "dashboard": "0.5.1"}))
 
 
 class HandOver(unittest.TestCase):
