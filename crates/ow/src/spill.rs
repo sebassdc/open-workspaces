@@ -32,6 +32,11 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Rule>> {
         };
         crate::common::identifier(pool)
             .map_err(|_| anyhow::anyhow!("pool {pool:?} is not an identifier"))?;
+        // Ordinary creates record no pool, so `default` cannot borrow (nor be counted).
+        ensure!(
+            pool != "default",
+            "pool default cannot spill; name another pool"
+        );
         crate::common::identifier(node)
             .map_err(|_| anyhow::anyhow!("node {node:?} is not an identifier"))?;
         let max_boxes: u64 = max
@@ -118,11 +123,16 @@ fn missing_images(inventory: &Value, pool: &str, node: &str) -> Vec<String> {
     let Some(wanted) = pool_images(inventory, pool) else {
         return vec![];
     };
-    let has = inventory
+    let lender = inventory
         .as_array()
         .into_iter()
         .flatten()
-        .find(|n| n["id"] == node)
+        .find(|n| n["id"] == node);
+    // A runner with the image store pulls a catalog image on demand, as placement allows.
+    if lender.is_some_and(|n| n["capabilities"]["image_store_v1"] == true) {
+        return vec![];
+    }
+    let has = lender
         .and_then(|n| n["capabilities"]["images"].as_array().cloned())
         .unwrap_or_default();
     wanted
@@ -349,6 +359,10 @@ mod tests {
             "ci:n2:2"
         );
         assert_eq!(from_json(&json!([])).unwrap(), "");
+        assert!(
+            parse("default:n2:1").is_err(),
+            "default records no pool, so it cannot spill"
+        );
         for bad in [
             "ci:n2",
             "ci:n2:x",

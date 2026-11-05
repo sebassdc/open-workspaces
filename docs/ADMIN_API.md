@@ -357,7 +357,8 @@ Durable upper bounds for an enrolled runner; lowering needs its boxes stopped.
 [Spill](MULTINODE.md#spill) rules and usage, for every pool with a rule (or the
 one asked for). `home_nodes` are the pool's own runners; `spill` has one entry
 per rule, in rule order; `boxes` and `pending` count that pool's boxes;
-`free_memory_after_reserve_mib` is what the pool may still take there. `state`
+`free_memory_after_reserve_mib` is the most memory one more box of the pool may
+use there (CPU, disk and the usual checks still apply). `state`
 is `available`, `full` (cap reached), `reserve` (only the reserve is left),
 `off` (`max_boxes` 0), `no_home` (no live runner in the pool, so nothing
 spills), `inert_offline`, `inert_draining`, `inert_revoked` or

@@ -550,10 +550,10 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 crate::dashboard_ui::selectable(root, &text)
                     .map_err(|e| invalid_value(&key, format!("{e:#}")))?;
             }
-            let warnings = crate::spill::check(&tx, &inventory, &key, &typed, &current)
-                .map_err(|reason| invalid_value(&key, reason))?;
             let previous = current[key.as_str()].clone();
             let change = json!({"key":key,"value":typed,"previous":previous});
+            // An unchanged value is a safe retry: it is not checked against the runners again.
+            let warnings: Vec<String> = vec![];
             if previous == typed {
                 let audit_id = audit(
                     &tx,
@@ -570,6 +570,8 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                     "effective":effective(&key),"warnings":warnings,"audit_id":audit_id}),
                 );
             }
+            let warnings = crate::spill::check(&tx, &inventory, &key, &typed, &current)
+                .map_err(|reason| invalid_value(&key, reason))?;
             let version = crate::telemetry::store_setting(&tx, &key, &typed, &ctx.actor.label())?;
             let audit_id = audit(
                 &tx,

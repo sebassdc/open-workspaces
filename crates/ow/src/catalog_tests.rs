@@ -5095,6 +5095,23 @@ fn spill_borrows_a_listed_runner_only_while_the_pool_is_full() {
     c.operation(p, job("j2")).unwrap();
     assert_eq!(node(&c, p, "j2"), "beta");
     assert_eq!(count(&c), 3);
+    // Only the borrowed placement is a spill: a retry may keep beta for j2, never for j0's pool change.
+    let spilled: Vec<(String, bool)> = c
+        .db
+        .prepare("SELECT r.name,b.spilled FROM box_pools b JOIN resources r ON r.physical=b.physical ORDER BY r.name")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        spilled,
+        [
+            ("j0".into(), false),
+            ("j1".into(), false),
+            ("j2".into(), true)
+        ]
+    );
     // The cap counts a pending create: j3's answer is lost, so it stays pending on beta.
     let mut j3 = job("j3");
     j3["operation_key"] = json!("j3-key");

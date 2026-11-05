@@ -74,7 +74,8 @@ ow config set placement.spill ""                     # off; boxes already placed
 - Each non-`default` create records its pool (`box_pools`), removed with the box.
   The controller logs `placement_spilled` on the borrowed runner and
   `placement_spill_full` when the pool and its spill runners are all full.
-- A rule names an enrolled runner of another pool. `config.set` warns when the
+- A rule names a pool other than `default` (ordinary creates record no pool) and
+  an enrolled runner of another pool. `config.set` warns when the
   reserve is above that runner's memory budget, or when it lacks an image every
   runner of the pool has; `ow placement status` shows each rule's `state`
   (`available`, `full`, `reserve`, `off`, `no_home`, `inert_offline`,

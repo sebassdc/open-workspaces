@@ -507,7 +507,7 @@ impl Catalog {
         crate::cache_catalog::initialize(&db)?;
         // Additive: the pool each non-default create asked for (spill counts and retries).
         db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS box_pools(physical TEXT PRIMARY KEY,pool TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS box_pools(physical TEXT PRIMARY KEY,pool TEXT NOT NULL,spilled INTEGER NOT NULL DEFAULT 0 CHECK(spilled IN (0,1)));",
         )?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS node_usage(node TEXT PRIMARY KEY,extra_mib INTEGER NOT NULL DEFAULT 0,extra_cpus INTEGER NOT NULL DEFAULT 0,extra_slots INTEGER NOT NULL DEFAULT 0);")?;
         crate::drain::initialize(&db)?;
@@ -2463,7 +2463,7 @@ impl Catalog {
         let settings = crate::telemetry::settings(&self.db)?;
         let rules: Vec<crate::spill::Rule> =
             serde_json::from_value(settings[crate::spill::RULES].clone()).unwrap_or_default();
-        if requested.is_none() && rules.iter().any(|r| r.pool == pool) {
+        if requested.is_none() && pool != "default" && rules.iter().any(|r| r.pool == pool) {
             let live = crate::spill::home_live(&inventory, pool);
             let keep_free = settings[crate::spill::KEEP_FREE].as_u64().unwrap_or(0);
             let boxes = |node: &str| {
@@ -2502,7 +2502,7 @@ impl Catalog {
     /// A create that spilled onto a runner of another pool remembers its own pool.
     fn spilled(&self, physical: &str, pool: &str) -> Result<bool> {
         Ok(self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM box_pools WHERE physical=?1 AND pool=?2)",
+            "SELECT EXISTS(SELECT 1 FROM box_pools WHERE physical=?1 AND pool=?2 AND spilled=1)",
             [physical, pool],
             |r| r.get(0),
         )?)
@@ -3041,9 +3041,11 @@ impl Catalog {
                     )?;
                     // The box's pool: what spill counts, and what a retry may keep.
                     if pool != "default" {
+                        // Spilled: the runner chosen is not in the pool asked for.
+                        let spilled = self.node_pool(&node)? != pool;
                         self.db.execute(
-                            "INSERT INTO box_pools(physical,pool) VALUES(?1,?2) ON CONFLICT(physical) DO UPDATE SET pool=excluded.pool",
-                            params![physical, pool],
+                            "INSERT INTO box_pools(physical,pool,spilled) VALUES(?1,?2,?3) ON CONFLICT(physical) DO UPDATE SET pool=excluded.pool,spilled=excluded.spilled",
+                            params![physical, pool, spilled],
                         )?;
                     }
                     self.save("machine",&physical,&json!({"state":"pending","image":request["image"].as_str().unwrap_or("alpine"),"memory_mib":request["memory_mib"].as_u64().unwrap_or(256),"vcpu_count":request["vcpu_count"].as_u64().unwrap_or(1)}))?;
