@@ -69,7 +69,7 @@ if (args[1] === "view") {
 
 test("release assets gate tagging and publication", () => {
     const workflow = read("../../../.github/workflows/aws-component-release.yml");
-    assert.match(workflow, /check-and-tag:\n    needs: clients/);
+    assert.match(workflow, /\n  tag:\n    if: github.event_name == 'push'\n    needs: \[clients, checks\]/);
     for (const artifact of ["ow-linux-amd64", "ow-darwin-arm64", "ow-darwin-amd64"]) {
         assert.ok(workflow.includes(`artifact: ${artifact}`));
     }

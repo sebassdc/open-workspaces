@@ -21,13 +21,24 @@ jobs:
             artifact: ow-linux-amd64
           - runner: macos-15
             artifact: ow-darwin-arm64
-          - runner: macos-15-intel
+          # Cross-built on Apple silicon and checked under Rosetta 2: Intel macOS runners
+          # were the slowest build and the longest queue.
+          - runner: macos-15
             artifact: ow-darwin-amd64
+            arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.0 --profile minimal --no-self-update
+      # Main saves the caches; pull requests restore them (keeps the repository under its cache quota).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.artifact }}-1.97.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Rosetta 2
+        if: matrix.arch == 'x86_64'
+        run: /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
       - name: Build portable Linux CLI using existing build machinery
         if: runner.os == 'Linux'
         run: |
@@ -42,11 +53,19 @@ jobs:
           docker run --rm --user 65534:65534 -v "$PWD/data/runtime-spike/bin:/client:ro" alpine:3.22 /client/ow-linux-amd64 --version
       - name: Build native macOS CLI using existing build machinery
         if: runner.os == 'macOS'
+        env:
+          OW_MACOS_ARCH: ${{ matrix.arch }}
         run: bash scripts/build-macos.sh
       - name: Check installer failures and clean native install without Rust or cloudflared
         env:
           OW_TEST_CLIENT: ${{ github.workspace }}/data/runtime-spike/bin/${{ matrix.artifact }}
-        run: python3 scripts/test-cli-install.py
+        run: |
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+            # The system Python is universal, so the installer and the client both run as Intel.
+            /usr/bin/arch -x86_64 /usr/bin/python3 scripts/test-cli-install.py
+          else
+            python3 scripts/test-cli-install.py
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -55,8 +74,8 @@ jobs:
             data/runtime-spike/bin/${{ matrix.artifact }}.sha256
             data/runtime-spike/bin/ow-guest-linux-amd64*
           if-no-files-found: error
-  check-and-tag:
-    needs: clients
+  # The pre-tag checks need no clients, so they run beside the client builds.
+  checks:
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -70,13 +89,18 @@ jobs:
           node-version: "24"
       # test/schema.test.mjs generates the package schema as `pulumi package add` does.
       - uses: pulumi/actions@v5
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: 1.97.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm ci --no-audit --no-fund
       - run: npm run check
       - name: Check SSH throughput and actionable errors before tagging
         working-directory: .
         run: |
           python3 scripts/test-ssh-acceptance.py
-          rustup toolchain install 1.97.0 --profile minimal --no-self-update
           cargo +1.97.0 test --locked -p ow --test ssh_proxy
           cargo +1.97.0 test --locked -p ow --bin ow node_stream_100_mib_each_way
           cargo +1.97.0 test --locked -p ow --bin ow known_rejections_give_safe_actions_without_worker_details
@@ -106,6 +130,20 @@ jobs:
           cargo +1.97.0 test --locked -p ow-core clock_tests
           cargo +1.97.0 test --locked -p ow-core vm::memory_tests
           cargo +1.97.0 test --locked -p ow-core runtime::disk_tests
+  tag:
+    if: github.event_name == 'push'
+    needs: [clients, checks]
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: deploy/aws
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - uses: actions/download-artifact@v4
         if: github.event_name == 'push'
         with:
@@ -167,18 +205,28 @@ jobs:
           fi
   published-clients:
     if: github.event_name == 'push'
-    needs: check-and-tag
+    needs: tag
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, macos-15, macos-15-intel]
+        include:
+          - runner: ubuntu-24.04
+          - runner: macos-15
+          - runner: macos-15
+            arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rosetta 2
+        if: matrix.arch == 'x86_64'
+        run: /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
       - name: Install the published version twice in a clean client directory
         env:
           OW_TEST_PUBLISHED_RELEASE: '1'
           OW_TEST_SOURCE_COMMIT: ${{ github.sha }}
-        run: python3 scripts/test-cli-install.py InstallTests.test_published_release_download
+        run: |
+          python=python3
+          if [ "${{ matrix.arch }}" = x86_64 ]; then python='/usr/bin/arch -x86_64 /usr/bin/python3'; fi
+          $python scripts/test-cli-install.py InstallTests.test_published_release_download
