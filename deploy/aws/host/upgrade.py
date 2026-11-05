@@ -142,6 +142,10 @@ def plan(manifest, pins, target, *, rendered=(), pending=(), runners=(), capture
         changes = {c for e in crossed(current) for c in e["changes"]}
         if any(MOVES.get(c) == name for c in changes) or name in rendered:
             move[name] = target
+    # The dashboard serves the admin API (the controller's settings) and /api/version, which
+    # clients upgrade to: it moves with any release that moves something on its host.
+    if move and "dashboard" in pins:
+        move["dashboard"] = target
     plan_ = {"from": dict(pins), "to": target, "move": move, "catalog_backup": False, "rollback_auto": True,
              "cold": []}
     # Catalog: the controller and dashboard move together around a schema change, after a copy.

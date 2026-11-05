@@ -26,6 +26,9 @@ unit whose code did not change since the release it runs is not touched.
 | `host-layout` | 0-2 | the units whose rendered files differ (`ow-host render` of the target) |
 | `stage0` | 3 | refused in place: hibernate, then `pulumi up` |
 
+The dashboard also moves whenever any other unit on its host moves: it serves the admin
+API (the controller's settings) and `/api/version`, which `ow upgrade` clients follow.
+
 ## Host layout v2
 
 ```text
