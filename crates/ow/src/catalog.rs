@@ -253,6 +253,9 @@ impl Dispatch {
 /// the capacity refusal it replaces, for any caller that does not make room.
 #[derive(Clone, Debug)]
 pub struct Yield(pub(crate) Vec<(i64, String, bool)>);
+
+/// Ephemeral spilled boxes stopped to make room, waiting to be deleted (owner, name).
+static STOPPED: Mutex<Vec<(i64, String)>> = Mutex::new(Vec::new());
 impl std::fmt::Display for Yield {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("node capacity exhausted")
@@ -3169,9 +3172,16 @@ impl Catalog {
     ) -> Result<Value> {
         let mut stopped = Vec::new();
         let result = Self::operation_making_room(shared, user, request, &mut stopped);
-        // After the operation, so it never waits for these deletes.
-        Self::delete_stopped(shared, &stopped);
+        // Deleted off the reply path (the runner pools' pass takes them): neither the box
+        // that needed the room nor its answer waits for them.
+        STOPPED.lock().unwrap().extend(stopped);
         result
+    }
+
+    /// Deletes the spilled boxes operations stopped to make room ([`STOPPED`]).
+    pub(crate) fn delete_queued(shared: &Mutex<Catalog>) {
+        let queued = std::mem::take(&mut *STOPPED.lock().unwrap());
+        Self::delete_stopped(shared, &queued);
     }
 
     /// [`Self::operation_shared`]; ephemeral spilled boxes it stopped to make room are left in

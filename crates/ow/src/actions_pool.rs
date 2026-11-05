@@ -204,6 +204,8 @@ fn draining(root: &Path) -> Result<std::collections::HashSet<String>> {
 }
 
 fn pass(shared: &Arc<Shared>) -> Result<()> {
+    // Spilled boxes stopped to make room for a runner's own box (docs/MULTINODE.md#spill).
+    crate::catalog::Catalog::delete_queued(&shared.catalog);
     let (pools, app_id) = pools(&shared.root)?;
     let repos: std::collections::BTreeSet<String> = {
         let entries = shared.entries.lock().unwrap();

@@ -437,17 +437,20 @@ pub(super) fn reserve_wake(shared: &Shared, t: &Transfer) -> Result<bool> {
     if let Some((node, crate::catalog::Yield(boxes))) = room {
         drop(c);
         let stopped = crate::catalog::Catalog::make_room(shared, &boxes, "a wake");
-        // Reserved right after the stops, before the deletes: a box spilled meanwhile cannot
-        // take the room. Not reserved (it was anyway): the next pass tries again.
+        // Reserved right after the stops, before the deletes. Not reserved (a box spilled
+        // while the stops ran took the room, or it was reserved anyway): the next pass
+        // tries again.
         {
             let c = shared.lock().unwrap();
-            if c.transfer(t.id)?.step == Step::Preparing
+            if c.transfer(t.id).is_ok_and(|now| now.step == Step::Preparing)
                 && let Err(e) = c.reserve_wake(t.id, &node, &input)
             {
                 eprintln!("placement_yield: wake {} not reserved on {node}: {e:#}", t.id);
             }
         }
-        crate::catalog::Catalog::delete_stopped(shared, &stopped);
+        // Off this pass: the wake goes on while they are deleted.
+        let shared = shared.clone();
+        std::thread::spawn(move || crate::catalog::Catalog::delete_stopped(&shared, &stopped));
         return Ok(true);
     }
     if !compatible_runner && compatibility.is_some() {
