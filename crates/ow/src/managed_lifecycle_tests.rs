@@ -453,6 +453,41 @@ fn a_moved_box_snapshot_is_published_and_forks_from_the_store_on_any_runner() {
 }
 
 #[test]
+fn the_publication_pass_waits_out_a_commit_held_by_a_slow_fsync() {
+    let (f, peers) = completed(Kind::Move, false);
+    let c = f.shared.lock().unwrap();
+    c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node) VALUES(?1,'snapshot','before','s-before',?2,'source')",params![f.user,json!({"name":"s-before","workspace":"physical","memory_mib":256,"vcpu_count":1,"disk_bytes":4,"state":"ready"}).to_string()]).unwrap();
+    drop(c);
+    let (_source, _target) = runners(&f, &peers);
+    let call = |node: &str, r: Value| -> Result<Value> {
+        match r["op"].as_str().unwrap() {
+            "capture-published" => Ok(json!({"present":false})),
+            "capture-push" => Ok(publication(&r, true)),
+            _ => rpc(&f.root, node, r),
+        }
+    };
+    // Another catalog connection holds the write lock past the old 5 s wait, as a commit
+    // does while a box's disk flush stalls its fsync on the same filesystem.
+    let holder = crate::nodes::db(&f.root).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let held = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(6));
+        holder.execute_batch("COMMIT").unwrap();
+    });
+    for (item, result) in publication::pass(&f.shared, &call) {
+        result.unwrap_or_else(|e| panic!("{item}: {e:#}"));
+    }
+    held.join().unwrap();
+    assert_eq!(
+        rows(
+            &f,
+            "SELECT COUNT(*) FROM resources WHERE kind='snapshot' AND name='before' AND node=''"
+        ),
+        1
+    );
+}
+
+#[test]
 fn a_snapshot_left_on_the_old_runner_is_rehomed_to_the_store_and_its_copy_removed() {
     let (f, peers) = completed(Kind::Move, false);
     // Taken before the move: its row and files are still on the old runner.

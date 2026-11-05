@@ -78,6 +78,13 @@ pub(crate) fn digest(secret: &str) -> String {
     format!("{:x}", Sha256::digest(secret.as_bytes()))
 }
 
+/// How long a catalog connection waits for another one's write lock. Every catalog commit
+/// fsyncs (synchronous=FULL), and on a host whose boxes share the catalog's filesystem one
+/// fsync can stall for seconds while a box's disk is flushed (a recovery capture or seal):
+/// the writer then holds the lock that long (about 6 s measured), which a 5 s wait did not
+/// outlast. Still well under the gateway's 45 s request bound.
+pub(crate) const CATALOG_BUSY: Duration = Duration::from_secs(15);
+
 pub(crate) fn db(root: &Path) -> Result<Connection> {
     let path = root.join("catalog.sqlite3");
     if !path.exists() {
@@ -89,7 +96,7 @@ pub(crate) fn db(root: &Path) -> Result<Connection> {
     }
     private(&path)?;
     let db = Connection::open(path)?;
-    db.busy_timeout(Duration::from_secs(5))?;
+    db.busy_timeout(CATALOG_BUSY)?;
     readable(&db)?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY, credential_hash TEXT, revoked INTEGER NOT NULL DEFAULT 0, heartbeat INTEGER NOT NULL DEFAULT 0, memory_mib INTEGER NOT NULL, slots INTEGER NOT NULL, capabilities TEXT NOT NULL DEFAULT '{}', session TEXT);
