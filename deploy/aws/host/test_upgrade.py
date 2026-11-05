@@ -222,8 +222,20 @@ class HandOver(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             h.ROOT = Path(tmp)
             self.assertTrue(u.handover_enabled())
-            h.write_json(f"{h.RUNNER}/controller-settings.json", {"upgrade.worker_handover": False})
+            self.assertEqual(u.running_boxes_setting(), "hibernate")
+            h.write_json(f"{h.RUNNER}/controller-settings.json",
+                         {"upgrade.worker_handover": False, "upgrade.running_boxes": "stop"})
             self.assertFalse(u.handover_enabled())
+            self.assertEqual(u.running_boxes_setting(), "stop")
+
+    def test_running_boxes_stop_replaces_hibernation_and_hand_over_still_wins(self):
+        entries = (entry("0.5.1", ["worker"], 2, handover=(1, 1, 1)), entry("0.5.2", ["worker"], 2, handover=(1, 1, 1)))
+        self.assertEqual(self.path(*entries, running_boxes="stop")[0], "handover")
+        path, why = self.path(*entries, running_boxes="stop", rendered={"worker"})
+        self.assertEqual((path, why), ("stop", "the worker's unit files or config change"))
+        m = manifest(*entries)
+        plan = u.plan(m, {**AT, "worker": "0.5.1"}, "0.5.2", captures=WARM, compat=COMPAT, running_boxes="stop")
+        self.assertEqual(plan["running_boxes"], "stop", "the path a refused hand-over falls back to")
 
 
 class HandOverBlocker(unittest.TestCase):
@@ -259,6 +271,9 @@ class Fake:
         self.late = late  # a box someone starts right after the next inventory read
         self.pids = {box: 100 + n for n, box in enumerate(sorted(boxes))}  # each box's VMM
         self.handed, self.report = [], []
+        self.managed = set()  # boxes only their controller may start: never stopped by the upgrader
+        self.silent = 0  # status polls a worker finishing its shutdown leaves unanswered, then exits
+        self.lists_failing = 0  # `ow list` calls that meet a worker just exiting
 
     def _hit(self, what):
         self.calls.append(what)
@@ -343,12 +358,21 @@ class Fake:
         self.ticking |= set(timers)
 
     def worker_status(self):
+        if self.silent and self.up["worker"]:
+            self.silent -= 1
+            if not self.silent:
+                self.up["worker"] = False
+            return None
         if not self.up["worker"]:
             return None
         return {"internet": True, "version": u.version_of(h.pin("worker")), "compat": COMPAT,
                 "worker_handover_v1": True, "adoption": self.report}
 
     def boxes(self):
+        if self.lists_failing:
+            self.lists_failing -= 1
+            self.up["worker"] = False
+            raise RuntimeError("ow: No such file or directory (os error 2)")
         snapshot = dict(self.box)
         if self.late:
             # A start (or a wake on connect) racing the upgrade: refused once quiesced.
@@ -363,6 +387,16 @@ class Fake:
 
     def captures(self):
         return [{"name": box, **COMPAT} for box, state in self.box.items() if state in ("running", "hibernated")]
+
+    def stop_boxes(self, boxes):
+        stopped = []
+        for box in boxes:
+            if self.box.get(box) == "running" and box not in self.managed:
+                self._hit(f"stop-box:{box}")
+                self.box[box] = "stopped"
+                self.pids.pop(box, None)
+                stopped.append(box)
+        return stopped
 
     def hibernate_all(self, release):
         self.quiesced = True
@@ -908,6 +942,119 @@ class Machine(unittest.TestCase):
         self.assertEqual(during, [set()])
         self.assertEqual((self.journal()["step"], ops.box["a"], ops.ticking),
                          ("aborted", "running", {"ow-recovery.timer"}))
+
+    def stop_plan(self):
+        return {"class": 2, "move": {"worker": "0.5.1"}, "restart": ["worker"], "catalog_backup": False,
+                "rollback_auto": True, "worker_path": "stop", "running_boxes": "stop"}
+
+    def test_running_boxes_stop_stops_them_and_starts_them_after_verify(self):
+        ops = Fake({"a": "running", "b": "running", "c": "stopped", "m": "running"})
+        ops.managed = {"m"}
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.stop_plan())
+        j = self.journal()
+        self.assertEqual((j["step"], j["error"], j["stopped"], j["hibernated"], j["resumed"]), ("done", None, 2, 1, 3))
+        self.assertEqual(ops.box, {"a": "running", "b": "running", "c": "stopped", "m": "running"})
+        self.assertNotIn("hibernated:a", ops.calls)
+        self.assertIn("hibernated:m", ops.calls, "a managed box is hibernated: only its controller may start it")
+        self.assertLess(ops.calls.index("stop-box:b"), ops.calls.index("hibernate"))
+        self.assertLess(ops.calls.index("verify"), ops.calls.index("resume:a"))
+        self.assertNotIn("resume:c", ops.calls, "a box stopped before the upgrade stays stopped")
+        events = {e["attrs"]["step"]: e["attrs"] for e in u.events({**j, "reported": []}) if "step" in e["attrs"]}
+        self.assertEqual((events["stop-boxes"]["boxes"], events["hibernate"]["boxes"]), (2, 1))
+
+    def test_a_refused_hand_over_falls_back_to_stopping_the_boxes(self):
+        ops = Fake({"a": "running"})
+        ops.blocker = "the staged Firecracker binary or guest kernel differs from the running one"
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan={**self.handover_plan(), "running_boxes": "stop"})
+        self.assertEqual((self.journal()["step"], ops.box["a"]), ("done", "running"))
+        self.assertIn("stop-box:a", ops.calls)
+        self.assertNotIn("handover", ops.calls)
+
+    def test_a_worker_restart_stops_the_boxes_when_the_setting_says_so(self):
+        h.write_json(f"{h.RUNNER}/controller-settings.json",
+                     {"upgrade.worker_handover": False, "upgrade.running_boxes": "stop"})
+        with mock.patch.object(h, "role", return_value="runner"):
+            ops = Fake({"a": "running"})
+            u.restart_worker(ops)
+            self.assertIn("stop-box:a", ops.calls)
+            ops = Fake({"a": "running"})
+            u.restart_worker(ops, hibernate=True)
+            self.assertNotIn("stop-box:a", ops.calls)
+            self.assertIn("hibernated:a", ops.calls)
+        self.assertEqual(ops.box["a"], "running")
+
+    def test_running_boxes_stop_abort_starts_the_stopped_boxes_again(self):
+        for fail in ("stop-box:b", "sync-images"):
+            ops = Fake({"a": "running", "b": "running"}, fail={fail})
+            with self.assertRaisesRegex(RuntimeError, f"injected failure at {fail}"):
+                self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.stop_plan())
+            self.assertEqual((self.journal()["step"], ops.box), ("aborted", {"a": "running", "b": "running"}), fail)
+            self.assertEqual(h.pins(), self.frm, "no pin moved")
+            self.assertFalse(ops.drained or ops.quiesced)
+
+    def test_running_boxes_stop_rollback_starts_the_stopped_boxes_on_the_old_worker(self):
+        ops = Fake({"a": "running"}, fail={"verify"})
+        real = ops.verify
+        ops.verify = lambda expected: (expected["worker"] == "0.5.0" and ops.fail.clear(), real(expected))
+        with self.assertRaisesRegex(RuntimeError, "injected failure at verify"):
+            self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.stop_plan())
+        self.assertEqual((self.journal()["step"], h.pin("worker"), ops.box["a"]), ("rolled-back", self.old, "running"))
+
+    def test_killed_while_stopping_the_boxes_then_recovered(self):
+        for kill, end in (("stop-box:b", "aborted"), ("start:worker", "rolled-back")):
+            for name in (*h.PINS, "current"):
+                h.set_pin(name, self.old)
+            ops = Fake({"a": "running", "b": "running"}, kill={kill})
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.stop_plan())
+            self.assertIn("stopped", ops.box.values())
+            ops.kill.clear()
+            u.recover(ops)
+            self.assertEqual((self.journal()["step"], ops.box), (end, {"a": "running", "b": "running"}), kill)
+            self.assertFalse(ops.drained or ops.quiesced)
+
+    def test_an_abort_meeting_the_old_worker_as_it_exits_still_restores_the_host(self):
+        def gave_up(ops):
+            def hibernate_all(release):
+                # The down client timed out (os error 11) while the old worker finishes its
+                # shutdown: silent, then gone, with every box hibernated.
+                ops.box.update(dict.fromkeys(ops.box, "hibernated"))
+                ops.silent = 2
+                raise RuntimeError("Resource temporarily unavailable (os error 11)")
+            return hibernate_all
+
+        def exits_at_list(ops):
+            def hibernate_all(release):
+                # The worker still answers; it exits just as the abort lists the boxes.
+                ops.box.update(dict.fromkeys(ops.box, "hibernated"))
+                ops.lists_failing = 1
+                raise RuntimeError("Resource temporarily unavailable (os error 11)")
+            return hibernate_all
+
+        for race in (gave_up, exits_at_list):
+            ops = Fake({"a": "running", "b": "running"}, timers=u.TIMERS)
+            ops.hibernate_all = race(ops)
+            with mock.patch.object(u.time, "sleep"), self.assertRaisesRegex(RuntimeError, "os error 11"):
+                self.run_plan(ops, ["worker"], 2, ["worker"])
+            self.assertEqual((self.journal()["step"], ops.box), ("aborted", {"a": "running", "b": "running"}),
+                             race.__name__)
+            self.assertIn("start:worker", ops.calls)
+            self.assertEqual((ops.drained, ops.ticking), (False, set(u.TIMERS)))
+
+    def test_an_abort_that_cannot_list_the_boxes_records_it_and_still_closes(self):
+        ops = Fake({"a": "running"}, fail={"sync-images"}, timers=u.TIMERS)
+        real = ops.sync_images
+
+        def sync_images(release):
+            ops.lists_failing = 99
+            real(release)
+        ops.sync_images = sync_images
+        with mock.patch.object(u.time, "sleep"), self.assertRaisesRegex(RuntimeError, "sync-images"):
+            self.run_plan(ops, ["worker"], 2, ["worker"])
+        j = self.journal()
+        self.assertEqual(j["step"], "aborted")
+        self.assertIn("boxes not resumed (ow: No such file or directory", j["error"])
+        self.assertEqual((ops.drained, ops.ticking, h.pins()), (False, set(u.TIMERS), self.frm))
 
     def test_a_done_journal_needs_no_recovery(self):
         ops = Fake({"a": "running"})

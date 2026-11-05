@@ -2,6 +2,50 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.60",
+      "class": 1,
+      "changes": [
+        "controller",
+        "agent",
+        "host-layout"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Runners now follow every change of the controller's upgrade settings: the node agent stored controller-settings.json with a no-clobber write, so only its first value ever landed and each later acknowledgement logged `controller settings: File exists (os error 17)`; it now replaces the file (temporary file and rename) and writes only when a value changes. New controller setting upgrade.running_boxes (hibernate, the default, or stop; config.set over the admin API, delivered with each acknowledgement, stored in the same file): when a worker upgrade or `ow-host restart --worker` cannot hand over, stop has the upgrader stop each running box (journal step stop-boxes, reported as an ow.host.upgrade.step event with the boxes stopped) instead of hibernating it, and start it again after verify, cold; abort, rollback and recover start them too. Managed boxes are still hibernated and ephemeral boxes stopped as before; `--hibernate` forces hibernation; hand-over still wins. `--plan` reports worker_path stop and running_boxes. Abort no longer leaves a host half-upgraded when the old worker exits while it acts (a `down --hibernate` client that timed out): it waits for the worker to answer or exit, starts it if it exited, tries the resume twice and records a failure instead of raising, so the drain, units and timers are restored and the journal reaches aborted. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel, hand-over format and host layout 2 are unchanged. Class 1: the agent and controller restart; the worker does not, so boxes keep running through this upgrade."
+    },
+    {
       "version": "0.9.59",
       "class": 2,
       "changes": [

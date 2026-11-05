@@ -75,6 +75,7 @@ Infrastructure code carries no telemetry setting.
 | `actions.pools` | `[]` | a JSON list | [GitHub Actions runner pools](ACTIONS.md). Read on every 2 s pass. |
 | `actions.github_app_id` | `0` | 0–4294967295 | The GitHub App the pools register runners with; `0`: none. |
 | `upgrade.worker_handover` | `true` | `true`, `false` | A worker upgrade or restart that keeps the VMM and guest kernel hands the running boxes to the new worker instead of hibernating them ([UPGRADES.md](UPGRADES.md#worker-hand-over-keeps-boxes-running)). Runners store it for `ow-host upgrade` within 3 s. |
+| `upgrade.running_boxes` | `hibernate` | `hibernate`, `stop` | What a worker upgrade or restart without hand-over does with the running boxes: hibernate them (RAM kept, minutes per large box) or stop them (seconds; RAM lost, disk kept, cold boot after verify) ([UPGRADES.md](UPGRADES.md#ow-host-upgrade)). Managed and ephemeral boxes keep their handling. Runners store it with `upgrade.worker_handover`. |
 | `dashboard.ui_bundle` | `builtin` | `builtin` or an installed bundle version | UI bundle the dashboard serves; see [UI bundles](DASHBOARD.md#ui-bundles). Refused unless installed, intact and API-compatible. |
 
 ## What runners report
@@ -115,7 +116,7 @@ severity:
 | `ow.node.channel.reconnected` | INFO | first acknowledgement after a loss | `reason`, `attempts`, `downtime_s` |
 | `ow.node.worker.restarted` | INFO | the worker answers from a new process | – |
 | `ow.node.worker.unavailable` | WARN | the worker stops answering status (once per outage) | – |
-| `ow.host.upgrade.step` | INFO | an upgrade step ended (sent as it ends while the agent runs, else when the journal closes) | `journal`, `step` (drain, hibernate or handover, …, adoption, undrain), `duration_ms`; for `hibernate` also `boxes` (hibernated) and `cold`; for `handover` also `boxes` (handed over) |
+| `ow.host.upgrade.step` | INFO | an upgrade step ended (sent as it ends while the agent runs, else when the journal closes) | `journal`, `step` (drain, stop-boxes, hibernate or handover, …, adoption, undrain), `duration_ms`; for `stop-boxes` also `boxes` (stopped); for `hibernate` also `boxes` (hibernated) and `cold`; for `handover` also `boxes` (handed over) |
 | `ow.host.upgrade` | INFO, WARN unless `done` | an upgrade journal closed | `journal`, `class`, `from`, `to` (releases), `outcome` (done, aborted, rolled-back), `duration_ms`, `resumed` |
 | `ow.node.operation` | INFO, WARN on failure | each job the agent runs, except reads, streams and credential refreshes | `op`, `outcome` (ok, error), `duration_ms`, `ow.box.id` when the job names a box, `error` on failure |
 

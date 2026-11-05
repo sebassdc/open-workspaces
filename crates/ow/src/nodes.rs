@@ -1702,17 +1702,30 @@ const BEAT_STALE: Duration = Duration::from_secs(1500);
 /// instead of waiting minutes for TCP to give up.
 const CONTROLLER_SILENT: Duration = Duration::from_secs(20);
 
-/// Stores the controller's `upgrade.worker_handover` for `ow-host upgrade` on this runner,
-/// which runs without a controller session of its own; written only when it changes.
-fn handover_setting(root: &Path, on: bool, written: &mut Option<bool>) {
-    if *written == Some(on) {
+/// Stores the controller's `upgrade.*` settings from an acknowledgement for `ow-host
+/// upgrade` on this runner, which runs without a controller session of its own; written
+/// only when they change, and replaced whole (write_private alone never overwrites).
+pub(crate) fn controller_settings(root: &Path, offer: &Value, written: &mut Option<Value>) {
+    let mut settings = json!({});
+    for (offered, key) in [
+        ("worker_handover", "upgrade.worker_handover"),
+        ("running_boxes", "upgrade.running_boxes"),
+    ] {
+        if !offer[offered].is_null() {
+            settings[key] = offer[offered].clone();
+        }
+    }
+    if settings == json!({}) || written.as_ref() == Some(&settings) {
         return;
     }
-    match write_private(
-        &root.join("controller-settings.json"),
-        &json!({"upgrade.worker_handover": on}),
-    ) {
-        Ok(()) => *written = Some(on),
+    let result = common::nonce().and_then(|nonce| {
+        let temporary = root.join(format!("controller-settings-{nonce}.tmp"));
+        write_private(&temporary, &settings)?;
+        fs::rename(&temporary, root.join("controller-settings.json"))?;
+        Ok(())
+    });
+    match result {
+        Ok(()) => *written = Some(settings),
         Err(e) => eprintln!("controller settings: {e:#}"),
     }
 }
@@ -1923,7 +1936,7 @@ pub fn agent(
         let _ = record.send(write);
     };
     // What controller-settings.json last said (the upgrader reads it there).
-    let mut handover_written = None;
+    let mut settings_written = None;
     loop {
         let result = (|| -> Result<()> {
             if guided {
@@ -2020,9 +2033,7 @@ pub fn agent(
                                 Ordering::SeqCst,
                             );
                             telemetry.acknowledged(&v, connecting);
-                            if let Some(on) = v["telemetry"]["worker_handover"].as_bool() {
-                                handover_setting(root, on, &mut handover_written);
-                            }
+                            controller_settings(root, &v["telemetry"], &mut settings_written);
                             if guided {
                                 let (root, instance, generation) =
                                     (root.to_owned(), instance.clone(), generation.to_owned());

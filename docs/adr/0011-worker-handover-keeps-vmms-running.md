@@ -174,7 +174,10 @@ new worker hibernates the boxes on stop and the old one wakes them.
 
 `upgrade.worker_handover` is a controller setting (catalog `settings` table,
 `ow config`), delivered to runners on every heartbeat acknowledgement and stored
-by the node agent for the upgrader to read; no per-runner or IaC switch. A worker
+by the node agent for the upgrader to read; no per-runner or IaC switch. From
+0.9.60 the node agent stores `upgrade.running_boxes` in the same file: when no
+hand-over is possible, `stop` has the upgrader stop the running boxes instead of
+hibernating them (docs/UPGRADES.md). A worker
 that can adopt on its host reports `worker_handover_v1` in its status, the agent
 advertises it with every heartbeat, and `ow nodes` shows it per node.
 

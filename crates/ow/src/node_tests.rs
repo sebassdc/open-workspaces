@@ -16,6 +16,45 @@ fn heartbeats_advertise_aws_metadata_and_disk_only_recovery_independently() {
 }
 
 #[test]
+fn controller_settings_follow_every_change_and_skip_unchanged_ones() {
+    let root = root();
+    let path = root.join("controller-settings.json");
+    let read = || serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap();
+    let mut written = None;
+    controller_settings(
+        &root,
+        &json!({"worker_handover":true,"running_boxes":"hibernate"}),
+        &mut written,
+    );
+    assert_eq!(
+        read(),
+        json!({"upgrade.worker_handover":true,"upgrade.running_boxes":"hibernate"})
+    );
+    controller_settings(
+        &root,
+        &json!({"worker_handover":false,"running_boxes":"stop"}),
+        &mut written,
+    );
+    assert_eq!(
+        read(),
+        json!({"upgrade.worker_handover":false,"upgrade.running_boxes":"stop"})
+    );
+    fs::remove_file(&path).unwrap();
+    controller_settings(
+        &root,
+        &json!({"worker_handover":false,"running_boxes":"stop"}),
+        &mut written,
+    );
+    assert!(!path.exists(), "an unchanged offer writes nothing");
+    controller_settings(&root, &json!({"enabled":true}), &mut written);
+    assert!(
+        !path.exists(),
+        "an offer without upgrade settings writes nothing"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn node_stream_100_mib_each_way() {
     use std::{
         net::{Shutdown, TcpListener},
