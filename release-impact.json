@@ -2,6 +2,49 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.63",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "A create or fork whose operation row stayed pending (its dispatch failed inside the controller, for example on a locked catalog write) now fails after the 30-minute creation timeout like an uncertain one when the runner has no such machine, so its machine row can be deleted and its reservation goes. Before, only a controller restart freed it. Runner pools no longer count a box whose create failed against `max` while its removal waits, so a refused delete does not take a warm runner's slot."
+    },
+    {
       "version": "0.9.62",
       "class": 1,
       "changes": [

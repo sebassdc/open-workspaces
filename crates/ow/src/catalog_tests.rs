@@ -4121,6 +4121,46 @@ fn a_rejected_fork_ends_failed_releases_its_reservation_and_deletes_without_the_
 }
 
 #[test]
+fn a_create_left_pending_by_a_failed_dispatch_times_out_and_can_be_deleted() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    let a = c.user(&identity("alice")).unwrap();
+    // The reply is lost, then the operation row is left pending as a dispatch that died
+    // in this process would leave it (no restart turns it uncertain).
+    *fake.reject.lock().unwrap() = Some("create".into());
+    fake.uncertain.store(true, Ordering::SeqCst);
+    c.operation(a, json!({"op":"create","id":"one","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"}))
+        .unwrap_err();
+    fake.uncertain.store(false, Ordering::SeqCst);
+    *fake.reject.lock().unwrap() = None;
+    c.db.execute("UPDATE operations SET state='pending' WHERE op='create'", [])
+        .unwrap();
+    assert_eq!(machine_states(&mut c, a)["one"], "pending");
+    let early = c
+        .operation(a, json!({"op":"delete","id":"one"}))
+        .unwrap_err();
+    assert!(early.to_string().contains("still being created or forked"));
+    c.db.execute(
+        "UPDATE operations SET created_at=datetime('now','-31 minutes') WHERE op='create'",
+        [],
+    )
+    .unwrap();
+    machine_states(&mut c, a);
+    let state: String = c
+        .db
+        .query_row("SELECT state FROM operations WHERE op='create'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "failed");
+    assert_eq!(c.state(a).unwrap()["stats"]["reserved_memory_mib"], 0);
+    let deleted = c.operation(a, json!({"op":"delete","id":"one"})).unwrap();
+    assert_eq!(deleted["deleted"], "one");
+    assert!(!machine_states(&mut c, a).contains_key("one"));
+}
+
+#[test]
 fn an_interrupted_fork_times_out_visibly_and_its_ghost_can_be_deleted() {
     let mut fake = Fake::new();
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();

@@ -113,7 +113,7 @@ jobs:
       - name: Check the admin API, its CLI wrappers and docs/ADMIN_API.md stay in step
         working-directory: .
         run: |
-          cargo +1.97.0 test --locked -p ow --bin ow -- admin:: admin_api_gate host_admin_requires workload_token spill placement::tests pools_take_only actions:: journal_tests an_ephemeral_box a_draining_runner
+          cargo +1.97.0 test --locked -p ow --bin ow -- admin:: admin_api_gate host_admin_requires workload_token spill placement::tests pools_take_only actions:: journal_tests an_ephemeral_box a_draining_runner a_create_left_pending an_interrupted_fork
       - name: Check tailnet previews before tagging
         working-directory: .
         run: cargo +1.97.0 test --locked -p ow --bin ow preview
