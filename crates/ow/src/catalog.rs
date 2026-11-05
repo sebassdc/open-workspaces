@@ -65,7 +65,8 @@ pub(crate) mod flights {
     impl State {
         fn touch(&mut self, id: &str) {
             self.seq += 1;
-            self.changed.insert(id.to_owned(), (self.seq, Instant::now()));
+            self.changed
+                .insert(id.to_owned(), (self.seq, Instant::now()));
             self.changed.retain(|_, (_, at)| at.elapsed() < MEMORY);
         }
     }
@@ -107,7 +108,10 @@ pub(crate) mod flights {
                 state = self.landed.wait(state).unwrap_or_else(|e| e.into_inner());
             }
         }
-        pub(crate) fn take(self: &Arc<Self>, physicals: impl IntoIterator<Item = String>) -> Flight {
+        pub(crate) fn take(
+            self: &Arc<Self>,
+            physicals: impl IntoIterator<Item = String>,
+        ) -> Flight {
             let mut ids: Vec<String> = physicals.into_iter().collect();
             ids.sort();
             ids.dedup();
@@ -243,6 +247,18 @@ impl Dispatch {
         }
     }
 }
+
+/// A runner's own box fits only once boxes another pool spilled there are stopped
+/// (docs/MULTINODE.md#spill): their owners and names. Reads as the capacity refusal it
+/// replaces, for any caller that does not make room.
+#[derive(Clone, Debug)]
+pub struct Yield(pub(crate) Vec<(i64, String)>);
+impl std::fmt::Display for Yield {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("node capacity exhausted")
+    }
+}
+impl std::error::Error for Yield {}
 
 #[derive(Debug)]
 pub struct ResourceNotFound(pub(crate) String);
@@ -821,7 +837,9 @@ impl Catalog {
                 machines.is_empty() || bootstrap.is_some(),
                 "existing machines require an explicit bootstrap_owner_email"
             );
-            let tx = catalog.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = catalog
+                .db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if let Some(email) = bootstrap {
                 tx.execute(
                     "INSERT INTO users(issuer,email) VALUES(?1,?2)",
@@ -1304,6 +1322,18 @@ impl Catalog {
         let fits = used_mib as u64 + extra_mib + intent.memory_mib as u64 <= limit as u64
             && used_cpus as u64 + extra_cpus + intent.cpus as u64 <= cpus as u64
             && used_slots as u64 + extra_slots < slots as u64;
+        // A waking box comes before boxes another pool spilled onto the runner.
+        if !fits && t.kind == crate::transfers::Kind::Wake {
+            let short = (
+                (used_mib as u64 + extra_mib + intent.memory_mib as u64)
+                    .saturating_sub(limit as u64),
+                (used_cpus as u64 + extra_cpus + intent.cpus as u64).saturating_sub(cpus as u64),
+                (used_slots as u64 + extra_slots + 1).saturating_sub(slots as u64),
+            );
+            if let Some(room) = c.yield_room(target, &t.source, short)? {
+                return Err(room.into());
+            }
+        }
         if !fits && t.kind == crate::transfers::Kind::Fork && target == t.source_node {
             return Err(fork_refusal(
                 target,
@@ -1657,7 +1687,11 @@ impl Catalog {
             let Some((machines, snapshots)) = inventory else {
                 continue;
             };
-            if self.applied.get(&node).is_some_and(|newer| *newer > inventory_read) {
+            if self
+                .applied
+                .get(&node)
+                .is_some_and(|newer| *newer > inventory_read)
+            {
                 continue;
             }
             self.applied.insert(node.clone(), inventory_read);
@@ -2036,7 +2070,9 @@ impl Catalog {
         const OF: &str = "kind='snapshot' AND (json_extract(metadata,'$.workspace')=?1 OR (json_extract(metadata,'$.state') IN ('pending','failed') AND physical IN (SELECT json_extract(request,'$.request.name') FROM operations WHERE op='snapshot' AND json_extract(request,'$.request.id')=?1)))";
         // Immediate: a deferred transaction that reads first fails at once (SQLITE_BUSY_SNAPSHOT)
         // instead of waiting when another catalog connection writes in between.
-        let tx = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let grantees = tx
             .prepare("SELECT grantee FROM grants WHERE physical=?1")?
             .query_map([physical], |r| r.get::<_, i64>(0))?
@@ -2631,6 +2667,42 @@ impl Catalog {
             extra.2 + pending.2,
         ))
     }
+    /// Running boxes another pool spilled onto `node`, newest first: owner, name, MiB, vCPUs.
+    fn borrowed(&self, node: &str, except: &str) -> Result<Vec<(i64, String, u64, u64)>> {
+        let mut stmt = self.db.prepare("SELECT r.owner,r.name,r.reserved_mib,r.reserved_cpus FROM resources r JOIN box_pools b ON b.physical=r.physical AND b.spilled=1 WHERE r.kind='machine' AND r.node=?1 AND r.physical<>?2 AND (r.reserved_mib>0 OR r.reserved_cpus>0) ORDER BY r.rowid DESC")?;
+        let rows = stmt
+            .query_map([node, except], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+    /// The fewest spilled boxes on `node` whose stop frees `short` (MiB, vCPUs, slots), or
+    /// None when stopping all of them would not.
+    fn yield_room(
+        &self,
+        node: &str,
+        except: &str,
+        short: (u64, u64, u64),
+    ) -> Result<Option<Yield>> {
+        let (mut mib, mut cpus, mut slots) = short;
+        let mut chosen = vec![];
+        for (owner, name, m, c) in self.borrowed(node, except)? {
+            if mib == 0 && cpus == 0 && slots == 0 {
+                break;
+            }
+            mib = mib.saturating_sub(m);
+            cpus = cpus.saturating_sub(c);
+            slots = slots.saturating_sub(1);
+            chosen.push((owner, name));
+        }
+        Ok((mib == 0 && cpus == 0 && slots == 0 && !chosen.is_empty()).then_some(Yield(chosen)))
+    }
     /// A runner's placement pool; the controller's own worker is in `default`.
     fn node_pool(&self, node: &str) -> Result<String> {
         Ok(self.db.query_row(
@@ -2644,6 +2716,7 @@ impl Catalog {
         &self,
         requested: Option<&str>,
         pool: &str,
+        may_spill: bool,
         memory: u64,
         image: &str,
         cpus: u64,
@@ -2660,6 +2733,8 @@ impl Catalog {
             return Ok("local".into());
         }
         let mut candidates = Vec::new();
+        // Runners full only because of boxes spilled onto them, and how much each is short.
+        let mut yieldable: Vec<(crate::placement::Candidate, (u64, u64, u64))> = Vec::new();
         // Why each runner was passed over, for the operator log when none is left.
         let mut passed = Vec::new();
         for n in inventory.as_array().unwrap() {
@@ -2695,60 +2770,76 @@ impl Catalog {
             let (used,count):(u32,u32)=self.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),SUM(CASE WHEN reserved_mib>0 THEN 1 ELSE 0 END) FROM resources WHERE kind='machine' AND node=?1",[id],|r|Ok((r.get(0)?,r.get::<_,Option<u32>>(1)?.unwrap_or(0))))?;
             let (extra_mib, extra_cpus, extra_slots) = self.extra_usage(id)?;
             let used_cpus:u32=self.db.query_row("SELECT COALESCE(SUM(reserved_cpus),0) FROM resources WHERE kind='machine' AND node=?1",[id],|r|r.get(0))?;
-            let fits = used as u64 + extra_mib + memory <= n["memory_mib"].as_u64().unwrap()
-                && count as u64 + extra_slots < n["slots"].as_u64().unwrap()
-                && used_cpus as u64 + extra_cpus + cpus
-                    <= n["capabilities"]["vcpus"].as_u64().unwrap_or(0);
-            if !fits {
+            let (limit, slots, vcpus) = (
+                n["memory_mib"].as_u64().unwrap(),
+                n["slots"].as_u64().unwrap(),
+                n["capabilities"]["vcpus"].as_u64().unwrap_or(0),
+            );
+            let short = (
+                (used as u64 + extra_mib + memory).saturating_sub(limit),
+                (used_cpus as u64 + extra_cpus + cpus).saturating_sub(vcpus),
+                (count as u64 + extra_slots + 1).saturating_sub(slots),
+            );
+            let fits = short == (0, 0, 0);
+            // Full only because of boxes another pool spilled here: the runner's own pool may
+            // still place it, once they are stopped.
+            let (lent_mib, lent_cpus, lent_slots) = if fits {
+                (0, 0, 0)
+            } else {
+                self.borrowed(id, "")?
+                    .iter()
+                    .fold((0, 0, 0), |(m, c, n), b| (m + b.2, c + b.3, n + 1))
+            };
+            let after_yield = !fits
+                && short.0 <= lent_mib
+                && short.1 <= lent_cpus
+                && short.2 <= lent_slots
+                && lent_slots > 0;
+            if !fits && !after_yield {
                 passed.push(format!(
                     "{id}: full (MiB {used}+{extra_mib} of {}, boxes {count}+{extra_slots} of {}, vCPUs {used_cpus}+{extra_cpus} of {})",
                     n["memory_mib"],
                     n["slots"],
                     n["capabilities"]["vcpus"]
                 ));
+                continue;
             }
+            let cap = n["capabilities"].clone();
+            let transfers: i64 = self.db.query_row(
+                "SELECT COALESCE(SUM(disk_bytes),0) FROM transfer_reservations WHERE node=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            let logical: i64 = self.db.query_row("SELECT COALESCE(SUM(a.disk_gib),0) FROM owner_allocations a JOIN resources r ON r.kind='machine' AND r.physical=a.physical WHERE r.node=?1",[id],|r|r.get(0))?;
+            let disk_extra = (transfers as u64).saturating_add(
+                (logical as u64 * common::GIB)
+                    .saturating_sub(cap["reserved_disk_bytes"].as_u64().unwrap_or(0)),
+            );
+            let candidate = crate::placement::Candidate {
+                id: id.to_owned(),
+                online: true,
+                active: cap["controller_drain"] != true && cap["active"] != false,
+                pool: cap["pool"].as_str().unwrap_or("default").into(),
+                free: crate::placement::Capacity {
+                    memory_mib: (limit + lent_mib).saturating_sub(used as u64 + extra_mib),
+                    cpus: (vcpus + lent_cpus).saturating_sub(used_cpus as u64 + extra_cpus),
+                    slots: (slots + lent_slots).saturating_sub(count as u64 + extra_slots),
+                    disk_bytes: cap["available_disk_bytes"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_sub(disk_extra),
+                },
+                joined: n["enrollment_order"].as_u64().unwrap_or(0),
+                capabilities: cap,
+            };
             if fits {
-                let cap = n["capabilities"].clone();
-                let transfers: i64 = self.db.query_row(
-                    "SELECT COALESCE(SUM(disk_bytes),0) FROM transfer_reservations WHERE node=?1",
-                    [id],
-                    |r| r.get(0),
-                )?;
-                let logical: i64 = self.db.query_row("SELECT COALESCE(SUM(a.disk_gib),0) FROM owner_allocations a JOIN resources r ON r.kind='machine' AND r.physical=a.physical WHERE r.node=?1",[id],|r|r.get(0))?;
-                let disk_extra = (transfers as u64).saturating_add(
-                    (logical as u64 * common::GIB)
-                        .saturating_sub(cap["reserved_disk_bytes"].as_u64().unwrap_or(0)),
-                );
-                candidates.push(crate::placement::Candidate {
-                    id: id.to_owned(),
-                    online: true,
-                    active: cap["controller_drain"] != true && cap["active"] != false,
-                    pool: cap["pool"].as_str().unwrap_or("default").into(),
-                    free: crate::placement::Capacity {
-                        memory_mib: n["memory_mib"]
-                            .as_u64()
-                            .unwrap()
-                            .saturating_sub(used as u64 + extra_mib),
-                        cpus: cap["vcpus"]
-                            .as_u64()
-                            .unwrap_or(0)
-                            .saturating_sub(used_cpus as u64 + extra_cpus),
-                        slots: n["slots"]
-                            .as_u64()
-                            .unwrap()
-                            .saturating_sub(count as u64 + extra_slots),
-                        disk_bytes: cap["available_disk_bytes"]
-                            .as_u64()
-                            .unwrap_or(0)
-                            .saturating_sub(disk_extra),
-                    },
-                    joined: n["enrollment_order"].as_u64().unwrap_or(0),
-                    capabilities: cap,
-                });
+                candidates.push(candidate);
+            } else {
+                yieldable.push((candidate, short));
             }
         }
 
-        if candidates.is_empty() {
+        if candidates.is_empty() && yieldable.is_empty() {
             let online: Vec<_> = inventory
                 .as_array()
                 .unwrap()
@@ -2808,9 +2899,13 @@ impl Catalog {
         let settings = crate::telemetry::settings(&self.db)?;
         let rules: Vec<crate::spill::Rule> =
             serde_json::from_value(settings[crate::spill::RULES].clone()).unwrap_or_default();
-        if requested.is_none() && pool != "default" && rules.iter().any(|r| r.pool == pool) {
+        if may_spill
+            && requested.is_none()
+            && pool != "default"
+            && rules.iter().any(|r| r.pool == pool)
+        {
             let live = crate::spill::home_live(&inventory, pool);
-            let keep_free = settings[crate::spill::KEEP_FREE].as_u64().unwrap_or(0);
+            let reserve = crate::spill::reserve(&settings);
             let boxes = |node: &str| {
                 self.db
                     .query_row(
@@ -2821,7 +2916,7 @@ impl Catalog {
                     .map_or(u64::MAX, |n| n as u64)
             };
             if let Some(n) =
-                crate::placement::spill(&candidates, &demand, &rules, keep_free, live, boxes)
+                crate::placement::spill(&candidates, &demand, &rules, &reserve, live, boxes)
             {
                 crate::telemetry::record_event(
                     &self.db,
@@ -2840,6 +2935,15 @@ impl Catalog {
                     "placement_spill_full",
                     &json!({"pool":pool}),
                 );
+            }
+        }
+        // A runner of the pool that is full only of other pools' spilled boxes takes it once
+        // they are stopped: a pool's own boxes come first on its runners.
+        let lenders: Vec<_> = yieldable.iter().map(|(c, _)| c.clone()).collect();
+        if let Some(n) = crate::placement::choose(&lenders, &demand) {
+            let short = yieldable.iter().find(|(c, _)| c.id == n.id).unwrap().1;
+            if let Some(room) = self.yield_room(&n.id, "", short)? {
+                return Err(room.into());
             }
         }
         // Runners passed the checks but none in this pool (or to spill to) had room.
@@ -2891,13 +2995,24 @@ impl Catalog {
         let (used,count):(u32,u32)=self.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),SUM(CASE WHEN reserved_mib>0 THEN 1 ELSE 0 END) FROM resources WHERE kind='machine' AND node=?1 AND physical<>?2",params![node,physical],|r|Ok((r.get(0)?,r.get::<_,Option<u32>>(1)?.unwrap_or(0))))?;
         let used_cpus:u32=self.db.query_row("SELECT COALESCE(SUM(reserved_cpus),0) FROM resources WHERE kind='machine' AND node=?1 AND physical<>?2",params![node,physical],|r|r.get(0))?;
         let (extra_mib, extra_cpus, extra_slots) = self.extra_usage(node)?;
-        ensure!(
-            used as u64 + extra_mib + memory <= limit
-                && count as u64 + extra_slots < slots
-                && used_cpus as u64 + extra_cpus + cpus
-                    <= n["capabilities"]["vcpus"].as_u64().unwrap_or(0),
-            "node capacity exhausted"
+        let vcpus = n["capabilities"]["vcpus"].as_u64().unwrap_or(0);
+        let short = (
+            (used as u64 + extra_mib + memory).saturating_sub(limit),
+            (used_cpus as u64 + extra_cpus + cpus).saturating_sub(vcpus),
+            (count as u64 + extra_slots + 1).saturating_sub(slots),
         );
+        if short != (0, 0, 0) {
+            // The runner's own boxes come first: spilled boxes make room for them.
+            let own: bool = self.db.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM box_pools WHERE physical=?1 AND spilled=1)",
+                [physical],
+                |r| r.get(0),
+            )?;
+            if own && let Some(room) = self.yield_room(node, physical, short)? {
+                return Err(room.into());
+            }
+            anyhow::bail!("node capacity exhausted");
+        }
         ensure!(
             n["capabilities"]["images"]
                 .as_array()
@@ -3006,7 +3121,10 @@ impl Catalog {
             };
             self.capacity(node, target, memory, cpus, image, local_status)
                 .map_err(|e| {
-                    if op == "fork" && e.to_string() == "node capacity exhausted" {
+                    if op == "fork"
+                        && e.to_string() == "node capacity exhausted"
+                        && e.downcast_ref::<Yield>().is_none()
+                    {
                         fork_refusal(node, cpus, memory)
                     } else {
                         e
@@ -3056,6 +3174,7 @@ impl Catalog {
             let c = lock()?;
             (c.root.clone(), c.flights.clone())
         };
+        let mut yielded = false;
         loop {
             let asked = Instant::now();
             // Runner inventories are read before the lock is taken, never under it.
@@ -3070,13 +3189,40 @@ impl Catalog {
                 )
             };
             let value = match prepared {
-                Err(error) => match error.downcast_ref::<InFlight>() {
-                    Some(InFlight(physical)) => {
+                Err(error) => {
+                    if let Some(InFlight(physical)) = error.downcast_ref::<InFlight>() {
                         flights.wait(physical);
                         continue;
                     }
-                    None => return Err(error),
-                },
+                    // Boxes spilled onto the runner make room for its own (once: a stop that
+                    // did not free it leaves the refusal as it was).
+                    if let Some(Yield(boxes)) = error.downcast_ref::<Yield>()
+                        && !yielded
+                    {
+                        yielded = true;
+                        for (owner, name) in boxes {
+                            let stopped = Self::operation_shared(
+                                shared,
+                                *owner,
+                                json!({"op":"stop","id":name}),
+                            );
+                            eprintln!(
+                                "placement_yield: stopped spilled box {name} for a runner's own box: {}",
+                                stopped
+                                    .as_ref()
+                                    .map_or_else(|e| format!("{e:#}"), |_| "ok".into())
+                            );
+                            crate::telemetry::controller_log(
+                                None,
+                                "WARN",
+                                "placement_yield",
+                                &json!({"box":name,"ok":stopped.is_ok()}),
+                            );
+                        }
+                        continue;
+                    }
+                    return Err(error);
+                }
                 Ok(value) => value,
             };
             let Some(mut dispatch) = dispatch else {
@@ -3209,6 +3355,13 @@ impl Catalog {
         }
         if op == "create" && grant.is_some() {
             request["ephemeral"] = json!(true);
+        }
+        // `"spill": false` keeps a create on its own pool's runners (docs/MULTINODE.md#spill).
+        if let Some(spill) = request.get("spill") {
+            ensure!(
+                op == "create" && spill.is_boolean(),
+                "spill is a create flag: true or false"
+            );
         }
         let name = request["id"].as_str().context("id")?.to_owned();
         common::address(&name)?;
@@ -3518,6 +3671,7 @@ impl Catalog {
                     node = self.choose(
                         request["node"].as_str(),
                         &pool,
+                        request["spill"] != false,
                         request["memory_mib"].as_u64().unwrap_or(256),
                         request["image"].as_str().unwrap_or("alpine"),
                         request["vcpu_count"].as_u64().unwrap_or(1),
@@ -3556,6 +3710,7 @@ impl Catalog {
             }
             request["id"] = json!(physical);
             request.as_object_mut().unwrap().remove("node");
+            request.as_object_mut().unwrap().remove("spill");
             let mut target = physical.clone();
             match op.as_str() {
                 "snapshot" => {
@@ -3818,7 +3973,9 @@ impl Catalog {
         let (root, envelope) = match sent {
             Sent::Unprepared(diagnostic, error) => {
                 eprintln!("operation {operation} preparation: {error:#}");
-                let tx = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let tx = self
+                    .db
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 if tx.execute(
                     "UPDATE operations SET state='not_dispatched',response=?2 WHERE id=?1 AND state='pending'",
                     params![operation, json!({"error":diagnostic}).to_string()],
@@ -3986,7 +4143,9 @@ impl Catalog {
         } else if op == "snapshot-delete" {
             let snapshot = input["name"].as_str().unwrap();
             let id = request["name"].as_str().unwrap();
-            let tx = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = self
+                .db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             // The name is free again: its capture operation stops claiming it.
             tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND owner=?1 AND resource=?2",params![user,snapshot])?;
             tx.execute(
@@ -4284,25 +4443,25 @@ mod tests {
         assert!(!output.to_string().contains("bob-private"));
         assert!(!output.to_string().contains(&physical));
         assert_eq!(
-            c.choose(None, "default", 2048, "ubuntu", 2, &json!({}), Some(32))
+            c.choose(None, "default", true, 2048, "ubuntu", 2, &json!({}), Some(32))
                 .unwrap(),
             "runner"
         );
         assert!(
-            c.choose(None, "default", 4096, "ubuntu", 2, &json!({}), Some(32))
+            c.choose(None, "default", true, 4096, "ubuntu", 2, &json!({}), Some(32))
                 .unwrap_err()
                 .to_string()
                 .contains("capacity exhausted")
         );
         assert!(
-            c.choose(None, "default", 256, "arch", 1, &json!({}), Some(32))
+            c.choose(None, "default", true, 256, "arch", 1, &json!({}), Some(32))
                 .unwrap_err()
                 .to_string()
                 .contains("lacks prepared image")
         );
         c.db.execute("UPDATE nodes SET heartbeat=0", []).unwrap();
         assert!(
-            c.choose(None, "default", 256, "ubuntu", 1, &json!({}), Some(32))
+            c.choose(None, "default", true, 256, "ubuntu", 1, &json!({}), Some(32))
                 .unwrap_err()
                 .to_string()
                 .contains("no online node")

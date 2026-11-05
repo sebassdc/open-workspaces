@@ -417,17 +417,38 @@ pub(super) fn reserve_wake(shared: &Shared, t: &Transfer) -> Result<bool> {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
     let mut compatible_runner = false;
+    // A runner full only of boxes another pool spilled there (docs/MULTINODE.md#spill).
+    let mut room: Option<crate::catalog::Yield> = None;
     for (node, caps) in nodes {
         let compatible = compatibility.as_ref().is_none_or(|expected| {
             serde_json::from_str::<Value>(&caps).is_ok_and(|caps| &caps["compat"] == expected)
         });
         compatible_runner |= compatible;
-        if compatible
-            && capable(&c, &node, input.disk_bytes.saturating_mul(2)).is_ok()
-            && c.reserve_wake(t.id, &node, &input).is_ok()
-        {
-            return Ok(true);
+        if compatible && capable(&c, &node, input.disk_bytes.saturating_mul(2)).is_ok() {
+            match c.reserve_wake(t.id, &node, &input) {
+                Ok(()) => return Ok(true),
+                Err(e) if room.is_none() => room = e.downcast_ref().cloned(),
+                Err(_) => {}
+            }
         }
+    }
+    if let Some(crate::catalog::Yield(boxes)) = room {
+        drop(c);
+        // Stopped, they free the runner: the next pass reserves it for this wake.
+        for (owner, name) in boxes {
+            let stopped = crate::catalog::Catalog::operation_shared(
+                shared,
+                owner,
+                json!({"op":"stop","id":name}),
+            );
+            eprintln!(
+                "placement_yield: stopped spilled box {name} for a wake: {}",
+                stopped
+                    .as_ref()
+                    .map_or_else(|e| format!("{e:#}"), |_| "ok".into())
+            );
+        }
+        return Ok(true);
     }
     if !compatible_runner && compatibility.is_some() {
         c.advance_transfer(

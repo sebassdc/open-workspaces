@@ -32,6 +32,11 @@ use std::{
 const TICK: Duration = Duration::from_secs(2);
 const MAX_THREADS: usize = 32;
 const HOLD_S: i64 = 10;
+/// A warm box found the pool's own runners full: none is tried again until one of the pool's
+/// boxes is removed, or for this long.
+const HOME_HOLD_S: i64 = 60;
+/// Queued jobs are asked for at most this often per pool, and only while it is saturated.
+const QUEUED_EVERY_S: i64 = 10;
 const REMOVE_RETRY_S: i64 = 10;
 const RECENT: usize = 50;
 /// The image contract (docs/ACTIONS.md#image): the start command reads the registration here.
@@ -58,6 +63,8 @@ struct Shared {
     entries: Mutex<BTreeMap<String, Entry>>,
     /// Pool -> unix s until which it makes no box.
     holds: Mutex<HashMap<String, i64>>,
+    /// Pool -> (unix s asked, jobs queued for its runners).
+    queued: Mutex<HashMap<String, (i64, u32)>>,
     /// Pool -> its last launch or removal error.
     errors: Mutex<HashMap<String, (i64, String)>>,
     /// The latest boxes' start times (ms since epoch), newest last.
@@ -86,6 +93,7 @@ pub(crate) fn start(root: &Path, catalog: Arc<Mutex<crate::catalog::Catalog>>) {
         catalog,
         entries: Mutex::new(entries),
         holds: Mutex::default(),
+        queued: Mutex::default(),
         errors: Mutex::default(),
         recent: Mutex::default(),
         threads: AtomicUsize::new(0),
@@ -228,7 +236,10 @@ fn pass(shared: &Arc<Shared>) -> Result<()> {
             let before = entries.clone();
             actions::observe(at, &mut entries, listed);
             for (name, e) in entries.iter() {
-                if before.get(name).is_some_and(|b| (b.online, b.busy) != (e.online, e.busy)) {
+                if before
+                    .get(name)
+                    .is_some_and(|b| (b.online, b.busy) != (e.online, e.busy))
+                {
                     save(shared, name, Some(e));
                     if e.online.is_some() && before[name].online.is_none() {
                         timing(shared, name, "online_ms");
@@ -246,13 +257,25 @@ fn pass(shared: &Arc<Shared>) -> Result<()> {
             .collect();
         drop(entries);
         let holds = shared.holds.lock().unwrap().clone();
-        actions.extend(actions::plan(at, &repo_pools, &mine, listed.as_ref(), &|pool| {
-            holds.get(pool).is_some_and(|until| *until > at)
-        }, &draining));
+        let mut queued = HashMap::new();
+        if listed.is_some() {
+            for p in &repo_pools {
+                queued.insert(p.name.clone(), queued_jobs(shared, p, &mine, app_id, at));
+            }
+        }
+        actions.extend(actions::plan(
+            at,
+            &repo_pools,
+            &mine,
+            listed.as_ref(),
+            &|pool| holds.get(pool).is_some_and(|until| *until > at),
+            &draining,
+            &|pool| queued.get(pool).copied().unwrap_or(0),
+        ));
     }
     for action in actions {
         match action {
-            Action::Launch { pool, count } => {
+            Action::Launch { pool, count, spill } => {
                 let Some(pool) = pools.iter().find(|p| p.name == pool) else {
                     continue;
                 };
@@ -266,7 +289,7 @@ fn pass(shared: &Arc<Shared>) -> Result<()> {
                         }
                     };
                     let (p, n) = (pool.clone(), name.clone());
-                    if !spawn(shared, move |s| launch(&s, &p, &n, app_id)) {
+                    if !spawn(shared, move |s| launch(&s, &p, &n, app_id, spill)) {
                         shared.entries.lock().unwrap().remove(&name);
                         save(shared, &name, None);
                         break;
@@ -378,6 +401,68 @@ fn error(shared: &Shared, pool: &str, message: String) {
 
 // ------------------------------------------------------------------------- boxes
 
+/// Jobs queued for the pool's runners, asked of GitHub only when they could get a box: the
+/// pool is saturated (every box busy, under `max`) and its placement pool may spill. Cached
+/// for QUEUED_EVERY_S; 0 when GitHub cannot say.
+fn queued_jobs(
+    shared: &Shared,
+    pool: &Pool,
+    entries: &BTreeMap<String, Entry>,
+    app_id: u64,
+    at: i64,
+) -> u32 {
+    if !actions::saturated(pool, entries) || !may_spill(&shared.root, &pool.token) {
+        shared.queued.lock().unwrap().remove(&pool.name);
+        return 0;
+    }
+    if let Some((asked, count)) = shared.queued.lock().unwrap().get(&pool.name)
+        && at - asked < QUEUED_EVERY_S
+    {
+        return *count;
+    }
+    let count = match shared.github.queued(app_id, &pool.repo, &pool.labels) {
+        Ok(count) => count,
+        Err(e) => {
+            error(shared, &pool.name, format!("listing queued jobs: {e:#}"));
+            0
+        }
+    };
+    shared
+        .queued
+        .lock()
+        .unwrap()
+        .insert(pool.name.clone(), (at, count));
+    count
+}
+
+/// Whether the placement pool of the pool's workload token has a spill rule that lends a box.
+fn may_spill(root: &Path, token: &str) -> bool {
+    (|| -> Result<bool> {
+        let db = crate::nodes::db(root)?;
+        let Some((_, pool)) = crate::tokens::by_name(&db, token)? else {
+            return Ok(false);
+        };
+        let settings = crate::telemetry::settings(&db)?;
+        let rules: Vec<crate::spill::Rule> =
+            serde_json::from_value(settings[crate::spill::RULES].clone()).unwrap_or_default();
+        Ok(rules.iter().any(|r| r.pool == pool && r.max_boxes > 0))
+    })()
+    .unwrap_or(false)
+}
+
+/// Whether placement put the box on a runner of another pool.
+fn spilled(root: &Path, name: &str) -> bool {
+    crate::nodes::db(root)
+        .and_then(|db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM resources r JOIN box_pools b ON b.physical=r.physical AND b.spilled=1 WHERE r.kind='machine' AND r.name=?1)",
+                [name],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap_or(false)
+}
+
 /// One box op as the pool's workload token: its owner, its placement pool, ephemeral.
 fn box_op(shared: &Shared, token: &str, op: Value) -> Result<Value> {
     let (user, op) = {
@@ -418,6 +503,7 @@ fn enter(shared: &Shared, pool: &Pool) -> Result<String> {
         busy: None,
         retry_at: 0,
         made: false,
+        spilled: false,
     };
     shared
         .entries
@@ -428,7 +514,7 @@ fn enter(shared: &Shared, pool: &Pool) -> Result<String> {
     Ok(name)
 }
 
-fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64) {
+fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64, spill: bool) {
     let name = name.to_owned();
     {
         let mut recent = shared.recent.lock().unwrap();
@@ -438,33 +524,56 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64) {
         recent.push_back(json!({"box":name,"pool":pool.name,"create_ms":now_ms()}));
     }
     let result = (|| -> Result<()> {
-        // The registration first: a GitHub fault then costs no box.
+        // The box first: a full runner then costs no GitHub call. A warm box stays on the
+        // pool's own runners; one for a queued job may spill (docs/MULTINODE.md#spill).
+        let create = json!({"op":"create","id":name,"image":pool.image,"memory_mib":pool.memory_mib,
+            "vcpu_count":pool.vcpu_count,"disk_gib":pool.disk_gib.unwrap_or(crate::common::DEFAULT_DISK_GIB),
+            "ephemeral":true,"spill":spill});
+        box_op(shared, &pool.token, create).context("create")?;
+        let spilled = spilled(&shared.root, &name);
+        update(shared, &name, |e| {
+            e.made = true;
+            e.spilled = spilled;
+        });
+        timing(shared, &name, "ready_ms");
+        ensure!(launching(shared, &name), "timed out while it was made");
         let (runner_id, jit) = shared
             .github
             .jit_config(app_id, &pool.repo, &name, &pool.labels)
             .context("runner registration")?;
         update(shared, &name, |e| e.runner_id = Some(runner_id));
         timing(shared, &name, "registered_ms");
-        let create = json!({"op":"create","id":name,"image":pool.image,"memory_mib":pool.memory_mib,
-            "vcpu_count":pool.vcpu_count,"disk_gib":pool.disk_gib.unwrap_or(crate::common::DEFAULT_DISK_GIB),"ephemeral":true});
-        box_op(shared, &pool.token, create).context("create")?;
-        update(shared, &name, |e| e.made = true);
-        timing(shared, &name, "ready_ms");
-        ensure!(launching(shared, &name), "timed out while it was made");
+        if !launching(shared, &name) {
+            // Timed out meanwhile: the removal may have missed the registration.
+            let _ = shared.github.remove_runner(app_id, &pool.repo, runner_id);
+            bail!("timed out while it was registered");
+        }
         let data = STANDARD.encode(jit.as_bytes());
         drop(jit);
         // A just-made box answers at once; allow a slow first boot.
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            match box_op(shared, &pool.token, json!({"op":"put","id":name,"path":JIT_PATH,"data":data})) {
+            match box_op(
+                shared,
+                &pool.token,
+                json!({"op":"put","id":name,"path":JIT_PATH,"data":data}),
+            ) {
                 Ok(_) => break,
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(500)),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(500))
+                }
                 Err(e) => return Err(e.context("putting the registration in the box")),
             }
         }
-        let started = box_op(shared, &pool.token, json!({"op":"exec","id":name,"command":START}))
-            .context("starting the runner")?;
-        let code = started["exit_code"].as_i64().or(started["result"]["exit_code"].as_i64());
+        let started = box_op(
+            shared,
+            &pool.token,
+            json!({"op":"exec","id":name,"command":START}),
+        )
+        .context("starting the runner")?;
+        let code = started["exit_code"]
+            .as_i64()
+            .or(started["result"]["exit_code"].as_i64());
         ensure!(code == Some(0), "{START} exited {code:?}");
         ensure!(launching(shared, &name), "timed out while it was started");
         Ok(())
@@ -491,12 +600,26 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64) {
             let _ = box_op(shared, &pool.token, json!({"op":"delete","id":name}));
         }
         Err(e) => {
-            error(shared, &pool.name, format!("{name}: launch failed: {e:#}"));
-            shared
-                .holds
-                .lock()
-                .unwrap()
-                .insert(pool.name.clone(), now() + HOLD_S);
+            let message = format!("{e:#}");
+            if !spill && message.contains("capacity exhausted") {
+                // Its own runners are full of busy boxes: warm boxes wait for one to go.
+                shared
+                    .holds
+                    .lock()
+                    .unwrap()
+                    .insert(format!("{}/home", pool.name), now() + HOME_HOLD_S);
+            } else {
+                error(
+                    shared,
+                    &pool.name,
+                    format!("{name}: launch failed: {message}"),
+                );
+                shared
+                    .holds
+                    .lock()
+                    .unwrap()
+                    .insert(pool.name.clone(), now() + HOLD_S);
+            }
             update(shared, &name, |e| {
                 e.phase = Phase::Removing;
                 e.retry_at = now() + 3600;
@@ -514,7 +637,10 @@ fn remove(shared: &Shared, name: &str, why: &str, force: bool, release: bool, ap
     let token = entry.token.clone();
     let result = (|| -> Result<bool> {
         if let Some(id) = entry.runner_id {
-            if let Err(e) = shared.github.remove_runner(app_id, &repo_of(&entry.spec), id) {
+            if let Err(e) = shared
+                .github
+                .remove_runner(app_id, &repo_of(&entry.spec), id)
+            {
                 if !force {
                     // It took a job a moment ago: keep the box.
                     return Ok(false);
@@ -522,12 +648,20 @@ fn remove(shared: &Shared, name: &str, why: &str, force: bool, release: bool, ap
                 eprintln!("actions pools: {name}: registration left to expire: {e:#}");
             }
         }
-        ensure!(!token.is_empty(), "no workload token recorded; delete the box by hand");
+        ensure!(
+            !token.is_empty(),
+            "no workload token recorded; delete the box by hand"
+        );
         // Already stopped or never started: the delete decides.
         let _ = box_op(shared, &token, json!({"op":"stop","id":name}));
         match box_op(shared, &token, json!({"op":"delete","id":name})) {
             Ok(_) => Ok(true),
-            Err(e) if e.downcast_ref::<crate::catalog::ResourceNotFound>().is_some() => Ok(true),
+            Err(e)
+                if e.downcast_ref::<crate::catalog::ResourceNotFound>()
+                    .is_some() =>
+            {
+                Ok(true)
+            }
             Err(e) => Err(e),
         }
     })();
@@ -537,7 +671,9 @@ fn remove(shared: &Shared, name: &str, why: &str, force: bool, release: bool, ap
             save(shared, name, None);
             if release {
                 // Room was freed: the pool may make boxes again at once.
-                shared.holds.lock().unwrap().remove(&entry.pool);
+                let mut holds = shared.holds.lock().unwrap();
+                holds.remove(&entry.pool);
+                holds.remove(&format!("{}/home", entry.pool));
             }
             timing(shared, name, "removed_ms");
             eprintln!("actions pools: removed {name}: {why}");
@@ -549,7 +685,11 @@ fn remove(shared: &Shared, name: &str, why: &str, force: bool, release: bool, ap
             });
         }
         Err(e) => {
-            error(shared, &entry.pool, format!("{name}: removal failed, retrying: {e:#}"));
+            error(
+                shared,
+                &entry.pool,
+                format!("{name}: removal failed, retrying: {e:#}"),
+            );
             update(shared, name, |e| e.retry_at = now() + REMOVE_RETRY_S);
         }
     }
@@ -565,7 +705,9 @@ pub(crate) fn status(root: &Path, only: Option<&str>) -> Result<Value> {
     let key = key_fingerprint(root)?;
     let entries = load_raw(root)?;
     let published: Option<String> = db(root)?
-        .query_row("SELECT body FROM runner_pool_status WHERE id=1", [], |r| r.get(0))
+        .query_row("SELECT body FROM runner_pool_status WHERE id=1", [], |r| {
+            r.get(0)
+        })
         .optional()?;
     let published: Value = published
         .map(|b| serde_json::from_str(&b))
@@ -593,14 +735,18 @@ pub(crate) fn status(root: &Path, only: Option<&str>) -> Result<Value> {
             "idle": count(&|e| e.phase == Phase::Started && e.busy.is_none()),
             "busy": count(&|e| e.phase == Phase::Started && e.busy.is_some()),
             "removing": count(&|e| e.phase == Phase::Removing),
+            "spilled": count(&|e| e.spilled && e.phase != Phase::Removing),
+            "home_held_s": published["holds"][format!("{name}/home")].as_i64().map(|u| (u - at).max(0)).unwrap_or(0),
             "held_s": published["holds"][name.as_str()].as_i64().map(|u| (u - at).max(0)).unwrap_or(0),
             "last_error": published["errors"][name.as_str()].clone(),
             "boxes": mine.iter().map(|(n, e)| json!({"box":n,"phase":e.phase,"age_s":at-e.created,
-                "online":e.online.is_some(),"busy":e.busy.is_some()})).collect::<Vec<_>>(),
+                "online":e.online.is_some(),"busy":e.busy.is_some(),"spilled":e.spilled})).collect::<Vec<_>>(),
             "recent": published["recent"].as_array().unwrap_or(&empty).iter().filter(|t| t["pool"] == name.as_str()).cloned().collect::<Vec<_>>(),
         }));
     }
-    Ok(json!({"running":!published.as_object().is_some_and(|o| o.is_empty()),"app_id":app_id,"app_key":key,"pools":out}))
+    Ok(
+        json!({"running":!published.as_object().is_some_and(|o| o.is_empty()),"app_id":app_id,"app_key":key,"pools":out}),
+    )
 }
 
 fn key_fingerprint(root: &Path) -> Result<Value> {
@@ -616,7 +762,10 @@ fn fingerprint(pem: &[u8]) -> String {
     let digest = sha2::Sha256::digest(pem);
     format!(
         "sha256:{}",
-        digest[..8].iter().map(|b| format!("{b:02x}")).collect::<String>()
+        digest[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     )
 }
 
@@ -725,21 +874,33 @@ impl GitHub {
         let id = match installation {
             Some(id) => id,
             None => {
-                let (_, got) = self.call("GET", &format!("/repos/{repo}/installation"), None, &jwt)?;
+                let (_, got) =
+                    self.call("GET", &format!("/repos/{repo}/installation"), None, &jwt)?;
                 let id = got["id"]
                     .as_u64()
                     .with_context(|| format!("the GitHub App is not installed on {repo}"))?;
-                self.installations.lock().unwrap().insert(repo.to_owned(), id);
+                self.installations
+                    .lock()
+                    .unwrap()
+                    .insert(repo.to_owned(), id);
                 id
             }
         };
-        let (status, got) = self.call("POST", &format!("/app/installations/{id}/access_tokens"), None, &jwt)?;
+        let (status, got) = self.call(
+            "POST",
+            &format!("/app/installations/{id}/access_tokens"),
+            None,
+            &jwt,
+        )?;
         if status == 404 {
             // Uninstalled (or reinstalled under a new id): look it up again next time.
             self.installations.lock().unwrap().remove(repo);
             bail!("the GitHub App's installation on {repo} is gone");
         }
-        let token = got["token"].as_str().context("installation token")?.to_owned();
+        let token = got["token"]
+            .as_str()
+            .context("installation token")?
+            .to_owned();
         // GitHub's are valid for an hour.
         self.tokens
             .lock()
@@ -749,10 +910,20 @@ impl GitHub {
     }
 
     /// One call: (status, JSON body). 304 on a GET answers the cached body.
-    fn call(&self, method: &str, path: &str, body: Option<&Value>, bearer: &str) -> Result<(u16, Value)> {
+    fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        bearer: &str,
+    ) -> Result<(u16, Value)> {
         let http = self.http.as_ref().context("no HTTP client")?;
         let wait = *self.wait_until.lock().unwrap();
-        ensure!(now() >= wait, "GitHub rate limit: waiting {} s", wait - now());
+        ensure!(
+            now() >= wait,
+            "GitHub rate limit: waiting {} s",
+            wait - now()
+        );
         let url = format!("{GITHUB}{path}");
         let mut request = http
             .request(method.parse()?, &url)
@@ -781,7 +952,8 @@ impl GitHub {
             if let Some(retry) = number("retry-after") {
                 *self.wait_until.lock().unwrap() = now() + retry;
             } else if number("x-ratelimit-remaining") == Some(0) {
-                *self.wait_until.lock().unwrap() = number("x-ratelimit-reset").unwrap_or(now() + 60) + 1;
+                *self.wait_until.lock().unwrap() =
+                    number("x-ratelimit-reset").unwrap_or(now() + 60) + 1;
             }
         }
         if status == 304 {
@@ -838,7 +1010,10 @@ impl GitHub {
             ensure!(status == 200, "runner list: HTTP {status}");
             let list = got["runners"].as_array().context("runner list")?;
             for r in list {
-                if let (Some(name), Ok(runner)) = (r["name"].as_str(), serde_json::from_value::<Runner>(r.clone())) {
+                if let (Some(name), Ok(runner)) = (
+                    r["name"].as_str(),
+                    serde_json::from_value::<Runner>(r.clone()),
+                ) {
                     out.insert(name.to_owned(), runner);
                 }
             }
@@ -849,8 +1024,50 @@ impl GitHub {
         Ok(out)
     }
 
+    /// Jobs queued for runners with `labels`: every label a queued job asks for is one of
+    /// them (as GitHub matches), in the repository's queued and running workflow runs.
+    fn queued(&self, app_id: u64, repo: &str, labels: &[String]) -> Result<u32> {
+        let token = self.token(app_id, repo)?;
+        let ours: Vec<String> = labels.iter().map(|l| l.to_ascii_lowercase()).collect();
+        let mut count = 0;
+        for status in ["queued", "in_progress"] {
+            let (code, runs) = self.call(
+                "GET",
+                &format!("/repos/{repo}/actions/runs?status={status}&per_page=50"),
+                None,
+                &token,
+            )?;
+            ensure!(code == 200, "workflow runs: HTTP {code}");
+            for run in runs["workflow_runs"].as_array().into_iter().flatten() {
+                let Some(id) = run["id"].as_u64() else {
+                    continue;
+                };
+                let (code, jobs) = self.call(
+                    "GET",
+                    &format!("/repos/{repo}/actions/runs/{id}/jobs?filter=latest&per_page=100"),
+                    None,
+                    &token,
+                )?;
+                ensure!(code == 200, "workflow jobs: HTTP {code}");
+                count += jobs["jobs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|j| j["status"] == "queued" && matches(&j["labels"], &ours))
+                    .count() as u32;
+            }
+        }
+        Ok(count)
+    }
+
     /// A single-use registration: (runner id, encoded JIT config).
-    fn jit_config(&self, app_id: u64, repo: &str, name: &str, labels: &[String]) -> Result<(u64, String)> {
+    fn jit_config(
+        &self,
+        app_id: u64,
+        repo: &str,
+        name: &str,
+        labels: &[String],
+    ) -> Result<(u64, String)> {
         let token = self.token(app_id, repo)?;
         let (_, got) = self.call(
             "POST",
@@ -878,7 +1095,42 @@ impl GitHub {
     /// Unregisters a runner; one already gone is fine. Busy runners are refused by GitHub.
     fn remove_runner(&self, app_id: u64, repo: &str, id: u64) -> Result<()> {
         let token = self.token(app_id, repo)?;
-        self.call("DELETE", &format!("/repos/{repo}/actions/runners/{id}"), None, &token)?;
+        self.call(
+            "DELETE",
+            &format!("/repos/{repo}/actions/runners/{id}"),
+            None,
+            &token,
+        )?;
         Ok(())
+    }
+}
+
+/// Whether a job asking for `asked` labels can run on a runner with `ours` (lowercase): it
+/// asks for at least one and every one is ours.
+fn matches(asked: &Value, ours: &[String]) -> bool {
+    let asked: Vec<String> = asked
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.as_str().map(str::to_ascii_lowercase))
+        .collect();
+    !asked.is_empty() && asked.iter().all(|l| ours.contains(l))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_job_matches_when_every_label_it_asks_for_is_the_pools() {
+        let ours = ["self-hosted", "linux", "x64", "app-ci"].map(String::from);
+        assert!(matches(
+            &json!(["self-hosted", "Linux", "X64", "app-ci"]),
+            &ours
+        ));
+        assert!(matches(&json!(["app-ci"]), &ours));
+        assert!(!matches(&json!(["ubuntu-latest"]), &ours));
+        assert!(!matches(&json!(["self-hosted", "app-ci", "gpu"]), &ours));
+        assert!(!matches(&json!([]), &ours));
     }
 }

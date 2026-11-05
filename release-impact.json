@@ -2,6 +2,49 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.70",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Spill keeps a runner's own boxes first. New settings placement.spill_keep_free_vcpus and placement.spill_keep_free_disk_gib extend the spill reserve to vCPUs and disk (default 0, inert without a spill rule). A create, start, fork, restore or wake of a runner's own box that fits only once boxes another pool spilled there are stopped stops the fewest of them and goes ahead (logged placement_yield). A create may ask not to spill (\"spill\": false). GitHub Actions runner pools keep warm runners on their own runners and give a box that may spill only to queued jobs (asked of GitHub only while the pool is saturated); a spilled box idle for 60 s is removed. Pool boxes are created before their runner registration. Protocol, worker interface 3, catalog schema 7, runtime and host layout 2 are unchanged. Class 1: the controller and dashboard restart (seconds); boxes keep running."
+    },
+    {
       "version": "0.9.69",
       "class": 2,
       "changes": [
