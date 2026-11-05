@@ -163,7 +163,8 @@ before any change).
   "telemetry.logs": true, "telemetry.log_level": "info",
   "alerts.offline_after_s": 60, "alerts.disk_low_gib": 20,
   "dashboard.ui_bundle": "builtin", "limits.box_memory_mib": 0,
-  "placement.spill": [], "placement.spill_keep_free_mib": 16384, "upgrade.worker_handover": true,
+  "placement.spill": [], "placement.spill_keep_free_mib": 16384, "placement.spill_keep_free_vcpus": 0,
+  "placement.spill_keep_free_disk_gib": 100, "upgrade.worker_handover": true,
   "upgrade.running_boxes": "hibernate"}}}
 ```
 
@@ -362,9 +363,11 @@ Durable upper bounds for an enrolled runner; lowering needs its boxes stopped.
 [Spill](MULTINODE.md#spill) rules and usage, for every pool with a rule (or the
 one asked for). `home_nodes` are the pool's own runners; `spill` has one entry
 per rule, in rule order; `boxes` and `pending` count that pool's boxes;
-`free_memory_after_reserve_mib` is the most memory one more box of the pool may
-use there (CPU, disk and the usual checks still apply). `state`
-is `available`, `full` (cap reached), `reserve` (only the reserve is left),
+`free_memory_after_reserve_mib`, `free_vcpus_after_reserve` and
+`free_disk_gib_after_reserve` are the most one more box of the pool may use there
+(the usual checks still apply). `state`
+is `available`, `full` (cap reached), `reserve` (only the reserve of memory,
+vCPUs or disk is left),
 `off` (`max_boxes` 0), `no_home` (no live runner in the pool, so nothing
 spills), `inert_offline`, `inert_draining`, `inert_revoked` or
 `inert_image_missing`.
@@ -374,17 +377,22 @@ spills), `inert_offline`, `inert_draining`, `inert_revoked` or
 {"op": "placement.status", "pool": "ci"}
 ```
 ```json
-{"ok": true, "op": "placement.status", "result": {"version": 43, "keep_free_mib": 32768, "pools": [{"pool": "ci",
+{"ok": true, "op": "placement.status", "result": {"version": 43, "keep_free_mib": 32768, "keep_free_vcpus": 16,
+  "keep_free_disk_gib": 200, "pools": [{"pool": "ci",
   "home_nodes": [{"node": "n1", "online": true, "active": true, "draining": false, "boxes": 5, "pending": 0,
                   "free_slots": 0, "free_memory_mib": 0}],
   "spill": [{"node": "n2", "max_boxes": 2, "boxes": 1, "pending": 0, "box_names": ["ci-runner-7f3a"],
-             "free_memory_mib": 57344, "free_memory_after_reserve_mib": 24576, "state": "available"}]}]}}
+             "free_memory_mib": 57344, "free_memory_after_reserve_mib": 24576, "free_vcpus": 40,
+             "free_vcpus_after_reserve": 24, "free_disk_gib": 600, "free_disk_gib_after_reserve": 400,
+             "state": "available"}]}]}}
 ```
 
 ### actions.status
 
-Each [runner pool](ACTIONS.md)'s boxes (`launching`, `idle`, `busy`, `removing`),
-whether it is held after a failed launch (`held_s`), its last error, and the
+Each [runner pool](ACTIONS.md)'s boxes (`launching`, `idle`, `busy`, `removing`,
+and how many `spilled` onto another pool's runner), whether it is held after a
+failed launch (`held_s`) or its warm boxes wait for room on its own runners
+(`home_held_s`), its last error, and the
 start times of its latest boxes in ms since the epoch (`create_ms` the create was
 sent, `ready_ms` the box booted, `registered_ms` its runner registration was
 minted, `started_ms` the runner started, `online_ms` GitHub listed it online,
@@ -401,8 +409,9 @@ the pools' first pass.
 {"ok": true, "op": "actions.status", "result": {"running": true, "app_id": 123456,
   "app_key": {"present": true, "fingerprint": "sha256:9f2c41d07a6b33e1"},
   "pools": [{"pool": "ci", "configured": true, "warm": 4, "max": 6, "launching": 0, "idle": 4, "busy": 1,
-             "removing": 0, "held_s": 0, "last_error": null,
-             "boxes": [{"box": "ci-3f1c9a02b7d4", "phase": "started", "age_s": 312, "online": true, "busy": true}],
+             "removing": 0, "spilled": 0, "held_s": 0, "home_held_s": 0, "last_error": null,
+             "boxes": [{"box": "ci-3f1c9a02b7d4", "phase": "started", "age_s": 312, "online": true, "busy": true,
+                        "spilled": false}],
              "recent": [{"box": "ci-3f1c9a02b7d4", "pool": "ci", "create_ms": 1793760000000, "ready_ms": 1793760002100,
                          "registered_ms": 1793760002600, "started_ms": 1793760003400, "online_ms": 1793760005900,
                          "busy_ms": 1793760290000}]}]}}

@@ -1435,3 +1435,27 @@ fn no_compatible_runner_fails_before_pull_and_allows_explicit_cold_retry() {
         "stored"
     );
 }
+
+#[test]
+fn a_wake_makes_room_only_from_boxes_spilled_onto_the_runner() {
+    let (mut f, peers) = parked_fixture("hibernated");
+    complete_park(&mut f, &peers, true);
+    let wake = admit_wake(&mut f, false);
+    let c = f.shared.lock().unwrap();
+    let input = intent(&c, &c.transfer(wake.id).unwrap()).unwrap();
+    // Both runners are full: source of an ordinary box, target of a box another pool spilled.
+    for (node, physical, spilled) in [("source", "p-own", false), ("target", "p-spill", true)] {
+        c.db.execute("INSERT INTO resources(owner,kind,name,physical,metadata,node,ssh_policy,reserved_mib,reserved_cpus) VALUES(?1,'machine',?2,?2,?3,?4,'\"disabled\"',2048,1)",
+            params![f.user, physical, json!({"id":physical,"state":"running","ephemeral":spilled}).to_string(), node]).unwrap();
+        if spilled {
+            c.db.execute("INSERT INTO box_pools(physical,pool,spilled) VALUES(?1,'ci',1)", [physical]).unwrap();
+        }
+    }
+    let refused = c.reserve_wake(wake.id, "source", &input).unwrap_err();
+    assert!(refused.downcast_ref::<crate::catalog::Yield>().is_none(), "{refused:#}");
+    let room = c.reserve_wake(wake.id, "target", &input).unwrap_err();
+    let crate::catalog::Yield(boxes) = room.downcast_ref::<crate::catalog::Yield>().unwrap().clone();
+    assert_eq!(boxes, vec![(f.user, "p-spill".to_string(), true)]);
+    // Nothing was reserved while it was refused.
+    assert_eq!(c.db.query_row("SELECT count(*) FROM transfer_reservations WHERE transfer=?1", [wake.id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}

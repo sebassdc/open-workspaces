@@ -963,7 +963,10 @@ fn an_ephemeral_box_is_never_snapshotted_forked_or_restored_and_nothing_is_reser
     fake.worker("alpha");
     let a = c.user(&identity("alice")).unwrap();
     c.operation(a, json!({"op":"create","id":"job","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine","ephemeral":true})).unwrap();
-    let rows = |c: &Catalog| -> i64 { c.db.query_row("SELECT COUNT(*) FROM resources", [], |r| r.get(0)).unwrap() };
+    let rows = |c: &Catalog| -> i64 {
+        c.db.query_row("SELECT COUNT(*) FROM resources", [], |r| r.get(0))
+            .unwrap()
+    };
     let before = (rows(&c), fake.calls.load(Ordering::SeqCst));
     for request in [
         json!({"op":"snapshot","id":"job","name":"keep"}),
@@ -971,12 +974,20 @@ fn an_ephemeral_box_is_never_snapshotted_forked_or_restored_and_nothing_is_reser
         json!({"op":"restore","id":"job","name":"keep"}),
     ] {
         let error = c.operation(a, request.clone()).unwrap_err();
-        assert!(format!("{error:#}").contains("is ephemeral"), "{request}: {error:#}");
+        assert!(
+            format!("{error:#}").contains("is ephemeral"),
+            "{request}: {error:#}"
+        );
     }
-    assert_eq!((rows(&c), fake.calls.load(Ordering::SeqCst)), before, "no row, no worker call");
+    assert_eq!(
+        (rows(&c), fake.calls.load(Ordering::SeqCst)),
+        before,
+        "no row, no worker call"
+    );
     // An ordinary box still snapshots.
     c.operation(a, json!({"op":"create","id":"dev","node":"alpha","memory_mib":256,"vcpu_count":1,"image":"alpine"})).unwrap();
-    c.operation(a, json!({"op":"snapshot","id":"dev","name":"keep"})).unwrap();
+    c.operation(a, json!({"op":"snapshot","id":"dev","name":"keep"}))
+        .unwrap();
 }
 
 #[test]
@@ -990,10 +1001,21 @@ fn a_draining_runner_lets_its_stopped_ephemeral_boxes_be_deleted_only() {
         c.operation(a, json!({"op":"stop","id":id})).unwrap();
     }
     c.db.execute("INSERT INTO runner_drains(node,eligible,state,generation,seal) VALUES('alpha',1,'draining',1,'fixture')", []).unwrap();
-    let error = c.operation(a, json!({"op":"delete","id":"dev"})).unwrap_err();
-    assert!(format!("{error:#}").contains("runner draining"), "{error:#}");
-    assert!(c.operation(a, json!({"op":"start","id":"job"})).is_err(), "only a delete passes");
-    assert_eq!(c.operation(a, json!({"op":"delete","id":"job"})).unwrap()["deleted"], "job");
+    let error = c
+        .operation(a, json!({"op":"delete","id":"dev"}))
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("runner draining"),
+        "{error:#}"
+    );
+    assert!(
+        c.operation(a, json!({"op":"start","id":"job"})).is_err(),
+        "only a delete passes"
+    );
+    assert_eq!(
+        c.operation(a, json!({"op":"delete","id":"job"})).unwrap()["deleted"],
+        "job"
+    );
 }
 
 #[test]
@@ -3866,7 +3888,7 @@ fn controller_without_worker_has_no_local_fallback_or_capacity() {
     assert_eq!(before["stats"]["limit_memory_mib"], 0);
     assert_eq!(before["discovery"]["nodes"], json!([]));
     assert!(
-        c.choose(None, "default", 256, "alpine", 1, &json!({}), None)
+        c.choose(None, "default", true, 256, "alpine", 1, &json!({}), None)
             .unwrap_err()
             .to_string()
             .contains("no online node")
@@ -4136,8 +4158,11 @@ fn a_create_left_pending_by_a_failed_dispatch_times_out_and_can_be_deleted() {
         .unwrap_err();
     fake.uncertain.store(false, Ordering::SeqCst);
     *fake.reject.lock().unwrap() = None;
-    c.db.execute("UPDATE operations SET state='pending' WHERE op='create'", [])
-        .unwrap();
+    c.db.execute(
+        "UPDATE operations SET state='pending' WHERE op='create'",
+        [],
+    )
+    .unwrap();
     assert_eq!(machine_states(&mut c, a)["one"], "pending");
     let early = c
         .operation(a, json!({"op":"delete","id":"one"}))
@@ -4149,9 +4174,8 @@ fn a_create_left_pending_by_a_failed_dispatch_times_out_and_can_be_deleted() {
     )
     .unwrap();
     machine_states(&mut c, a);
-    let state: String = c
-        .db
-        .query_row("SELECT state FROM operations WHERE op='create'", [], |r| {
+    let state: String =
+        c.db.query_row("SELECT state FROM operations WHERE op='create'", [], |r| {
             r.get(0)
         })
         .unwrap();
@@ -5245,6 +5269,104 @@ fn spill_borrows_a_listed_runner_only_while_the_pool_is_full() {
     assert_eq!(count(&c), 4);
 }
 
+#[test]
+fn a_runners_own_boxes_come_before_boxes_spilled_onto_it() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    fake.worker("beta");
+    quota_node(&fake);
+    // alpha, the jobs pool's own runner, holds two 256 MiB boxes; beta, a default runner, 768.
+    for (node, mib) in [("alpha", 512), ("beta", 768)] {
+        nodes::db(&fake.root)
+            .unwrap()
+            .execute("UPDATE nodes SET memory_mib=?1,capabilities=json_set(capabilities,'$.memory_mib',?1) WHERE id=?2", params![mib, node])
+            .unwrap();
+    }
+    nodes::set_pool(&fake.root, "alpha", "jobs").unwrap();
+    c.pool_admins = vec!["admin@example.test".into()];
+    let p = c.user(&identity("admin")).unwrap();
+    let a = c.user(&identity("alice")).unwrap();
+    let job = |id: &str| json!({"op":"create","id":id,"memory_mib":256,"vcpu_count":1,"pool":"jobs","ephemeral":true});
+    let names = |c: &Catalog, owner: i64| -> Vec<String> {
+        c.db.prepare("SELECT name FROM resources WHERE owner=?1 AND kind='machine'")
+            .unwrap()
+            .query_map([owner], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let state = |c: &Catalog, owner: i64, name: &str| -> (String, String) {
+        c.db.query_row(
+            "SELECT node,json_extract(metadata,'$.state') FROM resources WHERE owner=?1 AND kind='machine' AND name=?2",
+            params![owner, name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    crate::telemetry::set(&fake.root, "placement.spill", "jobs:beta:2", "t").unwrap();
+    crate::telemetry::set(&fake.root, "placement.spill_keep_free_mib", "0", "t").unwrap();
+    c.operation(p, job("j0")).unwrap();
+    c.operation(p, job("j1")).unwrap();
+    // A create that asks not to spill stays on its pool's full runners and is refused.
+    let mut warm = job("warm");
+    warm["spill"] = json!(false);
+    assert!(c.operation(p, warm).is_err());
+    assert!(
+        c.operation(p, json!({"op":"stop","id":"j0","spill":false}))
+            .is_err()
+    );
+    // j2 spills; alice's 512 MiB box fills beta beside it, then stops; j3 spills too.
+    c.operation(p, job("j2")).unwrap();
+    c.operation(
+        a,
+        json!({"op":"create","id":"mine","memory_mib":512,"vcpu_count":1}),
+    )
+    .unwrap();
+    assert_eq!(state(&c, a, "mine").0, "beta");
+    c.operation(a, json!({"op":"stop","id":"mine"})).unwrap();
+    c.operation(p, job("j3")).unwrap();
+    assert_eq!(state(&c, p, "j3"), ("beta".into(), "running".into()));
+    // Starting alice's box needs 256 MiB the spilled boxes hold. Without making room it is
+    // refused as before; through the shared path the newest spilled box (ephemeral here: a
+    // workload pool's job) is stopped and deleted, and it starts.
+    let refused = c
+        .operation(a, json!({"op":"start","id":"mine"}))
+        .unwrap_err();
+    assert_eq!(refused.to_string(), "node capacity exhausted");
+    let shared = Mutex::new(c);
+    Catalog::operation_shared(&shared, a, json!({"op":"start","id":"mine"})).unwrap();
+    // Stopped first; deleted off the reply path, by the runner pools' next pass.
+    assert_eq!(state(&shared.lock().unwrap(), p, "j3").1, "stopped");
+    Catalog::delete_queued(&shared);
+    let mut c = shared.into_inner().unwrap();
+    assert_eq!(state(&c, a, "mine"), ("beta".into(), "running".into()));
+    assert!(names(&c, p).iter().all(|n| n != "j3"));
+    assert_eq!(state(&c, p, "j2"), ("beta".into(), "running".into()));
+    // A spilled create never makes room: beta is full and j5 is refused, j2 and mine stay.
+    let shared = Mutex::new(c);
+    assert!(Catalog::operation_shared(&shared, p, job("j5")).is_err());
+    c = shared.into_inner().unwrap();
+    assert_eq!(state(&c, p, "j2").1, "running");
+    assert_eq!(state(&c, a, "mine").1, "running");
+    // An automatic create of a default box takes beta once the newest spilled box goes.
+    c.operation(a, json!({"op":"stop","id":"mine"})).unwrap();
+    c.operation(a, json!({"op":"delete","id":"mine"})).unwrap();
+    c.operation(p, job("j4")).unwrap();
+    let shared = Mutex::new(c);
+    Catalog::operation_shared(
+        &shared,
+        a,
+        json!({"op":"create","id":"other","memory_mib":512,"vcpu_count":1}),
+    )
+    .unwrap();
+    Catalog::delete_queued(&shared);
+    let c = shared.into_inner().unwrap();
+    assert_eq!(state(&c, a, "other"), ("beta".into(), "running".into()));
+    assert!(names(&c, p).iter().all(|n| n != "j4"));
+    assert_eq!(state(&c, p, "j2").1, "running");
+}
+
 /// A runner that answers each connection on its own thread. `create` takes `delay`
 /// milliseconds; `exec` waits up to `delay` for a second call to be in progress with it, so
 /// whether two calls overlap does not depend on how loaded the test host is. `peak` is the
@@ -5363,16 +5485,18 @@ fn creates_overlap_and_reconcile_leaves_the_ones_in_flight_alone() {
     let asked = Instant::now();
     loop {
         let mut c = shared.lock().unwrap();
-        let pending: i64 = c
-            .db
-            .query_row(
+        let pending: i64 =
+            c.db.query_row(
                 "SELECT COUNT(*) FROM operations WHERE op='create' AND state='pending'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
         if pending == 0 {
-            assert!(asked.elapsed() < Duration::from_secs(10), "no create in flight");
+            assert!(
+                asked.elapsed() < Duration::from_secs(10),
+                "no create in flight"
+            );
             drop(c);
             std::thread::sleep(Duration::from_millis(5));
             continue;
@@ -5384,9 +5508,8 @@ fn creates_overlap_and_reconcile_leaves_the_ones_in_flight_alone() {
         .unwrap();
         c.state(a).unwrap();
         // Creates that already landed succeeded; none may have failed or gone uncertain.
-        let settled: i64 = c
-            .db
-            .query_row(
+        let settled: i64 =
+            c.db.query_row(
                 "SELECT COUNT(*) FROM operations WHERE state NOT IN ('pending','succeeded')",
                 [],
                 |r| r.get(0),
@@ -5404,7 +5527,10 @@ fn creates_overlap_and_reconcile_leaves_the_ones_in_flight_alone() {
     let machines = state["workspaces"].as_array().unwrap();
     assert_eq!(machines.len(), 6);
     assert!(machines.iter().all(|m| m["state"] == "running"));
-    assert!(c.flights.since(u64::MAX).is_empty(), "a call is still marked in flight");
+    assert!(
+        c.flights.since(u64::MAX).is_empty(),
+        "a call is still marked in flight"
+    );
 }
 
 #[test]
@@ -5427,7 +5553,11 @@ fn calls_on_one_box_wait_for_each_other_and_other_boxes_do_not() {
             .map(|name| {
                 let shared = shared.clone();
                 std::thread::spawn(move || {
-                    Catalog::operation_shared(&shared, a, json!({"op":"exec","id":name,"command":"true"}))
+                    Catalog::operation_shared(
+                        &shared,
+                        a,
+                        json!({"op":"exec","id":name,"command":"true"}),
+                    )
                 })
             })
             .collect();

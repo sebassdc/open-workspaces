@@ -45,15 +45,19 @@ credentials do not identify a human owner and cannot enter human routes.
 ### Spill
 
 A pool whose own runners are full may borrow room on a named runner of another
-pool, up to a number of boxes, while that runner keeps a fixed amount of memory
-for its own pool. Both are controller settings ([admin API](ADMIN_API.md)),
-read on every create; off by default.
+pool, up to a number of boxes, while that runner keeps a fixed amount of memory,
+vCPUs and disk for its own pool. All are controller settings
+([admin API](ADMIN_API.md)), read on every create; off by default. The reserve
+settings do nothing without a rule, so they can be set once and spill turned on
+and off with the rule alone.
 
 ```sh
-ow config set placement.spill "jobs:runner-2:2"      # pool : runner : max boxes (comma-separated rules)
-ow config set placement.spill_keep_free_mib 32768    # memory every spill runner keeps for its own pool
-ow placement status --pool jobs                      # rules, and how full each runner is
-ow config set placement.spill ""                     # off; boxes already placed keep running
+ow config set placement.spill_keep_free_mib 32768      # memory every spill runner keeps for its own pool
+ow config set placement.spill_keep_free_vcpus 16       # vCPUs it keeps (default 0)
+ow config set placement.spill_keep_free_disk_gib 200   # disk it keeps (default 100)
+ow config set placement.spill "jobs:runner-2:2"        # on: pool : runner : max boxes (comma-separated rules)
+ow placement status --pool jobs                        # rules, and how full each runner is
+ow config set placement.spill ""                       # off; boxes already placed keep running
 ```
 
 - The first pass is unchanged: a create for `jobs` lands on a `jobs` runner
@@ -63,11 +67,27 @@ ow config set placement.spill ""                     # off; boxes already placed
   of it (or draining them) therefore stops its spill too: spill means full, not
   gone.
 - A borrowed runner takes the box only if it holds fewer than `max_boxes` of the
-  pool's boxes (pending creates count), still has `placement.spill_keep_free_mib`
-  of memory budget and a free slot after it, and passes every usual check
+  pool's boxes (pending creates count), still has the reserve
+  (`placement.spill_keep_free_mib` of memory budget, `_vcpus` vCPUs and
+  `_disk_gib` GiB of disk) and a free slot after it, and passes every usual check
   (online, not draining, image, shape, CPU, disk). Its own pool's boxes are never
-  stopped, moved or resized; the reserve is shared headroom, not a promise per
-  box.
+  stopped, moved or resized.
+- **A runner's own boxes come first.** A create, start, fork, restore or wake of
+  a box of the runner's own pool that does not fit only because of boxes spilled
+  onto it stops the fewest of those (newest first; an ephemeral one is also
+  deleted in the background once the box that needed the room has it, freeing
+  its disk and its place under the cap) and then goes ahead: it and its answer
+  wait only for those stops, and a wake reserves the freed room in the same
+  pass. A non-ephemeral spilled box
+  stays stopped on the runner, still counted under the cap, until its owner
+  deletes it. Stopping a spilled box ends whatever it was doing (a CI job fails). The
+  controller logs `placement_yield`. A spilled box never makes another box stop.
+  Memory, vCPUs and box slots are made room for; disk is not (stopping frees
+  none), so keep a disk reserve (`placement.spill_keep_free_disk_gib`, default
+  100). Moves onto the runner and resizes do not make room (a resize needs no
+  free room: its box is stopped).
+- A create may ask not to spill: `"spill": false` (create op only) keeps it on
+  its pool's own runners and refuses it when they are full.
 - The create still asks for `jobs`, so its token's scope, grant and the owner's
   limits apply as before. A retried create keeps the runner its first attempt
   spilled to, even after spill is turned off; lowering a cap stops nothing.
@@ -79,7 +99,10 @@ ow config set placement.spill ""                     # off; boxes already placed
   reserve is above that runner's memory budget, or when it lacks an image every
   runner of the pool has; `ow placement status` shows each rule's `state`
   (`available`, `full`, `reserve`, `off`, `no_home`, `inert_offline`,
-  `inert_draining`, `inert_revoked`, `inert_image_missing`).
+  `inert_draining`, `inert_revoked`, `inert_image_missing`) and each spill
+  runner's free memory, vCPUs and disk before and after the reserve.
+- [GitHub Actions runner pools](ACTIONS.md#spill) keep their warm runners on
+  their own runners and spill only boxes for jobs that are waiting.
 - The scaler of `jobs` counts only `jobs` runners, so borrowed room never looks
   like `jobs` capacity; the borrowed runner's own pool sees spilled boxes as load.
 

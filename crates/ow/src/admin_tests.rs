@@ -287,7 +287,9 @@ fn the_cli_builds_the_documented_request() {
     const KEY_FILE: &str = "/tmp/ow-admin-tests-app-key.pem";
     std::fs::write(
         KEY_FILE,
-        first("actions.app_key.set")["private_key"].as_str().unwrap(),
+        first("actions.app_key.set")["private_key"]
+            .as_str()
+            .unwrap(),
     )
     .unwrap();
     for (op, args) in cases {
@@ -642,7 +644,10 @@ fn documented_examples_match_real_answers() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(audit.contains("<redacted>") && !audit.contains("PRIVATE KEY"), "{audit}");
+    assert!(
+        audit.contains("<redacted>") && !audit.contains("PRIVATE KEY"),
+        "{audit}"
+    );
     let mode = std::fs::metadata(root.join(crate::actions_pool::KEY_FILE))
         .unwrap()
         .permissions()
@@ -927,6 +932,12 @@ fn spill_settings_refuse_warn_and_report() {
     call(
         &root,
         json!({"op":"config.set","key":"placement.spill_keep_free_mib","value":"1024"}),
+    );
+    // The disk reserve (default 100 GiB) is not there: this fixture reports no free disk.
+    assert_eq!(state(&root), "reserve");
+    call(
+        &root,
+        json!({"op":"config.set","key":"placement.spill_keep_free_disk_gib","value":"0"}),
     );
     assert_eq!(state(&root), "available");
     set(json!("ci:n2:0"));

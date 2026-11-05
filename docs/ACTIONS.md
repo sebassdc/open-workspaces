@@ -73,8 +73,9 @@ catalog is held only for its own bookkeeping, never during the runner's work, an
 runner boots new boxes side by side, so a burst of jobs larger than the warm pool
 gets its boxes in parallel.
 
-1. **Register**: a single-use runner registration (JIT config) from the App.
-2. **Create** the box through the pool's token (ephemeral, in the token's pool).
+1. **Create** the box through the pool's token (ephemeral, in the token's pool).
+   A full runner then costs no GitHub call.
+2. **Register**: a single-use runner registration (JIT config) from the App.
 3. **Hand off**: put the registration at `/home/dev/.ow-ci/jitconfig` and run
    `ow-ci-runner-start` in the box.
 4. **Idle** until GitHub assigns a job; **busy** while it runs.
@@ -103,10 +104,37 @@ boxes are gone.
 
 **GitHub calls.** One list of the repository's runners per pass (`ETag`, so an
 unchanged list costs no rate limit), one registration per box, and one
-unregister only when an idle runner is removed. The App key lives in a 0600 file
+unregister only when an idle runner is removed. With spill, the queued-job
+lists in [Spill](#spill), only while the pool is saturated. The App key lives in a 0600 file
 in the controller's data directory and in memory; no key, token or registration
 is logged, returned or put in the catalog: journals keep a put's contents only as
 their SHA-256.
+
+## Spill
+
+When the pool's placement pool has a [spill rule](MULTINODE.md#spill), a burst
+larger than the pool's own runners can hold borrows room on the rule's runner,
+without keeping anything warm there:
+
+- **Warm runners stay home.** Boxes made to keep `warm` idle runners ask not to
+  spill (`"spill": false`). When the pool's own runners are full, warm boxes wait
+  until one of the pool's boxes is removed (or 60 s); a spilled idle box never
+  counts as warm.
+- **Queued jobs get boxes.** Only while every box of the pool is busy and it is
+  under `max`, the controller asks GitHub, at most every 10 s, how many of the
+  repository's queued jobs ask only for the pool's labels: one list of queued
+  and one of running workflow runs (the newest 10 of each) and one job list per
+  run, at most 22 calls, and none while fewer than 1000 calls of the App's rate
+  limit are left, so the pool's own calls always have room. Each queued job no
+  idle or starting runner will take gets a box that may spill, within `max`.
+- **Spilled boxes are single-use and short-lived.** Like every pool box, one is
+  deleted when its job ends. One that is online with no job for 60 s (another
+  runner took the job) is removed. Ephemeral boxes are never hibernated,
+  snapshotted, moved or parked.
+- `max` caps the pool's boxes everywhere; the spill rule's `max_boxes` caps how
+  many of them a borrowed runner holds. Set `max` to what the pool's own runners
+  hold plus what it may borrow: without a rule the extra boxes are never asked
+  for.
 
 ## Image
 
@@ -125,6 +153,7 @@ good second guard for a repository that might ever run them.
 ## Status
 
 `ow actions status [--pool P]` ([actions.status](ADMIN_API.md#actionsstatus)):
-each pool's boxes by phase, whether it is held, its last error, and its latest
+each pool's boxes by phase (and how many spilled), whether it is held
+(`held_s`, and `home_held_s` for warm boxes), its last error, and its latest
 boxes' start times (create sent, box ready, registered, started, online, busy,
 removed).

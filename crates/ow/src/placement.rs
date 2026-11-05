@@ -94,13 +94,13 @@ pub fn choose<'a>(nodes: &'a [Candidate], d: &Demand<'_>) -> Option<&'a Candidat
 /// Spill, the second pass: runs only when [`choose`] found no runner in the pool and the
 /// pool has a live home runner (`home_live`). Tries each rule of the pool in order: its
 /// runner takes the box when it has fewer than `max_boxes` of the pool's boxes (`boxes`,
-/// pending creates included), still has `keep_free_mib` of memory and a free slot after it,
-/// and passes every check of the first pass.
+/// pending creates included), still has the `reserve` (memory, vCPUs, disk) and a free slot
+/// after it, and passes every check of the first pass.
 pub fn spill<'a>(
     nodes: &'a [Candidate],
     d: &Demand<'_>,
     rules: &[crate::spill::Rule],
-    keep_free_mib: u64,
+    reserve: &crate::spill::Reserve,
     home_live: bool,
     boxes: impl Fn(&str) -> u64,
 ) -> Option<&'a Candidate> {
@@ -115,7 +115,10 @@ pub fn spill<'a>(
                 .iter()
                 .find(|n| n.id == rule.node && n.pool != d.pool)?;
             if boxes(&n.id) >= rule.max_boxes
-                || n.free.memory_mib < d.memory_mib.saturating_add(keep_free_mib)
+                || n.free.memory_mib < d.memory_mib.saturating_add(reserve.memory_mib)
+                || n.free.cpus < d.cpus.saturating_add(reserve.cpus)
+                || (reserve.disk_bytes > 0
+                    && n.free.disk_bytes < d.disk_bytes.saturating_add(reserve.disk_bytes))
                 || n.free.slots < 2
             {
                 return None;
