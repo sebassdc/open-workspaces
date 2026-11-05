@@ -232,7 +232,7 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   a controller-only host's under `controller`) and are forwarded with the other
   events, so each upgrade's history outlives `upgrade.json`, which keeps only the
   last journal.
-- **first upgrade to 0.9.55**: it still runs the previous release's upgrader and
+- **first upgrade to 0.9.56**: it still runs the previous release's upgrader and
   hibernation (840 s for all boxes, whole-disk sealing). On a host with a box whose
   hibernation takes longer (about 4 s per GiB of allocated disk), hibernate that
   box by hand first (`ow hibernate BOX`); it wakes on its next connection.
