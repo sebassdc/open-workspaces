@@ -492,6 +492,21 @@ class Machine(unittest.TestCase):
         self.assertIn("hibernate-box:job", ops.calls, "the worker is asked (it stops an ephemeral box)")
         self.assertNotIn("resume:job", ops.calls)
 
+    def test_with_only_an_ephemeral_box_the_adoption_still_runs(self):
+        ops = Fake({})
+        real = ops.start
+
+        def start(name):
+            real(name)
+            if name == "worker":
+                ops.report.append({"id": "job", "result": "unresponsive", "detail": "guest did not answer"})
+
+        ops.start = start
+        self.run_plan(ops, ["worker"], 2, ["worker"], plan=self.handover_plan())
+        j = self.journal()
+        self.assertEqual((j["step"], j["handover"], j["adoption"], j["error"]), ("done", {}, {}, None))
+        self.assertIn("hibernate-box:job", ops.calls, "the worker is asked to stop it")
+
     def test_the_report_is_read_from_a_worker_that_is_not_busy(self):
         ops = Fake({"a": "running"})
         real, answers = ops.worker_status, []

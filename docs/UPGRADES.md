@@ -523,13 +523,13 @@ processes, RAM and clock are untouched; only the worker swap is downtime.
   hibernation pauses while the worker is quiesced.
 - **Per box fallback**: a VMM that is gone leaves its box stopped with its disk
   (as a worker crash did). One this worker cannot keep (another binary or guest
-  kernel, its fds not taken, or a box that is not stopped) is ended: the box
+  kernel, a VM never started, or a box that is not stopped) is ended: the box
   keeps its disk and loses its RAM state; the upgrader prevents the first two
-  by comparing the staged Firecracker and kernel bytes and requiring the running
-  worker's `worker_handover_v1` (only where `pidfd_getfd` works) before it hands
-  over. An adopted VMM whose API or guest does not answer stays running,
-  reported `unresponsive`; after verify the upgrader has the worker hibernate it
-  (with its placement authority, without a guest sync) and its resume step wakes
+  by comparing the staged Firecracker and kernel bytes before it hands over. An
+  adopted VMM whose API or guest does not answer, or whose console or log could
+  not be taken (`pidfd_getfd` refused), stays running, reported `unresponsive`;
+  after verify the upgrader has the worker hibernate it (with its placement
+  authority, going on without a guest sync only there) and its resume step wakes
   it. A box that was running and came back stopped boots again, cold. The
   journal error names every box not kept running; none of these rolls the
   upgrade back. An adopted box keeps its in-guest setup (network, tools) until

@@ -840,8 +840,9 @@ def execute(plan_, ops, frm, to, target_name):
         j.value["error"] = f"{e}"
         rollback(j, ops)
         raise
-    if j.value.get("handover"):
-        # Past verify: an interrupted report finishes the upgrade, never rolls it back.
+    if j.value.get("handover") is not None:
+        # Past verify: an interrupted report finishes the upgrade, never rolls it back. Also
+        # with no box recorded: the worker may have adopted ephemeral ones, left out of it.
         j.step("adoption")
         j.value["adoption"] = adoption(j["handover"], ops)
     finish(j, ops)

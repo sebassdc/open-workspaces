@@ -352,10 +352,13 @@ pub enum Adoption {
     /// The recorded process no longer runs.
     Gone,
     /// The recorded VMM runs, verified, but this worker cannot keep it: another binary or
-    /// guest kernel, or its console and log could not be taken. The caller ends it through
-    /// this handle, so no VMM is left that no worker manages.
+    /// guest kernel. The caller ends it through this handle, so no VMM is left that no
+    /// worker manages.
     Refused(String, Vmm),
     Adopted(Box<Vm>),
+    /// Verified and kept, but its console or log could not be taken (why): only its API
+    /// reaches it, which is enough to hibernate it with its RAM.
+    ApiOnly(String, Box<Vm>),
 }
 
 pub struct Vm {
@@ -370,6 +373,9 @@ pub struct Vm {
     memory_base: MemoryBase,
     /// Detached for the next worker: dropping it leaves the VMM, TAP and policy running.
     keep: bool,
+    /// Set only while the worker hibernates a box adopted unresponsive: its capture goes on
+    /// when the guest sync fails (a dead console cannot answer it).
+    pub(crate) sync_optional: bool,
 }
 
 impl Vm {
@@ -483,6 +489,7 @@ impl Vm {
                 address,
                 memory_base: MemoryBase::Unknown,
                 keep: false,
+                sync_optional: false,
             };
             // Before anything can fail or the worker die: a later worker finds this VMM by
             // it (ADR 0011). Any error drops `vm`, which ends the VMM.
@@ -573,7 +580,11 @@ impl Vm {
             kernel_sha256,
             hash,
         ) {
-            Ok(vm) => Ok(Adoption::Adopted(Box::new(vm))),
+            Ok((vm, None)) => Ok(Adoption::Adopted(Box::new(vm))),
+            Ok((vm, Some(lost))) => Ok(Adoption::ApiOnly(
+                format!("VMM {pid}: {lost}"),
+                Box::new(vm),
+            )),
             Err((e, pidfd)) => Ok(Adoption::Refused(
                 format!("VMM {pid}: {e:#}"),
                 Vmm::Adopted { pid, pidfd },
@@ -581,7 +592,8 @@ impl Vm {
         }
     }
 
-    /// Takes a verified VMM over, or hands its pidfd back with the reason it cannot.
+    /// Takes a verified VMM over (with why its console or log could not be taken, if so), or
+    /// hands its pidfd back with the reason it cannot.
     fn take_over(
         directory: &Path,
         record: &Value,
@@ -590,7 +602,7 @@ impl Vm {
         vmm_sha256: &str,
         kernel_sha256: &str,
         hash: impl Fn(&Path) -> Result<String>,
-    ) -> std::result::Result<Self, (anyhow::Error, std::os::fd::OwnedFd)> {
+    ) -> std::result::Result<(Self, Option<String>), (anyhow::Error, std::os::fd::OwnedFd)> {
         let parts = (|| -> Result<_> {
             ensure!(
                 record["format"] == RECORD_FORMAT,
@@ -623,8 +635,18 @@ impl Vm {
                 );
                 Ok(unsafe { File::from_raw_fd(raw as i32) })
             };
-            let master = take(&record["pty_fd"])?;
-            let errors = take(&record["log_fd"])?;
+            // A security module may refuse what the probe in `handover_supported` allowed.
+            let (master, errors) = (take(&record["pty_fd"]), take(&record["log_fd"]));
+            let lost: Vec<_> = [&master, &errors]
+                .into_iter()
+                .filter_map(|taken| taken.as_ref().err().map(|e| format!("{e:#}")))
+                .collect();
+            // Without its console a guest command fails at once instead of hanging.
+            let master = match master {
+                Ok(master) => master,
+                Err(_) => File::open("/dev/null")?,
+            };
+            let lost = (!lost.is_empty()).then(|| lost.join("; "));
             let diagnostics = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -633,22 +655,26 @@ impl Vm {
                 .create(true)
                 .append(true)
                 .open(directory.join("serial.log"))?;
-            Ok((master, errors, diagnostics, log, tap, address))
+            Ok((master, errors.ok(), diagnostics, log, tap, address, lost))
         })();
         match parts {
-            Ok((master, errors, diagnostics, log, tap, address)) => Ok(Self {
-                child: Vmm::Adopted { pid, pidfd },
-                master,
-                log,
-                diagnostics: Some(drain(errors, diagnostics)),
-                buffer: Vec::new(),
-                socket: directory.join("api.sock"),
-                tap,
-                address,
-                // The last captured image is not known here: the next capture is a full one.
-                memory_base: MemoryBase::Unknown,
-                keep: false,
-            }),
+            Ok((master, errors, diagnostics, log, tap, address, lost)) => Ok((
+                Self {
+                    child: Vmm::Adopted { pid, pidfd },
+                    master,
+                    log,
+                    diagnostics: errors.map(|errors| drain(errors, diagnostics)),
+                    buffer: Vec::new(),
+                    socket: directory.join("api.sock"),
+                    tap,
+                    address,
+                    // The last captured image is not known here: the next capture is a full one.
+                    memory_base: MemoryBase::Unknown,
+                    keep: false,
+                    sync_optional: false,
+                },
+                lost,
+            )),
             Err(e) => Err((e, pidfd)),
         }
     }
@@ -656,15 +682,23 @@ impl Vm {
     /// Checks an adopted VMM answers: its API (a VM a capture left paused runs again) and
     /// a guest command on its console within `timeout`.
     pub fn healthy(&mut self, timeout: Duration) -> Result<()> {
-        let info = self.api_get("/")?;
-        match info["state"].as_str() {
-            Some("Running") => {}
-            Some("Paused") => self.resume()?,
-            other => anyhow::bail!("VMM state {other:?}"),
+        match self.state()?.as_str() {
+            "Running" => {}
+            "Paused" => self.resume()?,
+            other => anyhow::bail!("VMM state {other}"),
         }
         let (_, code) = self.command_within("true", timeout)?;
         ensure!(code == 0, "guest exit {code}");
         Ok(())
+    }
+
+    /// The VM's state as its API reports it: `Not started`, `Running` or `Paused`.
+    pub fn state(&self) -> Result<String> {
+        let info = self.api_get("/")?;
+        info["state"]
+            .as_str()
+            .map(str::to_owned)
+            .context("VMM state")
     }
 
     /// Leaves the VMM, its TAP and network policy running for the next worker.
@@ -933,11 +967,16 @@ impl Vm {
     /// are saved (a `Diff` snapshot), and after the guest runs again they are laid over a
     /// reflink of that earlier image, so `memory` is still a complete image.
     pub fn capture(&mut self, directory: &Path, disk: &Path, resume: bool) -> Result<Duration> {
-        // A hibernation saves RAM and disk paused together, consistent without a sync, so a
-        // guest whose console does not answer (an adoption that failed its check) still
-        // hibernates; a capture the guest keeps running after needs its disk synced first.
-        if let Err(error) = self.checked("sync") {
-            ensure!(!resume, error);
+        // A failed sync ends the capture: a later cold boot would lose the guest's unflushed
+        // writes. Only a box adopted unresponsive is hibernated without it (RAM and disk are
+        // saved paused together, consistent without it), since its console may not answer.
+        if let Err(error) = self
+            .checked("sync")
+            .context("guest sync before the capture")
+        {
+            if resume || !self.sync_optional {
+                return Err(error);
+            }
             eprintln!("hibernating without a guest sync: {error:#}");
         }
         let memory = directory.join("memory");
@@ -1122,6 +1161,7 @@ mod command_tests {
         let mut vm = Vm {
             child: child.into(),
             keep: false,
+            sync_optional: false,
             master,
             log: File::create(&log).unwrap(),
             diagnostics: None,
@@ -1337,6 +1377,7 @@ mod clock_tests {
         let mut vm = Vm {
             child: child.into(),
             keep: false,
+            sync_optional: false,
             master: std::os::fd::OwnedFd::from(master).into(),
             log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
             diagnostics: None,
@@ -1556,6 +1597,7 @@ fn capture_fixture_steps(
         Vm {
             child: Command::new("sleep").arg("60").spawn().unwrap().into(),
             keep: false,
+            sync_optional: false,
             master: std::os::fd::OwnedFd::from(master).into(),
             log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
             diagnostics: None,

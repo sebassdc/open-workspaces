@@ -2491,11 +2491,12 @@ impl Runtime {
     }
 
     /// Adopts the VMMs an earlier worker left running (ADR 0011). A box whose VMM is gone,
-    /// or one this worker cannot keep (another binary or guest kernel, its fds not taken,
-    /// or a box that is not stopped: its VMM outlived a capture or move), keeps its disk and
-    /// state and its VMM is ended. An adopted one that does not answer stays adopted and is
-    /// reported `unresponsive`: hibernating it here would hold the starting worker for as
-    /// long as its RAM takes to write, so the upgrader hibernates it afterwards.
+    /// or one this worker cannot keep (another binary or guest kernel, a box that is not
+    /// stopped: its VMM outlived a capture or move, or a VM never started), keeps its disk
+    /// and state and its VMM is ended. An adopted one that does not answer, or whose console
+    /// or log could not be taken, stays adopted and is reported `unresponsive`: hibernating
+    /// it here would hold the starting worker for as long as its RAM takes to write, so the
+    /// upgrader hibernates it afterwards.
     /// Returns, per box, what happened.
     pub fn adopt(&mut self) -> Vec<Value> {
         let ids: Vec<String> = self
@@ -2538,27 +2539,38 @@ impl Runtime {
             fs::remove_file(directory.join(vm::RECORD))?;
             Ok((if reason.is_some() { "ended" } else { "gone" }, reason))
         };
-        let machine = match Vm::adopt(&directory, vmm, &self.kernel_hash, hash)? {
+        let (machine, api_only) = match Vm::adopt(&directory, vmm, &self.kernel_hash, hash)? {
             vm::Adoption::Gone => return release(None),
             vm::Adoption::Refused(reason, mut process) => {
                 process.kill()?;
                 process.wait()?;
                 return release(Some(reason));
             }
-            // A box hibernated, exporting or moved had its VMM dropped after the capture:
-            // one still running (the worker died first) must not run a second copy.
-            vm::Adoption::Adopted(machine) if workspace.state != "stopped" => {
-                drop(machine); // ends it and cleans its TAP and record
-                return Ok((
-                    "ended",
-                    Some(format!(
-                        "box is {}: its VMM outlived a capture or move",
-                        workspace.state
-                    )),
-                ));
-            }
-            vm::Adoption::Adopted(machine) => *machine,
+            vm::Adoption::Adopted(machine) => (*machine, None),
+            vm::Adoption::ApiOnly(reason, machine) => (*machine, Some(reason)),
         };
+        // Dropping it ends it and cleans its TAP and record. A box hibernated, exporting or
+        // moved had its VMM dropped after the capture: one still running (the worker died
+        // first) must not run a second copy.
+        if workspace.state != "stopped" {
+            drop(machine);
+            let reason = format!(
+                "box is {}: its VMM outlived a capture or move",
+                workspace.state
+            );
+            return Ok(("ended", Some(reason)));
+        }
+        // A worker that died during a cold start recorded a VMM before starting it: no guest
+        // runs there, so the box boots again from its disk.
+        if let Ok(state) = machine.state()
+            && !matches!(state.as_str(), "Running" | "Paused")
+        {
+            drop(machine);
+            return Ok((
+                "ended",
+                Some(format!("VMM state {state}: its guest never started")),
+            ));
+        }
         self.machines.insert(id.into(), machine);
         self.state.workspaces.get_mut(id).unwrap().state = "running".into();
         self.idle.touch(id, std::time::Instant::now());
@@ -2570,9 +2582,10 @@ impl Runtime {
                     .unwrap()
                     .healthy(std::time::Duration::from_secs(10))
             });
-        match checked {
-            Ok(()) => Ok(("adopted", None)),
-            Err(unhealthy) => Ok(("unresponsive", Some(format!("{unhealthy:#}")))),
+        match (checked, api_only) {
+            (Ok(()), None) => Ok(("adopted", None)),
+            (_, Some(reason)) => Ok(("unresponsive", Some(reason))),
+            (Err(unhealthy), None) => Ok(("unresponsive", Some(format!("{unhealthy:#}")))),
         }
     }
 
@@ -2598,7 +2611,13 @@ impl Runtime {
             if let Some(managed) = self.state.placements.get(&id) {
                 request["placement"] = json!(managed.authority);
             }
-            out[&id] = match self.request(&request) {
+            self.machines.get_mut(&id).unwrap().sync_optional = true;
+            let result = self.request(&request);
+            // Still running (its hibernation failed): later captures need their sync again.
+            if let Some(machine) = self.machines.get_mut(&id) {
+                machine.sync_optional = false;
+            }
+            out[&id] = match result {
                 Ok(_) if op == "stop" => json!("stopped"),
                 Ok(_) => json!("hibernated"),
                 Err(e) => json!(format!("{e:#}")),
@@ -2746,11 +2765,111 @@ mod adoption_tests {
         );
     }
 
-    /// The stand-in adopted as `legacy`'s running VMM by a worker running its binary.
-    fn adopted(runtime: &mut Runtime, child: &std::process::Child) {
+    /// This worker runs the stand-in's binary: it would adopt it.
+    fn same_binary(runtime: &mut Runtime, child: &std::process::Child) {
         runtime.assets = runtime.root.join("assets");
         fs::create_dir_all(runtime.binary().parent().unwrap()).unwrap();
         fs::copy(format!("/proc/{}/exe", child.id()), runtime.binary()).unwrap();
+    }
+
+    /// Answers one `GET /` on `legacy`'s VMM API socket with `state`, as Firecracker does.
+    fn api_answering(runtime: &Runtime, state: &str) -> std::thread::JoinHandle<()> {
+        use std::io::{Read, Write};
+        let socket = runtime.machine_dir("legacy").join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let body = json!({"state":state}).to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        })
+    }
+
+    #[test]
+    fn a_vmm_whose_guest_never_started_is_ended_and_its_box_stays_stopped() {
+        // A worker that died during a cold start: its record names a VMM before InstanceStart.
+        let mut runtime = super::disk_tests::fixture();
+        let mut child = recorded_vmm(&runtime);
+        same_binary(&mut runtime, &child);
+        let api = api_answering(&runtime, "Not started");
+        let report = runtime.adopt();
+        let (result, detail) = outcome(&report);
+        assert_eq!(result, "ended", "{detail}");
+        assert!(detail.as_str().unwrap().contains("Not started"), "{detail}");
+        api.join().unwrap();
+        assert!(child.wait().unwrap().code().is_none(), "killed");
+        assert_eq!(runtime.workspace("legacy").unwrap().state, "stopped");
+        assert!(runtime.machines.is_empty());
+        assert!(runtime.machine_dir("legacy").join("disk.ext4").exists());
+        assert!(!runtime.machine_dir("legacy").join(vm::RECORD).exists());
+    }
+
+    #[test]
+    fn a_vmm_whose_console_cannot_be_taken_is_kept_unresponsive_not_ended() {
+        // As when a security module refuses pidfd_getfd: the record names an fd it lacks.
+        let mut runtime = super::disk_tests::fixture();
+        let mut child = recorded_vmm(&runtime);
+        same_binary(&mut runtime, &child);
+        let path = runtime.machine_dir("legacy").join(vm::RECORD);
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["pty_fd"] = json!(9);
+        fs::write(&path, record.to_string()).unwrap();
+        let report = runtime.adopt();
+        let (result, detail) = outcome(&report);
+        assert_eq!(result, "unresponsive", "{detail}");
+        assert!(
+            detail.as_str().unwrap().contains("taking its fd 9"),
+            "{detail}"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "still running, RAM kept"
+        );
+        assert_eq!(runtime.workspace("legacy").unwrap().state, "running");
+        assert!(runtime.machines.contains_key("legacy"));
+        runtime.machines.clear();
+        assert!(
+            child.wait().unwrap().code().is_none(),
+            "dropping it ends it"
+        );
+    }
+
+    #[test]
+    fn a_failed_guest_sync_fails_a_hibernation_unless_the_box_was_adopted_unresponsive() {
+        let mut runtime = super::disk_tests::fixture();
+        let mut child = recorded_vmm(&runtime);
+        adopted(&mut runtime, &child);
+        runtime.state.workspaces.get_mut("legacy").unwrap().state = "running".into();
+        // The stand-in's console is read-only /dev/null: every guest command fails.
+        let error = runtime
+            .request(&json!({"op":"hibernate","id":"legacy"}))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("guest sync before the capture"),
+            "{error:#}"
+        );
+        assert!(runtime.machines.contains_key("legacy"), "still running");
+        runtime.adoption =
+            vec![json!({"id":"legacy","result":"unresponsive","detail":"guest did not answer"})];
+        let out = runtime
+            .request(&json!({"op":"hibernate-unresponsive"}))
+            .unwrap();
+        // Past the sync, it fails at the stand-in's missing API instead.
+        let failed = out["legacy"].as_str().unwrap();
+        assert!(!failed.contains("guest sync"), "{failed}");
+        assert!(!runtime.machines["legacy"].sync_optional, "reset after");
+        runtime.machines.clear();
+        child.wait().unwrap();
+    }
+
+    /// The stand-in adopted as `legacy`'s running VMM by a worker running its binary.
+    fn adopted(runtime: &mut Runtime, child: &std::process::Child) {
+        same_binary(runtime, child);
         let Ok(vm::Adoption::Adopted(machine)) = Vm::adopt(
             &runtime.machine_dir("legacy"),
             &hash(&runtime.binary()).unwrap(),
@@ -3372,7 +3491,10 @@ mod disk_tests {
             json!({"op":"export","id":"legacy"}),
         ] {
             let error = runtime.request(&request).unwrap_err();
-            assert!(format!("{error:#}").contains("is ephemeral"), "{request}: {error:#}");
+            assert!(
+                format!("{error:#}").contains("is ephemeral"),
+                "{request}: {error:#}"
+            );
         }
         assert!(!runtime.state.workspaces.contains_key("copy"));
         fs::remove_dir_all(&runtime.root).unwrap();
