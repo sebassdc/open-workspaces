@@ -12,8 +12,11 @@ it; /usr/local/sbin/ow-host runs the copy in /srv/ow/current.
   setup                 render units and files from the stored config; print what changed
   apply                 fetch the SSM config, validate, store, set up, act on class 0; report the rest
   ready [--wait S] [--images]
+  enrolled              (runner) exit 0 when enrolled and online with its controller
   restart --control-plane | --worker
   upgrade [REF] [--plan] [--accept-cold] [--max-class N] [--controller-version V (runner hosts)]
+  unchanged [--image NAME=SHA256]..
+                        after apply: exit 0 when an upgrade and each image build would do nothing
   recover               finish or undo an upgrade that was interrupted
   status
 
@@ -1406,6 +1409,9 @@ def main(argv):
     r = sub.add_parser("ready")
     r.add_argument("--wait", type=int, default=600)
     r.add_argument("--images", action="store_true")
+    sub.add_parser("enrolled")
+    unchanged = sub.add_parser("unchanged")
+    unchanged.add_argument("--image", action="append", default=[], metavar="NAME=SHA256")
     restart = sub.add_parser("restart")
     which = restart.add_mutually_exclusive_group(required=True)
     which.add_argument("--control-plane", action="store_true")
@@ -1456,7 +1462,12 @@ def main(argv):
         if args.command == "ready":
             ready(args.wait, args.images)
             return 0
+        if args.command == "enrolled":
+            return 0 if p(f"{RUNNER}/node.json").exists() and node_online() else 1
         import upgrade
+
+        if args.command == "unchanged":
+            return upgrade.unchanged(args.image)
 
         if args.command == "recover":
             with upgrade.locked():

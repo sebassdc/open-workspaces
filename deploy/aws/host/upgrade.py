@@ -936,6 +936,44 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
         return 0
 
 
+def unchanged(images=()):
+    """ci-post-up's fast path, run right after apply: 0 when `upgrade` would find nothing to do
+    and each image (NAME=SHA256) is built from the recipe with that hash; else 1, printing what
+    is left. Any doubt (an error included) counts as something left."""
+    try:
+        config = h.validate(h.read_json(h.CONFIG))
+        frm = h.pins()
+        todo = []
+        if (h.read_json(JOURNAL) or {}).get("step") not in (None, *TERMINAL):
+            todo.append("an interrupted upgrade")
+        if h.pending():
+            todo.append(f"restarts pending: {', '.join(sorted(h.pending()))}")
+        target = fetch(config)
+        if frm["current"] != target["release"]:
+            todo.append(f"release {target['release']} (running {frm['current']})")
+        else:
+            # Apply just rendered the files with this release's ow-host, so no pin moves for them.
+            # A runner's plan without --controller-version also weighs the catalog schema: it only adds moves.
+            pins = {name: version_of(frm[name]) for name in h.role_pins(config)}
+            result = plan(target["manifest"], pins, target["version"])
+            if result["move"] or result["restart"]:
+                todo.append(f"pins to move: {', '.join(sorted(result['move']))}")
+        if images:
+            # An image build waits for the developer image first (a replaced host rebuilds it).
+            if h.run(["systemctl", "show", "-p", "ActiveState", "--value", "open-workspaces-images.service"],
+                     check=False).strip() == "activating":
+                todo.append("the developer image is still building")
+            built = {i.get("name"): i.get("recipe_sha256") for i in h.ow("image", "list", timeout=60)}
+            for name, _, digest in (i.partition("=") for i in images):
+                if built.get(name) != digest:
+                    todo.append(f"image {name} (not built from this recipe)")
+    except Exception as e:
+        todo = [f"could not check ({e})"]
+    for line in todo:
+        say(f"to do: {line}")
+    return 1 if todo else 0
+
+
 def restart_worker(ops=None):
     """Class 2 restart on the same releases: drain, hibernate, restart, resume."""
     if h.role() == "controller":
