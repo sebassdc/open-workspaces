@@ -1565,7 +1565,9 @@ impl Runtime {
         // A failed adoption leaves its VMM running on this disk; the next worker adopts or
         // ends it (ADR 0011).
         if let Some(pid) = vm::recorded_live_pid(&self.machine_dir(id)) {
-            bail!("{id}'s previous VMM (PID {pid}) still runs; restart the worker to adopt or end it");
+            bail!(
+                "{id}'s previous VMM (PID {pid}) still runs; restart the worker to adopt or end it"
+            );
         }
         // A box hibernated on another host kernel or CPU (a replaced host) cannot
         // resume its RAM; it boots its hibernated disk cold instead.
