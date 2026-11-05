@@ -974,6 +974,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         | Action::Token { .. }
         | Action::Health
         | Action::Placement { .. }
+        | Action::Actions { .. }
         | Action::Config { .. } => unreachable!(),
         Action::Supervisor => {
             supervise(&root)?;

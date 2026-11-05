@@ -51,6 +51,9 @@ mod remote;
 mod scaler;
 #[cfg(target_os = "linux")]
 mod selfhost;
+mod actions;
+#[cfg(target_os = "linux")]
+mod actions_pool;
 mod spill;
 mod ssh_client;
 #[cfg(target_os = "linux")]
@@ -104,6 +107,43 @@ enum PlacementAction {
         #[arg(long)]
         pool: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ActionsAction {
+    /// Each runner pool's boxes and their latest start times.
+    Status {
+        /// Only this pool.
+        #[arg(long)]
+        pool: Option<String>,
+    },
+    /// The GitHub App key the pools register runners with.
+    AppKey {
+        #[command(subcommand)]
+        action: AppKeyAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AppKeyAction {
+    /// Store the App's private key (its .pem file; "-" reads standard input). Never shown again.
+    Set {
+        #[arg(long = "key-file", value_name = "FILE", value_parser = read_key_file)]
+        private_key: String,
+    },
+}
+
+/// The PEM a `--key-file` names ("-" is standard input), read when the command is parsed.
+fn read_key_file(path: &str) -> std::result::Result<String, String> {
+    use std::io::Read;
+    let mut text = String::new();
+    let read = if path == "-" {
+        std::io::stdin().read_to_string(&mut text).map(|_| ())
+    } else {
+        std::fs::File::open(path).and_then(|mut f| f.read_to_string(&mut text).map(|_| ()))
+    };
+    read.map_err(|e| format!("cannot read {path}: {e}"))?;
+    Ok(text)
 }
 
 #[derive(Subcommand)]
@@ -281,6 +321,11 @@ enum Action {
     Placement {
         #[command(subcommand)]
         command: PlacementAction,
+    },
+    /// Admin: GitHub Actions runner pools (see docs/ACTIONS.md).
+    Actions {
+        #[command(subcommand)]
+        command: ActionsAction,
     },
     /// Admin: controller-held settings that runners receive (see docs/TELEMETRY.md).
     Config {

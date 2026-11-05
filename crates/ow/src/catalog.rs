@@ -387,6 +387,25 @@ fn permitted(role: &str, op: &str) -> bool {
 }
 
 impl Catalog {
+    /// Another connection to the catalog `open` already owns in this process, for work that
+    /// must not wait on the shared one (each runner pool box). SQLite serializes the writes:
+    /// placement and reservations run in `BEGIN IMMEDIATE`, as across gateway processes.
+    pub(crate) fn secondary(root: &Path, pool_admins: Vec<String>) -> Result<Self> {
+        // Held only so the struct is the same; the opening gateway holds the flock.
+        let lock = OpenOptions::new()
+            .read(true)
+            .open(root.join("catalog-gateway.lock"))?;
+        let db = Connection::open(root.join("catalog.sqlite3"))?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+        Ok(Self {
+            db,
+            root: root.into(),
+            pool_admins,
+            _lock: lock,
+        })
+    }
+
     pub fn open(root: &Path, issuer: &str, bootstrap: Option<&str>) -> Result<Self> {
         use std::os::fd::AsRawFd;
         let lock_path = root.join("catalog-gateway.lock");

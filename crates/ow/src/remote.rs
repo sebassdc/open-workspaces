@@ -1082,6 +1082,9 @@ pub fn run(path: &Path, listen: SocketAddr, dashboard: Option<PathBuf>) -> Resul
         crate::scaler::start(catalog);
         crate::aws_identity::start(catalog);
     }
+    if let Some(root) = &dashboard {
+        crate::actions_pool::start(root, config.pool_admins.clone());
+    }
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

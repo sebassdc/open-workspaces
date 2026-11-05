@@ -72,7 +72,7 @@ fn now() -> i64 {
 // Controller-held settings (one source; read on every acknowledgement).
 
 /// Allowed keys and their defaults.
-pub const KEYS: [(&str, &str); 11] = [
+pub const KEYS: [(&str, &str); 13] = [
     ("telemetry.enabled", "true"),
     ("telemetry.interval_s", "15"),
     ("telemetry.forward_endpoint", ""),
@@ -89,6 +89,9 @@ pub const KEYS: [(&str, &str); 11] = [
     // (docs/MULTINODE.md#spill), and the memory every spill host keeps for its own pool.
     (crate::spill::RULES, ""),
     (crate::spill::KEEP_FREE, "16384"),
+    // GitHub Actions runner pools (docs/ACTIONS.md) and the GitHub App they register with.
+    (crate::actions::POOLS, "[]"),
+    (crate::actions::APP_ID, "0"),
 ];
 
 pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
@@ -121,6 +124,8 @@ pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
         "limits.box_memory_mib" => number(0..=u64::from(crate::common::HOST_MEMORY_MIB)),
         crate::spill::RULES => Ok(json!(crate::spill::parse(value)?)),
         crate::spill::KEEP_FREE => number(0..=u64::from(crate::common::HOST_MEMORY_MIB)),
+        crate::actions::POOLS => crate::actions::typed(value),
+        crate::actions::APP_ID => number(0..=u64::from(u32::MAX)),
         crate::dashboard_ui::SETTING => {
             if value != "builtin" {
                 crate::dashboard_ui::valid_version(value)?;
@@ -155,7 +160,7 @@ pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
 pub fn settings(db: &Connection) -> Result<Value> {
     // One query: it also runs with every acknowledgement.
     let stored: BTreeMap<String, String> = db
-        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key LIKE 'limits.%' OR key LIKE 'placement.%' OR key='config_version'")?
+        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key LIKE 'limits.%' OR key LIKE 'placement.%' OR key LIKE 'actions.%' OR key='config_version'")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut out = json!({});
@@ -186,6 +191,7 @@ pub(crate) fn default(key: &str) -> Value {
 pub(crate) fn store_setting(db: &Connection, key: &str, typed: &Value, actor: &str) -> Result<i64> {
     let stored = match typed {
         Value::String(text) => text.clone(),
+        Value::Array(_) if key == crate::actions::POOLS => typed.to_string(),
         Value::Array(_) => crate::spill::text(typed),
         _ => typed.to_string(),
     };

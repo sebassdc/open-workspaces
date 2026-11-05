@@ -67,6 +67,8 @@ pub(crate) const OPS: &[OpSpec] = &[
         true,
     ),
     op("placement.status", &[&["placement", "status"]], false),
+    op("actions.status", &[&["actions", "status"]], false),
+    op("actions.app_key.set", &[&["actions", "app-key", "set"]], true),
 ];
 
 pub(crate) fn spec(name: &str) -> Option<&'static OpSpec> {
@@ -132,6 +134,10 @@ pub(crate) enum AdminRequest {
     HostRevoke { node: String },
     #[serde(rename = "placement.status")]
     PlacementStatus { pool: Option<String> },
+    #[serde(rename = "actions.status")]
+    ActionsStatus { pool: Option<String> },
+    #[serde(rename = "actions.app_key.set")]
+    ActionsAppKeySet { private_key: String },
 }
 
 /// Who made a request, as the gateway or the socket verified it.
@@ -320,7 +326,13 @@ pub(crate) fn handle(ctx: &Context, body: &[u8]) -> (u16, Value) {
         Err(_) => return (400, invalid_request("body is not JSON").body(None)),
     };
     let name = raw.get("op").and_then(Value::as_str).map(str::to_owned);
-    let answer = parse(&raw).and_then(|request| run(ctx, &raw, request));
+    let request = parse(&raw);
+    // What the audit log keeps: never a secret a request carries.
+    let mut raw = raw;
+    if let Some(key) = raw.get_mut("private_key") {
+        *key = json!("<redacted>");
+    }
+    let answer = request.and_then(|request| run(ctx, &raw, request));
     match answer {
         Ok(result) => (200, json!({"ok":true,"op":name,"result":result})),
         Err(failure) => {
@@ -459,6 +471,8 @@ fn known_key(key: &str) -> std::result::Result<(), Failure> {
 fn effective(key: &str) -> &'static str {
     if key.starts_with("placement.") || key.starts_with("limits.") {
         "next_create"
+    } else if key.starts_with("actions.") {
+        "next_pass"
     } else if key.starts_with("dashboard.") {
         "next_request"
     } else {
@@ -478,6 +492,9 @@ fn value_text(key: &str, value: &Value) -> std::result::Result<String, Failure> 
             .to_owned()),
         Value::String(text) => Ok(text.clone()),
         Value::Bool(b) if default.is_boolean() => Ok(b.to_string()),
+        Value::Array(_) if key == crate::actions::POOLS => {
+            crate::actions::from_json(value).map_err(|e| invalid_value(key, format!("{e:#}")))
+        }
         Value::Array(_) if default.is_array() => {
             crate::spill::from_json(value).map_err(|e| invalid_value(key, e))
         }
@@ -891,6 +908,38 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                     .map_err(|e| invalid_request(format!("pool: {e}")))?;
             }
             Ok(crate::spill::status(root, pool.as_deref())?)
+        }
+        AdminRequest::ActionsStatus { pool } => {
+            if let Some(pool) = &pool {
+                crate::common::identifier(pool)
+                    .map_err(|e| invalid_request(format!("pool: {e}")))?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(failure(409, "rejected", "Runner pools run on a Linux controller."))
+            }
+            #[cfg(target_os = "linux")]
+            {
+                Ok(crate::actions_pool::status(root, pool.as_deref())?)
+            }
+        }
+        AdminRequest::ActionsAppKeySet { private_key } => {
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = private_key;
+                Err(failure(409, "rejected", "Runner pools run on a Linux controller."))
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let result = crate::actions_pool::set_app_key(root, &private_key)
+                    .map_err(|e| invalid_value("private_key", format!("{e:#}")))?;
+                let db = crate::nodes::db(root)?;
+                let audit_id = audit(&db, "actions.app_key.set", &ctx.actor, raw, "ok", None, Some(&result))?;
+                changed("actions.app_key.set", &ctx.actor, json!({"fingerprint":result["fingerprint"]}));
+                let mut result = result;
+                result["audit_id"] = json!(audit_id);
+                Ok(result)
+            }
         }
         AdminRequest::HostRevoke { node } => {
             crate::common::identifier(&node).map_err(|e| invalid_value("node", e))?;

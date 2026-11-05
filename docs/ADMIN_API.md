@@ -142,6 +142,8 @@ reissue. Keys live in `admin_operations`.
 | `ow host budget NODE --memory M --slots N --cpus C` | `host.budget` |
 | `ow host revoke NODE` | `host.revoke` |
 | `ow placement status [--pool P]` | `placement.status` |
+| `ow actions status [--pool P]` | `actions.status` |
+| `ow actions app-key set --key-file FILE` | `actions.app_key.set` (`-` reads standard input) |
 
 The examples below are the contract: a test parses every request and response,
 and checks that the CLI builds each request exactly.
@@ -376,6 +378,47 @@ spills), `inert_offline`, `inert_draining`, `inert_revoked` or
                   "free_slots": 0, "free_memory_mib": 0}],
   "spill": [{"node": "n2", "max_boxes": 2, "boxes": 1, "pending": 0, "box_names": ["ci-runner-7f3a"],
              "free_memory_mib": 57344, "free_memory_after_reserve_mib": 24576, "state": "available"}]}]}}
+```
+
+### actions.status
+
+Each [runner pool](ACTIONS.md)'s boxes (`launching`, `idle`, `busy`, `removing`),
+whether it is held after a failed launch (`held_s`), its last error, and the
+start times of its latest boxes in ms since the epoch (`create_ms` the create was
+sent, `ready_ms` the box booted, `registered_ms` its runner registration was
+minted, `started_ms` the runner started, `online_ms` GitHub listed it online,
+`busy_ms` GitHub gave it a job, `removed_ms` it was deleted). `app_key` never
+holds the key, only whether one is stored and its fingerprint.
+
+<!-- admin:example op=actions.status -->
+```json
+{"op": "actions.status", "pool": "ci"}
+```
+```json
+{"ok": true, "op": "actions.status", "result": {"running": true, "app_id": 123456,
+  "app_key": {"present": true, "fingerprint": "sha256:9f2c41d07a6b33e1"},
+  "pools": [{"pool": "ci", "configured": true, "warm": 4, "max": 6, "launching": 0, "idle": 4, "busy": 1,
+             "removing": 0, "held_s": 0, "last_error": null,
+             "boxes": [{"box": "ci-3f1c9a02b7d4", "phase": "started", "age_s": 312, "online": true, "busy": true}],
+             "recent": [{"box": "ci-3f1c9a02b7d4", "pool": "ci", "create_ms": 1793760000000, "ready_ms": 1793760002100,
+                         "registered_ms": 1793760002600, "started_ms": 1793760003400, "online_ms": 1793760005900,
+                         "busy_ms": 1793760290000}]}]}}
+```
+
+### actions.app_key.set
+
+Stores the GitHub App's private key (PEM) that the pools register runners with,
+0600 in the controller's data directory. It is never returned or logged, and
+the audit log records the request with the key replaced. Setting the same key
+again returns `"changed": false`.
+
+<!-- admin:example op=actions.app_key.set -->
+```json
+{"op": "actions.app_key.set", "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----\n"}
+```
+```json
+{"ok": true, "op": "actions.app_key.set", "result": {"fingerprint": "sha256:9f2c41d07a6b33e1", "changed": true,
+  "audit_id": 88}}
 ```
 
 ### host.revoke
