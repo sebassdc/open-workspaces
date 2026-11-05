@@ -957,6 +957,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Action::Login { .. }
+        | Action::Upgrade { .. }
         | Action::Host { .. }
         | Action::Node { .. }
         | Action::Backup { .. }

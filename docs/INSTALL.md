@@ -74,6 +74,66 @@ credentials. Existing host-served `/cli/install.sh` installations remain compati
 see [networking and remote CLI](NETWORKING.md). They are a compatibility path,
 not the versioned GitHub Release download path.
 
+## Keeping the CLI current
+
+`ow upgrade` replaces the installed client with the release your controller
+runs, read from the controller's `GET /api/version` over the same login that
+other commands use. It downloads this
+platform's executable from that GitHub release and checks it as the installer
+does: the digest must match the asset's `.sha256`, the release's `SHA256SUMS`
+must list that digest for the asset, the header must be this platform's
+executable, and the new binary must report the expected version. Only then is it
+written next to the running client, synced and renamed over it, keeping its
+permissions. Any failed check leaves the current client in place. It refuses,
+before downloading anything, when the client was started through a symlink (as
+the installer does) and when it is a host's own release (a file in a host's
+`releases/` directory, which the host's services run): upgrade a host with
+`ow-host upgrade`.
+
+```sh
+ow upgrade                  # to the controller's release; never older than this client
+ow upgrade --check          # print current and target; exit 0 if current, 10 if an upgrade is available
+ow upgrade --version v0.9.58  # exactly this release, even an older one
+ow upgrade --json           # after an upgrade: {"from":"0.9.57","to":"0.9.58","seconds":2.4,"upgraded":true}
+```
+
+An equal version prints one line and exits 0 without downloading anything; with
+`--json` it prints nothing, so a timer's log grows only when something changed
+(`--check --json` always prints the line). A controller older than this client
+is not a downgrade target; only an explicit `--version` installs an older
+release. `--check` exits 10 only once the release's asset for this platform can
+be downloaded. Errors exit 1.
+
+To keep a Mac's client in step with its controller, run it from a launchd user
+agent every 30 seconds. Save this as
+`~/Library/LaunchAgents/dev.open-workspaces.upgrade.plist`, then load it with
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.open-workspaces.upgrade.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.open-workspaces.upgrade</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>exec "$HOME/.local/bin/ow" upgrade --json >> "$HOME/Library/Logs/ow-upgrade.log" 2>&amp;1</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>30</integer>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+```
+
+Adjust the client path if you installed it with `OW_INSTALL_DIR`. A Cloudflare
+Access login needs a current browser session for the check to reach the
+controller; a tailnet login needs nothing more.
+
 ## Assets and runtime acceptance
 
 Each new release contains the following raw executables, each with a `.sha256`
@@ -128,3 +188,14 @@ evidence separately for each tested platform/runtime: version execution does not
 prove user admission, TLS trust or a live authenticated connection. Consumer release
 pins and connection guides are maintained in the consuming project, after this
 evidence.
+
+Once the release is published, the workflow can tell downstream repositories at
+once. Set the repository variable `RELEASE_DISPATCH_REPOS` to a space-separated
+list of `owner/repo` names and the secret `RELEASE_DISPATCH_TOKEN` to a token
+allowed to send `repository_dispatch` events to them (contents write on each).
+Each listed repository then receives event type `open-workspaces-release` with
+`client_payload` `{"tag": "vX.Y.Z", "commit": "<sha>", "version": "X.Y.Z"}`,
+for example to start its own deployment from a
+`on: repository_dispatch: types: [open-workspaces-release]` workflow. When
+either setting is unset the step logs one line and succeeds; a failed dispatch
+is a warning and never fails the release.

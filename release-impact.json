@@ -2,6 +2,44 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.58",
+      "class": 0,
+      "changes": [
+        "component"
+      ],
+      "waivers": {
+        "worker": "crates/ow/src/host.rs lists only the new ow upgrade command among those it never dispatches; the worker's own code is unchanged"
+      },
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Client self-update: ow upgrade [--version vX.Y.Z] [--check] [--json] installs the release the configured controller runs (GET /api/version, so no new API op) or the named one. It downloads this platform's published client, refuses it unless its .sha256 matches, SHA256SUMS lists that hash, the header is this platform's executable and it reports the expected version, then renames it over the running binary. It never downgrades unless --version names the release; --check exits 0 when current and 10 when an upgrade is available. Release notify: after publishing, the release workflow sends a repository_dispatch (open-workspaces-release, with tag, commit and version) to each repository in the RELEASE_DISPATCH_REPOS variable, using the RELEASE_DISPATCH_TOKEN secret; a failed dispatch only warns. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 0: nothing restarts."
+    },
+    {
       "version": "0.9.57",
       "class": 2,
       "changes": [

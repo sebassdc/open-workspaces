@@ -189,6 +189,10 @@ print one JSON value on stdout, without an interactive prompt or progress banner
   a local worker answers a repeat with `"existed": false`. Hibernation, recovery
   and transfer captures cannot be deleted this way.
 
+- `upgrade [--version vX.Y.Z] [--check] [--json]`: replace this client with
+  the release the controller runs, verified before anything is replaced; see
+  [keeping the CLI current](INSTALL.md#keeping-the-cli-current).
+
 Host participation, enrollment, local image build, backup, `node` (singular),
 `up`/`down`, `dashboard`/`serve`, `token` and `node-*` (including `node-pool`) are host/operator commands, not steps
 needed by a remote coworker agent. The admin commands (`config`, `health`,

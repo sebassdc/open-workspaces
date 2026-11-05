@@ -227,6 +227,23 @@ fn call(transport: &Transport, method: &str, path: &str, body: Option<&Value>) -
     }
 }
 
+/// The release the configured controller runs: `server` from its `GET /api/version`.
+pub(crate) fn server_version(
+    data_dir: Option<PathBuf>,
+    server: Option<String>,
+    local: bool,
+) -> Result<String> {
+    let transport = transport(data_dir, server, local)?
+        .context("no controller configured: run ow login <server>, or pass --version")?;
+    let (status, body) = call(&transport, "GET", "/api/version", None)?;
+    serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v["result"]["server"].as_str().map(str::to_owned))
+        .with_context(|| {
+            format!("the controller's /api/version has no server version (HTTP {status})")
+        })
+}
+
 /// Saves the request of an op that takes a retry key, as the operation API does.
 fn remember(request: &Value) -> Result<()> {
     let Some(key) = request["operation_key"].as_str() else {
