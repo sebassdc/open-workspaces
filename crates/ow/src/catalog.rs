@@ -3401,7 +3401,7 @@ impl Catalog {
                 .context("runner unreachable; the machine may be back, try again")?;
                 if swept["error"] == nodes::NOT_TAKEN {
                     return Err(limits::Rejection(format!(
-                        "the runner of machine '{name}' is busy and took nothing; retry the delete"
+                        "the runner of machine '{name}' took nothing (busy, restarting or offline); retry the delete"
                     ))
                     .into());
                 }

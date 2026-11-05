@@ -836,7 +836,8 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
             return;
         }
     };
-    let (tx, mut rx) = mpsc::channel(16);
+    // Job IDs waiting for the agent to read them: a burst for one runner fits.
+    let (tx, mut rx) = mpsc::channel(JOB_SLOTS);
     {
         let mut sessions = c.sessions.lock().unwrap();
         if full(&sessions) {
@@ -1045,11 +1046,12 @@ async fn proxy(c: Controller, node: String, mut stream: tokio::net::UnixStream) 
         "unauthorized proxy peer"
     );
     let attached = async {
-        // A burst waits for a proxy as long as a runner's agent waits for a job slot.
-        let _permit =
-            tokio::time::timeout(JOB_ATTACH_WAIT, c.slots.clone().acquire_owned())
-                .await
-                .context("controller capacity")??;
+        // Never waited for: some callers hold the catalog. Beyond it the job is not taken.
+        let _permit = c
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .context("controller capacity")?;
         let db = {
             let (root, node) = (c.root.clone(), node.clone());
             tokio::task::spawn_blocking(move || -> Result<_> {
