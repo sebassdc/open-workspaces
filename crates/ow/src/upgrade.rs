@@ -14,8 +14,8 @@ use std::{
 };
 
 const RELEASES: &str = "https://github.com/sebassdc/open-workspaces/releases";
-/// How long a latest release whose `status` failed against the controller is not downloaded
-/// again: a timer runs `ow upgrade` every 30 s.
+/// How long a release that failed after its `.sha256` was found (download, checks or
+/// `status`) is not downloaded again: a timer runs `ow upgrade` every 30 s.
 const REFUSAL: Duration = Duration::from_secs(600);
 /// `--check` exit status when the target is a different release than this client.
 pub(crate) const AVAILABLE: i32 = 10;
@@ -353,24 +353,26 @@ trait Releases {
     /// Why installing `target` failed within `REFUSAL`, if it did.
     fn refused(&self, target: Version) -> Option<String>;
     fn refuse(&mut self, target: Version, why: &str);
+    /// The controller is an HTTPS server, not this host's socket: only then can a
+    /// candidate's `status` reach it.
+    fn https(&mut self) -> Result<bool>;
 }
 
 /// Picks the target and installs it: the latest release when it is newer than this client
 /// and compatible with the controller, else the controller's release, or exactly
-/// `--version`. The latest release is only tried against an HTTPS server (`https`): its
-/// `status` cannot reach a controller over the local socket.
+/// `--version`. The latest release is only tried against an HTTPS server: its `status`
+/// cannot reach a controller over the local socket.
 fn select(
     releases: &mut impl Releases,
     current: Version,
     version: Option<&str>,
     check: bool,
-    https: bool,
 ) -> Result<Outcome> {
     if let Some(version) = version {
         return attempt(releases, current, parse(version)?, Source::Version, check);
     }
     let mut controller = None;
-    let reason = if https {
+    let reason = if releases.https()? {
         match latest(releases, current, check, &mut controller)? {
             Ok(outcome) => return Ok(outcome),
             Err(reason) => reason,
@@ -384,7 +386,10 @@ fn select(
     };
     let target = parse(&controller).context("the controller's /api/version")?;
     let mut outcome = attempt(releases, current, target, Source::Controller, check)?;
-    outcome.reason = Some(reason);
+    outcome.reason = Some(match outcome.reason {
+        Some(also) => format!("{reason}; {also}"),
+        None => reason,
+    });
     Ok(outcome)
 }
 
@@ -441,7 +446,9 @@ fn latest(
     }
 }
 
-/// The controller's release or `--version`: no compatibility check, no memo.
+/// The controller's release or `--version`: no compatibility check. A controller release
+/// that failed after its `.sha256` was found is remembered, like a latest one; `--version`
+/// always tries.
 fn attempt(
     releases: &mut impl Releases,
     current: Version,
@@ -458,21 +465,31 @@ fn attempt(
     if !wanted(current, target, source == Source::Version) {
         return Ok(outcome);
     }
+    let remember = source == Source::Controller;
+    if let Some(why) = releases.refused(target).filter(|_| remember) {
+        outcome.reason = Some(format!("v{} was refused recently: {why}", show(target)));
+        return Ok(outcome);
+    }
     if !check {
         releases.replaceable()?;
     }
     let published = releases.published(target)?;
     if check {
         outcome.step = Step::Available;
-    } else {
-        releases.install(target, &published, false)?;
-        outcome.step = Step::Upgraded;
+        return Ok(outcome);
     }
+    if let Err(error) = releases.install(target, &published, false) {
+        if remember {
+            releases.refuse(target, &format!("{error:#}"));
+        }
+        return Err(error);
+    }
+    outcome.step = Step::Upgraded;
     Ok(outcome)
 }
 
 /// The real network, files and processes.
-struct Github<F> {
+struct Github<F, H> {
     client: reqwest::blocking::Client,
     no_redirect: reqwest::blocking::Client,
     controller: Option<F>,
@@ -481,9 +498,10 @@ struct Github<F> {
     options: Vec<OsString>,
     exe: Option<PathBuf>,
     memo: Option<PathBuf>,
+    https: Option<H>,
 }
 
-impl<F: FnOnce() -> Result<String>> Releases for Github<F> {
+impl<F: FnOnce() -> Result<String>, H: FnOnce() -> Result<bool>> Releases for Github<F, H> {
     fn latest(&mut self) -> Result<String> {
         let url = format!("{RELEASES}/latest");
         let response = self
@@ -563,30 +581,42 @@ impl<F: FnOnce() -> Result<String>> Releases for Github<F> {
     }
 
     fn refuse(&mut self, target: Version, why: &str) {
-        if let Some(path) = &self.memo {
-            // Best effort: without it the next run downloads the candidate again.
-            let _ = path.parent().map(fs::create_dir_all);
-            let _ = fs::write(path, format!("{}\n{why}", show(target)));
-        }
+        let v = show(target);
+        let saved = match &self.memo {
+            None => Err(anyhow!("HOME or XDG_CONFIG_HOME required")),
+            Some(path) => path
+                .parent()
+                .map_or(Ok(()), fs::create_dir_all)
+                .and_then(|()| fs::write(path, format!("{v}\n{why}")))
+                .with_context(|| format!("cannot write {}", path.display())),
+        };
         // `--json` stays quiet on the fallback's no-op; this is the timer log's one trace.
-        eprintln!(
-            "ow upgrade: v{} refused for {} minutes: {why}",
-            show(target),
-            REFUSAL.as_secs() / 60
-        );
+        match saved {
+            Ok(()) => eprintln!(
+                "ow upgrade: v{v} refused for {} minutes: {why}",
+                REFUSAL.as_secs() / 60
+            ),
+            Err(error) => eprintln!(
+                "ow upgrade: v{v} failed and could not be remembered ({error:#}), so the next run downloads it again: {why}"
+            ),
+        }
+    }
+
+    fn https(&mut self) -> Result<bool> {
+        (self.https.take().context("already asked")?)()
     }
 }
 
 /// Runs `ow upgrade`; `controller` asks the configured controller which release it runs,
-/// `options` are the global options that configured it and `https` says that controller is
-/// an HTTPS server (not the local socket).
+/// `options` are the global options that configured it and `https` says whether that
+/// controller is an HTTPS server (not the local socket); it is asked only without `--version`.
 pub(crate) fn run(
     version: Option<String>,
     check: bool,
     json: bool,
     controller: impl FnOnce() -> Result<String>,
     options: Vec<OsString>,
-    https: bool,
+    https: impl FnOnce() -> Result<bool>,
 ) -> Result<i32> {
     let started = Instant::now();
     let current = parse(env!("CARGO_PKG_VERSION"))?;
@@ -607,8 +637,9 @@ pub(crate) fn run(
         memo: crate::client::config()
             .ok()
             .map(|config| config.with_file_name("upgrade-refused")),
+        https: Some(https),
     };
-    let outcome = select(&mut github, current, version.as_deref(), check, https)?;
+    let outcome = select(&mut github, current, version.as_deref(), check)?;
     // A timer runs `--json` often: a no-op stays silent there.
     if outcome.step == Step::Current && json && !check {
         return Ok(0);
@@ -669,7 +700,10 @@ mod tests {
         latest: Result<&'static str, &'static str>,
         controller: &'static str,
         missing: Option<Version>,
-        install_error: Option<&'static str>,
+        https: bool,
+        /// Installing one of these fails with its message.
+        broken: Vec<(Version, &'static str)>,
+        installs: usize,
         refused: Option<(Version, String)>,
         asked_controller: bool,
         installed: Vec<(Version, bool)>,
@@ -680,7 +714,9 @@ mod tests {
             latest: Ok(latest),
             controller,
             missing: None,
-            install_error: None,
+            https: true,
+            broken: Vec::new(),
+            installs: 0,
             refused: None,
             asked_controller: false,
             installed: Vec::new(),
@@ -706,7 +742,8 @@ mod tests {
             Ok("sha".into())
         }
         fn install(&mut self, target: Version, _: &str, against_controller: bool) -> Result<()> {
-            if let Some(error) = self.install_error.filter(|_| against_controller) {
+            self.installs += 1;
+            if let Some((_, error)) = self.broken.iter().find(|(v, _)| *v == target) {
                 bail!("{error}");
             }
             self.installed.push((target, against_controller));
@@ -721,6 +758,9 @@ mod tests {
         fn refuse(&mut self, target: Version, why: &str) {
             self.refused = Some((target, why.into()));
         }
+        fn https(&mut self) -> Result<bool> {
+            Ok(self.https)
+        }
     }
 
     const CURRENT: Version = (0, 9, 62);
@@ -728,7 +768,7 @@ mod tests {
     #[test]
     fn a_newer_compatible_latest_release_is_installed() {
         let mut r = fake("v0.9.64", "0.9.62");
-        let o = select(&mut r, CURRENT, None, false, true).unwrap();
+        let o = select(&mut r, CURRENT, None, false).unwrap();
         assert_eq!(
             (o.to, o.source, o.step),
             ((0, 9, 64), Source::Latest, Step::Upgraded)
@@ -744,8 +784,11 @@ mod tests {
     #[test]
     fn an_incompatible_latest_release_falls_back_to_the_controller() {
         let mut r = fake("v0.9.64", "0.9.63");
-        r.install_error = Some("not compatible with the controller: status is not connected");
-        let o = select(&mut r, CURRENT, None, false, true).unwrap();
+        r.broken = vec![(
+            (0, 9, 64),
+            "not compatible with the controller: status is not connected",
+        )];
+        let o = select(&mut r, CURRENT, None, false).unwrap();
         assert_eq!(
             (o.to, o.source, o.step),
             ((0, 9, 63), Source::Controller, Step::Upgraded)
@@ -763,7 +806,7 @@ mod tests {
 
         let mut again = fake("v0.9.64", "0.9.62");
         again.refused = r.refused.take();
-        let o = select(&mut again, CURRENT, None, false, true).unwrap();
+        let o = select(&mut again, CURRENT, None, false).unwrap();
         assert_eq!((o.source, o.step), (Source::Controller, Step::Current));
         assert!(o.reason.unwrap().contains("refused recently"));
         assert!(again.installed.is_empty());
@@ -776,18 +819,56 @@ mod tests {
             "the downloaded client did not finish [\"--version\"] within 30 s",
         ] {
             let mut r = fake("v0.9.64", "0.9.62");
-            r.install_error = Some(error);
-            let o = select(&mut r, CURRENT, None, false, true).unwrap();
+            r.broken = vec![((0, 9, 64), error)];
+            let o = select(&mut r, CURRENT, None, false).unwrap();
             assert_eq!((o.source, o.step), (Source::Controller, Step::Current));
             assert_eq!(r.refused, Some(((0, 9, 64), error.to_owned())));
         }
     }
 
     #[test]
+    fn a_broken_release_the_controller_also_runs_is_downloaded_once() {
+        let mut r = fake("v0.9.64", "0.9.64");
+        r.broken = vec![((0, 9, 64), "download checksum mismatch for ow-darwin-arm64")];
+        let o = select(&mut r, CURRENT, None, false).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            ((0, 9, 64), Source::Controller, Step::Current)
+        );
+        assert!(o.reason.unwrap().contains("refused recently"));
+        assert_eq!(r.installs, 1, "the fallback does not download it again");
+    }
+
+    #[test]
+    fn a_failed_controller_release_is_remembered_but_version_always_tries() {
+        let mut r = fake("", "0.9.63");
+        r.latest = Err("offline");
+        r.broken = vec![((0, 9, 63), "download checksum mismatch for ow-darwin-arm64")];
+        assert!(
+            select(&mut r, CURRENT, None, false).is_err(),
+            "the failure is reported"
+        );
+        assert_eq!(r.refused.as_ref().map(|(v, _)| *v), Some((0, 9, 63)));
+
+        let mut again = fake("", "0.9.63");
+        again.latest = Err("offline");
+        again.broken = r.broken.clone();
+        again.refused = r.refused.clone();
+        let o = select(&mut again, CURRENT, None, false).unwrap();
+        assert_eq!((o.source, o.step), (Source::Controller, Step::Current));
+        assert!(o.reason.unwrap().contains("v0.9.63 was refused recently"));
+        assert_eq!(again.installs, 0);
+
+        assert!(select(&mut again, CURRENT, Some("v0.9.63"), false).is_err());
+        assert_eq!(again.installs, 1, "--version is not held back by the memo");
+    }
+
+    #[test]
     fn a_local_controller_never_tries_the_latest_release() {
         let mut r = fake("v0.9.64", "0.9.63");
         r.latest = Err("not asked");
-        let o = select(&mut r, CURRENT, None, false, false).unwrap();
+        r.https = false;
+        let o = select(&mut r, CURRENT, None, false).unwrap();
         assert_eq!(
             (o.to, o.source, o.step),
             ((0, 9, 63), Source::Controller, Step::Upgraded)
@@ -825,7 +906,7 @@ mod tests {
     fn a_latest_release_without_its_assets_keeps_the_client() {
         let mut r = fake("v0.9.64", "0.9.62");
         r.missing = Some((0, 9, 64));
-        let o = select(&mut r, CURRENT, None, false, true).unwrap();
+        let o = select(&mut r, CURRENT, None, false).unwrap();
         assert_eq!((o.source, o.step), (Source::Controller, Step::Current));
         assert!(o.reason.unwrap().contains("404"));
         assert!(
@@ -838,7 +919,7 @@ mod tests {
     fn an_unknown_latest_release_falls_back_to_the_controller() {
         let mut r = fake("", "0.9.63");
         r.latest = Err("offline");
-        let o = select(&mut r, CURRENT, None, false, true).unwrap();
+        let o = select(&mut r, CURRENT, None, false).unwrap();
         assert_eq!(
             (o.to, o.source, o.step),
             ((0, 9, 63), Source::Controller, Step::Upgraded)
@@ -850,7 +931,7 @@ mod tests {
     fn a_latest_release_not_newer_is_a_no_op() {
         for latest in ["v0.9.62", "v0.9.61"] {
             let mut r = fake(latest, "0.9.70");
-            let o = select(&mut r, CURRENT, None, false, true).unwrap();
+            let o = select(&mut r, CURRENT, None, false).unwrap();
             assert_eq!((o.source, o.step), (Source::Latest, Step::Current));
             assert!(!r.asked_controller && r.installed.is_empty());
         }
@@ -859,7 +940,7 @@ mod tests {
     #[test]
     fn check_reports_the_latest_release_without_downloading_it() {
         let mut r = fake("v0.9.64", "0.9.62");
-        let o = select(&mut r, CURRENT, None, true, true).unwrap();
+        let o = select(&mut r, CURRENT, None, true).unwrap();
         assert_eq!(
             (o.to, o.source, o.step),
             ((0, 9, 64), Source::Latest, Step::Available)
@@ -872,15 +953,15 @@ mod tests {
     fn an_explicit_version_never_looks_up_the_latest_release() {
         let mut r = fake("v0.9.64", "0.9.64");
         r.latest = Err("not asked");
-        let o = select(&mut r, CURRENT, Some("v0.9.57"), false, true).unwrap();
+        let o = select(&mut r, CURRENT, Some("v0.9.57"), false).unwrap();
         assert_eq!(
             (o.to, o.source, o.step),
             ((0, 9, 57), Source::Version, Step::Upgraded)
         );
         assert_eq!(r.installed, [((0, 9, 57), false)]);
-        let o = select(&mut r, CURRENT, Some("0.9.62"), false, true).unwrap();
+        let o = select(&mut r, CURRENT, Some("0.9.62"), false).unwrap();
         assert_eq!(o.step, Step::Current);
-        assert!(select(&mut r, CURRENT, Some("garbage"), false, true).is_err());
+        assert!(select(&mut r, CURRENT, Some("garbage"), false).is_err());
         assert!(!r.asked_controller);
     }
 
