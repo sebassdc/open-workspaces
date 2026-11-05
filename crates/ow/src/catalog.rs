@@ -2557,31 +2557,54 @@ impl Catalog {
             return Ok("local".into());
         }
         let mut candidates = Vec::new();
+        // Why each runner was passed over, for the operator log when none is left.
+        let mut passed = Vec::new();
         for n in inventory.as_array().unwrap() {
             let id = n["id"].as_str().unwrap();
-            if requested.is_some_and(|r| r != id)
-                || (disk.is_some() && n["capabilities"]["disk_resize_v1"] != true)
-                || common::guest_shape(&n["capabilities"], memory, cpus).is_err()
-                || n["online"] != true
-                || n["capabilities"]["drain"] == true
-                || common::node_operation(&n["capabilities"], "create").is_err()
-                || !(n["capabilities"]["images"]
-                    .as_array()
-                    .is_some_and(|a| a.iter().any(|i| i == image))
-                    || (n["capabilities"]["image_store_v1"] == true
-                        && crate::image_catalog::resolve(&self.db, image).is_ok()))
-                || cpus > n["capabilities"]["vcpus"].as_u64().unwrap_or(0)
+            let skip = if requested.is_some_and(|r| r != id) {
+                Some("not the runner asked for")
+            } else if disk.is_some() && n["capabilities"]["disk_resize_v1"] != true {
+                Some("no disk sizing")
+            } else if common::guest_shape(&n["capabilities"], memory, cpus).is_err() {
+                Some("box shape too large")
+            } else if n["online"] != true {
+                Some("offline")
+            } else if n["capabilities"]["drain"] == true {
+                Some("draining")
+            } else if common::node_operation(&n["capabilities"], "create").is_err() {
+                Some("no create")
+            } else if !(n["capabilities"]["images"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|i| i == image))
+                || (n["capabilities"]["image_store_v1"] == true
+                    && crate::image_catalog::resolve(&self.db, image).is_ok()))
             {
+                Some("image missing")
+            } else if cpus > n["capabilities"]["vcpus"].as_u64().unwrap_or(0) {
+                Some("more vCPUs than the runner has")
+            } else {
+                None
+            };
+            if let Some(why) = skip {
+                passed.push(format!("{id}: {why}"));
                 continue;
             }
             let (used,count):(u32,u32)=self.db.query_row("SELECT COALESCE(SUM(reserved_mib),0),SUM(CASE WHEN reserved_mib>0 THEN 1 ELSE 0 END) FROM resources WHERE kind='machine' AND node=?1",[id],|r|Ok((r.get(0)?,r.get::<_,Option<u32>>(1)?.unwrap_or(0))))?;
             let (extra_mib, extra_cpus, extra_slots) = self.extra_usage(id)?;
             let used_cpus:u32=self.db.query_row("SELECT COALESCE(SUM(reserved_cpus),0) FROM resources WHERE kind='machine' AND node=?1",[id],|r|r.get(0))?;
-            if used as u64 + extra_mib + memory <= n["memory_mib"].as_u64().unwrap()
+            let fits = used as u64 + extra_mib + memory <= n["memory_mib"].as_u64().unwrap()
                 && count as u64 + extra_slots < n["slots"].as_u64().unwrap()
                 && used_cpus as u64 + extra_cpus + cpus
-                    <= n["capabilities"]["vcpus"].as_u64().unwrap_or(0)
-            {
+                    <= n["capabilities"]["vcpus"].as_u64().unwrap_or(0);
+            if !fits {
+                passed.push(format!(
+                    "{id}: full (MiB {used}+{extra_mib} of {}, boxes {count}+{extra_slots} of {}, vCPUs {used_cpus}+{extra_cpus} of {})",
+                    n["memory_mib"],
+                    n["slots"],
+                    n["capabilities"]["vcpus"]
+                ));
+            }
+            if fits {
                 let cap = n["capabilities"].clone();
                 let transfers: i64 = self.db.query_row(
                     "SELECT COALESCE(SUM(disk_bytes),0) FROM transfer_reservations WHERE node=?1",
@@ -2633,6 +2656,10 @@ impl Catalog {
                         && n["capabilities"]["drain"] != true
                 })
                 .collect();
+            eprintln!(
+                "placement: no runner for {memory} MiB, {cpus} vCPU, {image} in pool {pool}: {}",
+                passed.join("; ")
+            );
             ensure!(!online.is_empty(), "no online node available");
             let prepared: Vec<_> = online
                 .into_iter()
