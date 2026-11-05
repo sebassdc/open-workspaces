@@ -130,8 +130,8 @@ tools bundle): a worker release that changes that setup reaches it at its next
 cold boot or wake.
 
 Checks 2-3 are kept out of an upgrade's way before it starts (§5): the upgrader
-compares the Firecracker and guest kernel bytes of both releases (finding neither
-on the running release counts as a difference), and hands over only when the
+compares the Firecracker and guest kernel bytes of both releases (a running release
+missing its Firecracker binary or guest kernel counts as a difference), and hands over only when the
 running worker advertises `worker_handover_v1`, which it does only where
 `pidfd_getfd` works on a process outside its own tree, as a VMM the previous worker
 spawned is (Linux 5.6+; Yama `ptrace_scope` 1 and 2 allow it only with
