@@ -456,7 +456,18 @@ fn user_on(db: &mut Connection, identity: &Identity) -> Result<i64> {
         "invalid identity"
     );
     let email = identity.email.to_ascii_lowercase();
-    let tx = db.transaction()?;
+    // A known user is only read: no write lock for every request.
+    let known: Option<i64> = db
+        .query_row(
+            "SELECT id FROM users WHERE issuer=?1 AND subject=?2",
+            params![identity.issuer, identity.subject],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id) = known {
+        return Ok(id);
+    }
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let existing: Option<i64> = tx
         .query_row(
             "SELECT id FROM users WHERE issuer=?1 AND subject=?2",
@@ -810,7 +821,7 @@ impl Catalog {
                 machines.is_empty() || bootstrap.is_some(),
                 "existing machines require an explicit bootstrap_owner_email"
             );
-            let tx = catalog.db.transaction()?;
+            let tx = catalog.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if let Some(email) = bootstrap {
                 tx.execute(
                     "INSERT INTO users(issuer,email) VALUES(?1,?2)",
@@ -2023,7 +2034,9 @@ impl Catalog {
         // Its snapshots: captured ones name it as their workspace; a reservation whose capture
         // never completed is found through the snapshot operation that made it.
         const OF: &str = "kind='snapshot' AND (json_extract(metadata,'$.workspace')=?1 OR (json_extract(metadata,'$.state') IN ('pending','failed') AND physical IN (SELECT json_extract(request,'$.request.name') FROM operations WHERE op='snapshot' AND json_extract(request,'$.request.id')=?1)))";
-        let tx = self.db.transaction()?;
+        // Immediate: a deferred transaction that reads first fails at once (SQLITE_BUSY_SNAPSHOT)
+        // instead of waiting when another catalog connection writes in between.
+        let tx = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let grantees = tx
             .prepare("SELECT grantee FROM grants WHERE physical=?1")?
             .query_map([physical], |r| r.get::<_, i64>(0))?
@@ -2419,7 +2432,7 @@ impl Catalog {
             self.remove_snapshot_copy(&node, physical, &id)?;
         }
         let value = self.without_runner(user, "snapshot-delete", snapshot, physical, input, |c| {
-            let tx = c.db.transaction()?;
+            let tx = c.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND owner=?1 AND resource=?2",params![user,snapshot])?;
             tx.execute(
                 "DELETE FROM resources WHERE kind='snapshot' AND physical=?1",
@@ -3805,7 +3818,7 @@ impl Catalog {
         let (root, envelope) = match sent {
             Sent::Unprepared(diagnostic, error) => {
                 eprintln!("operation {operation} preparation: {error:#}");
-                let tx = self.db.transaction()?;
+                let tx = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 if tx.execute(
                     "UPDATE operations SET state='not_dispatched',response=?2 WHERE id=?1 AND state='pending'",
                     params![operation, json!({"error":diagnostic}).to_string()],
@@ -3973,7 +3986,7 @@ impl Catalog {
         } else if op == "snapshot-delete" {
             let snapshot = input["name"].as_str().unwrap();
             let id = request["name"].as_str().unwrap();
-            let tx = self.db.transaction()?;
+            let tx = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             // The name is free again: its capture operation stops claiming it.
             tx.execute("UPDATE operations SET resource='deleted:'||resource WHERE op='snapshot' AND owner=?1 AND resource=?2",params![user,snapshot])?;
             tx.execute(
