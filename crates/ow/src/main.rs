@@ -375,6 +375,10 @@ enum Action {
         /// (a service stop, which must not kill running machines).
         #[arg(long, requires = "hibernate")]
         wait: bool,
+        /// Leave the running machines to the next worker, which adopts them (an upgrade
+        /// that keeps the VMM and guest kernel; see ADR 0011).
+        #[arg(long, conflicts_with = "hibernate")]
+        detach: bool,
     },
     /// JSON selected server, identity, compatibility and placement discovery.
     Status,

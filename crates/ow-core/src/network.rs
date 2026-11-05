@@ -20,8 +20,18 @@ fn nft(text: &str) -> Result<()> {
     );
     Ok(())
 }
+/// Replaces the policy in one transaction: a worker that adopts running boxes (ADR 0011)
+/// finds the previous worker's table, and the forward chain must never be absent.
 pub fn initialize() -> Result<()> {
-    nft(&policy())
+    // An adopted namespace still forwards: hold that until `enable` restores the host
+    // addresses this replacement table drops, as in a fresh namespace.
+    if enabled() {
+        std::fs::write("/proc/sys/net/ipv4/ip_forward", "0")?;
+    }
+    nft(&format!(
+        "table inet ow {{}}\ndelete table inet ow\n{}",
+        policy()
+    ))
 }
 /// The worker namespace's whole policy. Guests reach the per-box AWS metadata endpoint
 /// (`crate::metadata`) at EC2's address: `prerouting` redirects it to the TAP's own host

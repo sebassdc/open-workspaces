@@ -887,6 +887,8 @@ mod tests {
         for op in [
             "shutdown",
             "quiesce",
+            "detach",
+            "hibernate-unresponsive",
             "recovery-prepare",
             "recovery-result",
             "recovery-seal",

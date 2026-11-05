@@ -11,7 +11,7 @@ is in [deploy/aws/README.md](../deploy/aws/README.md#upgrades-in-place).
 | --- | --- | --- | --- |
 | 0 config | nothing, or a file is rewritten | untouched | untouched |
 | 1 control plane | `open-workspaces.service` (controller and node agent) or `open-workspaces-dashboard.service` | untouched: processes, RAM, idle timers | dropped once; clients reconnect |
-| 2 runner | `open-workspaces-worker.service` | hibernated, worker swapped, resumed; processes continue when every capture still matches | dropped |
+| 2 runner | `open-workspaces-worker.service` | kept running and adopted by the new worker when the VMM and guest kernel stay ([hand-over](#worker-hand-over-keeps-boxes-running)); otherwise hibernated, worker swapped, resumed, and processes continue when every capture still matches | dropped |
 | 3 host | the instance | hibernated before, resumed after; a new host kernel boots RAM states cold | dropped |
 
 A release's class is the highest class of the units it moves on that host; a
@@ -156,8 +156,8 @@ worker files need `worker`, dashboard files `dashboard`, `nodes.rs`,
 ## `ow-host upgrade`
 
 ```text
-fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] → stop → [sync images]
-      → switch → start → verify → [resume] → [undrain] → done
+fetch → plan → stage → gate → [catalog copy] → [drain → hibernate | handover] → stop → [sync images]
+      → switch → start → verify → [adoption] → [resume] → [undrain] → done
 ```
 
 - **fetch**: `git fetch` the ref (default: the config's `release.ref`), read its
@@ -201,6 +201,8 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   reuses the chunks it shares with the box's last durable recovery point, so it
   rereads only what changed since. Ephemeral boxes (a CI job's, see
   [the CLI](AGENT_CLI.md)) are stopped instead of hibernated and are not resumed.
+  When the plan hands the worker over, this step is `handover` instead
+  ([below](#worker-hand-over-keeps-boxes-running)).
 - **start**: the new worker is quiesced as soon as it answers, before the agent
   and the dashboard start, so no wake on connection reaches it until verify passes
   (a large box's resume hashes its hibernation snapshot first and would hold the
@@ -492,6 +494,108 @@ stays hibernated until capacity frees. The node agent's heartbeats no longer wai
 on worker status, cache inventory or status-file writes. Protocol windows, worker
 interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are
 unchanged.
+
+## Worker hand-over keeps boxes running
+
+From 0.9.59 ([ADR 0011](adr/0011-worker-handover-keeps-vmms-running.md)) a
+worker restart that keeps Firecracker and the guest kernel does not hibernate
+anything: the old worker detaches from its VMMs (`ow down --detach`) and exits,
+the VMMs keep running in the unit's `guests` cgroup (`KillMode=process`), and
+the new worker enters their namespaces and adopts each one (PID and start time,
+Firecracker binary hash, guest kernel hash, then its console and log pipe
+through `pidfd_getfd`, its API and a guest command within 10 s). Guest
+processes, RAM and clock are untouched; only the worker swap is downtime.
+
+- **When**: `ow-host upgrade` plans `worker_path: handover` when no release the
+  worker crosses lists `vmm` or `guest-kernel`, both releases' `runtime.vmm`
+  and guest kernel hash are equal, the target's `runtime.handover.accepts`
+  covers the running release's `runtime.handover.speaks`, the worker's unit
+  files render unchanged and no worker config change is pending, the controller setting `upgrade.worker_handover` is
+  on (default; the node agent stores it in `runner/controller-settings.json`)
+  and `--hibernate` was not passed. `--plan` prints the path and why. Otherwise
+  the worker restarts through hibernation as before. `ow-host restart --worker`
+  hands over when the running worker advertises `worker_handover_v1`.
+- **Journal**: the `hibernate` step becomes `handover`; it records each running
+  box's VMM PID, and after verify a step `adoption` records per box `kept`
+  (adopted, same PID) or what happened instead. Recovering at `adoption`
+  finishes the upgrade. Aborting after `handover` began restarts the worker unit
+  (its stop hibernates what is still attached, its start adopts the rest). Idle
+  hibernation pauses while the worker is quiesced.
+- **Per box fallback**: a VMM that is gone leaves its box stopped with its disk
+  (as a worker crash did). One this worker cannot keep (another binary or guest
+  kernel, its fds not taken, or a box that is not stopped) is ended: the box
+  keeps its disk and loses its RAM state; the upgrader prevents the first two
+  by comparing the staged Firecracker and kernel bytes and requiring the running
+  worker's `worker_handover_v1` (only where `pidfd_getfd` works) before it hands
+  over. An adopted VMM whose API or guest does not answer stays running,
+  reported `unresponsive`; after verify the upgrader has the worker hibernate it
+  (with its placement authority, without a guest sync) and its resume step wakes
+  it. A box that was running and came back stopped boots again, cold. The
+  journal error names every box not kept running; none of these rolls the
+  upgrade back. An adopted box keeps its in-guest setup (network, tools) until
+  its next cold boot or wake. Ephemeral boxes are handed over and adopted like
+  the others, but the upgrader neither records nor resumes them (as on the
+  hibernate path, where they are stopped): one adopted `unresponsive` is
+  stopped, not hibernated, and one that came back stopped stays stopped.
+- **Abort and rollback**: before the switch, the old worker starts again and
+  adopts its own VMMs. After it, rollback stops the new worker, which
+  hibernates every box (the unit's `ExecStop`), and the old one wakes them.
+- **Network**: the nftables policy is replaced in one transaction and
+  forwarding stays off until the uplink is back. `slirp4netns` restarts with
+  the worker, so guest connections to the Internet open during the swap are
+  reset; new ones work as soon as the worker is up. SSH and terminal streams
+  reconnect, as on a class 1 restart. Published HTTP ports (`ow publish`)
+  stop with the old worker, as on any worker stop.
+- **First upgrade**: 0.9.59 itself installs through hibernation (the worker
+  it replaces cannot detach, and the worker unit gains `KillMode=process`). From
+  0.9.59 on, `ow-host restart --worker` and worker-only upgrades hand over.
+
+A worker that crashes no longer takes its VMMs with it: its supervisor exits with
+an error, systemd restarts the unit, and the new worker adopts them the same way.
+A reboot in the seconds between detach and the new worker's start loses those
+boxes' RAM state; the boot's journal recovery boots them again, cold. The host
+check below records timings.
+
+### Sandbox EC2 check: hand-over (2026-11-03)
+
+Observed on one throwaway m8i-flex.xlarge host in the sandbox account (Ubuntu
+24.04 AMI `ami-0d6dd9e8265d48906`, host kernel 7.0.0-1014-aws, systemd 255,
+4 vCPUs, 16 GiB, Btrfs data volume), destroyed afterwards. The host installed
+the hand-over branch, then built on 0.9.50 and numbered 0.9.51; 0.9.52 (worker
+only) and 0.9.53 (declaring `vmm`) were test releases built from it (version
+bumps and manifest entries). Those numbers name the test builds in the table,
+not the published releases of the same numbers. Two
+Alpine boxes ran throughout: `big` (4096 MiB, 2 GiB of it filled with random
+data in a tmpfs) and `small` (1024 MiB). Each ran a counter (`echo $i > /tmp/t`
+every second) and a heartbeat that appends the guest's `/proc/uptime` every
+0.1 s; the counter's PID, the VMM PID (`vmm.json`) and the largest heartbeat
+gap were read before and after each step. A probe on the host ran
+`ow exec big -- true` once a second. Each measurement is a single run (n = 1),
+so no p50/p95.
+
+| Step | Path | Result |
+| --- | --- | --- |
+| `ow-host restart --worker` on 0.9.51 | hand-over | both kept: same VMM PIDs, same counter PIDs, guest uptime continuous. Command 1.3 s end to end (journal: start 1.1 s); one `ow exec` probe failed (unreachable at most 1 s) |
+| `ow-host upgrade` 0.9.51 → 0.9.52 (worker only) | hand-over (`same VMM and guest kernel`) | both kept with the same VMM and counter PIDs; largest guest heartbeat gap 0.14 s (`big`) and 0.12 s (`small`): the guests never paused. 1 of 530 probes failed (at most 1 s). Journal: handover 0.0 s, start 1.1 s, verify 6.1 s; the command's 556 s were the release build on the host |
+| Forced adoption failure: `small`'s VMM stopped (`SIGSTOP`) across `ow-host restart --worker`, continued 25 s later | hand-over, then fallback | `big` adopted. `small`: its API timed out after 10 s, the new worker hibernated it, and the upgrade's resume step woke it on a new VMM with the same counter PID (RAM state kept). Journal start 52.9 s, resume 0.5 s; error names `small` |
+| `ow-host upgrade` 0.9.52 → 0.9.53 (declares `vmm`) | hibernate (`vmm change`) | both hibernated and woken on new VMMs with the same counter PIDs; journal hibernate 81.7 s, resume 19.6 s; the longest probe outage 81.9 s |
+
+So a worker-only change costs about a second of control-plane outage and no
+guest pause, against 80-100 s of hibernation and wake for 5 GiB of boxes here
+(the ADR cites about 31 minutes for a 16 GiB and a 4 GiB box on another host). Systemd logged both VMMs as "left-over process ... in
+control group while starting unit. Ignoring.", as expected with
+`KillMode=process`. The VMM held its console (`/dev/ptmx`) as fd 3 and its log
+pipe's read end as fd 4 throughout.
+
+In the forced-failure run the new worker hibernated the unresponsive box itself
+while starting (the 52.9 s start). After review that hibernation moved to the
+upgrader, after verify, so a large unresponsive box cannot hold the new worker's
+start past the upgrader's quiesce limit and turn into a rollback; that version
+was checked with the upgrader's state-machine tests, not on a host.
+
+Found and fixed during the run: the upgrader read the adoption report from a
+busy worker's last answer, which predated the adoption, and reported every box
+as not kept; it now waits for a fresh answer.
 
 ## Order for 0.9.48 and later
 

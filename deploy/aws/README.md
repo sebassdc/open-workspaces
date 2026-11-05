@@ -125,8 +125,11 @@ loopback only otherwise. It picks the address at start, so the service waits up
 to 60 s for Tailscale to connect first (after a reboot, for example). Workspace commands through the wrapper go to the local
 runner (`/srv/ow/.ow/runner`); `node add` needs SSH access from the `ow` user.
 Boxes idle for `idleMinutes` (30) hibernate and wake on the next connection; see
-[wake on connect](../../docs/DAILY_USE.md). Stopping the worker unit (a worker
-restart, a reboot, an instance stop or a host replacement) runs `ow down --hibernate --wait`:
+[wake on connect](../../docs/DAILY_USE.md). `ow-host restart --worker` and worker-only
+upgrades hand the running boxes to the new worker instead, which keeps them running
+([worker hand-over](../../docs/UPGRADES.md#worker-hand-over-keeps-boxes-running)).
+Stopping the worker unit otherwise (`restart --worker --hibernate`, a reboot, an instance
+stop or a host replacement) runs `ow down --hibernate --wait`:
 the worker refuses new starts and wakes, hibernates the running boxes, then
 stops, so their processes carry on when they next wake. If a box stays running
 (busy, or its capture failed), the stop retries every 5 s with starts still
@@ -414,8 +417,10 @@ forces the build), and moves only the units the release changed:
 
 - a control-plane release restarts `open-workspaces.service` and the dashboard;
   boxes keep running (open SSH and terminal streams reconnect);
-- a runner release drains the runner, hibernates its boxes, swaps the worker
-  and wakes them; their processes continue;
+- a runner release drains the runner and swaps the worker; when Firecracker and
+  the guest kernel stay, the new worker adopts the running boxes (they never
+  stop), otherwise it hibernates them, swaps the worker and wakes them; their
+  processes continue either way (`--hibernate` forces the second path);
 - a release that changes stage 0 is refused in place: hibernate the boxes
   (`ow-aws ci-preflight`), then `pulumi up` replaces the host.
 
