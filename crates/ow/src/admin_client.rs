@@ -227,6 +227,18 @@ fn call(transport: &Transport, method: &str, path: &str, body: Option<&Value>) -
     }
 }
 
+/// The controller these options reach is an HTTPS server, not this host's socket.
+pub(crate) fn https(
+    data_dir: Option<PathBuf>,
+    server: Option<String>,
+    local: bool,
+) -> Result<bool> {
+    Ok(matches!(
+        transport(data_dir, server, local)?,
+        Some(Transport::Https(_))
+    ))
+}
+
 /// The release the configured controller runs: `server` from its `GET /api/version`.
 pub(crate) fn server_version(
     data_dir: Option<PathBuf>,

@@ -190,7 +190,8 @@ print one JSON value on stdout, without an interactive prompt or progress banner
   and transfer captures cannot be deleted this way.
 
 - `upgrade [--version vX.Y.Z] [--check] [--json]`: replace this client with
-  the release the controller runs, verified before anything is replaced; see
+  the latest release that passes its own `status` against the controller (else
+  the controller's release), verified before anything is replaced; see
   [keeping the CLI current](INSTALL.md#keeping-the-cli-current).
 
 Host participation, enrollment, local image build, backup, `node` (singular),
