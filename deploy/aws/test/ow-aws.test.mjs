@@ -242,17 +242,17 @@ test("post_up returns after apply when ow-host finds nothing changed, else upgra
     assert.deepEqual(postUp("--max-class 1 --image team=abc"),
         { last: "nothing changed", log: ["ready --wait 3000", "apply", check] });
     assert.deepEqual(postUp("--max-class 1 --image team=abc", { unchanged: 1 }),
-        { last: "", log: ["ready --wait 3000", "apply", check, "upgrade --max-class 1"] });
+        { last: "", log: ["ready --wait 3000", "apply", check, "upgrade --max-class 1", "apply"] });
     // An ow-host without `unchanged` (an older release) exits 2: the full path.
-    assert.equal(postUp("--image team=abc", { unchanged: 2 }).log.at(-1), "upgrade");
+    assert.deepEqual(postUp("--image team=abc", { unchanged: 2 }).log.slice(-2), ["upgrade", "apply"]);
     // A runner's first pass: enrolment first, and never an upgrade without its controller's release.
     assert.deepEqual(postUp("--runner --image team=abc", { enrolled: 1 }),
         { last: "needs: enrol", log: ["ready --wait 3000", "enrolled"] });
     assert.deepEqual(postUp("--runner --image team=abc", { unchanged: 1 }),
         { last: "needs: upgrade", log: ["ready --wait 3000", "enrolled", "apply", check] });
     assert.equal(postUp("--runner --image team=abc").last, "nothing changed");
-    assert.equal(postUp("--controller-version 0.6.0 --image team=abc", { unchanged: 1 }).log.at(-1),
-        "upgrade --controller-version 0.6.0");
+    assert.deepEqual(postUp("--controller-version 0.6.0 --image team=abc", { unchanged: 1 }).log.slice(-2),
+        ["upgrade --controller-version 0.6.0", "apply"], "the upgraded ow-host applies settings the old one dropped");
 });
 
 test("ssh-config pins the host and box keys and checks them strictly", () => {

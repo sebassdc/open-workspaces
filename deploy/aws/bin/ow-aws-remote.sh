@@ -164,7 +164,8 @@ after_start() {
 # post_up WAIT [--runner] [UPGRADE_ARG..] [--image NAME=SHA256]..: after `pulumi up`, as
 # after_start, then config and release (hosts with ow-host): apply, then the upgrade unless
 # `ow-host unchanged` finds the release and each image (built from the recipe with that hash) in
-# place, which ends with the line `nothing changed`. --runner, a runner's first pass, ends early
+# place, which ends with the line `nothing changed`; after an upgrade, apply again with the new
+# release's ow-host. --runner, a runner's first pass, ends early
 # with `needs: enrol` (not enrolled and online) or `needs: upgrade` (ow-aws then asks its
 # controller for --controller-version and calls again without --runner).
 post_up() {
@@ -187,6 +188,9 @@ post_up() {
   if ow-host unchanged ${images[@]+"${images[@]}"}; then echo "nothing changed"; return 0; fi
   if [[ -n $runner ]]; then echo "needs: upgrade"; return 0; fi
   ow-host upgrade ${upgrade[@]+"${upgrade[@]}"}
+  # The first apply ran the old release's ow-host, which drops settings it does not know;
+  # the upgraded one stores the whole config.
+  ow-host apply
 }
 
 ow_host() {
