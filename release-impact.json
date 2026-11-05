@@ -42,7 +42,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "The dashboard now moves with every release that moves a unit on its host: it serves the admin API (the controller's settings) and /api/version, which clients upgrade to. Before, a release that changed only the controller or agent left the dashboard on its old release, so a new controller setting (0.9.60's upgrade.running_boxes) was refused as unknown and `ow upgrade` clients kept seeing the old version. This release declares a dashboard change so the upgrader already running moves the dashboard now. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 1: the dashboard restarts (seconds); boxes keep running."
+      "notes": "The dashboard now moves whenever the agent moves (whose restart already drops its streams): it serves the admin API (the controller's settings) and /api/version, which clients upgrade to. Before, a release that changed only the controller or agent left the dashboard on its old release, so a new controller setting (0.9.60's upgrade.running_boxes) was refused as unknown and `ow upgrade` clients kept seeing the old version. This release declares a dashboard change so the upgrader already running moves the dashboard now. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 1: the dashboard restarts (seconds); boxes keep running."
     },
     {
       "version": "0.9.61",

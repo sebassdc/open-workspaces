@@ -63,7 +63,7 @@ class Planner(unittest.TestCase):
         plan = u.plan(manifest(entry("0.5.1", ["component", "config"], 0)), AT, "0.5.1")
         self.assertEqual((plan["class"], plan["restart"]), (0, []))
         plan = u.plan(manifest(entry("0.5.1", ["worker"], 2)), AT, "0.5.1", captures=WARM, compat=COMPAT)
-        self.assertEqual((plan["class"], plan["restart"], plan["cold"]), (2, ["dashboard", "worker"], []))
+        self.assertEqual((plan["class"], plan["restart"], plan["cold"]), (2, ["worker"], []))
 
     def test_each_unit_counts_the_releases_it_has_not_run(self):
         # The worker already runs 0.5.1, so 0.5.1's worker change does not move it again.
@@ -71,12 +71,16 @@ class Planner(unittest.TestCase):
         plan = u.plan(m, {**AT, "worker": "0.5.1"}, "0.5.2")
         self.assertEqual(plan["move"], {"agent": "0.5.2", "dashboard": "0.5.2"})
 
-    def test_the_dashboard_moves_with_every_release_that_moves_a_unit(self):
-        # It serves the admin API (controller settings) and /api/version, which clients follow.
+    def test_the_dashboard_moves_with_the_agent(self):
+        # It serves the admin API (controller settings) and /api/version, which clients follow;
+        # the agent's restart already drops its streams, so it adds no disconnect.
         plan = u.plan(manifest(entry("0.5.1", ["controller"], 1)), {"agent": "0.5.0", "dashboard": "0.5.0"}, "0.5.1")
         self.assertEqual(plan["move"], {"agent": "0.5.1", "dashboard": "0.5.1"})
         plan = u.plan(manifest(entry("0.5.1", ["component"], 0)), AT, "0.5.1")
         self.assertEqual((plan["move"], plan["restart"]), ({}, []))
+        # A worker-only release keeps the dashboard's streams.
+        plan = u.plan(manifest(entry("0.5.1", ["worker"], 2)), AT, "0.5.1", captures=WARM, compat=COMPAT)
+        self.assertEqual(plan["move"], {"worker": "0.5.1"})
         plan = u.plan(manifest(entry("0.5.1", ["agent"], 1)), {"worker": "0.5.0", "agent": "0.5.0"}, "0.5.1")
         self.assertEqual(plan["move"], {"agent": "0.5.1"})
 
@@ -1410,7 +1414,7 @@ class Unchanged(unittest.TestCase):
         cases = {
             "release": lambda: h.set_pin("current", "0.5.0-aaaaaaaaaaaa"),
             # Current is the target, but the worker still runs a release whose change it has not taken.
-            "pins to move: dashboard, worker": lambda: h.set_pin("worker", "0.5.0-aaaaaaaaaaaa"),
+            "pins to move: worker": lambda: h.set_pin("worker", "0.5.0-aaaaaaaaaaaa"),
             "restarts pending": lambda: h.mark_pending({"agent"}, "config changed"),
             "interrupted upgrade": lambda: h.write_json(u.JOURNAL, {"step": "hibernate"}),
             "image team": lambda: self.images[1].update(recipe_sha256="b" * 64),
