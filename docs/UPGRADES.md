@@ -193,7 +193,14 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   `down --hibernate` captures; they are recorded in the journal before it acts.
   The capture gate runs a last time here, on every capture now present, so a
   box started after planning cannot lose its RAM state without `--accept-cold`;
-  a refusal aborts (quiesce lifted, drain removed).
+  a refusal aborts (quiesce lifted, drain removed). Each box has its own budget:
+  120 s, plus 20 s per GiB of RAM, plus 4 s per GiB of allocated disk. The first
+  box that fails or overruns it ends `down --hibernate` at once (the worker keeps
+  running, starts are allowed again) and the upgrade aborts; the upgrader's own
+  cap is the sum of the budgets plus 600 s. A hibernation is chunk-sealed and
+  reuses the chunks it shares with the box's last durable recovery point, so it
+  rereads only what changed since. Ephemeral boxes (a CI job's, see
+  [the CLI](AGENT_CLI.md)) are stopped instead of hibernated and are not resumed.
 - **start**: the new worker is quiesced as soon as it answers, before the agent
   and the dashboard start, so no wake on connection reaches it until verify passes
   (a large box's resume hashes its hibernation snapshot first and would hold the
@@ -214,6 +221,12 @@ fetch → plan → stage → gate → [catalog copy] → [drain → hibernate] �
   undrain. **rollback** (switch, start or verify): pins back, units restarted and
   verified on the old releases, then as abort. A box that does not resume stays
   hibernated (it wakes on its next connection) and is reported.
+- **events**: when the journal reaches done, aborted, rolled-back or failed, the
+  upgrader hands its timings to the host's telemetry intake: one
+  `ow.host.upgrade.step` event per step and one `ow.host.upgrade` event (see
+  [telemetry](TELEMETRY.md)). They land in the runner's event log (`ow health`,
+  the admin API's `health.get`) and are forwarded with the other events, so each
+  upgrade's history outlives `upgrade.json`, which keeps only the last journal.
 - **recover**: every upgrade and every boot (`open-workspaces-recover.service`)
   reads the journal first and aborts, rolls back or finishes. It first stops the
   recorded timers and any timer a reboot started again (adding those to the

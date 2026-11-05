@@ -264,7 +264,8 @@ stopped before it is deleted). The pool binds where it creates; `put`, `exec`,
 program an owner of its own. Everything else is refused before any worker
 contact: other operations, `OWNER@example.com/BOX` addresses (shares included),
 `owner` on create, another pool, the dashboard and `/api/state`. Owner limits
-apply to its creates as to the owner's own.
+apply to its creates as to the owner's own. Its boxes are ephemeral: never
+hibernated, and stopped instead when their worker restarts or upgrades.
 
 Issue, list and revoke them on the controller host:
 
