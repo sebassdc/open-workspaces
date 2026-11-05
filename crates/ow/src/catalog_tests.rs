@@ -5336,6 +5336,9 @@ fn a_runners_own_boxes_come_before_boxes_spilled_onto_it() {
     assert_eq!(refused.to_string(), "node capacity exhausted");
     let shared = Mutex::new(c);
     Catalog::operation_shared(&shared, a, json!({"op":"start","id":"mine"})).unwrap();
+    // Stopped first; deleted off the reply path, by the runner pools' next pass.
+    assert_eq!(state(&shared.lock().unwrap(), p, "j3").1, "stopped");
+    Catalog::delete_queued(&shared);
     let mut c = shared.into_inner().unwrap();
     assert_eq!(state(&c, a, "mine"), ("beta".into(), "running".into()));
     assert!(names(&c, p).iter().all(|n| n != "j3"));
@@ -5357,6 +5360,7 @@ fn a_runners_own_boxes_come_before_boxes_spilled_onto_it() {
         json!({"op":"create","id":"other","memory_mib":512,"vcpu_count":1}),
     )
     .unwrap();
+    Catalog::delete_queued(&shared);
     let c = shared.into_inner().unwrap();
     assert_eq!(state(&c, a, "other"), ("beta".into(), "running".into()));
     assert!(names(&c, p).iter().all(|n| n != "j4"));
