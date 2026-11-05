@@ -339,6 +339,20 @@ class Machine(unittest.TestCase):
                           "kernel_sha256": COMPAT["kernel_sha256"], **manifest})
         self.assertEqual([c["name"] for c in u.captures(COMPAT)], ["m-1/sleep-b"])
 
+    def test_an_ephemeral_box_never_meets_the_capture_gate(self):
+        h.write_json(f"{h.RUNNER}/state.json", {"workspaces": {
+            "m-job": {"id": "m-job", "state": "running", "ephemeral": True},
+            "m-dev": {"id": "m-dev", "state": "running"}}})
+        self.assertEqual([c["name"] for c in u.captures(COMPAT)], ["m-dev"])
+
+    def test_the_hibernate_cap_grows_with_each_running_box(self):
+        gib = 1 << 30
+        self.assertEqual(u.hibernate_budget([]), 600)
+        self.assertEqual(u.hibernate_budget([
+            {"state": "running", "memory_mib": 16384, "disk_allocated_bytes": 256 * gib},
+            {"state": "running", "memory_mib": 4096, "disk_allocated_bytes": None},
+            {"state": "hibernated", "memory_mib": 65536}]), 600 + (120 + 320 + 1024) + (120 + 80))
+
     def test_a_box_started_after_the_last_plan_still_meets_the_capture_gate(self):
         # Planned with no box at all, for a release with another guest kernel.
         m = manifest(entry("0.5.1", ["guest-kernel"], 2, kernel="f" * 64))

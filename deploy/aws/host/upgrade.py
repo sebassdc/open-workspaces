@@ -412,7 +412,7 @@ def captures(compat):
         found.append({"name": f"{m.get('workspace')}/{m.get('name')}", "runtime": m.get("runtime"),
                       "cpu": m.get("cpu"), "kernel_sha256": m.get("kernel_sha256")})
     for box in (h.read_json(f"{h.RUNNER}/state.json") or {}).get("workspaces", {}).values():
-        if box.get("state") == "running":
+        if box.get("state") == "running" and not box.get("ephemeral"):  # ephemeral: stopped, never captured
             found.append({"name": box["id"], **(compat or {})})
     return found
 
@@ -423,6 +423,16 @@ def host_cpu():
     model = next(line for line in info if line.startswith("model name"))
     flags = next(line for line in info if line.startswith("flags"))
     return f"{model}\n{flags}\nhost-kernel:{p('/proc/sys/kernel/osrelease').read_text().strip()}"
+
+
+def hibernate_budget(boxes):
+    """Seconds `ow down --hibernate` may take: each running box's own budget (RAM written,
+    disk sealed; the same formula as the worker's), plus room for its other requests.
+    A fixed cap of 1800 s cut off boxes of 16 GiB on large disks."""
+    def gib(n):
+        return -(-int(n or 0) // (1 << 30))
+    return 600 + sum(120 + 20 * gib((b.get("memory_mib") or 0) << 20) + 4 * gib(b.get("disk_allocated_bytes"))
+                     for b in boxes if b.get("state") == "running")
 
 
 class HostOps:
@@ -472,15 +482,17 @@ class HostOps:
             return None
 
     def boxes(self):
+        """Box -> state; ephemeral boxes (a CI job's) are left out: never hibernated or resumed."""
         if h.role() == "controller":
             return {}
-        return {b["id"]: b["state"] for b in h.ow("list", timeout=1200)}
+        return {b["id"]: b["state"] for b in h.ow("list", timeout=1200) if not b.get("ephemeral")}
 
     def hibernate_all(self, release):
         # The old worker's own binary: it quiesces, hibernates each box and only then
         # shuts the worker down; on a failure it calls the shutdown off (boxes keep running).
+        # It gives up on its own at the first box over budget; this cap is only a backstop.
         h.run([str(p(f"{h.SRV}/releases/{release}/bin/ow")), "--data-dir", h.RUNNER, "down", "--hibernate"],
-              user="ow", capture=False, timeout=1800,
+              user="ow", capture=False, timeout=hibernate_budget(h.ow("list", timeout=1200)),
               env={"HOME": "/srv/ow", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
                    "OW_ASSET_DIR": f"{h.SRV}/run/worker/assets"})
         h.systemctl("stop", h.UNITS["worker"])  # its stop hook finds no worker: a no-op
