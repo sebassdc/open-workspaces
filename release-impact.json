@@ -2,6 +2,49 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.68",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Catalog transactions that read before they write now start immediate. A deferred one failed at once with 'database is locked' (SQLite BUSY_SNAPSHOT, which the busy timeout never retries) when another catalog connection wrote in between; with box operations running side by side this hit some deletes in a burst (the runner deleted the box, the catalog row stayed, marked missing). Protocol, worker interface 3, catalog schema 7, runtime and host layout 2 are unchanged. Class 1: the controller and dashboard restart (seconds); boxes keep running."
+    },
+    {
       "version": "0.9.67",
       "class": 1,
       "changes": [
