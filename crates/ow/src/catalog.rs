@@ -456,6 +456,17 @@ fn user_on(db: &mut Connection, identity: &Identity) -> Result<i64> {
         "invalid identity"
     );
     let email = identity.email.to_ascii_lowercase();
+    // A known user is only read: no write lock for every request.
+    let known: Option<i64> = db
+        .query_row(
+            "SELECT id FROM users WHERE issuer=?1 AND subject=?2",
+            params![identity.issuer, identity.subject],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id) = known {
+        return Ok(id);
+    }
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let existing: Option<i64> = tx
         .query_row(
