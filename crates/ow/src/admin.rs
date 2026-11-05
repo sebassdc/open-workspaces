@@ -66,6 +66,7 @@ pub(crate) const OPS: &[OpSpec] = &[
         &[&["host", "revoke"], &["node-revoke"]],
         true,
     ),
+    op("placement.status", &[&["placement", "status"]], false),
 ];
 
 pub(crate) fn spec(name: &str) -> Option<&'static OpSpec> {
@@ -129,6 +130,8 @@ pub(crate) enum AdminRequest {
     },
     #[serde(rename = "host.revoke")]
     HostRevoke { node: String },
+    #[serde(rename = "placement.status")]
+    PlacementStatus { pool: Option<String> },
 }
 
 /// Who made a request, as the gateway or the socket verified it.
@@ -475,6 +478,9 @@ fn value_text(key: &str, value: &Value) -> std::result::Result<String, Failure> 
             .to_owned()),
         Value::String(text) => Ok(text.clone()),
         Value::Bool(b) if default.is_boolean() => Ok(b.to_string()),
+        Value::Array(_) if default.is_array() => {
+            crate::spill::from_json(value).map_err(|e| invalid_value(key, e))
+        }
         Value::Number(n) if default.is_u64() && n.is_u64() => Ok(n.to_string()),
         _ => Err(invalid_value(
             key,
@@ -483,6 +489,7 @@ fn value_text(key: &str, value: &Value) -> std::result::Result<String, Failure> 
                 match default {
                     Value::Bool(_) => "true or false",
                     Value::Number(_) => "a whole number",
+                    Value::Array(_) => "a list of rules or their pool:node:max_boxes string",
                     _ => "a string",
                 }
             ),
@@ -514,6 +521,12 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             expected_version,
         } => {
             known_key(&key)?;
+            // Read before the transaction: it opens its own connection.
+            let inventory = if key.starts_with("placement.") {
+                crate::nodes::inventory(root)?
+            } else {
+                json!([])
+            };
             let mut db = crate::nodes::db(root)?;
             let tx = immediate(&mut db)?;
             let current = crate::telemetry::settings(&tx)?;
@@ -537,6 +550,8 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 crate::dashboard_ui::selectable(root, &text)
                     .map_err(|e| invalid_value(&key, format!("{e:#}")))?;
             }
+            let warnings = crate::spill::check(&tx, &inventory, &key, &typed, &current)
+                .map_err(|reason| invalid_value(&key, reason))?;
             let previous = current[key.as_str()].clone();
             let change = json!({"key":key,"value":typed,"previous":previous});
             if previous == typed {
@@ -552,7 +567,7 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 tx.commit()?;
                 return Ok(
                     json!({"key":key,"value":typed,"previous":previous,"changed":false,"version":version,
-                    "effective":effective(&key),"warnings":[],"audit_id":audit_id}),
+                    "effective":effective(&key),"warnings":warnings,"audit_id":audit_id}),
                 );
             }
             let version = crate::telemetry::store_setting(&tx, &key, &typed, &ctx.actor.label())?;
@@ -573,7 +588,7 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             );
             Ok(
                 json!({"key":key,"value":typed,"previous":previous,"changed":true,"version":version,
-                "effective":effective(&key),"warnings":[],"audit_id":audit_id}),
+                "effective":effective(&key),"warnings":warnings,"audit_id":audit_id}),
             )
         }
         AdminRequest::ConfigHistory { key, limit } => {
@@ -867,6 +882,13 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             })?;
             changed("host.budget", &ctx.actor, json!({"node":node}));
             Ok(result)
+        }
+        AdminRequest::PlacementStatus { pool } => {
+            if let Some(pool) = &pool {
+                crate::common::identifier(pool)
+                    .map_err(|e| invalid_request(format!("pool: {e}")))?;
+            }
+            Ok(crate::spill::status(root, pool.as_deref())?)
         }
         AdminRequest::HostRevoke { node } => {
             crate::common::identifier(&node).map_err(|e| invalid_value("node", e))?;

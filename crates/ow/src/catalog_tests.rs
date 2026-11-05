@@ -5047,3 +5047,98 @@ fn transfers_onto_a_pool_runner_need_a_pool_admin() {
     c.pool_admins = vec!["owner@example.test".into()];
     c.begin_transfer(user, "to-pool", &intent).unwrap();
 }
+
+#[test]
+fn spill_borrows_a_listed_runner_only_while_the_pool_is_full() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    fake.worker("beta");
+    quota_node(&fake);
+    // alpha, the pool's own runner, holds two 256 MiB boxes.
+    nodes::db(&fake.root)
+        .unwrap()
+        .execute("UPDATE nodes SET memory_mib=512,capabilities=json_set(capabilities,'$.memory_mib',512) WHERE id='alpha'", [])
+        .unwrap();
+    nodes::set_pool(&fake.root, "alpha", "jobs").unwrap();
+    c.pool_admins = vec!["admin@example.test".into()];
+    let p = c.user(&identity("admin")).unwrap();
+    let a = c.user(&identity("alice")).unwrap();
+    let node = |c: &Catalog, owner: i64, name: &str| -> String {
+        c.db.query_row(
+            "SELECT node FROM resources WHERE owner=?1 AND kind='machine' AND name=?2",
+            params![owner, name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let job =
+        |id: &str| json!({"op":"create","id":id,"memory_mib":256,"vcpu_count":1,"pool":"jobs"});
+    let count = |c: &Catalog| -> i64 {
+        c.db.query_row(
+            "SELECT COUNT(*) FROM box_pools WHERE pool='jobs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    c.operation(p, job("j0")).unwrap();
+    c.operation(p, job("j1")).unwrap();
+    assert_eq!(
+        (node(&c, p, "j0"), node(&c, p, "j1")),
+        ("alpha".into(), "alpha".into())
+    );
+    // Spill off (the default): a full pool refuses.
+    assert!(c.operation(p, job("j2")).is_err());
+    crate::telemetry::set(&fake.root, "placement.spill", "jobs:beta:2", "t").unwrap();
+    crate::telemetry::set(&fake.root, "placement.spill_keep_free_mib", "0", "t").unwrap();
+    c.operation(p, job("j2")).unwrap();
+    assert_eq!(node(&c, p, "j2"), "beta");
+    assert_eq!(count(&c), 3);
+    // The cap counts a pending create: j3's answer is lost, so it stays pending on beta.
+    let mut j3 = job("j3");
+    j3["operation_key"] = json!("j3-key");
+    fake.uncertain.store(true, Ordering::SeqCst);
+    *fake.reject.lock().unwrap() = Some("create".into());
+    assert!(c.operation(p, j3.clone()).is_err());
+    *fake.reject.lock().unwrap() = None;
+    fake.uncertain.store(false, Ordering::SeqCst);
+    assert_eq!(node(&c, p, "j3"), "beta");
+    assert!(c.operation(p, job("j4")).is_err());
+    // Spill off: the retried create keeps the runner it spilled to; nothing running stops.
+    crate::telemetry::set(&fake.root, "placement.spill", "", "t").unwrap();
+    c.operation(p, j3).unwrap();
+    assert_eq!(node(&c, p, "j3"), "beta");
+    assert!(c.operation(p, job("j4")).is_err());
+    // An ordinary create on beta is not a jobs box and is not counted.
+    c.operation(
+        a,
+        json!({"op":"create","id":"mine","memory_mib":256,"vcpu_count":1}),
+    )
+    .unwrap();
+    assert_eq!(node(&c, a, "mine"), "beta");
+    assert_eq!(count(&c), 4);
+    // The reserve: beta (4096 MiB, 768 held by j2, j3 and mine) must keep it after one more box.
+    crate::telemetry::set(&fake.root, "placement.spill", "jobs:beta:3", "t").unwrap();
+    crate::telemetry::set(&fake.root, "placement.spill_keep_free_mib", "3073", "t").unwrap();
+    assert!(c.operation(p, job("j4")).is_err());
+    crate::telemetry::set(&fake.root, "placement.spill_keep_free_mib", "3072", "t").unwrap();
+    // No live home runner: the pool is off, so nothing spills.
+    nodes::set_pool(&fake.root, "alpha", "jobs-off").unwrap();
+    assert!(c.operation(p, job("j4")).is_err());
+    nodes::set_pool(&fake.root, "alpha", "jobs").unwrap();
+    c.operation(p, job("j4")).unwrap();
+    assert_eq!(node(&c, p, "j4"), "beta");
+    // placement.status sees the same.
+    let status = crate::spill::status(&fake.root, Some("jobs")).unwrap();
+    let spill = &status["pools"][0]["spill"][0];
+    assert_eq!(
+        (spill["boxes"].clone(), spill["state"].clone()),
+        (json!(3), json!("full"))
+    );
+    assert_eq!(status["pools"][0]["home_nodes"][0]["boxes"], 2);
+    // Deleting a spilled box drops its row.
+    c.operation(p, json!({"op":"stop","id":"j2"})).unwrap();
+    c.operation(p, json!({"op":"delete","id":"j2"})).unwrap();
+    assert_eq!(count(&c), 4);
+}

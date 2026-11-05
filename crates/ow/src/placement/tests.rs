@@ -115,3 +115,108 @@ fn placement_stale_or_future_cache_hints_are_cold_and_cold_capable_node_can_pull
     z.capabilities["image_store_v1"] = json!(true);
     assert!(choose(&[z], &d).is_some());
 }
+
+fn rule(node: &str, max_boxes: u64) -> crate::spill::Rule {
+    crate::spill::Rule {
+        pool: "ci".into(),
+        node: node.into(),
+        max_boxes,
+    }
+}
+
+#[test]
+fn spill_only_when_the_home_pool_is_full_and_alive_within_cap_and_reserve() {
+    let ci = Demand {
+        pool: "ci",
+        ..demand()
+    };
+    let mut home = node("n1");
+    home.pool = "ci".into();
+    let mut lender = node("n2");
+    lender.free = Capacity {
+        memory_mib: 32768,
+        cpus: 8,
+        slots: 6,
+        disk_bytes: 64 * crate::common::GIB,
+    };
+    let none = |_: &str| 0;
+    // Home has room: the first pass takes it even though the lender has more room.
+    assert_eq!(
+        choose(&[home.clone(), lender.clone()], &ci).unwrap().id,
+        "n1"
+    );
+    // Home full: the first pass finds nothing and the rule lends n2.
+    let mut full = home.clone();
+    full.free.slots = 0;
+    let nodes = [full.clone(), lender.clone()];
+    assert!(choose(&nodes, &ci).is_none());
+    assert_eq!(
+        spill(&nodes, &ci, &[rule("n2", 2)], 16384, true, none)
+            .unwrap()
+            .id,
+        "n2"
+    );
+    // No live home (empty, off, offline or draining pool): nothing spills.
+    assert!(spill(&nodes, &ci, &[rule("n2", 2)], 16384, false, none).is_none());
+    // Cap reached, counting pending creates; zero means off.
+    assert!(
+        spill(&nodes, &ci, &[rule("n2", 2)], 16384, true, |n| u64::from(
+            n == "n2"
+        ) * 2)
+        .is_none()
+    );
+    assert!(spill(&nodes, &ci, &[rule("n2", 0)], 16384, true, none).is_none());
+    // The reserve: memory left after the box, and a slot.
+    assert!(spill(&nodes, &ci, &[rule("n2", 2)], 32768 - 1023, true, none).is_none());
+    assert!(spill(&nodes, &ci, &[rule("n2", 2)], 32768 - 1024, true, none).is_some());
+    let mut one_slot = lender.clone();
+    one_slot.free.slots = 1;
+    assert!(
+        spill(
+            &[full.clone(), one_slot],
+            &ci,
+            &[rule("n2", 2)],
+            0,
+            true,
+            none
+        )
+        .is_none()
+    );
+    // The usual checks still apply to the lender.
+    for broken in 0..4 {
+        let mut n = lender.clone();
+        match broken {
+            0 => n.online = false,
+            1 => n.capabilities["drain"] = json!(true),
+            2 => n.capabilities["images"] = json!([]),
+            _ => n.active = false,
+        }
+        assert!(
+            spill(&[full.clone(), n], &ci, &[rule("n2", 2)], 0, true, none).is_none(),
+            "{broken}"
+        );
+    }
+    // Rules are tried in order; a rule for another pool or a runner of the pool itself lends nothing.
+    let mut n3 = lender.clone();
+    n3.id = "n3".into();
+    let nodes = [full.clone(), lender.clone(), n3];
+    assert_eq!(
+        spill(&nodes, &ci, &[rule("n3", 1), rule("n2", 1)], 0, true, none)
+            .unwrap()
+            .id,
+        "n3"
+    );
+    let other = crate::spill::Rule {
+        pool: "jobs".into(),
+        ..rule("n2", 2)
+    };
+    assert!(spill(&nodes, &ci, &[other], 0, true, none).is_none());
+    assert!(spill(&nodes, &ci, &[rule("n1", 2)], 0, true, none).is_none());
+    // Default-pool creates never take the spill path, nor do creates that name a runner.
+    assert!(spill(&nodes, &demand(), &[rule("n2", 2)], 0, true, none).is_none());
+    let named = Demand {
+        requested: Some("n2"),
+        ..ci
+    };
+    assert!(spill(&nodes, &named, &[rule("n2", 2)], 0, true, none).is_none());
+}

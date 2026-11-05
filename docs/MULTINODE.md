@@ -42,6 +42,46 @@ cannot enroll/revoke nodes. Node administration is local OS-operator CLI only.
 This is an explicit shared-pool policy, not per-user private-node RBAC. Node
 credentials do not identify a human owner and cannot enter human routes.
 
+### Spill
+
+A pool whose own runners are full may borrow room on a named runner of another
+pool, up to a number of boxes, while that runner keeps a fixed amount of memory
+for its own pool. Both are controller settings ([admin API](ADMIN_API.md)),
+read on every create; off by default.
+
+```sh
+ow config set placement.spill "jobs:runner-2:2"      # pool : runner : max boxes (comma-separated rules)
+ow config set placement.spill_keep_free_mib 32768    # memory every spill runner keeps for its own pool
+ow placement status --pool jobs                      # rules, and how full each runner is
+ow config set placement.spill ""                     # off; boxes already placed keep running
+```
+
+- The first pass is unchanged: a create for `jobs` lands on a `jobs` runner
+  whenever one fits, even when the borrowed runner has more room.
+- Only when none fits, and at least one `jobs` runner is online, active and not
+  draining, the rules for `jobs` are tried in order. Taking a pool's runners out
+  of it (or draining them) therefore stops its spill too: spill means full, not
+  gone.
+- A borrowed runner takes the box only if it holds fewer than `max_boxes` of the
+  pool's boxes (pending creates count), still has `placement.spill_keep_free_mib`
+  of memory budget and a free slot after it, and passes every usual check
+  (online, not draining, image, shape, CPU, disk). Its own pool's boxes are never
+  stopped, moved or resized; the reserve is shared headroom, not a promise per
+  box.
+- The create still asks for `jobs`, so its token's scope, grant and the owner's
+  limits apply as before. A retried create keeps the runner its first attempt
+  spilled to, even after spill is turned off; lowering a cap stops nothing.
+- Each non-`default` create records its pool (`box_pools`), removed with the box.
+  The controller logs `placement_spilled` on the borrowed runner and
+  `placement_spill_full` when the pool and its spill runners are all full.
+- A rule names an enrolled runner of another pool. `config.set` warns when the
+  reserve is above that runner's memory budget, or when it lacks an image every
+  runner of the pool has; `ow placement status` shows each rule's `state`
+  (`available`, `full`, `reserve`, `off`, `no_home`, `inert_offline`,
+  `inert_draining`, `inert_revoked`, `inert_image_missing`).
+- The scaler of `jobs` counts only `jobs` runners, so borrowed room never looks
+  like `jobs` capacity; the borrowed runner's own pool sees spilled boxes as load.
+
 ## Operator commands (prepare; planner owns deployment)
 
 Build with the installed toolchain; use a new private data root on a

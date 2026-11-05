@@ -505,6 +505,10 @@ impl Catalog {
 
         // Additive guards are enforced by SQLite even for prior schema-5 writers.
         crate::cache_catalog::initialize(&db)?;
+        // Additive: the pool each non-default create asked for (spill counts and retries).
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS box_pools(physical TEXT PRIMARY KEY,pool TEXT NOT NULL);",
+        )?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS node_usage(node TEXT PRIMARY KEY,extra_mib INTEGER NOT NULL DEFAULT 0,extra_cpus INTEGER NOT NULL DEFAULT 0,extra_slots INTEGER NOT NULL DEFAULT 0);")?;
         crate::drain::initialize(&db)?;
         crate::store_gc::initialize(&db)?;
@@ -1736,6 +1740,7 @@ impl Catalog {
         )?;
         tx.execute("DELETE FROM grants WHERE physical=?1", [physical])?;
         tx.execute("DELETE FROM aws_roles WHERE physical=?1", [physical])?;
+        tx.execute("DELETE FROM box_pools WHERE physical=?1", [physical])?;
         tx.execute(
             "DELETE FROM owner_allocations WHERE physical=?1",
             [physical],
@@ -2451,9 +2456,56 @@ impl Catalog {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs(),
         };
-        crate::placement::choose(&candidates, &demand)
-            .map(|n| n.id.clone())
-            .context("node capacity exhausted")
+        if let Some(n) = crate::placement::choose(&candidates, &demand) {
+            return Ok(n.id.clone());
+        }
+        // Spill (docs/MULTINODE.md#spill): the pool's runners are full; borrow a listed one.
+        let settings = crate::telemetry::settings(&self.db)?;
+        let rules: Vec<crate::spill::Rule> =
+            serde_json::from_value(settings[crate::spill::RULES].clone()).unwrap_or_default();
+        if requested.is_none() && rules.iter().any(|r| r.pool == pool) {
+            let live = crate::spill::home_live(&inventory, pool);
+            let keep_free = settings[crate::spill::KEEP_FREE].as_u64().unwrap_or(0);
+            let boxes = |node: &str| {
+                self.db
+                    .query_row(
+                        "SELECT COUNT(*) FROM box_pools b JOIN resources r ON r.kind='machine' AND r.physical=b.physical WHERE r.node=?1 AND b.pool=?2",
+                        [node, pool],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map_or(u64::MAX, |n| n as u64)
+            };
+            if let Some(n) =
+                crate::placement::spill(&candidates, &demand, &rules, keep_free, live, boxes)
+            {
+                crate::telemetry::record_event(
+                    &self.db,
+                    &n.id,
+                    "INFO",
+                    "placement_spilled",
+                    &json!({"pool":pool}),
+                )?;
+                return Ok(n.id.clone());
+            }
+            if live {
+                eprintln!("placement_spill_full pool={pool}");
+                crate::telemetry::controller_log(
+                    None,
+                    "WARN",
+                    "placement_spill_full",
+                    &json!({"pool":pool}),
+                );
+            }
+        }
+        anyhow::bail!("node capacity exhausted")
+    }
+    /// A create that spilled onto a runner of another pool remembers its own pool.
+    fn spilled(&self, physical: &str, pool: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM box_pools WHERE physical=?1 AND pool=?2)",
+            [physical, pool],
+            |r| r.get(0),
+        )?)
     }
     fn capacity(
         &self,
@@ -2987,11 +3039,22 @@ impl Catalog {
                         "UPDATE resources SET node=?1 WHERE kind='machine' AND physical=?2",
                         params![node, physical],
                     )?;
+                    // The box's pool: what spill counts, and what a retry may keep.
+                    if pool != "default" {
+                        self.db.execute(
+                            "INSERT INTO box_pools(physical,pool) VALUES(?1,?2) ON CONFLICT(physical) DO UPDATE SET pool=excluded.pool",
+                            params![physical, pool],
+                        )?;
+                    }
                     self.save("machine",&physical,&json!({"state":"pending","image":request["image"].as_str().unwrap_or("alpine"),"memory_mib":request["memory_mib"].as_u64().unwrap_or(256),"vcpu_count":request["vcpu_count"].as_u64().unwrap_or(1)}))?;
                 }
             }
-            // A retried create keeps its first runner only when that runner is in the pool asked for.
-            if op == "create" && self.node_pool(&node)? != pool {
+            // A retried create keeps its first runner only when that runner is in the pool asked
+            // for, or is where that pool's create spilled.
+            if op == "create"
+                && self.node_pool(&node)? != pool
+                && !self.spilled(&physical, &pool)?
+            {
                 return Err(limits::Rejection(format!(
                     "machine '{name}' is already being created in another pool; delete it or ask for that pool"
                 ))
