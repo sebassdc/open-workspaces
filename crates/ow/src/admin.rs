@@ -854,7 +854,10 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             .map_err(|e| {
                 if e.is::<crate::limits::Rejection>()
                     || e.is::<Failure>()
-                    || matches!(e.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(..)))
+                    || matches!(
+                        e.downcast_ref::<rusqlite::Error>(),
+                        Some(rusqlite::Error::SqliteFailure(..))
+                    )
                 {
                     Failure::from(e)
                 } else {
@@ -947,8 +950,8 @@ fn peer_allowed(uid: u32) -> bool {
     uid == 0 || uid == unsafe { libc::geteuid() }
 }
 
-/// Serves `GET /api/version` and `POST /api/admin` on `<root>/admin.sock` (mode 0600). The
-/// caller holds the controller's single-instance lock, so a leftover socket is stale.
+/// Serves `GET /api/version` and `POST /api/admin` on `<root>/admin.sock` (mode 0600) once it
+/// holds `admin.lock`; a socket left by an earlier holder is then stale.
 pub(crate) async fn serve_socket(root: PathBuf, fallback_controller: Option<String>) -> Result<()> {
     use axum::{
         Router,
@@ -974,7 +977,6 @@ pub(crate) async fn serve_socket(root: PathBuf, fallback_controller: Option<Stri
     let _ = std::fs::remove_file(&path);
     let listener = tokio::net::UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    let controller = saved_controller(&root).or(fallback_controller);
     let reply = |status: u16, body: Value| {
         (
             StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -1043,7 +1045,8 @@ pub(crate) async fn serve_socket(root: PathBuf, fallback_controller: Option<Stri
                                 uid: peer.uid,
                                 claimed_user,
                             },
-                            controller,
+                            // Read per request: `ow host up` may save it after this started.
+                            controller: saved_controller(&root).or(controller),
                         };
                         handle(&ctx, &body)
                     })
@@ -1059,7 +1062,7 @@ pub(crate) async fn serve_socket(root: PathBuf, fallback_controller: Option<Stri
                 },
             ),
         )
-        .with_state((root, controller));
+        .with_state((root, fallback_controller));
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<Peer>(),

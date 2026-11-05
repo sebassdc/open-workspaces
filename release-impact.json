@@ -2,6 +2,47 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.54",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard",
+        "component",
+        "host-layout"
+      ],
+      "waivers": {
+        "worker": "host.rs only stops dispatching the admin commands, which the CLI now sends to the admin API; the worker's own code is unchanged"
+      },
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Admin API: every operator operation (settings, fleet health, node pools, workload tokens, host invitations) is one audited op on POST /api/admin. The gateway serves it to the designated pool owner over HTTPS; the node controller (or, without one, the dashboard) serves the same op handlers on admin.sock in the controller data directory to root and the controller user. ow config, health, node-pool, token and host invite|budget|revoke are thin wrappers and need that controller running; ow config list and get print the new result objects (settings nested under settings, version beside them). New: ow config history, config set --expect-version. Additive tables admin_audit and admin_operations; catalog schema unchanged. The AWS component's dashboardOwner binds a tailnet login as the gateway's owner once they have signed in. Class 1: the controller and dashboard restart; workers and boxes keep running."
+    },
+    {
       "version": "0.9.53",
       "class": 0,
       "changes": [

@@ -4,7 +4,7 @@ Every operator operation is an HTTP API call on the controller. The `ow` admin
 commands (`ow config`, `ow health`, `ow node-pool`, `ow token`, `ow host
 invite|budget|revoke`) are a thin wrapper over it: each builds one request, sends
 it, and prints the result. No CLI code reads or writes the controller database,
-on the controller host either. Shipped in v0.9.53.
+on the controller host either. Shipped in v0.9.54.
 
 ```mermaid
 flowchart LR
@@ -109,7 +109,7 @@ failure: time, op, actor, `via` (`https` or `local`), the request, the result
 `config.set`, and for `config.set` and `node.pool.set` the value and the previous
 one. A change and its row commit in one transaction. Reads write nothing.
 `ow config history` and the idempotent `token.revoke` read this table, so they
-know only changes made through the API (from v0.9.53): a token revoked before
+know only changes made through the API (from v0.9.54): a token revoked before
 then is `not_found`. The
 actor is the verified identity: `{"kind":"access"|"tailnet","subject","email"}`
 or `{"kind":"host","uid","claimed_user"}`. Tokens and invitation secrets are
