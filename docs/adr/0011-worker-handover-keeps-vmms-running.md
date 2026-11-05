@@ -102,8 +102,8 @@ No VMM is left running that no worker manages, except where noted below. Per box
 - the box is not `stopped` (hibernated, exporting or moved: the worker died after
   the capture and before dropping the VMM): the VMM is ended the same way, so no
   second copy of the box runs;
-- check 3 (a security module may refuse `pidfd_getfd` where the start-up probe on
-  the worker's own process succeeded) or checks 4-5 (or re-attaching its
+- check 3 (a security module may refuse `pidfd_getfd` on the VMM where the
+  start-up probe succeeded) or checks 4-5 (or re-attaching its
   network) fail on an adopted VMM: it stays adopted and running, reported
   `unresponsive`; without its console only its API reaches it, which suffices to
   hibernate it. The worker does not hibernate it
@@ -121,17 +121,21 @@ is lost, its disk and its uptime as a box are not.
 
 Not covered: an unreadable record, a `pidfd_open` failing for lack of fds or
 memory, or a kill that fails leave that VMM running with its record and TAP (the
-box cannot start a second VMM on its disk, and the next worker tries again); a
+box's start refuses while its recorded VMM still runs, so no second VMM opens its
+disk, and the next worker tries again); a
 worker that dies between spawning a VMM and writing its record leaves that VMM
 unrecorded. An adopted box keeps the in-guest setup it was started with (network,
 tools bundle): a worker release that changes that setup reaches it at its next
 cold boot or wake.
 
 Checks 2-3 are kept out of an upgrade's way before it starts (§5): the upgrader
-compares the Firecracker and guest kernel bytes of both releases, and hands over
-only when the running worker advertises `worker_handover_v1`, which it does only
-where `pidfd_getfd` works on its own process (Linux 5.6+, Yama `ptrace_scope` below
-3); a refusal on the VMM itself falls back as above, keeping its RAM.
+compares the Firecracker and guest kernel bytes of both releases (finding neither
+on the running release counts as a difference), and hands over only when the
+running worker advertises `worker_handover_v1`, which it does only where
+`pidfd_getfd` works on a process outside its own tree, as a VMM the previous worker
+spawned is (Linux 5.6+; Yama `ptrace_scope` 1 and 2 allow it only with
+`CAP_SYS_PTRACE` in the worker's user namespace, 3 never); a refusal on the VMM
+itself falls back as above, keeping its RAM.
 
 ### 5. The upgrader decides: hand over or hibernate
 

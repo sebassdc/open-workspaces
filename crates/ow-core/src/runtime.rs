@@ -1562,6 +1562,11 @@ impl Runtime {
         if self.machines.contains_key(id) {
             return Ok(json!(workspace));
         }
+        // A failed adoption leaves its VMM running on this disk; the next worker adopts or
+        // ends it (ADR 0011).
+        if let Some(pid) = vm::recorded_live_pid(&self.machine_dir(id)) {
+            bail!("{id}'s previous VMM (PID {pid}) still runs; restart the worker to adopt or end it");
+        }
         // A box hibernated on another host kernel or CPU (a replaced host) cannot
         // resume its RAM; it boots its hibernated disk cold instead.
         let mut resume = true;
@@ -2884,6 +2889,23 @@ mod adoption_tests {
     }
 
     #[test]
+    fn a_box_whose_vmm_still_runs_never_starts_a_second_one_on_its_disk() {
+        // As a failed adoption leaves it: the VMM runs on, its box `stopped`.
+        let mut runtime = super::disk_tests::fixture();
+        let mut child = recorded_vmm(&runtime);
+        let error = runtime.start("legacy").unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&format!("VMM (PID {}) still runs", child.id())),
+            "{error:#}"
+        );
+        assert!(child.try_wait().unwrap().is_none(), "left running");
+        assert!(runtime.machine_dir("legacy").join(vm::RECORD).exists());
+        assert_eq!(runtime.workspace("legacy").unwrap().state, "stopped");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
     fn a_vmm_that_outlived_its_boxes_capture_is_ended() {
         let mut runtime = super::disk_tests::fixture();
         let mut child = recorded_vmm(&runtime);
@@ -3003,6 +3025,10 @@ mod adoption_tests {
 
     #[test]
     fn a_failed_guest_sync_fails_a_hibernation_unless_the_box_was_adopted_unresponsive() {
+        if let Some(why) = vm::fds_untakeable() {
+            eprintln!("skipped: {why}");
+            return;
+        }
         let mut runtime = super::disk_tests::fixture();
         let mut child = recorded_vmm(&runtime);
         adopted(&mut runtime, &child);
@@ -3045,6 +3071,10 @@ mod adoption_tests {
 
     #[test]
     fn an_unresponsive_ephemeral_box_is_stopped_not_hibernated() {
+        if let Some(why) = vm::fds_untakeable() {
+            eprintln!("skipped: {why}");
+            return;
+        }
         let mut runtime = super::disk_tests::fixture();
         let mut child = recorded_vmm(&runtime);
         adopted(&mut runtime, &child);
@@ -3066,6 +3096,10 @@ mod adoption_tests {
 
     #[test]
     fn detach_forgets_running_vmms_without_ending_them() {
+        if let Some(why) = vm::fds_untakeable() {
+            eprintln!("skipped: {why}");
+            return;
+        }
         let mut runtime = super::disk_tests::fixture();
         let mut child = recorded_vmm(&runtime);
         adopted(&mut runtime, &child);
