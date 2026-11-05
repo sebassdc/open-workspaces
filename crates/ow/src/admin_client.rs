@@ -1,7 +1,10 @@
 //! The admin commands as a thin wrapper over the admin API (docs/ADMIN_API.md): each command
 //! builds one op's request, sends it over HTTPS or the controller's admin.sock, and prints
 //! the result. Nothing here reads or writes the controller database.
-use crate::{Action, ConfigAction, HostAction, PlacementAction, TokenAction, admin};
+use crate::{
+    Action, AppKeyAction, ConfigAction, HostAction, PlacementAction, ActionsAction, TokenAction,
+    admin,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -41,6 +44,15 @@ pub(crate) fn request(action: &Action, key: &str) -> Option<Value> {
         Action::Placement {
             command: PlacementAction::Status { pool },
         } => json!({"op":"placement.status","pool":pool}),
+        Action::Actions {
+            command: ActionsAction::Status { pool },
+        } => json!({"op":"actions.status","pool":pool}),
+        Action::Actions {
+            command:
+                ActionsAction::AppKey {
+                    action: AppKeyAction::Set { private_key },
+                },
+        } => json!({"op":"actions.app_key.set","private_key":private_key}),
         Action::NodePool { node, pool } => json!({"op":"node.pool.set","node":node,"pool":pool}),
         Action::Token { action } => match action {
             TokenAction::Issue { name, owner, pool } => {

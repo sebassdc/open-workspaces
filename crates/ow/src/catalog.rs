@@ -953,6 +953,11 @@ impl Catalog {
         self.transfer_write(|c| {
             // Recheck current ownership/sharing even for a joined operation.
             let source = c.machine(user, &intent.machine, intent.kind.permission())?;
+            // Before anything is reserved: the worker would refuse the export anyway.
+            ensure!(
+                !c.db.query_row("SELECT COALESCE(json_extract(metadata,'$.ephemeral'),0) FROM resources WHERE kind='machine' AND physical=?1",[&source],|r|r.get::<_,bool>(0))?,
+                "an ephemeral box is never moved, parked or copied to another runner; delete it instead"
+            );
             let (owner, source_node, source_epoch, source_capture, policy_generation):(i64,String,i64,Option<String>,i64) = c.db.query_row("SELECT owner,node,placement_epoch,current_capture,ssh_policy_generation FROM resources WHERE kind='machine' AND physical=?1",[&source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
             ensure!(matches!(intent.kind, Kind::Fork | Kind::Wake) || owner == user, "placement changes require the owner");
             if let Some((operation, previous)) = c.db.query_row("SELECT id,request FROM operations WHERE owner=?1 AND retry_key=?2",params![user,key],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).optional()? {
@@ -1250,9 +1255,16 @@ impl Catalog {
         Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND physical=?1 AND placement_epoch=0 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=?1))",[physical],|r|r.get(0))?)
     }
     fn legacy_access(&self, physical: &str) -> Result<()> {
-        let (node,state):(String,Option<String>)=self.db.query_row("SELECT node,json_extract(metadata,'$.state') FROM resources WHERE kind='machine' AND physical=?1",[physical],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        self.legacy_access_op(physical, "")
+    }
+    /// As `legacy_access`; a draining runner also lets an ephemeral box be deleted (a drain
+    /// deletes them instead of parking them).
+    fn legacy_access_op(&self, physical: &str, op: &str) -> Result<()> {
+        let (node,state,ephemeral):(String,Option<String>,bool)=self.db.query_row("SELECT node,json_extract(metadata,'$.state'),COALESCE(json_extract(metadata,'$.ephemeral'),0) FROM resources WHERE kind='machine' AND physical=?1",[physical],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         ensure!(
-            !crate::drain::blocked(&self.db, &node)? || state.as_deref() == Some("running"),
+            !crate::drain::blocked(&self.db, &node)?
+                || state.as_deref() == Some("running")
+                || (op == "delete" && ephemeral),
             "runner draining; waiting for park and wake elsewhere"
         );
         ensure!(
@@ -2240,7 +2252,7 @@ impl Catalog {
         let object = request.as_object_mut().context("request")?;
         object.remove("node");
         object.remove("operation_key");
-        let fingerprint = json!({"request":request,"node":node}).to_string();
+        let fingerprint = json!({"request":nodes::journaled(&request),"node":node}).to_string();
         let key = match input["operation_key"].as_str() {
             Some(key) => key.to_owned(),
             None => common::nonce()?,
@@ -2760,6 +2772,20 @@ impl Catalog {
         }
         let name = request["id"].as_str().context("id")?.to_owned();
         common::address(&name)?;
+        // Refused before any row is reserved (the worker refuses them too).
+        if matches!(op.as_str(), "snapshot" | "fork" | "restore") {
+            // By physical ID, so a shared address (OWNER/BOX) is checked too.
+            let ephemeral: bool = match self.machine(user, &name, &op) {
+                Ok(physical) => self.db.query_row("SELECT EXISTS(SELECT 1 FROM resources WHERE kind='machine' AND physical=?1 AND json_extract(metadata,'$.ephemeral')=1)",[&physical],|r|r.get(0))?,
+                Err(_) => false, // the usual lookup below reports it
+            };
+            if ephemeral {
+                return Err(limits::Rejection(format!(
+                    "machine '{name}' is ephemeral: it is never snapshotted, forked or restored; delete it instead"
+                ))
+                .into());
+            }
+        }
         // Create or fork for another owner: the new box, its operation and quota are theirs.
         let owner = match request.as_object_mut().context("request")?.remove("owner") {
             None | Some(Value::Null) => user,
@@ -2851,7 +2877,7 @@ impl Catalog {
             {
                 return Ok(value);
             }
-            self.legacy_access(&physical)?;
+            self.legacy_access_op(&physical, &op)?;
             if let Some(placement) = self.managed_placement(&physical)? {
                 if op == "restore" {
                     return Err(limits::Rejection(format!(
@@ -2920,7 +2946,7 @@ impl Catalog {
         if op == "delete" {
             // The runner no longer has it: nothing to dispatch, only the row to drop.
             let physical = self.machine(user, &name, &op)?;
-            self.legacy_access(&physical)?;
+            self.legacy_access_op(&physical, &op)?;
             let node = self.placement("machine", &physical)?;
             if self.missing(&physical)? && !self.listed(&node, &physical)? {
                 return self.delete_missing(user, &name, &physical, &input);
@@ -2998,7 +3024,7 @@ impl Catalog {
             } else {
                 self.machine(user, &name, &op)?
             };
-            self.legacy_access(&physical)?;
+            self.legacy_access_op(&physical, &op)?;
             let metadata: String = self.db.query_row(
                 "SELECT metadata FROM resources WHERE kind='machine' AND physical=?1",
                 [&physical],
@@ -3199,7 +3225,7 @@ impl Catalog {
                     );
                 }
             }
-            self.legacy_access(&target)?;
+            self.legacy_access_op(&target, &op)?;
             prior_reservation=self.db.query_row("SELECT reserved_mib,reserved_cpus FROM resources WHERE kind='machine' AND physical=?1",[&target],|r|Ok((r.get(0)?,r.get(1)?)))?;
             let key = if let Some(key) = input["operation_key"].as_str() {
                 common::identifier(key)?;
@@ -3214,7 +3240,7 @@ impl Catalog {
             };
             let previous:Option<(i64,String,String,Option<String>)>=self.db.query_row("SELECT id,request,state,response FROM operations WHERE owner=?1 AND retry_key=?2",params![owner,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
             request.as_object_mut().unwrap().remove("operation_key");
-            let fingerprint = json!({"request":request,"node":node}).to_string();
+            let fingerprint = json!({"request":nodes::journaled(&request),"node":node}).to_string();
             if let Some((id, previous, state, response)) = previous {
                 ensure!(
                     previous == fingerprint,

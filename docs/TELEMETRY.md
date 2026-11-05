@@ -72,6 +72,8 @@ Infrastructure code carries no telemetry setting.
 | `limits.box_memory_mib` | `0` | 0–65536 | Largest memory a box may be created or resized to. `0`: only the runner's memory budget limits it. Boxes already over a lowered limit still start. |
 | `placement.spill` | empty | `pool:node:max_boxes`, comma-separated, at most 8; or the typed list over the API | [Spill](MULTINODE.md#spill) rules: a full pool (not `default`) may place up to `max_boxes` boxes on that runner of another pool. Empty is off. Takes effect at the next create. |
 | `placement.spill_keep_free_mib` | `16384` | 0–4194304 | Memory every spill runner keeps for its own pool. |
+| `actions.pools` | `[]` | a JSON list | [GitHub Actions runner pools](ACTIONS.md). Read on every 2 s pass. |
+| `actions.github_app_id` | `0` | 0–4294967295 | The GitHub App the pools register runners with; `0`: none. |
 | `dashboard.ui_bundle` | `builtin` | `builtin` or an installed bundle version | UI bundle the dashboard serves; see [UI bundles](DASHBOARD.md#ui-bundles). Refused unless installed, intact and API-compatible. |
 
 ## What runners report

@@ -230,6 +230,13 @@ mod image_tests {
     }
 }
 
+/// What an ephemeral box refuses: every operation that would keep or move a copy of it.
+/// (Hibernation refuses it with its own message; recovery points skip it.)
+fn ephemeral_refused(op: &str) -> bool {
+    matches!(op, "snapshot" | "fork" | "restore" | "image-save")
+        || crate::common::PLACEMENT_OPERATIONS.contains(&op)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: String,
@@ -2029,6 +2036,10 @@ impl Runtime {
         }
         let op = request["op"].as_str().context("missing operation")?;
         let id = request["id"].as_str().unwrap_or("");
+        ensure!(
+            !(ephemeral_refused(op) && self.state.workspaces.get(id).is_some_and(|w| w.ephemeral)),
+            "{id} is ephemeral: it is never snapshotted, forked or moved; delete it instead"
+        );
         if crate::common::PLACEMENT_OPERATIONS.contains(&op) {
             return self.lifecycle_request(request);
         }
@@ -3020,6 +3031,35 @@ mod disk_tests {
                 .get("ephemeral")
                 .is_none()
         );
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn an_ephemeral_box_gets_no_recovery_point_snapshot_fork_or_move() {
+        let mut runtime = fixture();
+        runtime
+            .state
+            .workspaces
+            .get_mut("legacy")
+            .unwrap()
+            .ephemeral = true;
+        let store = "a".repeat(64);
+        let point = runtime
+            .request(&json!({"op":"recovery-prepare","id":"legacy","store":store}))
+            .unwrap();
+        assert!(point.get("snapshot").is_none(), "{point}");
+        assert!(!runtime.root.join("recovery").join("legacy.json").exists());
+        for request in [
+            json!({"op":"snapshot","id":"legacy","name":"keep"}),
+            json!({"op":"fork","id":"legacy","child":"copy"}),
+            json!({"op":"restore","id":"legacy","name":"keep"}),
+            json!({"op":"image-save","id":"legacy","name":"mine"}),
+            json!({"op":"export","id":"legacy"}),
+        ] {
+            let error = runtime.request(&request).unwrap_err();
+            assert!(format!("{error:#}").contains("is ephemeral"), "{request}: {error:#}");
+        }
+        assert!(!runtime.state.workspaces.contains_key("copy"));
         fs::remove_dir_all(&runtime.root).unwrap();
     }
 

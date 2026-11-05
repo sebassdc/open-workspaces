@@ -276,7 +276,19 @@ fn the_cli_builds_the_documented_request() {
         ("host.revoke", &["host", "revoke", "n3"]),
         ("host.revoke", &["node-revoke", "n3"]),
         ("placement.status", &["placement", "status", "--pool", "ci"]),
+        ("actions.status", &["actions", "status", "--pool", "ci"]),
+        (
+            "actions.app_key.set",
+            &["actions", "app-key", "set", "--key-file", KEY_FILE],
+        ),
     ];
+    // The documented key, in the file `--key-file` reads when the command is parsed.
+    const KEY_FILE: &str = "/tmp/ow-admin-tests-app-key.pem";
+    std::fs::write(
+        KEY_FILE,
+        first("actions.app_key.set")["private_key"].as_str().unwrap(),
+    )
+    .unwrap();
     for (op, args) in cases {
         let cli = Cli::try_parse_from([&["ow"], *args].concat()).unwrap();
         let key = cli.operation_key.clone().unwrap_or_else(|| "unused".into());
@@ -584,6 +596,15 @@ fn documented_examples_match_real_answers() {
         if let Some(r) = request.as_object_mut() {
             r.remove("expected_version");
         }
+        if op == "actions.app_key.set" {
+            // A real key, made for this run (the documented one is shortened).
+            let key = std::process::Command::new("openssl")
+                .args(["genrsa", "2048"])
+                .output()
+                .unwrap();
+            assert!(key.status.success());
+            request["private_key"] = json!(String::from_utf8(key.stdout).unwrap());
+        }
         if op == "host.budget" {
             crate::nodes::db(&root)
                 .unwrap()
@@ -612,6 +633,20 @@ fn documented_examples_match_real_answers() {
             assert_eq!(answer, documented, "{op}");
         }
     }
+    let audit: String = crate::nodes::db(&root)
+        .unwrap()
+        .query_row(
+            "SELECT request FROM admin_audit WHERE op='actions.app_key.set'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(audit.contains("<redacted>") && !audit.contains("PRIVATE KEY"), "{audit}");
+    let mode = std::fs::metadata(root.join(crate::actions_pool::KEY_FILE))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -40,6 +40,27 @@ pub(crate) fn verify(db: &Connection, presented: &str) -> Result<Option<(Identit
         .optional()?)
 }
 
+/// The identity a token acts as and its pool, by the token's name (for the controller's own
+/// programs, such as runner pools, that act through a token they name).
+pub(crate) fn by_name(db: &Connection, name: &str) -> Result<Option<(Identity, String)>> {
+    Ok(db
+        .query_row(
+            "SELECT u.issuer,u.subject,u.email,t.pool FROM workload_tokens t JOIN users u ON u.id=t.owner WHERE t.name=?1 AND u.subject IS NOT NULL",
+            [name],
+            |r| {
+                Ok((
+                    Identity {
+                        issuer: r.get(0)?,
+                        subject: r.get(1)?,
+                        email: r.get(2)?,
+                    },
+                    r.get(3)?,
+                ))
+            },
+        )
+        .optional()?)
+}
+
 /// Narrow a validated dashboard operation to what a token bound to `pool` may do.
 pub(crate) fn scoped(mut operation: Value, pool: &str) -> Result<Value> {
     let op = operation["op"].as_str().unwrap_or_default().to_owned();
