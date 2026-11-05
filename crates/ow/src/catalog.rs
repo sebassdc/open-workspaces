@@ -43,41 +43,76 @@ impl std::fmt::Display for InFlight {
 impl std::error::Error for InFlight {}
 
 /// Boxes (physical IDs) whose runner call is in flight outside the catalog lock. Marked and
-/// cleared under the lock; read by reconcile, which leaves them to the call's own result.
+/// cleared under the lock; reconcile leaves them, and boxes whose call started or landed after
+/// its inventory was read, to the call's own result.
 pub(crate) mod flights {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    /// How long a landed call is remembered; an inventory read longer ago is not applied.
+    pub(crate) const MEMORY: Duration = Duration::from_secs(600);
+
+    #[derive(Default)]
+    struct State {
+        flying: BTreeMap<String, usize>,
+        /// Each change's sequence number, and when and on which box it was.
+        seq: u64,
+        changed: BTreeMap<String, (u64, Instant)>,
+    }
+    impl State {
+        fn touch(&mut self, id: &str) {
+            self.seq += 1;
+            self.changed.insert(id.to_owned(), (self.seq, Instant::now()));
+            self.changed.retain(|_, (_, at)| at.elapsed() < MEMORY);
+        }
+    }
 
     #[derive(Default)]
     pub(crate) struct Flights {
-        flying: Mutex<BTreeMap<String, usize>>,
+        state: Mutex<State>,
         landed: Condvar,
     }
     impl Flights {
-        fn map(&self) -> MutexGuard<'_, BTreeMap<String, usize>> {
-            self.flying.lock().unwrap_or_else(|e| e.into_inner())
+        fn state(&self) -> MutexGuard<'_, State> {
+            self.state.lock().unwrap_or_else(|e| e.into_inner())
         }
         pub(crate) fn flying(&self, physical: &str) -> bool {
-            self.map().contains_key(physical)
+            self.state().flying.contains_key(physical)
         }
-        /// The boxes in flight now, as a JSON array for SQL `json_each`.
-        pub(crate) fn all(&self) -> String {
-            serde_json::to_string(&self.map().keys().collect::<Vec<_>>()).unwrap_or_default()
+        /// The sequence number of the latest start or landing, read before an inventory.
+        pub(crate) fn seq(&self) -> u64 {
+            self.state().seq
+        }
+        /// Boxes an inventory read at `seq` may misreport: in flight now, or started or landed
+        /// since.
+        pub(crate) fn since(&self, seq: u64) -> BTreeSet<String> {
+            let state = self.state();
+            let mut ids: BTreeSet<String> = state.flying.keys().cloned().collect();
+            ids.extend(
+                state
+                    .changed
+                    .iter()
+                    .filter(|(_, (n, _))| *n > seq)
+                    .map(|(id, _)| id.clone()),
+            );
+            ids
         }
         /// Blocks until no call is in flight for this box.
         pub(crate) fn wait(&self, physical: &str) {
-            let mut map = self.map();
-            while map.contains_key(physical) {
-                map = self.landed.wait(map).unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state();
+            while state.flying.contains_key(physical) {
+                state = self.landed.wait(state).unwrap_or_else(|e| e.into_inner());
             }
         }
         pub(crate) fn take(self: &Arc<Self>, physicals: impl IntoIterator<Item = String>) -> Flight {
             let mut ids: Vec<String> = physicals.into_iter().collect();
             ids.sort();
             ids.dedup();
-            let mut map = self.map();
+            let mut state = self.state();
             for id in &ids {
-                *map.entry(id.clone()).or_default() += 1;
+                *state.flying.entry(id.clone()).or_default() += 1;
+                state.touch(id);
             }
             Flight {
                 flights: self.clone(),
@@ -92,17 +127,56 @@ pub(crate) mod flights {
     }
     impl Drop for Flight {
         fn drop(&mut self) {
-            let mut map = self.flights.map();
+            let mut state = self.flights.state();
             for id in &self.ids {
-                if let Some(n) = map.get_mut(id) {
+                if let Some(n) = state.flying.get_mut(id) {
                     *n -= 1;
                     if *n == 0 {
-                        map.remove(id);
+                        state.flying.remove(id);
                     }
                 }
+                state.touch(id);
             }
             self.flights.landed.notify_all();
         }
+    }
+}
+
+/// Every runner's machines and snapshots, read without the catalog lock (see `reconcile`).
+pub(crate) struct Inventory {
+    seq: u64,
+    read: Instant,
+    runners: Vec<(String, Option<(Value, Value)>)>,
+}
+
+impl Inventory {
+    /// Asks every online runner at once: a read costs the slowest runner's reply, not their sum.
+    pub(crate) fn read(root: &Path, flights: &flights::Flights) -> Result<Self> {
+        let seq = flights.seq();
+        let read = Instant::now();
+        let mut pool = vec!["local".to_owned()];
+        for node in nodes::inventory(root)?.as_array().unwrap() {
+            if node["online"] == true {
+                pool.push(node["id"].as_str().unwrap().to_owned());
+            }
+        }
+        let runners = std::thread::scope(|scope| {
+            let calls: Vec<_> = pool
+                .into_iter()
+                .map(|node| {
+                    let call = scope.spawn({
+                        let node = node.clone();
+                        move || inventory_of(root, &node)
+                    });
+                    (node, call)
+                })
+                .collect();
+            calls
+                .into_iter()
+                .map(|(node, call)| (node, call.join().ok().flatten()))
+                .collect()
+        });
+        Ok(Self { seq, read, runners })
     }
 }
 
@@ -1538,36 +1612,25 @@ impl Catalog {
         )
         .into()
     }
+    /// Reads every runner's inventory and applies it. Holds the catalog for the runner calls:
+    /// callers that can let go of it read with [`Inventory::read`] first, then [`Self::apply`].
     fn reconcile(&mut self) -> Result<(Value, Value)> {
+        let inventory = Inventory::read(&self.root, &self.flights)?;
+        self.apply(inventory)
+    }
+
+    /// Applies an inventory, except to boxes whose rows a runner call changed since it was read.
+    pub(crate) fn apply(&mut self, inventory: Inventory) -> Result<(Value, Value)> {
         let mut all_machines = Vec::new();
         let mut all_snapshots = Vec::new();
-        let mut pool = vec!["local".to_owned()];
-        for node in nodes::inventory(&self.root)?.as_array().unwrap() {
-            if node["online"] == true {
-                pool.push(node["id"].as_str().unwrap().to_owned());
-            }
+        if inventory.read.elapsed() >= flights::MEMORY {
+            return Ok((json!(all_machines), json!(all_snapshots)));
         }
-        // Every runner at once: a pass costs the slowest runner's reply, not their sum.
-        let fetched: Vec<(String, Option<(Value, Value)>)> = std::thread::scope(|scope| {
-            let root = &self.root;
-            let calls: Vec<_> = pool
-                .into_iter()
-                .map(|node| {
-                    let call = scope.spawn({
-                        let node = node.clone();
-                        move || inventory_of(root, &node)
-                    });
-                    (node, call)
-                })
-                .collect();
-            calls
-                .into_iter()
-                .map(|(node, call)| (node, call.join().ok().flatten()))
-                .collect()
-        });
-        // Boxes whose runner call is in flight: what a runner lists for them now may already
-        // be stale when that call lands, so their rows are left to its result.
-        let flying = self.flights.all();
+        let skip = self.flights.since(inventory.seq);
+        let fetched = inventory.runners;
+        // Boxes a runner call is changing, or changed after this inventory was read: what it
+        // lists for them may be stale, so their rows are left to the call's result.
+        let flying = serde_json::to_string(&skip)?;
         for (node, inventory) in fetched {
             let Some((machines, snapshots)) = inventory else {
                 continue;
@@ -1581,7 +1644,7 @@ impl Catalog {
                 &node,
                 &machines,
                 &snapshots,
-                &flying,
+                (&skip, &flying),
                 &mut all_machines,
                 &mut all_snapshots,
             );
@@ -1602,7 +1665,7 @@ impl Catalog {
         node: &str,
         machines: &Value,
         snapshots: &Value,
-        flying: &str,
+        (skip, flying): (&std::collections::BTreeSet<String>, &str),
         all_machines: &mut Vec<Value>,
         all_snapshots: &mut Vec<Value>,
     ) -> Result<()> {
@@ -1618,7 +1681,7 @@ impl Catalog {
                 extra_cpus += m["vcpu_count"].as_i64().unwrap_or(16);
                 extra_slots += 1;
             }
-            if self.flights.flying(physical) {
+            if skip.contains(physical) {
                 all_machines.push(m.clone());
                 continue;
             }
@@ -1667,7 +1730,7 @@ impl Catalog {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
         for physical in absent {
-            if !observed.contains(physical.as_str()) && !self.flights.flying(&physical) {
+            if !observed.contains(physical.as_str()) && !skip.contains(&physical) {
                 self.db.execute("UPDATE resources SET reserved_mib=0,reserved_cpus=0 WHERE kind='machine' AND physical=?1 AND node=?2",params![physical,node])?;
                 // A fork child (it names its source) ends failed; a create stays pending
                 // so a retry with a new key reuses its placement.
@@ -1683,7 +1746,7 @@ impl Catalog {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for physical in known {
-            if !observed.contains(physical.as_str()) && !self.flights.flying(&physical) {
+            if !observed.contains(physical.as_str()) && !skip.contains(&physical) {
                 limits::absent(&self.db, &physical)?;
             }
         }
@@ -1695,7 +1758,7 @@ impl Catalog {
         for snapshot in snapshots.as_array().context("invalid snapshots")? {
             let physical = snapshot["name"].as_str().context("snapshot ID")?;
             let parent = snapshot["workspace"].as_str().context("snapshot parent")?;
-            if self.flights.flying(parent) {
+            if skip.contains(parent) {
                 continue;
             }
             let owner:Option<i64>=self.db.query_row("SELECT owner FROM resources WHERE kind='machine' AND physical=?1 AND node=?2 AND placement_managed=0 AND NOT EXISTS(SELECT 1 FROM transfer_locks WHERE machine=resources.physical)",params![parent,node],|r|r.get(0)).optional()?;
@@ -2057,6 +2120,9 @@ impl Catalog {
                 }
             }
             let physical = self.machine(user, address, "rename")?;
+            if self.flights.flying(&physical) {
+                return Err(InFlight(physical).into());
+            }
             let (old, email): (String, String) = self.db.query_row("SELECT r.name,u.email FROM resources r JOIN users u ON u.id=r.owner WHERE r.kind='machine' AND r.physical=?1",[&physical],|r|Ok((r.get(0)?,r.get(1)?)))?;
             if old == new {
                 return Ok(json!({"id":new,"renamed_from":old}));
@@ -2739,6 +2805,11 @@ impl Catalog {
                 );
             }
         }
+        // Runners passed the checks but none in this pool (or to spill to) had room.
+        eprintln!(
+            "placement: no room for {memory} MiB, {cpus} vCPU, {image} in pool {pool}: {}",
+            passed.join("; ")
+        );
         anyhow::bail!("node capacity exhausted")
     }
     /// A create that spilled onto a runner of another pool remembers its own pool.
@@ -2911,11 +2982,11 @@ impl Catalog {
     /// One box operation with the catalog held throughout (tests, and callers that hold it).
     pub fn operation(&mut self, user: i64, request: Value) -> Result<Value> {
         let mut dispatch = None;
-        let value = self.prepare(user, request, &mut dispatch)?;
+        let value = self.prepare(user, request, &mut dispatch, None)?;
         match dispatch {
             Some(mut dispatch) => {
                 let sent = dispatch.send(&self.root);
-                self.finish(dispatch, sent)
+                self.finish(dispatch, sent, true)
             }
             None => Ok(value),
         }
@@ -2934,16 +3005,20 @@ impl Catalog {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("catalog lock poisoned"))
         };
+        let (root, flights) = {
+            let c = lock()?;
+            (c.root.clone(), c.flights.clone())
+        };
         loop {
             let asked = Instant::now();
+            // Runner inventories are read before the lock is taken, never under it.
+            let inventory = Inventory::read(&root, &flights)?;
             let mut dispatch = None;
-            let (prepared, root, flights, waited) = {
+            let (prepared, waited) = {
                 let mut c = lock()?;
                 let waited = asked.elapsed();
                 (
-                    c.prepare(user, request.clone(), &mut dispatch),
-                    c.root.clone(),
-                    c.flights.clone(),
+                    c.prepare(user, request.clone(), &mut dispatch, Some(inventory)),
                     waited,
                 )
             };
@@ -2968,7 +3043,13 @@ impl Catalog {
                 dispatch.operation,
                 dispatch.node.clone(),
             );
-            let result = lock()?.finish(dispatch, sent);
+            let result = lock()?.finish(dispatch, sent, false);
+            // What the runner did may have touched other rows (a failed create's partial
+            // effects): refresh, again reading the runners unlocked.
+            let refreshed = Inventory::read(&root, &flights).and_then(|i| lock()?.apply(i));
+            if let Err(error) = refreshed {
+                eprintln!("operation {operation} reconciliation: {error:#}");
+            }
             if matches!(op.as_str(), "create" | "delete" | "fork") {
                 eprintln!(
                     "operation {operation} ({op}) on {node}: catalog wait {} ms, prepared {} ms, runner {} ms, done {} ms",
@@ -2989,6 +3070,7 @@ impl Catalog {
         user: i64,
         mut request: Value,
         dispatch: &mut Option<Dispatch>,
+        inventory: Option<Inventory>,
     ) -> Result<Value> {
         let op = request["op"].as_str().context("op")?.to_owned();
         ensure!(
@@ -3256,7 +3338,10 @@ impl Catalog {
         } else if let Some(node) = request["node"].as_str() {
             nodes::online(&self.root, node)?;
         }
-        self.reconcile()?;
+        match inventory {
+            Some(inventory) => self.apply(inventory)?,
+            None => self.reconcile()?,
+        };
         if op == "delete" {
             // The runner no longer has it: nothing to dispatch, only the row to drop.
             let physical = self.machine(user, &name, &op)?;
@@ -3657,7 +3742,9 @@ impl Catalog {
     }
 
     /// Records the runner's answer to a [`Dispatch`], under the catalog lock.
-    fn finish(&mut self, dispatch: Dispatch, sent: Sent) -> Result<Value> {
+    /// `refresh`: reconcile here (the caller holds the catalog throughout); otherwise the
+    /// caller reconciles after letting go of it.
+    fn finish(&mut self, dispatch: Dispatch, sent: Sent, refresh: bool) -> Result<Value> {
         let Dispatch {
             op,
             user,
@@ -3729,7 +3816,7 @@ impl Catalog {
                     .unwrap_or("worker returned no error")
             );
             // A runtime error can follow partial effects; inventory decides resource state.
-            if let Err(error) = self.reconcile() {
+            if let Err(error) = refresh.then(|| self.reconcile()).transpose() {
                 eprintln!("operation {operation} reconciliation: {error:#}");
             }
             return Err(self.outcome_error(owner, operation));
@@ -3902,7 +3989,9 @@ impl Catalog {
         if matches!(op.as_str(), "stop" | "hibernate") {
             self.db.execute("UPDATE resources SET reserved_mib=0,reserved_cpus=0 WHERE kind='machine' AND physical=?1",[&physical])?;
         }
-        self.reconcile()?;
+        if refresh {
+            self.reconcile()?;
+        }
         Ok(value)
     }
     pub fn publications(&self, physical: &str) -> Result<Value> {

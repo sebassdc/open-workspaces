@@ -964,7 +964,8 @@ async fn admin(app: &App, identity: crate::catalog::Identity, request: Request) 
         .and_then(|v| v["op"].as_str().and_then(crate::admin::spec))
         .is_none_or(|spec| spec.mutating);
     let answer = tokio::task::spawn_blocking(move || {
-        // Admin changes wait for in-flight placements, as host invitations always did.
+        // Admin changes wait for in-flight placements (choice and reservation, made under the
+        // catalog lock), as host invitations always did; never for a runner's work on a box.
         let _admission = catalog.as_ref().filter(|_| mutating).map(|c| c.lock());
         let ctx = crate::admin::Context {
             root: &root,

@@ -277,6 +277,10 @@ fn worker(root: PathBuf) -> Result<()> {
     let terminals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Creates booting on their own threads; the worker winds down only after they land.
     let booting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Requests for a box still booting wait here, in arrival order, until its boot lands.
+    let (landed_tx, landed) = std::sync::mpsc::channel::<String>();
+    let mut deferred: Vec<(UnixStream, Value)> = Vec::new();
+    let mut ready = std::collections::VecDeque::new();
     let mut idle_check = Instant::now();
     // Live forks whose capture a sealing thread finished: (reply, parent, child, capture).
     let (sealed_forks, forks) = std::sync::mpsc::channel::<(UnixStream, String, String, String)>();
@@ -305,8 +309,29 @@ fn worker(root: PathBuf) -> Result<()> {
                 }
             }
         }
-        match incoming.recv_timeout(Duration::from_millis(10)) {
+        while let Ok(id) = landed.try_recv() {
+            let (now, later) = deferred
+                .drain(..)
+                .partition::<Vec<_>, _>(|(_, r): &(UnixStream, Value)| r["id"] == id.as_str());
+            ready.extend(now);
+            deferred = later;
+        }
+        let next = match ready.pop_front() {
+            Some(waiting) => Ok(waiting),
+            None => incoming.recv_timeout(Duration::from_millis(10)),
+        };
+        match next {
             Ok((mut stream, mut request)) => {
+                let id = request["id"].as_str().unwrap_or("");
+                if !id.is_empty()
+                    && runtime
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
+                        .booting(id)
+                {
+                    deferred.push((stream, request));
+                    continue;
+                }
                 if matches!(
                     request["op"].as_str(),
                     Some("detach" | "shutdown" | "quiesce")
@@ -452,20 +477,38 @@ fn worker(root: PathBuf) -> Result<()> {
                             // a thread runs it and this one takes the next request.
                             runtime::Step::Create(mut creating) => {
                                 let runtime = runtime.clone();
-                                let booting = booting.clone();
+                                // Lands the boot however the thread ends: the count goes down
+                                // and the box's waiting requests run.
+                                struct Landing(
+                                    Arc<std::sync::atomic::AtomicUsize>,
+                                    std::sync::mpsc::Sender<String>,
+                                    String,
+                                );
+                                impl Drop for Landing {
+                                    fn drop(&mut self) {
+                                        self.0.fetch_sub(1, Ordering::SeqCst);
+                                        let _ = self.1.send(std::mem::take(&mut self.2));
+                                    }
+                                }
                                 booting.fetch_add(1, Ordering::SeqCst);
+                                let landing =
+                                    Landing(booting.clone(), landed_tx.clone(), creating.id().into());
                                 std::thread::spawn(move || {
-                                    let booted = creating.boot();
-                                    let result = match runtime.lock() {
-                                        Ok(mut runtime) => runtime.create_finish(*creating, booted),
-                                        Err(_) => Err(anyhow::anyhow!("runtime lock poisoned")),
-                                    };
+                                    let _landing = landing;
+                                    let booted = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| creating.boot()),
+                                    )
+                                    .unwrap_or_else(|_| Err(anyhow::anyhow!("box boot panicked")));
+                                    // A poisoned runtime still records the box: else it stays booting.
+                                    let result = runtime
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .create_finish(*creating, booted);
                                     if let Err(error) =
                                         wire::send(&mut stream, &wire::response(result))
                                     {
                                         eprintln!("create reply: {error:#}");
                                     }
-                                    booting.fetch_sub(1, Ordering::SeqCst);
                                 });
                             }
                             // The guest already runs again; hashing its capture here would hold

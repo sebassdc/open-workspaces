@@ -688,6 +688,9 @@ pub struct Creating {
 }
 
 impl Creating {
+    pub fn id(&self) -> &str {
+        &self.workspace.id
+    }
     /// The slow part: filesystem growth, boot (or restore) and guest setup. Touches only this
     /// box, so it runs without the runtime.
     pub fn boot(&mut self) -> Result<()> {
@@ -1362,14 +1365,30 @@ impl Runtime {
         })
     }
 
-    /// Records a [`Creating`]'s boot: the box runs, or is `failed` with its VMM gone.
+    /// Whether this box is booting off the worker thread (its requests wait for it).
+    pub fn booting(&self, id: &str) -> bool {
+        self.creating.contains(id)
+    }
+
+    /// Records a [`Creating`]'s boot: the box runs, or is `failed` with its VMM gone. One that
+    /// lands after the worker began shutting down is stopped instead (its disk is kept).
     pub fn create_finish(&mut self, creating: Creating, booted: Result<()>) -> Result<Value> {
         let Creating {
             workspace, machine, ..
         } = creating;
         let id = workspace.id;
         self.creating.remove(&id);
-        let state = if booted.is_ok() {
+        let booted = if self.closing && booted.is_ok() {
+            Err(anyhow::anyhow!(
+                "the worker is shutting down; the new box was stopped"
+            ))
+        } else {
+            booted
+        };
+        let state = if self.closing {
+            drop(machine);
+            "stopped"
+        } else if booted.is_ok() {
             self.machines.insert(id.clone(), machine);
             self.idle.touch(&id, std::time::Instant::now());
             "running"
