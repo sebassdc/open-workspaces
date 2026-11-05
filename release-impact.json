@@ -2,6 +2,41 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.53",
+      "class": 0,
+      "changes": [
+        "component"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ]
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Faster release builds: Rust build caches, the pre-tag checks beside the client builds, and the Intel macOS client cross-built on Apple silicon and checked under Rosetta 2. Hosts install the same clients. Class 0: nothing restarts."
+    },
+    {
       "version": "0.9.52",
       "class": 0,
       "changes": [

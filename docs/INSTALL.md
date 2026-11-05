@@ -91,8 +91,9 @@ checking provenance. Never copy a binary from another revision into a release.
 No SDK, build tool, guest image, private connection configuration or credentials
 are included.
 
-Native macOS jobs target macOS 13.0 and execute the resulting client on macOS 15
-(Apple Silicon and Intel). macOS 15+ is the supported release-client baseline;
+macOS jobs target macOS 13.0 and execute the resulting client on macOS 15 Apple
+Silicon; the Intel client is cross-built there and executed under Rosetta 2, not
+on Intel hardware. macOS 15+ is the supported release-client baseline;
 13/14 execution has not been accepted even though the build deployment floor is
 13.0. The binaries are not Apple-notarized. Linux jobs execute the static client
 on Ubuntu 24.04 and, as an unprivileged user, in Alpine 3.22 without host libraries.

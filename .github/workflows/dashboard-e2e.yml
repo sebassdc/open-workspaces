@@ -29,11 +29,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal --no-self-update
+      # Both matrix legs build the same binary, so they share one cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dashboard-e2e-1.97.0
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.ui == 'builtin' }}
       - name: Build the dashboard binary
         working-directory: .
-        run: |
-          rustup toolchain install 1.97.0 --profile minimal --no-self-update
-          cargo +1.97.0 build --locked -p ow
+        run: cargo +1.97.0 build --locked -p ow
       - run: npm ci --no-audit --no-fund
       - run: npx playwright install --with-deps chromium
       - name: Check the matrix checker

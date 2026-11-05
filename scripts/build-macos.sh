@@ -3,13 +3,14 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 if [[ $(uname -s) == Darwin ]]; then
-  # Native release runners exercise the same binary they publish.
-  case $(uname -m) in
+  # OW_MACOS_ARCH=x86_64 cross-builds the Intel client on Apple silicon; CI runs it under Rosetta 2.
+  case ${OW_MACOS_ARCH:-$(uname -m)} in
     arm64) arch=arm64; target=aarch64-apple-darwin ;;
     x86_64) arch=amd64; target=x86_64-apple-darwin ;;
     *) echo 'Unsupported macOS architecture' >&2; exit 1 ;;
   esac
   export MACOSX_DEPLOYMENT_TARGET=13.0
+  rustup target add --toolchain 1.97.0 "$target"
   cargo +1.97.0 build --locked --release -p ow --target "$target" -j 2
   mkdir -p data/runtime-spike/bin
   artifact="data/runtime-spike/bin/ow-darwin-$arch"
