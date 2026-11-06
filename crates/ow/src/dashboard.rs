@@ -449,17 +449,24 @@ pub async fn handle(
     }
     if path == "/api/version" && method == Method::GET {
         let ui_root = root.clone();
-        let ui = tokio::task::spawn_blocking(move || {
-            crate::dashboard_ui::selected(ui_root.as_deref()).info
+        let (ui, client) = tokio::task::spawn_blocking(move || {
+            (
+                crate::dashboard_ui::selected(ui_root.as_deref()).info,
+                crate::admin::client_release(ui_root.as_deref()),
+            )
         })
         .await
-        .unwrap_or(Value::Null);
+        .unwrap_or((Value::Null, None));
         let mut result = json!({
             "api":crate::dashboard_ui::API_VERSION,
             "server":env!("CARGO_PKG_VERSION"),
             "capabilities":[crate::dashboard_ui::CAPABILITY],
             "ui":ui,
         });
+        // The client release an operator chose: `ow upgrade` installs it (else `server`).
+        if let Some(client) = client {
+            result["client"] = json!(client);
+        }
         crate::admin::version_fields(&mut result);
         return secure(Json(json!({"ok":true,"result":result})).into_response());
     }

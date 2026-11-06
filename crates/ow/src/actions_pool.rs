@@ -11,7 +11,7 @@
 //! GitHub hands a queued job to an idle runner at once; the box is removed when GitHub drops
 //! the runner after its job. The App key stays in a 0600 file and in memory; no key, token or
 //! registration is logged or kept in the catalog.
-use crate::actions::{self, Action, Entry, Phase, Pool, Runner};
+use crate::actions::{self, Action, Entry, Phase, Pool, Runner, api_base};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rusqlite::OptionalExtension;
@@ -215,7 +215,7 @@ fn pass(shared: &Arc<Shared>) -> Result<()> {
         }
         pools
             .iter()
-            .map(|p| p.repo.clone())
+            .map(|p| p.scope().to_owned())
             .chain(entries.values().map(|e| repo_of(&e.spec)))
             .collect()
     };
@@ -230,14 +230,18 @@ fn pass(shared: &Arc<Shared>) -> Result<()> {
             Err(error) => {
                 let error = error.context(format!("listing {repo}'s runners"));
                 // In each of its pools' status, not only the log.
-                for p in pools.iter().filter(|p| &p.repo == repo) {
+                for p in pools.iter().filter(|p| p.scope() == repo) {
                     self::error(shared, &p.name, format!("{error:#}"));
                 }
                 failure = Some(error);
                 None
             }
         };
-        let repo_pools: Vec<Pool> = pools.iter().filter(|p| &p.repo == repo).cloned().collect();
+        let repo_pools: Vec<Pool> = pools
+            .iter()
+            .filter(|p| p.scope() == repo)
+            .cloned()
+            .collect();
         let mut entries = shared.entries.lock().unwrap();
         if let Some(listed) = &listed {
             let before = entries.clone();
@@ -427,7 +431,10 @@ fn queued_jobs(
     {
         return *count;
     }
-    let count = match shared.github.queued(app_id, &pool.repo, &pool.labels) {
+    let count = match shared
+        .github
+        .queued(app_id, pool.scope(), &pool.queue_repos(), &pool.labels)
+    {
         Ok(count) => count,
         Err(e) => {
             error(shared, &pool.name, format!("listing queued jobs: {e:#}"));
@@ -574,13 +581,13 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64, spill: bool) {
         ensure!(launching(shared, &name), "timed out while it was made");
         let (runner_id, jit) = shared
             .github
-            .jit_config(app_id, &pool.repo, &name, &pool.labels)
+            .jit_config(app_id, pool.scope(), pool.group(), &name, &pool.labels)
             .context("runner registration")?;
         update(shared, &name, |e| e.runner_id = Some(runner_id));
         timing(shared, &name, "registered_ms");
         if !launching(shared, &name) {
             // Timed out meanwhile: the removal may have missed the registration.
-            let _ = shared.github.remove_runner(app_id, &pool.repo, runner_id);
+            let _ = shared.github.remove_runner(app_id, pool.scope(), runner_id);
             bail!("timed out while it was registered");
         }
         let data = STANDARD.encode(jit.as_bytes());
@@ -630,7 +637,9 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64, spill: bool) {
                 return;
             }
             // Its entry is gone with whatever existed then: clean up what was made after.
-            let _ = shared.github.remove_runner_named(app_id, &pool.repo, &name);
+            let _ = shared
+                .github
+                .remove_runner_named(app_id, pool.scope(), &name);
             let _ = box_op(shared, &pool.token, json!({"op":"stop","id":name}));
             let _ = box_op(shared, &pool.token, json!({"op":"delete","id":name}));
         }
@@ -919,8 +928,12 @@ impl GitHub {
         let id = match installation {
             Some(id) => id,
             None => {
-                let (_, got) =
-                    self.call("GET", &format!("/repos/{repo}/installation"), None, &jwt)?;
+                let (_, got) = self.call(
+                    "GET",
+                    &format!("{}/installation", api_base(repo)),
+                    None,
+                    &jwt,
+                )?;
                 let id = got["id"]
                     .as_u64()
                     .with_context(|| format!("the GitHub App is not installed on {repo}"))?;
@@ -1041,14 +1054,17 @@ impl GitHub {
         Ok((status, value))
     }
 
-    /// The repository's runners by name.
+    /// The scope's (repository's or organisation's) runners by name.
     fn runners(&self, app_id: u64, repo: &str) -> Result<HashMap<String, Runner>> {
         let token = self.token(app_id, repo)?;
         let mut out = HashMap::new();
         for page in 1..=20 {
             let (status, got) = self.call(
                 "GET",
-                &format!("/repos/{repo}/actions/runners?per_page=100&page={page}"),
+                &format!(
+                    "{}/actions/runners?per_page=100&page={page}",
+                    api_base(repo)
+                ),
                 None,
                 &token,
             )?;
@@ -1066,26 +1082,43 @@ impl GitHub {
                 }
             }
             if list.len() < 100 {
-                break;
+                return Ok(out);
             }
         }
-        Ok(out)
+        // A runner missing from a cut-off list would look gone and have its box removed.
+        bail!("runner list: more than 2000 runners, the list would be incomplete")
     }
 
     /// Jobs queued for runners with `labels`: every label a queued job asks for is one of
-    /// them (as GitHub matches), in the repository's queued and running workflow runs.
-    fn queued(&self, app_id: u64, repo: &str, labels: &[String]) -> Result<u32> {
-        // Never at the cost of what the pool itself needs (runner lists, registrations).
-        let left = *self.remaining.lock().unwrap();
-        if left.is_some_and(|n| n < QUEUED_FLOOR) {
+    /// them (as GitHub matches), in the queued and running workflow runs of `repos`, read
+    /// with the installation token of `scope` (the repository, or their organisation).
+    fn queued(&self, app_id: u64, scope: &str, repos: &[String], labels: &[String]) -> Result<u32> {
+        // Never at the cost of what the pool itself needs (runner lists, registrations):
+        // checked before every call, as several repositories' scans add up.
+        let low = || {
+            self.remaining
+                .lock()
+                .unwrap()
+                .is_some_and(|n| n < QUEUED_FLOOR)
+        };
+        if low() {
+            let left = *self.remaining.lock().unwrap();
             // Expected under load, not a fault: no spill until the limit refills.
-            eprintln!("actions pools: GitHub rate limit low ({left:?} left): not asking for queued jobs");
+            eprintln!(
+                "actions pools: GitHub rate limit low ({left:?} left): not asking for queued jobs"
+            );
             return Ok(0);
         }
-        let token = self.token(app_id, repo)?;
+        let token = self.token(app_id, scope)?;
         let ours: Vec<String> = labels.iter().map(|l| l.to_ascii_lowercase()).collect();
         let mut count = 0;
-        for status in ["queued", "in_progress"] {
+        'scan: for (repo, status) in repos
+            .iter()
+            .flat_map(|r| ["queued", "in_progress"].map(|s| (r, s)))
+        {
+            if low() {
+                break 'scan;
+            }
             let (code, runs) = self.call(
                 "GET",
                 &format!("/repos/{repo}/actions/runs?status={status}&per_page={QUEUED_RUNS}"),
@@ -1097,6 +1130,9 @@ impl GitHub {
                 let Some(id) = run["id"].as_u64() else {
                     continue;
                 };
+                if low() {
+                    break 'scan;
+                }
                 let (code, jobs) = self.call(
                     "GET",
                     &format!("/repos/{repo}/actions/runs/{id}/jobs?filter=latest&per_page=100"),
@@ -1119,15 +1155,18 @@ impl GitHub {
     fn jit_config(
         &self,
         app_id: u64,
-        repo: &str,
+        scope: &str,
+        group: u64,
         name: &str,
         labels: &[String],
     ) -> Result<(u64, String)> {
-        let token = self.token(app_id, repo)?;
+        let token = self.token(app_id, scope)?;
         let (_, got) = self.call(
             "POST",
-            &format!("/repos/{repo}/actions/runners/generate-jitconfig"),
-            Some(&json!({"name":name,"runner_group_id":1,"labels":labels,"work_folder":"_work"})),
+            &format!("{}/actions/runners/generate-jitconfig", api_base(scope)),
+            Some(
+                &json!({"name":name,"runner_group_id":group,"labels":labels,"work_folder":"_work"}),
+            ),
             &token,
         )?;
         Ok((
@@ -1152,7 +1191,7 @@ impl GitHub {
         let token = self.token(app_id, repo)?;
         self.call(
             "DELETE",
-            &format!("/repos/{repo}/actions/runners/{id}"),
+            &format!("{}/actions/runners/{id}", api_base(repo)),
             None,
             &token,
         )?;

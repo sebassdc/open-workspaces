@@ -49,6 +49,10 @@ CONTROLLER = f"{DATA}/controller"
 # A runner host (role runner) joins another host's controller: the join it reads from
 # Secrets Manager, the controller's CA and URL, all on the data volume.
 JOIN = f"{RUNNER}/join.json"
+# The agent asks for the release its controller chose here; ow-self-upgrade.path watches it.
+SELF_UPGRADE = f"{DATA}/self-upgrade"
+SELF_UPGRADE_PATH = "/etc/systemd/system/ow-self-upgrade.path"
+SELF_UPGRADE_SERVICE = "/etc/systemd/system/ow-self-upgrade.service"
 CA = f"{DATA}/controller-ca.pem"
 CONTROLLER_ENV = f"{DATA}/controller.env"
 JOIN_TTL = 600
@@ -442,7 +446,7 @@ ConditionPathExists=|{JOIN}
 
 [Service]
 User=ow
-Environment=HOME=/srv/ow OW_ASSET_DIR={asset}
+Environment=HOME=/srv/ow OW_ASSET_DIR={asset} OW_HOST_LAYOUT={SRV}
 EnvironmentFile={CONTROLLER_ENV}
 ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet
 ExecStart={SRV}/run/agent/bin/ow --data-dir {RUNNER} node-agent --controller ${{OW_CONTROLLER}} --credential {RUNNER}/node.json --join {JOIN} --ca-cert {CA}
@@ -456,7 +460,7 @@ RequiresMountsFor=/srv/ow
 
 [Service]
 User=ow
-Environment=HOME=/srv/ow OW_ASSET_DIR={SRV}/run/agent/assets
+Environment=HOME=/srv/ow OW_ASSET_DIR={SRV}/run/agent/assets OW_HOST_LAYOUT={SRV}
 ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet
 ExecStart={SRV}/run/agent/bin/ow host up --controller-only
 """
@@ -469,7 +473,7 @@ RequiresMountsFor=/srv/ow
 
 [Service]
 User=ow
-Environment=HOME=/srv/ow OW_ASSET_DIR={asset}
+Environment=HOME=/srv/ow OW_ASSET_DIR={asset} OW_HOST_LAYOUT={SRV}
 ExecStartPre=/usr/local/lib/open-workspaces/wait-tailnet
 ExecStart={SRV}/run/agent/bin/ow host up --external-worker --memory {budget['memory']} --slots {budget['slots']} --cpus {budget['cpus']}
 """
@@ -499,6 +503,34 @@ ExecStart=/usr/local/sbin/ow-host recover
 
 [Install]
 WantedBy=multi-user.target
+""",
+        0o644,
+    )
+    # The release the controller chose for this host (docs/UPGRADES.md#choosing-the-release):
+    # its agent writes the request; root installs it with this host's own upgrader.
+    files[SELF_UPGRADE_PATH] = (
+        f"""[Unit]
+Description=Open Workspaces: watch for the release this host's agent asks for
+
+[Path]
+PathChanged={SELF_UPGRADE}/request.json
+Unit=ow-self-upgrade.service
+
+[Install]
+WantedBy=multi-user.target
+""",
+        0o644,
+    )
+    files[SELF_UPGRADE_SERVICE] = (
+        """[Unit]
+Description=Open Workspaces: install the release the controller chose for this host
+After=open-workspaces-recover.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ow-host self-upgrade
+# A worker upgrade that hibernates boxes has no fixed bound (docs/UPGRADES.md).
+TimeoutStartSec=infinity
 """,
         0o644,
     )
@@ -553,7 +585,7 @@ StartLimitIntervalSec=0
 [Service]
 User=ow
 EnvironmentFile=/etc/open-workspaces/dashboard.env
-Environment=HOME=/srv/ow OW_ASSET_DIR={asset}
+Environment=HOME=/srv/ow OW_ASSET_DIR={asset} OW_HOST_LAYOUT={SRV}
 ExecStartPre=+/usr/local/lib/open-workspaces/dashboard-prepare
 ExecStart={SRV}/run/dashboard/bin/ow --data-dir {DATA}/controller dashboard --config {DATA}/dashboard.json --listen 127.0.0.1:8787
 Restart=always
@@ -686,6 +718,8 @@ OWNED = (
     f"/etc/systemd/system/{CONTROL}",
     f"/etc/systemd/system/{GUESTS}",
     "/etc/systemd/system/open-workspaces-recover.service",
+    "/etc/systemd/system/ow-self-upgrade.path",
+    "/etc/systemd/system/ow-self-upgrade.service",
     "/etc/systemd/system/open-workspaces-dashboard.service",
     "/etc/systemd/system/open-workspaces-images.service",
     "/etc/systemd/system/ow-backup.service",
@@ -761,12 +795,19 @@ def setup(config):
     for path in OWNED:
         if path not in files and p(path).exists():
             unit = Path(path).name
-            if unit.endswith((".service", ".timer")):
+            if unit.endswith((".service", ".timer", ".path")):
                 run(["systemctl", "disable", "--now", unit], check=False)
             p(path).unlink()
             changed.add(path)
     if "daemon-reload" in due:
         systemctl("daemon-reload")
+    if SELF_UPGRADE_PATH in files:
+        # The agent's request directory, then the watch on it once it is installed.
+        p(SELF_UPGRADE).mkdir(parents=True, exist_ok=True)
+        os.chmod(p(SELF_UPGRADE), 0o755)
+        chown(p(SELF_UPGRADE), "ow")
+        if SELF_UPGRADE_PATH in changed:
+            systemctl("enable", "--now", "ow-self-upgrade.path")
     if "apparmor" in due:
         run(["apparmor_parser", "-r", "/etc/apparmor.d/open-workspaces"])
     network = {item.split(":", 1)[1] for item in due if item.startswith("direct-network:")}
@@ -1164,9 +1205,12 @@ def apply_config():
     for unit, reason in sorted(pending().items()):
         cls = 2 if unit == "worker" else 1
         say(f"pending: restart {UNITS[unit]} ({reason}; class {cls}): ow-host upgrade")
+    import upgrade
+
     current = staged(pin("current")) or {}
-    if current.get("ref") != config["release"]["ref"]:
-        say(f"pending: release {config['release']['ref']} (running {current.get('ref')}): ow-host upgrade")
+    want = upgrade.chosen_ref() or config["release"]["ref"]
+    if current.get("ref") != want:
+        say(f"pending: release {want} (running {current.get('ref')}): ow-host upgrade")
     return 0
 
 
@@ -1414,6 +1458,7 @@ def main(argv):
     r.add_argument("--wait", type=int, default=600)
     r.add_argument("--images", action="store_true")
     sub.add_parser("enrolled")
+    sub.add_parser("self-upgrade", help="install the release this host's agent asked for (ow-self-upgrade.service)")
     unchanged = sub.add_parser("unchanged")
     unchanged.add_argument("--image", action="append", default=[], metavar="NAME=SHA256")
     restart = sub.add_parser("restart")
@@ -1474,6 +1519,10 @@ def main(argv):
             return 0 if p(f"{RUNNER}/node.json").exists() and node_online() else 1
         import upgrade
 
+        if args.command == "self-upgrade":
+            import upgrade
+
+            return upgrade.self_upgrade()
         if args.command == "unchanged":
             return upgrade.unchanged(args.image)
 

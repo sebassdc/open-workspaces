@@ -97,6 +97,23 @@ class Render(unittest.TestCase):
         self.assertIn("OW_IDLE_HIBERNATE_SECS=1800\n", env)
         self.assertIn("OW_MAX_MEMORY_MIB=11776\n", env)
 
+    def test_the_agent_asks_root_for_the_chosen_release_through_a_watched_file(self):
+        watch = self.files[h.SELF_UPGRADE_PATH]
+        self.assertIn("PathChanged=/srv/ow/.ow/self-upgrade/request.json", watch)
+        self.assertIn("Unit=ow-self-upgrade.service", watch)
+        service = self.files[h.SELF_UPGRADE_SERVICE]
+        self.assertIn("ExecStart=/usr/local/sbin/ow-host self-upgrade", service)
+        self.assertNotIn("User=", service, "the upgrader runs as root, the agent does not")
+        runner = config(role="runner", dashboard={}, runner={
+            "node": "r1", "controller": "ow-host", "joinSecretArn": CONFIG["tailscale"]["secretArn"]})
+        for role, c in (("host", config()), ("runner", runner), ("controller", config(role="controller", developerImages=[]))):
+            files = {k: v[0] for k, v in h.render(c, BUDGET).items()}
+            self.assertIn("OW_HOST_LAYOUT=/srv/ow", files["/etc/systemd/system/open-workspaces.service"], role)
+            self.assertIn(h.SELF_UPGRADE_PATH, files, role)
+        self.assertIn("OW_HOST_LAYOUT=/srv/ow", self.files["/etc/systemd/system/open-workspaces-dashboard.service"])
+        for path in (h.SELF_UPGRADE_PATH, h.SELF_UPGRADE_SERVICE):
+            self.assertIn(path, h.OWNED)
+
     def test_dashboard_stays_on_loopback_and_is_served_to_the_tailnet_only(self):
         unit = self.files["/etc/systemd/system/open-workspaces-dashboard.service"]
         self.assertIn("--listen 127.0.0.1:8787", unit)

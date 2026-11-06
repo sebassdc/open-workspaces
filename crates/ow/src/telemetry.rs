@@ -72,7 +72,7 @@ fn now() -> i64 {
 // Controller-held settings (one source; read on every acknowledgement).
 
 /// Allowed keys and their defaults.
-pub const KEYS: [(&str, &str); 18] = [
+pub const KEYS: [(&str, &str); 21] = [
     ("telemetry.enabled", "true"),
     ("telemetry.interval_s", "15"),
     ("telemetry.forward_endpoint", ""),
@@ -101,6 +101,13 @@ pub const KEYS: [(&str, &str); 18] = [
     // What a worker upgrade without hand-over does with running boxes: hibernate them
     // (RAM kept) or stop them (fast, cold boot after) (docs/UPGRADES.md).
     ("upgrade.running_boxes", "hibernate"),
+    // The release each host runs, chosen by an operator (`ow upgrade set`); empty: none chosen,
+    // so no host moves. Each host's agent applies its own (docs/UPGRADES.md#choosing-the-release).
+    ("upgrade.version", ""),
+    // One runner's release instead of the fleet's, by runner name (`ow upgrade set --runner`).
+    ("upgrade.runner_versions", "{}"),
+    // The release `ow upgrade` installs on clients; empty: the release the controller runs.
+    ("upgrade.client_version", ""),
     // Per placement pool, the exact private ADDRESS:PORT destinations its boxes may reach
     // (docs/NETWORKING.md#private-destinations); none by default.
     (crate::private_egress::SETTING, "[]"),
@@ -127,6 +134,8 @@ pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
             "hibernate" | "stop" => Ok(json!(value)),
             _ => bail!("upgrade.running_boxes is hibernate or stop"),
         },
+        "upgrade.version" | "upgrade.client_version" => crate::self_upgrade::typed_version(value),
+        "upgrade.runner_versions" => crate::self_upgrade::typed_runner_versions(value),
         "telemetry.logs" => match value {
             "true" => Ok(json!(true)),
             "false" => Ok(json!(false)),
@@ -253,7 +262,16 @@ pub fn set(root: &Path, key: &str, value: &str, actor: &str) -> Result<Value> {
 /// What the acknowledgement carries to agents.
 pub(crate) fn offer(db: &Connection) -> Value {
     settings(db)
-        .map(|s| json!({"enabled":s["telemetry.enabled"],"interval_s":s["telemetry.interval_s"],"version":s["version"],"worker_handover":s["upgrade.worker_handover"],"running_boxes":s["upgrade.running_boxes"]}))
+        .map(|s| json!({"enabled":s["telemetry.enabled"],"interval_s":s["telemetry.interval_s"],"version":s["version"],"worker_handover":s["upgrade.worker_handover"],"running_boxes":s["upgrade.running_boxes"],
+            // The chosen releases; each agent picks its own and asks its host's upgrader.
+            "upgrade_version":s["upgrade.version"],"runner_versions":s["upgrade.runner_versions"],
+            "controller_release":env!("CARGO_PKG_VERSION")}))
+        .map(|mut offer| {
+            let times = crate::self_upgrade::chosen_times(db).unwrap_or_default();
+            offer["upgrade_chosen_at"] = times["fleet"].clone();
+            offer["runner_chosen_at"] = times["runners"].clone();
+            offer
+        })
         .unwrap_or(json!({"enabled":true,"interval_s":15}))
 }
 

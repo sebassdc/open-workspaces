@@ -372,6 +372,10 @@ trait Releases {
     fn latest(&mut self) -> Result<String>;
     /// The release the configured controller serves `GET /api/version` from.
     fn controller(&mut self) -> Result<String>;
+    /// The last `controller` answer is a client release the operator chose
+    /// (`upgrade.client_version`), not the release the controller runs: it must pass its
+    /// own `status` against the controller first.
+    fn chosen_client(&self) -> bool;
     /// Fails unless this client's file may be replaced; checked before any download.
     fn replaceable(&mut self) -> Result<()>;
     /// This platform's `.sha256` in `target`'s release.
@@ -399,7 +403,7 @@ fn select(
     check: bool,
 ) -> Result<Outcome> {
     if let Some(version) = version {
-        return attempt(releases, current, parse(version)?, Source::Version, check);
+        return attempt(releases, current, parse(version)?, Source::Version, check, false);
     }
     let mut controller = None;
     let reason = if releases.https()? {
@@ -415,12 +419,34 @@ fn select(
         None => releases.controller()?,
     };
     let target = parse(&controller).context("the controller's /api/version")?;
-    let mut outcome = attempt(releases, current, target, Source::Controller, check)?;
+    // An operator's client release is checked like a latest one (it may be the same release).
+    let against = releases.chosen_client() && releases.https()?;
+    let mut outcome = attempt(releases, current, target, Source::Controller, check, against)?;
     outcome.reason = Some(match outcome.reason {
         Some(also) => format!("{reason}; {also}"),
         None => reason,
     });
     Ok(outcome)
+}
+
+/// What `ow upgrade` installs: the release the controller chose for its clients (or, with
+/// none chosen, the one it runs), or exactly `--version`. A new release on GitHub is only
+/// available: it is installed when the owner opts in with `--latest`, or once the operator
+/// chooses it (docs/UPGRADES.md#choosing-the-release).
+fn choose(
+    releases: &mut impl Releases,
+    current: Version,
+    version: Option<&str>,
+    check: bool,
+    latest: bool,
+) -> Result<Outcome> {
+    if latest || version.is_some() {
+        return select(releases, current, version, check);
+    }
+    let target = parse(&releases.controller()?).context("the controller's /api/version")?;
+    // A chosen client release is checked against the controller, where it can be (HTTPS).
+    let against = releases.chosen_client() && releases.https()?;
+    attempt(releases, current, target, Source::Controller, check, against)
 }
 
 /// The latest release's outcome, or why the controller's release is the target instead.
@@ -437,7 +463,7 @@ fn latest(
         Err(error) => return Ok(Err(format!("the latest release is unknown: {error:#}"))),
     };
     if !wanted(current, latest, false) {
-        return attempt(releases, current, latest, Source::Latest, check).map(Ok);
+        return attempt(releases, current, latest, Source::Latest, check, false).map(Ok);
     }
     let v = show(latest);
     if let Some(why) = releases.refused(latest) {
@@ -481,15 +507,17 @@ fn latest(
 /// runs it, so the cause is gone (a client often sees a release before its controller has it).
 const INCOMPATIBLE: &str = "not compatible with the controller";
 
-/// The controller's release or `--version`: no compatibility check. A controller release
-/// that failed after its `.sha256` was found is remembered, like a latest one; `--version`
-/// always tries.
+/// The controller's release or `--version`: no compatibility check, unless `against` (a
+/// client release the operator chose, which the controller does not run itself). A controller
+/// release that failed after its `.sha256` was found is remembered, like a latest one;
+/// `--version` always tries.
 fn attempt(
     releases: &mut impl Releases,
     current: Version,
     target: Version,
     source: Source,
     check: bool,
+    against: bool,
 ) -> Result<Outcome> {
     let mut outcome = Outcome {
         to: target,
@@ -503,7 +531,7 @@ fn attempt(
     let remember = source == Source::Controller;
     let refused = releases
         .refused(target)
-        .filter(|why| remember && !why.starts_with(INCOMPATIBLE));
+        .filter(|why| remember && (against || !why.starts_with(INCOMPATIBLE)));
     if let Some(why) = refused {
         outcome.reason = Some(format!("v{} was refused recently: {why}", show(target)));
         // `--check` still reports it as available: it is newer, only held back for now.
@@ -519,7 +547,7 @@ fn attempt(
         outcome.step = Step::Available;
         return Ok(outcome);
     }
-    if let Err(error) = releases.install(target, &published, false) {
+    if let Err(error) = releases.install(target, &published, against) {
         if remember {
             releases.refuse(target, &format!("{error:#}"));
         }
@@ -534,15 +562,18 @@ struct Github<F, H> {
     client: reqwest::blocking::Client,
     no_redirect: reqwest::blocking::Client,
     controller: Option<F>,
+    /// The controller's answer was the operator's client choice.
+    client_choice: bool,
     /// Global options this process got (`--data-dir`, `--server`, `--local`), for the
     /// candidate's `status`.
     options: Vec<OsString>,
     exe: Option<PathBuf>,
     memo: Option<PathBuf>,
     https: Option<H>,
+    https_answer: Option<bool>,
 }
 
-impl<F: FnOnce() -> Result<String>, H: FnOnce() -> Result<bool>> Releases for Github<F, H> {
+impl<F: FnOnce() -> Result<(String, bool)>, H: FnOnce() -> Result<bool>> Releases for Github<F, H> {
     fn latest(&mut self) -> Result<String> {
         let url = format!("{RELEASES}/latest");
         let response = self
@@ -565,10 +596,16 @@ impl<F: FnOnce() -> Result<String>, H: FnOnce() -> Result<bool>> Releases for Gi
     }
 
     fn controller(&mut self) -> Result<String> {
-        (self
+        let (release, client) = (self
             .controller
             .take()
-            .context("the controller was already asked")?)()
+            .context("the controller was already asked")?)()?;
+        self.client_choice = client;
+        Ok(release)
+    }
+
+    fn chosen_client(&self) -> bool {
+        self.client_choice
     }
 
     fn replaceable(&mut self) -> Result<()> {
@@ -651,7 +688,13 @@ impl<F: FnOnce() -> Result<String>, H: FnOnce() -> Result<bool>> Releases for Gi
     }
 
     fn https(&mut self) -> Result<bool> {
-        (self.https.take().context("already asked")?)()
+        // Asked once; later calls (the --latest fallback) reuse the answer.
+        if let Some(answer) = self.https_answer {
+            return Ok(answer);
+        }
+        let answer = (self.https.take().context("already asked")?)()?;
+        self.https_answer = Some(answer);
+        Ok(answer)
     }
 }
 
@@ -660,9 +703,10 @@ impl<F: FnOnce() -> Result<String>, H: FnOnce() -> Result<bool>> Releases for Gi
 /// controller is an HTTPS server (not the local socket); it is asked only without `--version`.
 pub(crate) fn run(
     version: Option<String>,
+    latest: bool,
     check: bool,
     json: bool,
-    controller: impl FnOnce() -> Result<String>,
+    controller: impl FnOnce() -> Result<(String, bool)>,
     options: Vec<OsString>,
     https: impl FnOnce() -> Result<bool>,
 ) -> Result<i32> {
@@ -680,14 +724,16 @@ pub(crate) fn run(
         client: build(reqwest::redirect::Policy::default())?,
         no_redirect: build(reqwest::redirect::Policy::none())?,
         controller: Some(controller),
+        client_choice: false,
         options,
         exe: None,
         memo: crate::client::config()
             .ok()
             .map(|config| config.with_file_name("upgrade-refused")),
         https: Some(https),
+        https_answer: None,
     };
-    let outcome = select(&mut github, current, version.as_deref(), check)?;
+    let outcome = choose(&mut github, current, version.as_deref(), check, latest)?;
     // A timer runs `--json` often: a no-op stays silent there.
     if outcome.step == Step::Current && json && !check {
         return Ok(0);
@@ -755,6 +801,8 @@ mod tests {
         refused: Vec<(Version, String)>,
         asked_controller: bool,
         installed: Vec<(Version, bool)>,
+        /// The controller answers an operator's client choice.
+        client: bool,
     }
 
     fn fake(latest: &'static str, controller: &'static str) -> Fake {
@@ -768,6 +816,7 @@ mod tests {
             refused: Vec::new(),
             asked_controller: false,
             installed: Vec::new(),
+            client: false,
         }
     }
 
@@ -781,6 +830,9 @@ mod tests {
             assert!(!self.asked_controller, "the controller is asked once");
             self.asked_controller = true;
             Ok(self.controller.into())
+        }
+        fn chosen_client(&self) -> bool {
+            self.client
         }
         fn replaceable(&mut self) -> Result<()> {
             Ok(())
@@ -813,6 +865,71 @@ mod tests {
     }
 
     const CURRENT: Version = (0, 9, 62);
+
+    #[test]
+    fn the_server_kind_is_asked_once_and_reused() {
+        let mut asked = 0;
+        let mut github = Github {
+            client: reqwest::blocking::Client::new(),
+            no_redirect: reqwest::blocking::Client::new(),
+            controller: None::<fn() -> Result<(String, bool)>>,
+            client_choice: false,
+            options: vec![],
+            exe: None,
+            memo: None,
+            https: Some(|| {
+                asked += 1;
+                Ok(true)
+            }),
+            https_answer: None,
+        };
+        assert!(github.https().unwrap());
+        assert!(github.https().unwrap(), "the --latest fallback asks again");
+        drop(github);
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn a_new_release_waits_for_the_operator_or_latest() {
+        // GitHub has 0.9.64; the controller chose (or runs) 0.9.62: nothing to install.
+        let mut r = fake("v0.9.64", "0.9.62");
+        let o = choose(&mut r, CURRENT, None, false, false).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            (CURRENT, Source::Controller, Step::Current)
+        );
+        assert!(r.installed.is_empty());
+        // The operator chose 0.9.63: installed, without asking GitHub for its latest.
+        let mut r = fake("v0.9.64", "0.9.63");
+        r.latest = Err("not asked");
+        let o = choose(&mut r, CURRENT, None, false, false).unwrap();
+        assert_eq!((o.to, o.step), ((0, 9, 63), Step::Upgraded));
+        assert_eq!(r.installed, [((0, 9, 63), false)]);
+        // An operator's client choice is checked against the controller before it replaces this one.
+        let mut r = fake("v0.9.64", "0.9.63");
+        r.client = true;
+        let o = choose(&mut r, CURRENT, None, false, false).unwrap();
+        assert_eq!(o.step, Step::Upgraded);
+        assert_eq!(r.installed, [((0, 9, 63), true)]);
+        let mut r = fake("v0.9.64", "0.9.63");
+        (r.client, r.https) = (true, false);
+        choose(&mut r, CURRENT, None, false, false).unwrap();
+        assert_eq!(r.installed, [((0, 9, 63), false)], "over the local socket it cannot be");
+        // --latest refused as incompatible, falling back to the same chosen client release:
+        // still checked, never installed unchecked.
+        let mut r = fake("v0.9.63", "0.9.63");
+        r.client = true;
+        r.broken = vec![((0, 9, 63), "not compatible with the controller: status asks first")];
+        assert!(choose(&mut r, CURRENT, None, false, true).is_ok());
+        assert!(r.installed.is_empty());
+        // The owner opts in: the latest compatible release.
+        let mut r = fake("v0.9.64", "0.9.62");
+        let o = choose(&mut r, CURRENT, None, false, true).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            ((0, 9, 64), Source::Latest, Step::Upgraded)
+        );
+    }
 
     #[test]
     fn a_newer_compatible_latest_release_is_installed() {

@@ -5,6 +5,73 @@ only what the release changed. The decision record is
 [ADR 0005](adr/0005-change-classes-and-engine-boundary.md); the operator view
 is in [deploy/aws/README.md](../deploy/aws/README.md#upgrades-in-place).
 
+## Choosing the release
+
+From 0.9.75 a published release is only available: no host installs it until an
+operator chooses it on the controller, and then each host's own agent installs
+it. Nothing in between: no CI job, no SSM command, no per-host step.
+
+```text
+ow upgrade set 0.9.75 [--runner NAME]          admin op upgrade.set
+  -> controller settings upgrade.version / upgrade.runner_versions (+ the decision time)
+  -> every acknowledgement (one per 3 s heartbeat) carries them and the controller's release
+  -> each runner's agent: chosen release != the host's release (current/STAGED)
+       -> writes /srv/ow/.ow/self-upgrade/request.json (version, controller release, decision time)
+  -> ow-self-upgrade.path (root) -> ow-host self-upgrade
+       -> ow-host upgrade vVERSION: fetch, plan, stage the verified released binaries,
+          hand-over or hibernate, switch, verify; rollback on failure
+       -> /srv/ow/.ow/self-upgrade/result.json (state, error, seconds, staging and journal steps)
+  -> the agent's next heartbeat reports host_release and the result
+  -> ow upgrade status: per host release and since; healthy_s once every chosen host runs it
+```
+
+- **Settings** ([TELEMETRY.md](TELEMETRY.md#settings-controller-only)): `upgrade.version` (the
+  fleet; empty: none chosen), `upgrade.runner_versions` (one runner instead of
+  the fleet) and `upgrade.client_version` (what `ow upgrade` installs on
+  clients). Only `ow upgrade set` (admin op `upgrade.set`) sets them: it dates
+  the decision (the fleet's and each runner's apart) and a controller-only host
+  follows at once; `config.set` refuses them.
+- **Who asks**: a runner's agent, and on a host with a local runner that
+  runner's agent. A controller-only host's controller asks for the fleet release
+  when the choice changes and when it starts. The agent asks once per (release,
+  controller release, decision time) and remembers it across restarts, so a host
+  that refused a release or rolled it back does not try again by itself: choosing
+  the release again (a new decision time) retries it, and so does the
+  controller moving (a runner refused because its controller had to go first).
+  An agent outside a host layout (no `OW_HOST_LAYOUT`) never asks.
+- **Order**: every chosen host starts at once. A runner passes its controller's
+  release as `--controller-version`; a release whose protocol the old controller
+  would refuse is refused at plan on that runner, which asks again as soon as its
+  controller reports the new release.
+- **Who installs**: `ow-self-upgrade.service`, as root, runs the host's own
+  upgrader with everything above (verified released binaries, capture gate,
+  hand-over, abort and rollback, one upgrade at a time: it waits for one already
+  running). It takes only an exact `X.Y.Z` from the request, which the `ow` user
+  writes; a request written while it runs is taken next.
+- **The config's release.ref only bootstraps**: once a release is chosen,
+  `ow-host upgrade` without a ref, `ow-host unchanged` (so `ow-aws ci-post-up`)
+  and a replaced instance's boot install the chosen release, so a deploy never
+  moves a host away from the controller's choice. Clearing the choice
+  (`ow upgrade set none`) moves nothing and hands the hosts back to their
+  config's ref.
+- **Clients**: `ow upgrade` installs `upgrade.client_version` (after its own
+  `status` passes against the controller, over HTTPS), else the release the
+  controller runs; GitHub's latest release only with `--latest`
+  ([INSTALL.md](INSTALL.md#keeping-the-cli-current)). A timer running `ow
+  upgrade` therefore installs what was chosen, when it was chosen.
+- **Recorded even when running**: the agent records the chosen release in the
+  request even when its host already runs it, so a deploy or boot, which install
+  the recorded release, never return to an older request.
+- **Timing**: `ow upgrade status` gives each host's `since` (when its agent
+  first reported the release) and `healthy_s`: from the last decision to the
+  last chosen host online at its release, verified (its upgrader's report for
+  that release says `done`, written after verify). Each host's `self_upgrade`
+  result has the request time, the upgrader's total seconds, staging seconds,
+  the journal's steps and a `warning` for what the upgrade could not keep (a box
+  not resumed or not kept running).
+- **First release**: 0.9.75 itself installs the old way (its hosts have no
+  watch yet); every later release can be chosen.
+
 ## Change classes
 
 | Class | What restarts | Running boxes | Open SSH and terminal streams |

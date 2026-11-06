@@ -76,8 +76,18 @@ not the versioned GitHub Release download path.
 
 ## Keeping the CLI current
 
-`ow upgrade` replaces the installed client with the newest published release
-that works with your controller. It finds that release from the redirect of
+`ow upgrade` replaces the installed client with the release your controller's
+operator chose for clients (`ow upgrade set VERSION --client`, the setting
+`upgrade.client_version`), or, with none chosen, the release the controller runs
+(both from its `GET /api/version`: `client`, else `server`). A new release on
+GitHub is only available: it is installed once it is chosen (a chosen client
+release must first pass its own `status` against the controller, as below), or when you opt in
+with `ow upgrade --latest`, so a timer that runs `ow upgrade` installs exactly what
+the operator chose, when they choose it ([UPGRADES.md](UPGRADES.md#choosing-the-release)).
+It never goes older than this client unless `--version` names that release.
+
+`ow upgrade --latest` takes the newest published release that works with your
+controller. It finds that release from the redirect of
 `https://github.com/sebassdc/open-workspaces/releases/latest` (GitHub sends it
 only to a published release that is not a draft or prerelease), reading the tag
 from the `Location` header without following it, so a timer spends no GitHub API
@@ -113,14 +123,15 @@ controller answers `GET /api/version`, since its compatibility cannot be checked
 otherwise.
 
 ```sh
-ow upgrade                  # to the latest compatible release; never older than this client
+ow upgrade                  # to the release the controller chose for clients (else its own); never older than this client
+ow upgrade --latest         # opt in: the latest compatible release on GitHub
 ow upgrade --check          # print current and target; exit 0 if current, 10 if an upgrade is available
 ow upgrade --version v0.9.58  # exactly this release, even an older one; no latest lookup or status check
 ow upgrade --json           # after an upgrade: {"from":"0.9.62","to":"0.9.64","seconds":2.4,"upgraded":true,"source":"latest"}
 ```
 
-`source` says where the target came from: `latest`, `controller` (the
-fallback, with a `reason`) or `version`. An equal or older latest release prints
+`source` says where the target came from: `controller` (the chosen release, or
+`--latest`'s fallback, with a `reason`), `latest` or `version`. An equal or older latest release prints
 one line and exits 0 without downloading anything; with `--json` it prints
 nothing, so a timer's log grows only when something changed (`--check --json`
 always prints the line). Only an explicit `--version` installs an older release.

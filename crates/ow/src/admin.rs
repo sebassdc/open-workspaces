@@ -71,6 +71,8 @@ pub(crate) const OPS: &[OpSpec] = &[
     op("actions.app_key.set", &[&["actions", "app-key", "set"]], true),
     op("limits.owner.get", &[&["limits", "get"]], false),
     op("limits.owner.set", &[&["limits", "set"]], true),
+    op("upgrade.set", &[&["upgrade", "set"]], true),
+    op("upgrade.status", &[&["upgrade", "status"]], false),
 ];
 
 pub(crate) fn spec(name: &str) -> Option<&'static OpSpec> {
@@ -150,6 +152,14 @@ pub(crate) enum AdminRequest {
         disk_gib: Option<u64>,
         boxes: Option<u64>,
     },
+    #[serde(rename = "upgrade.set")]
+    UpgradeSet {
+        version: String,
+        runner: Option<String>,
+        client: Option<bool>,
+    },
+    #[serde(rename = "upgrade.status")]
+    UpgradeStatus {},
 }
 
 /// Who made a request, as the gateway or the socket verified it.
@@ -583,6 +593,18 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             expected_version,
         } => {
             known_key(&key)?;
+            if matches!(
+                key.as_str(),
+                "upgrade.version" | "upgrade.runner_versions" | "upgrade.client_version"
+            ) {
+                // One path for a release choice: it is dated and the controller's own host
+                // follows it (docs/UPGRADES.md#choosing-the-release).
+                return Err(failure(
+                    409,
+                    "rejected",
+                    format!("{key} is chosen with ow upgrade set (admin op upgrade.set)."),
+                ));
+            }
             // Read before the transaction: it opens its own connection.
             let inventory = if key.starts_with("placement.") {
                 crate::nodes::inventory(root)?
@@ -994,6 +1016,92 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 json!({"owner":email,"owner_id":id,"caps":caps,"override":overridden,"usage":crate::limits::usage(&db,id,"")?}),
             )
         }
+        AdminRequest::UpgradeSet {
+            version,
+            runner,
+            client,
+        } => {
+            let client = client.unwrap_or(false);
+            if client && runner.is_some() {
+                return Err(invalid_request("choose either a runner or the clients"));
+            }
+            // Empty or "none" clears the choice: nothing moves until one is made again.
+            let version = match version.as_str() {
+                "" | "none" => String::new(),
+                text => crate::self_upgrade::release(text)
+                    .map_err(|e| invalid_value("version", format!("{e:#}")))?,
+            };
+            let mut db = crate::nodes::db(root)?;
+            let tx = immediate(&mut db)?;
+            let current = crate::telemetry::settings(&tx)?;
+            let (key, typed) = if client {
+                ("upgrade.client_version", json!(version))
+            } else if let Some(runner) = &runner {
+                crate::common::identifier(runner).map_err(|e| invalid_value("runner", e))?;
+                if !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1 AND revoked=0)",
+                    [runner],
+                    |r| r.get::<_, bool>(0),
+                )? {
+                    return Err(not_found("runner", runner));
+                }
+                let mut map = current["upgrade.runner_versions"].clone();
+                let entries = map.as_object_mut().expect("typed as an object");
+                if version.is_empty() {
+                    entries.remove(runner);
+                } else {
+                    entries.insert(runner.clone(), json!(version));
+                }
+                ("upgrade.runner_versions", map)
+            } else {
+                ("upgrade.version", json!(version))
+            };
+            let previous = current[key].clone();
+            let change = json!({"key":key,"value":typed,"previous":previous});
+            let changed_now = previous != typed;
+            let mut config_version = current["version"].as_i64().unwrap_or(0);
+            if changed_now {
+                config_version =
+                    crate::telemetry::store_setting(&tx, key, &typed, &ctx.actor.label())?;
+            }
+            // Dated even when unchanged: choosing a release again retries it on a host that
+            // refused it or rolled it back.
+            let chosen_at = now();
+            if !client {
+                crate::self_upgrade::mark_chosen(&tx, runner.as_deref(), chosen_at)?;
+            }
+            let audit_id = audit(
+                &tx,
+                "upgrade.set",
+                &ctx.actor,
+                raw,
+                if changed_now { "ok" } else { "unchanged" },
+                Some(config_version),
+                Some(&change),
+            )?;
+            tx.commit()?;
+            if !client {
+                crate::self_upgrade::follow_controller(root);
+            }
+            changed(
+                "upgrade.set",
+                &ctx.actor,
+                json!({"key":key,"version":config_version}),
+            );
+            Ok(
+                json!({"key":key,"value":typed,"previous":previous,"changed":changed_now,
+                "version":config_version,"chosen_at":(!client).then_some(chosen_at),"audit_id":audit_id}),
+            )
+        }
+        AdminRequest::UpgradeStatus {} => {
+            let inventory = crate::nodes::inventory(root)?;
+            let db = crate::nodes::db(root)?;
+            Ok(crate::self_upgrade::status(
+                &crate::telemetry::settings(&db)?,
+                &crate::self_upgrade::chosen_times(&db)?,
+                &inventory,
+            ))
+        }
         AdminRequest::LimitsOwnerSet {
             owner,
             cpus,
@@ -1106,6 +1214,16 @@ pub(crate) fn saved_controller(root: &Path) -> Option<String> {
     saved["controller"].as_str().map(str::to_owned)
 }
 
+/// The client release an operator chose on this controller (`upgrade.client_version`), which
+/// `ow upgrade` installs; None when none is chosen (clients then follow the server release).
+pub(crate) fn client_release(root: Option<&Path>) -> Option<String> {
+    let db = crate::nodes::db(root?).ok()?;
+    crate::telemetry::settings(&db).ok()?["upgrade.client_version"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+}
+
 /// `GET /api/version` additions.
 pub(crate) fn version_fields(value: &mut Value) {
     if let Some(capabilities) = value["capabilities"].as_array_mut() {
@@ -1179,22 +1297,30 @@ pub(crate) async fn serve_socket(root: PathBuf, fallback_controller: Option<Stri
     let router = Router::new()
         .route(
             "/api/version",
-            get(move |ConnectInfo(peer): ConnectInfo<Peer>| async move {
-                if !peer_allowed(peer.uid) {
-                    return reply(
-                        403,
-                        failure(
+            get(
+                move |State((root, _)): State<(PathBuf, Option<String>)>,
+                      ConnectInfo(peer): ConnectInfo<Peer>| async move {
+                    if !peer_allowed(peer.uid) {
+                        return reply(
                             403,
-                            "admin_required",
-                            "Admin operations need the pool owner's login.",
-                        )
-                        .body(None),
-                    );
-                }
-                let mut result = json!({"server":env!("CARGO_PKG_VERSION")});
-                version_fields(&mut result);
-                reply(200, json!({"ok":true,"result":result}))
-            }),
+                            failure(
+                                403,
+                                "admin_required",
+                                "Admin operations need the pool owner's login.",
+                            )
+                            .body(None),
+                        );
+                    }
+                    let mut result = json!({"server":env!("CARGO_PKG_VERSION")});
+                    if let Ok(Some(client)) =
+                        tokio::task::spawn_blocking(move || client_release(Some(&root))).await
+                    {
+                        result["client"] = json!(client);
+                    }
+                    version_fields(&mut result);
+                    reply(200, json!({"ok":true,"result":result}))
+                },
+            ),
         )
         .route(
             "/api/admin",

@@ -36,6 +36,11 @@ TERMINAL = ("done", "aborted", "rolled-back", "failed")
 # Paused while a journal is open: a recovery run's capture or hash holds the
 # one-request worker, and a backup's reads compete with the hibernation.
 TIMERS = ("ow-recovery.timer", "ow-backup.timer")
+# The release the controller chose for this host, as its agent asked for it (written by the
+# ow user), and what this host's upgrader made of it (read by the agent).
+REQUEST = f"{h.SELF_UPGRADE}/request.json"
+RESULT = f"{h.SELF_UPGRADE}/result.json"
+RELEASE = re.compile(r"^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$")
 
 
 def version(text):
@@ -220,9 +225,33 @@ def git(*args, check=True):
     return h.run(["git", "-C", str(p(f"{h.SRV}/src")), *args], user="ow", check=check)
 
 
+def chosen_request():
+    """The release this host's agent last asked for (its controller's choice), checked: the
+    ow user writes it, so only an exact release version (and controller release) is taken.
+    None when none was asked for."""
+    req = h.read_json(REQUEST)
+    if not isinstance(req, dict) or not isinstance(req.get("version"), str) or not RELEASE.match(req["version"]):
+        return None
+    controller = req.get("controller")
+    if not (isinstance(controller, str) and RELEASE.match(controller)):
+        controller = None
+    at = req.get("chosen_at")
+    return {"version": req["version"], "controller": controller,
+            "chosen_at": at if isinstance(at, int) and not isinstance(at, bool) else 0,
+            "requested_at": req.get("requested_at") if isinstance(req.get("requested_at"), (int, float)) else None}
+
+
+def chosen_ref():
+    """The tag of the chosen release, which every upgrade without an explicit ref (and a new
+    instance's boot) installs instead of the config's `release.ref`: the controller is the
+    single source of the release a host runs; the config's ref only bootstraps."""
+    req = chosen_request()
+    return req and f"v{req['version']}"
+
+
 def fetch(config, ref=None):
     """Fetches the release ref (git objects only) and reads its manifest and version."""
-    repository, ref = config["release"]["repository"], ref or config["release"]["ref"]
+    repository, ref = config["release"]["repository"], ref or chosen_ref() or config["release"]["ref"]
     if not h.REF.match(ref) or ".." in ref:
         raise Refused(f"release ref {ref!r} is not a tag, branch or commit")
     src = p(f"{h.SRV}/src")
@@ -1182,6 +1211,71 @@ def upgrade(ref=None, plan_only=False, accept_cold=False, max_class=2, ops=None,
         prune()
         say(f"upgraded to {target['release']} (class {result['class']})")
         return 0
+
+
+def write_result(value):
+    """result.json for the agent: world-readable, and written through a fresh temporary file
+    (the directory is the ow user's, so no fixed name is ever followed)."""
+    fd, tmp = tempfile.mkstemp(dir=p(h.SELF_UPGRADE), prefix=".result-")
+    try:
+        # On the open descriptor: the name could be swapped for a symlink meanwhile.
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w") as out:
+            json.dump(value, out, sort_keys=True)
+            out.write("\n")
+        os.replace(tmp, p(RESULT))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def self_upgrade(ops=None, wait=5, limit=3600):
+    """ow-self-upgrade.service, started by its path unit when the agent writes a request:
+    installs the chosen release with this host's own upgrader (verified released binaries,
+    hand-over, rollback on failure), then records the outcome, with how long each part took,
+    where the agent reports it. A request already answered is not run again; a newer one
+    written meanwhile is taken next (the path unit only fires while this is idle)."""
+    while True:
+        req = chosen_request()
+        if req is None:
+            return 0
+        key = {k: req[k] for k in ("version", "controller", "chosen_at")}
+        last = h.read_json(RESULT) or {}
+        if last.get("request") == key and last.get("state") in ("done", "failed"):
+            return 0
+        started = time.time()
+        result = {"request": key, "version": req["version"], "state": "running", "started": round(started, 1),
+                  "requested_at": req["requested_at"]}
+        write_result(result)
+        say(f"self-upgrade: installing {req['version']} (chosen at {req['chosen_at']})")
+        controller = req["controller"] if h.role() == "runner" else None
+        error = None
+        while True:
+            try:
+                upgrade(f"v{req['version']}", ops=ops, controller=controller)
+                break
+            except Refused as e:
+                # One upgrade at a time: wait for one already running (a deploy's) to end.
+                if str(e) == "another upgrade or restart is running" and time.time() - started < limit:
+                    time.sleep(wait)
+                    continue
+                error = str(e)
+            except Exception as e:  # recorded for the agent; the upgrader already rolled back
+                error = str(e) or type(e).__name__
+            break
+        journal = h.read_json(JOURNAL) or {}
+        finished = time.time()
+        result.update(state="failed" if error else "done", error=error, finished=round(finished, 1),
+                      seconds=round(finished - started, 1),
+                      release=(h.staged(h.pin("current")) or {}).get("version"),
+                      staged_s=(h.staged(h.pin("current")) or {}).get("seconds"))
+        if journal.get("started", "") >= time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)):
+            result["steps"] = journal.get("seconds")
+            # Done with something to report (a box not resumed or not kept running).
+            result["warning"] = journal.get("error") if not error else None
+        write_result(result)
+        say(f"self-upgrade: {result['state']} in {result['seconds']} s" + (f": {error}" if error else ""))
 
 
 def unchanged(images=()):
