@@ -16,7 +16,7 @@ impl std::fmt::Display for Rejection {
 }
 impl std::error::Error for Rejection {}
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Resources {
     pub cpus: u64,
@@ -87,20 +87,28 @@ impl Default for Pool {
         }
     }
 }
-pub(crate) fn load(root: &Path) -> Result<Config> {
-    let path = root.join("limits.json");
-    let c = match std::fs::symlink_metadata(&path) {
+/// limits.json's bytes, or None when it is missing; a public or oversized file fails closed.
+fn read(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
         Ok(_) => {
-            nodes::private(&path).context("limits.json must be private")?;
+            nodes::private(path).context("limits.json must be private")?;
             ensure!(
-                std::fs::metadata(&path)?.len() <= 65536,
+                std::fs::metadata(path)?.len() <= 65536,
                 "limits.json exceeds 64 KiB"
             );
-            serde_json::from_slice::<Config>(&std::fs::read(&path)?)
-                .context("invalid limits.json")?
+            Ok(Some(std::fs::read(path)?))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
-        Err(e) => return Err(e.into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+fn parse(bytes: Option<&[u8]>) -> Result<Config> {
+    let c = match bytes {
+        Some(bytes) => {
+            ensure!(bytes.len() <= 65536, "limits.json exceeds 64 KiB");
+            serde_json::from_slice::<Config>(bytes).context("invalid limits.json")?
+        }
+        None => Config::default(),
     };
     for caps in std::iter::once(&c.owner_defaults).chain(c.owners.values()) {
         ensure!(
@@ -119,6 +127,47 @@ pub(crate) fn load(root: &Path) -> Result<Config> {
         "pool hours must be 1–87600"
     );
     Ok(c)
+}
+pub(crate) fn load(root: &Path) -> Result<Config> {
+    parse(read(&root.join("limits.json"))?.as_deref())
+}
+/// An owner's caps and whether they are an override rather than the defaults.
+pub(crate) fn owner_caps(root: &Path, owner: i64) -> Result<(Resources, bool)> {
+    let c = load(root)?;
+    Ok(match c.owners.get(&owner.to_string()) {
+        Some(caps) => (*caps, true),
+        None => (c.owner_defaults, false),
+    })
+}
+/// Writes one owner's override into limits.json, keeping every other field. The caller
+/// serializes writers; readers see the old or the new file, never a partial one.
+pub(crate) fn set_owner(root: &Path, owner: i64, caps: Resources) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = root.join("limits.json");
+    let mut text: Value = match read(&path)? {
+        Some(bytes) => serde_json::from_slice(&bytes).context("invalid limits.json")?,
+        None => json!({}),
+    };
+    ensure!(text.is_object(), "invalid limits.json");
+    if !text["owners"].is_object() {
+        text["owners"] = json!({});
+    }
+    text["owners"][owner.to_string()] = json!(caps);
+    let bytes = serde_json::to_vec_pretty(&text)?;
+    parse(Some(&bytes))?;
+    let temporary = root.join(".limits.json.new");
+    let _ = std::fs::remove_file(&temporary);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&temporary, &path)?;
+    std::fs::File::open(root)?.sync_all()?;
+    Ok(())
 }
 
 /// Additive table: existing runtime reservations remain untouched.
@@ -178,7 +227,7 @@ fn allocation(db: &Connection, physical: &str) -> Result<Resources> {
             boxes: 0,
         }))
 }
-fn usage(db: &Connection, user: i64, excluding: &str) -> Result<Resources> {
+pub(crate) fn usage(db: &Connection, user: i64, excluding: &str) -> Result<Resources> {
     Ok(db.query_row("SELECT COALESCE(SUM(a.cpus),0),COALESCE(SUM(a.memory_mib),0),COALESCE(SUM(a.disk_gib),0),COUNT(*) FROM owner_allocations a JOIN resources r ON r.kind='machine' AND r.physical=a.physical WHERE r.owner=?1 AND r.physical<>?2",params![user,excluding],|r| {
         Ok(Resources {cpus:r.get::<_, i64>(0)? as u64,memory_mib:r.get::<_, i64>(1)? as u64,disk_gib:r.get::<_, i64>(2)? as u64,boxes:r.get::<_, i64>(3)? as u64})
     })?)
@@ -202,14 +251,15 @@ pub(crate) fn unresolved(db: &Connection, physical: &str) -> Result<bool> {
     Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE state IN ('pending','uncertain') AND op IN ('create','fork','resize','restore','start') AND (json_extract(request,'$.request.id')=?1 OR json_extract(request,'$.request.child')=?1))",[physical],|r|r.get(0))?)
 }
 /// Inventory may replace a forecast only when no effect on this machine is unresolved.
+/// A report without a disk size (a deleted managed copy whose files are gone) keeps the
+/// admitted disk forecast: only a box never accounted for falls back to the maximum.
 pub(crate) fn observe(db: &Connection, physical: &str, value: &Value) -> Result<()> {
-    save(
-        db,
-        physical,
-        Resources::shape(value),
-        unresolved(db, physical)?,
-    )?;
-    Ok(())
+    let mut shape = Resources::shape(value);
+    let prior = allocation(db, physical)?;
+    if value["disk_bytes"].as_u64().is_none() && prior.boxes == 1 {
+        shape.disk_gib = prior.disk_gib;
+    }
+    save(db, physical, shape, unresolved(db, physical)?)
 }
 pub(crate) fn absent(db: &Connection, physical: &str) -> Result<()> {
     if !unresolved(db, physical)? {

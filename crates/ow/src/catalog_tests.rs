@@ -2216,6 +2216,49 @@ fn owner_quota_unknown_native_disk_never_uses_linux_default() {
 }
 
 #[test]
+fn owner_quota_report_without_disk_size_keeps_the_admitted_forecast() {
+    let fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    let owner = c.user(&identity("alice")).unwrap();
+    let disk =
+        |c: &Catalog| limits::state(&fake.root, &c.db, owner).unwrap()["usage"]["disk_gib"].clone();
+    let physical = c.reserve(owner, "machine", "ci").unwrap();
+    limits::admit(
+        &fake.root,
+        &c.db,
+        &physical,
+        "create",
+        &json!({"memory_mib":256,"vcpu_count":1,"disk_gib":32}),
+        &json!({}),
+    )
+    .unwrap();
+    assert_eq!(disk(&c), 32);
+    // A deleted managed copy is still listed, but its files (and disk size) are gone.
+    limits::observe(
+        &c.db,
+        &physical,
+        &json!({"id":physical,"state":"deleted","memory_mib":256,"vcpu_count":1,"disk_bytes":null}),
+    )
+    .unwrap();
+    assert_eq!(
+        disk(&c),
+        32,
+        "a missing size never counts as the 16 TiB maximum"
+    );
+    // A box never accounted for is still charged the maximum until its size is known.
+    let unknown = c.reserve(owner, "machine", "unknown").unwrap();
+    limits::observe(&c.db, &unknown, &json!({"memory_mib":256,"vcpu_count":1})).unwrap();
+    assert_eq!(disk(&c), 32 + u64::from(common::MAX_DISK_GIB));
+    limits::observe(
+        &c.db,
+        &unknown,
+        &json!({"memory_mib":256,"vcpu_count":1,"disk_bytes":8 * common::GIB}),
+    )
+    .unwrap();
+    assert_eq!(disk(&c), 40);
+}
+
+#[test]
 fn image_pull_failure_releases_undispatched_capacity_and_retry_readmits() {
     let mut fake = Fake::new();
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();

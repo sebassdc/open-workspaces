@@ -11,8 +11,10 @@ Defaults per owner are **16 CPUs, 32768 MiB RAM, 256 GiB disk and 8 boxes**.
 Create reserves the requested disk or the normal 32 GiB default; forks use the
 source's resource shape, or the named snapshot's CPU/RAM shape. Legacy snapshots
 do not report disk size: the source's current grow-only disk is a conservative
-upper bound. Unknown disk telemetry is charged at the maximum supported 16384 GiB
-until a positive inventory observation is available. Unknown CPU/RAM fields
+upper bound. A box with no admitted forecast and unknown disk telemetry is charged
+at the maximum supported 16384 GiB until a positive inventory observation is
+available. A box already admitted keeps its forecast when a report lacks a disk size
+(a deleted copy whose files are gone reports none), so it never jumps to that maximum. Unknown CPU/RAM fields
 likewise use the maximum supported shape. Pre-policy unresolved effects without
 an allocation record retain that maximum until reconciliation resolves them.
 Native Mac creates lack
@@ -30,6 +32,19 @@ releases its demand. Confirmed deletion releases the allocation; forgetting an
 offline/missing catalog row is refused while an effect remains unresolved. Reducing limits never
 stops or resizes a box; existing starts, exec and same-size/reducing changes keep
 working. Additional resource growth must fit the corresponding limit.
+
+## Setting an owner's limits
+
+The admin API reads and sets one owner's caps ([ADMIN_API.md](ADMIN_API.md#limitsownerget)):
+
+```sh
+ow limits get ci@example.com
+ow limits set ci@example.com --cpus 26 --memory-mib 53248 --disk-gib 416 --boxes 13
+```
+
+`set` writes the owner's override into `limits.json` below (flags left out keep
+their current value), audited like every admin change. Defaults and pool pricing
+are still edited in the file.
 
 ## Private operator configuration
 

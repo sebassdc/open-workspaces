@@ -1115,6 +1115,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         | Action::NodeRevoke { .. }
         | Action::NodePool { .. }
         | Action::Token { .. }
+        | Action::Limits { .. }
         | Action::Health
         | Action::Placement { .. }
         | Action::Actions { .. }

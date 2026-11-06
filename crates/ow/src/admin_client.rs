@@ -2,8 +2,8 @@
 //! builds one op's request, sends it over HTTPS or the controller's admin.sock, and prints
 //! the result. Nothing here reads or writes the controller database.
 use crate::{
-    Action, AppKeyAction, ConfigAction, HostAction, PlacementAction, ActionsAction, TokenAction,
-    admin,
+    Action, AppKeyAction, ConfigAction, HostAction, LimitsAction, PlacementAction, ActionsAction,
+    TokenAction, admin,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -60,6 +60,18 @@ pub(crate) fn request(action: &Action, key: &str) -> Option<Value> {
             }
             TokenAction::Revoke { name } => json!({"op":"token.revoke","name":name}),
             TokenAction::List => json!({"op":"token.list"}),
+        },
+        Action::Limits { action } => match action {
+            LimitsAction::Get { owner } => json!({"op":"limits.owner.get","owner":owner}),
+            LimitsAction::Set {
+                owner,
+                cpus,
+                memory_mib,
+                disk_gib,
+                boxes,
+            } => {
+                json!({"op":"limits.owner.set","owner":owner,"cpus":cpus,"memory_mib":memory_mib,"disk_gib":disk_gib,"boxes":boxes})
+            }
         },
         Action::Host {
             command:
