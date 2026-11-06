@@ -69,6 +69,8 @@ pub(crate) const OPS: &[OpSpec] = &[
     op("placement.status", &[&["placement", "status"]], false),
     op("actions.status", &[&["actions", "status"]], false),
     op("actions.app_key.set", &[&["actions", "app-key", "set"]], true),
+    op("limits.owner.get", &[&["limits", "get"]], false),
+    op("limits.owner.set", &[&["limits", "set"]], true),
 ];
 
 pub(crate) fn spec(name: &str) -> Option<&'static OpSpec> {
@@ -138,6 +140,16 @@ pub(crate) enum AdminRequest {
     ActionsStatus { pool: Option<String> },
     #[serde(rename = "actions.app_key.set")]
     ActionsAppKeySet { private_key: String },
+    #[serde(rename = "limits.owner.get")]
+    LimitsOwnerGet { owner: String },
+    #[serde(rename = "limits.owner.set")]
+    LimitsOwnerSet {
+        owner: String,
+        cpus: Option<u64>,
+        memory_mib: Option<u64>,
+        disk_gib: Option<u64>,
+        boxes: Option<u64>,
+    },
 }
 
 /// Who made a request, as the gateway or the socket verified it.
@@ -510,6 +522,35 @@ fn value_text(key: &str, value: &Value) -> std::result::Result<String, Failure> 
                     _ => "a string",
                 }
             ),
+        )),
+    }
+}
+
+/// The catalog user ID of a signed-in owner's email; never creates one.
+fn owner_id(db: &Connection, owner: &str) -> std::result::Result<(String, i64), Failure> {
+    let email = owner.to_ascii_lowercase();
+    crate::common::email(&email).map_err(|e| invalid_value("owner", e))?;
+    if !db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='users')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Err(failure(
+            503,
+            "unavailable",
+            "No workspace catalog here; run this on the controller.",
+        ));
+    }
+    let ids: Vec<i64> = db
+        .prepare("SELECT id FROM users WHERE email=?1")?
+        .query_map([&email], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    match ids[..] {
+        [id] => Ok((email, id)),
+        [] => Err(not_found("owner", &email)),
+        _ => Err(invalid_value(
+            "owner",
+            format!("{email} belongs to more than one identity provider"),
         )),
     }
 }
@@ -940,6 +981,79 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 result["audit_id"] = json!(audit_id);
                 Ok(result)
             }
+        }
+        AdminRequest::LimitsOwnerGet { owner } => {
+            let db = crate::nodes::db(root)?;
+            let (email, id) = owner_id(&db, &owner)?;
+            let (caps, overridden) = crate::limits::owner_caps(root, id)?;
+            Ok(
+                json!({"owner":email,"owner_id":id,"caps":caps,"override":overridden,"usage":crate::limits::usage(&db,id,"")?}),
+            )
+        }
+        AdminRequest::LimitsOwnerSet {
+            owner,
+            cpus,
+            memory_mib,
+            disk_gib,
+            boxes,
+        } => {
+            if [cpus, memory_mib, disk_gib, boxes]
+                .iter()
+                .all(Option::is_none)
+            {
+                return Err(invalid_request(
+                    "give at least one of cpus, memory_mib, disk_gib, boxes",
+                ));
+            }
+            for (field, n) in [
+                ("cpus", cpus),
+                ("memory_mib", memory_mib),
+                ("disk_gib", disk_gib),
+                ("boxes", boxes),
+            ] {
+                if n.is_some_and(|n| n > i64::MAX as u64 / 4) {
+                    return Err(invalid_value(field, "out of range"));
+                }
+            }
+            // The transaction serializes limit writers; the file itself is the stored value.
+            let mut db = crate::nodes::db(root)?;
+            let tx = immediate(&mut db)?;
+            let (email, id) = owner_id(&tx, &owner)?;
+            let (previous, overridden) = crate::limits::owner_caps(root, id)?;
+            let caps = crate::limits::Resources {
+                cpus: cpus.unwrap_or(previous.cpus),
+                memory_mib: memory_mib.unwrap_or(previous.memory_mib),
+                disk_gib: disk_gib.unwrap_or(previous.disk_gib),
+                boxes: boxes.unwrap_or(previous.boxes),
+            };
+            let result = |changed: bool| json!({"owner":email,"owner_id":id,"caps":caps,"previous":previous,"changed":changed,"effective":"next_create"});
+            if overridden && caps == previous {
+                audit(
+                    &tx,
+                    "limits.owner.set",
+                    &ctx.actor,
+                    raw,
+                    "unchanged",
+                    None,
+                    None,
+                )?;
+                tx.commit()?;
+                return Ok(result(false));
+            }
+            // Audit row first: a failed file write rolls it back with the transaction.
+            audit(
+                &tx,
+                "limits.owner.set",
+                &ctx.actor,
+                raw,
+                "ok",
+                None,
+                Some(&json!({"value":caps,"previous":previous})),
+            )?;
+            crate::limits::set_owner(root, id, caps)?;
+            tx.commit()?;
+            changed("limits.owner.set", &ctx.actor, json!({"owner":email}));
+            Ok(result(true))
         }
         AdminRequest::HostRevoke { node } => {
             crate::common::identifier(&node).map_err(|e| invalid_value("node", e))?;

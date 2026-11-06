@@ -106,8 +106,8 @@ Responses carry `cache-control: no-store`.
 Every mutating op that passed the gate writes one `admin_audit` row, success or
 failure: time, op, actor, `via` (`https` or `local`), the request, the result
 (`ok`, `unchanged` or the error code), the configuration version after a
-`config.set`, and for `config.set` and `node.pool.set` the value and the previous
-one. A change and its row commit in one transaction. Reads write nothing.
+`config.set`, and for `config.set`, `node.pool.set` and `limits.owner.set` the value
+and the previous one. A change and its row commit in one transaction. Reads write nothing.
 `ow config history` and the idempotent `token.revoke` read this table, so they
 know only changes made through the API (from v0.9.54): a token revoked before
 then is `not_found`. The
@@ -144,6 +144,8 @@ reissue. Keys live in `admin_operations`.
 | `ow placement status [--pool P]` | `placement.status` |
 | `ow actions status [--pool P]` | `actions.status` |
 | `ow actions app-key set --key-file FILE` | `actions.app_key.set` (`-` reads standard input) |
+| `ow limits get EMAIL` | `limits.owner.get` |
+| `ow limits set EMAIL [--cpus N] [--memory-mib N] [--disk-gib N] [--boxes N]` | `limits.owner.set` |
 
 The examples below are the contract: a test parses every request and response,
 and checks that the CLI builds each request exactly.
@@ -431,6 +433,43 @@ again returns `"changed": false`.
 ```json
 {"ok": true, "op": "actions.app_key.set", "result": {"fingerprint": "sha256:9f2c41d07a6b33e1", "changed": true,
   "audit_id": 88}}
+```
+
+### limits.owner.get
+
+One owner's [limits](LIMITS.md): `caps` (their override, or the defaults when
+`override` is false) and `usage`, the same four fields counted the way admission
+counts them. `owner` is the login email of a user the catalog knows; an unknown
+one is `not_found`.
+
+<!-- admin:example op=limits.owner.get -->
+```json
+{"op": "limits.owner.get", "owner": "someone@example.com"}
+```
+```json
+{"ok": true, "op": "limits.owner.get", "result": {"owner": "someone@example.com", "owner_id": 1,
+  "caps": {"cpus": 16, "memory_mib": 32768, "disk_gib": 256, "boxes": 8}, "override": false,
+  "usage": {"cpus": 0, "memory_mib": 0, "disk_gib": 0, "boxes": 0}}}
+```
+
+### limits.owner.set
+
+Sets one owner's override in the controller's `limits.json`, keeping every other
+field, through an atomic, private (0600) replace. Fields left out keep their
+current value (from the override, or the defaults); at least one is required.
+Each is a whole number; zero denies new demand in that dimension. Lowering a cap
+never stops or shrinks a box. It applies from the next create, fork, resize or
+restore. The same caps again return `"changed": false`.
+
+<!-- admin:example op=limits.owner.set -->
+```json
+{"op": "limits.owner.set", "owner": "someone@example.com", "cpus": 26, "memory_mib": 53248, "disk_gib": 416, "boxes": 13}
+```
+```json
+{"ok": true, "op": "limits.owner.set", "result": {"owner": "someone@example.com", "owner_id": 1,
+  "caps": {"cpus": 26, "memory_mib": 53248, "disk_gib": 416, "boxes": 13},
+  "previous": {"cpus": 16, "memory_mib": 32768, "disk_gib": 256, "boxes": 8},
+  "changed": true, "effective": "next_create"}}
 ```
 
 ### host.revoke

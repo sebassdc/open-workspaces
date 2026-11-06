@@ -111,6 +111,28 @@ enum PlacementAction {
 }
 
 #[derive(Subcommand)]
+enum LimitsAction {
+    /// An owner's caps (their override, or the defaults) and current usage.
+    Get {
+        /// Owner login email.
+        owner: String,
+    },
+    /// Set an owner's caps; flags left out keep their current value.
+    Set {
+        /// Owner login email.
+        owner: String,
+        #[arg(long)]
+        cpus: Option<u64>,
+        #[arg(long)]
+        memory_mib: Option<u64>,
+        #[arg(long)]
+        disk_gib: Option<u64>,
+        #[arg(long)]
+        boxes: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ActionsAction {
     /// Each runner pool's boxes and their latest start times.
     Status {
@@ -330,6 +352,11 @@ enum Action {
     Nodes,
     /// Admin: fleet health as JSON (alerts, latest node telemetry); exits 1 on an alert.
     Health,
+    /// Admin: per-owner CPU, RAM, disk and box limits (see docs/LIMITS.md).
+    Limits {
+        #[command(subcommand)]
+        action: LimitsAction,
+    },
     /// Admin: placement pools' spill rules and usage (see docs/MULTINODE.md#spill).
     Placement {
         #[command(subcommand)]

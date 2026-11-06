@@ -282,6 +282,26 @@ fn the_cli_builds_the_documented_request() {
             "actions.app_key.set",
             &["actions", "app-key", "set", "--key-file", KEY_FILE],
         ),
+        (
+            "limits.owner.get",
+            &["limits", "get", "someone@example.com"],
+        ),
+        (
+            "limits.owner.set",
+            &[
+                "limits",
+                "set",
+                "someone@example.com",
+                "--cpus",
+                "26",
+                "--memory-mib",
+                "53248",
+                "--disk-gib",
+                "416",
+                "--boxes",
+                "13",
+            ],
+        ),
     ];
     // The documented key, in the file `--key-file` reads when the command is parsed.
     const KEY_FILE: &str = "/tmp/ow-admin-tests-app-key.pem";
@@ -742,6 +762,103 @@ fn node_pool_and_tokens() {
     assert_eq!(
         (status, never["error_code"].as_str()),
         (404, Some("not_found"))
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn owner_limits_are_read_and_set_through_the_api() {
+    let root = temp_root();
+    crate::limits::free_pool(&root);
+    let mut catalog = crate::catalog::Catalog::open(&root, "issuer", None).unwrap();
+    let id = catalog
+        .user(&crate::catalog::Identity {
+            issuer: "issuer".into(),
+            subject: "s".into(),
+            email: "ci@example.com".into(),
+        })
+        .unwrap();
+    drop(catalog);
+    let (status, got) = call(
+        &root,
+        json!({"op":"limits.owner.get","owner":"CI@example.com"}),
+    );
+    assert_eq!(status, 200, "{got}");
+    assert_eq!(got["result"]["owner_id"], id);
+    assert_eq!(got["result"]["override"], false);
+    assert_eq!(got["result"]["caps"]["boxes"], 8);
+    let (status, set) = call(
+        &root,
+        json!({"op":"limits.owner.set","owner":"ci@example.com","boxes":13,"disk_gib":416}),
+    );
+    assert_eq!(status, 200, "{set}");
+    assert_eq!(
+        set["result"]["caps"],
+        json!({"cpus":16,"memory_mib":32768,"disk_gib":416,"boxes":13})
+    );
+    // Private, still the pool's pricing, and what admission reads.
+    let mode = std::fs::metadata(root.join("limits.json"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(root.join("limits.json")).unwrap()).unwrap();
+    assert_eq!(file["pool"]["default_type"], "test-self-hosted");
+    assert_eq!(crate::limits::owner_caps(&root, id).unwrap().0.boxes, 13);
+    let (_, again) = call(
+        &root,
+        json!({"op":"limits.owner.set","owner":"ci@example.com","boxes":13}),
+    );
+    assert_eq!(again["result"]["changed"], false);
+    let (_, got) = call(
+        &root,
+        json!({"op":"limits.owner.get","owner":"ci@example.com"}),
+    );
+    assert_eq!(got["result"]["override"], true);
+    assert_eq!(got["result"]["caps"]["disk_gib"], 416);
+    for (request, status, code) in [
+        (
+            json!({"op":"limits.owner.get","owner":"nobody@example.com"}),
+            404,
+            "not_found",
+        ),
+        (
+            json!({"op":"limits.owner.set","owner":"ci@example.com"}),
+            400,
+            "invalid_request",
+        ),
+        (
+            json!({"op":"limits.owner.set","owner":"ci@example.com","cpus":u64::MAX}),
+            422,
+            "invalid_value",
+        ),
+        (
+            json!({"op":"limits.owner.set","owner":"not-an-email","cpus":1}),
+            422,
+            "invalid_value",
+        ),
+    ] {
+        let (s, answer) = call(&root, request);
+        assert_eq!(
+            (s, answer["error_code"].as_str()),
+            (status, Some(code)),
+            "{answer}"
+        );
+    }
+    assert_eq!(
+        audit_rows(&root)
+            .into_iter()
+            .filter(|(op, ..)| op == "limits.owner.set")
+            .map(|(_, result, _)| result)
+            .collect::<Vec<_>>(),
+        [
+            "ok",
+            "unchanged",
+            "invalid_request",
+            "invalid_value",
+            "invalid_value"
+        ]
     );
     std::fs::remove_dir_all(root).unwrap();
 }
