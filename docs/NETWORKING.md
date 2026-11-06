@@ -55,6 +55,8 @@ ow config set network.private_egress '[]'     # none again
   The runner's agent puts them into the worker's `private_egress` set in one nft
   transaction, again after a worker restart. All boxes on that runner share the
   set, so list only services whose own authentication protects them.
+  Turning a spill rule off (or to 0) closes its pool's destinations on that
+  runner at once, also for that pool's boxes still running there.
 - `ow nodes` shows `private_egress_v1` and how many destinations each runner
   holds (`private_egress_count`); `ow config get network.private_egress` shows
   the addresses.
