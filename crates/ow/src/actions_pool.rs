@@ -561,15 +561,15 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64, spill: bool) {
             "vcpu_count":pool.vcpu_count,"disk_gib":pool.disk_gib.unwrap_or(crate::common::DEFAULT_DISK_GIB),
             "ephemeral":true,"spill":spill});
         box_op(shared, &pool.token, create).context("create")?;
-        // Before the runner registers: no job runs in the box without its role.
-        if let Some(role) = &pool.aws_role {
-            attach_role(shared, &pool.token, &name, role).context("attaching its AWS role")?;
-        }
         let spilled = spilled(&shared.root, &name);
         update(shared, &name, |e| {
             e.made = true;
             e.spilled = spilled;
         });
+        // Before the runner registers: no job runs in the box without its role.
+        if let Some(role) = &pool.aws_role {
+            attach_role(shared, &pool.token, &name, role).context("attaching its AWS role")?;
+        }
         timing(shared, &name, "ready_ms");
         ensure!(launching(shared, &name), "timed out while it was made");
         let (runner_id, jit) = shared

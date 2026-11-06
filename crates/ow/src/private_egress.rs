@@ -40,6 +40,10 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Entry>> {
             .with_context(|| format!("pool {}", entry.pool))?;
         entry.to = ow_core::egress::text(&list);
     }
+    // A runner may get several pools' lists (its own and those spilling onto it): all of them
+    // together must fit the worker's set.
+    let all: Vec<&String> = entries.iter().flat_map(|e| &e.to).collect();
+    ow_core::egress::destinations(&json!(all)).context("all pools together")?;
     Ok(entries)
 }
 
@@ -74,21 +78,32 @@ pub(crate) fn for_node(db: &Connection, node: &str) -> Value {
             .unwrap_or_else(|| "default".into());
         let spill: Vec<crate::spill::Rule> =
             serde_json::from_value(settings[crate::spill::RULES].clone()).unwrap_or_default();
-        Ok(json!(share(&entries, &own, &spill, node)))
+        Ok(json!(share(&entries, &own, &spill, node)?))
     };
     read().unwrap_or(Value::Null)
 }
 
-/// [`for_node`]'s pure part.
-fn share(entries: &[Entry], own: &str, spill: &[crate::spill::Rule], node: &str) -> Vec<String> {
-    let mut to: Vec<String> = entries
+/// [`for_node`]'s pure part. A spill rule with no room (`max_boxes` 0) is off and opens
+/// nothing. In the worker's own order, so an unchanged list is never applied again.
+fn share(
+    entries: &[Entry],
+    own: &str,
+    spill: &[crate::spill::Rule],
+    node: &str,
+) -> Result<Vec<String>> {
+    let to: Vec<&String> = entries
         .iter()
-        .filter(|e| e.pool == own || spill.iter().any(|r| r.node == node && r.pool == e.pool))
-        .flat_map(|e| e.to.iter().cloned())
+        .filter(|e| {
+            e.pool == own
+                || spill
+                    .iter()
+                    .any(|r| r.node == node && r.pool == e.pool && r.max_boxes > 0)
+        })
+        .flat_map(|e| &e.to)
         .collect();
-    to.sort();
-    to.dedup();
-    to
+    Ok(ow_core::egress::text(&ow_core::egress::destinations(
+        &json!(to),
+    )?))
 }
 
 #[cfg(test)]
@@ -117,6 +132,25 @@ mod tests {
             assert!(parse(bad).is_err(), "{bad}");
         }
         assert!(from_json(&json!("ci")).is_err());
+        // All pools together fit one runner's set.
+        let list = |from: u32, n: u32| {
+            (from..from + n)
+                .map(|i| format!("10.0.1.{i}:443"))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            from_json(&json!([{"pool":"a","to":list(0, 33)},{"pool":"b","to":list(33, 32)}]))
+                .is_err()
+        );
+        assert!(
+            from_json(&json!([{"pool":"a","to":list(0, 33)},{"pool":"b","to":list(0, 64)}]))
+                .is_ok()
+        );
+        // Numeric order, as the worker reports it.
+        assert_eq!(
+            parse(r#"[{"pool":"ci","to":["10.0.0.10:443","10.0.0.2:443"]}]"#).unwrap()[0].to,
+            ["10.0.0.2:443", "10.0.0.10:443"]
+        );
         assert_eq!(
             typed(&from_json(&json!([{"pool":"ci","to":["10.0.0.1:443"]}])).unwrap()).unwrap(),
             json!([{"pool":"ci","to":["10.0.0.1:443"]}])
@@ -129,24 +163,31 @@ mod tests {
             r#"[{"pool":"ci","to":["10.0.0.1:443","10.0.0.2:443"]},{"pool":"build","to":["10.0.0.2:443","10.0.0.3:5000"]}]"#,
         )
         .unwrap();
-        let spill = [Rule {
-            pool: "ci".into(),
-            node: "people-1".into(),
-            max_boxes: 2,
-        }];
-        assert_eq!(
-            share(&entries, "ci", &spill, "ci-1"),
-            ["10.0.0.1:443", "10.0.0.2:443"]
-        );
+        let spill = [
+            Rule {
+                pool: "ci".into(),
+                node: "people-1".into(),
+                max_boxes: 2,
+            },
+            Rule {
+                pool: "ci".into(),
+                node: "people-3".into(),
+                max_boxes: 0,
+            },
+        ];
+        let share = |own: &str, node: &str| share(&entries, own, &spill, node).unwrap();
+        assert_eq!(share("ci", "ci-1"), ["10.0.0.1:443", "10.0.0.2:443"]);
         // A runner of another pool that `ci` may spill onto.
         assert_eq!(
-            share(&entries, "default", &spill, "people-1"),
+            share("default", "people-1"),
             ["10.0.0.1:443", "10.0.0.2:443"]
         );
+        // A spill rule with no room is off: nothing opens there.
+        assert!(share("default", "people-3").is_empty());
         // Any other runner: nothing.
-        assert!(share(&entries, "default", &spill, "people-2").is_empty());
+        assert!(share("default", "people-2").is_empty());
         assert_eq!(
-            share(&entries, "build", &spill, "people-1"),
+            share("build", "people-1"),
             ["10.0.0.1:443", "10.0.0.2:443", "10.0.0.3:5000"]
         );
     }

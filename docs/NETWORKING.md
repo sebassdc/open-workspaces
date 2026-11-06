@@ -46,12 +46,12 @@ ow config set network.private_egress '[]'     # none again
 ```
 
 - Only exact addresses in 10/8, 172.16/12, 192.168/16 or 100.64/10 with a port
-  are accepted (at most 64): no ranges, no loopback, link-local or metadata
+  are accepted (at most 64, all pools together): no ranges, no loopback, link-local or metadata
   address, no guest-range or multicast address. The runner's own addresses stay
   blocked even when listed. Nothing else private becomes reachable.
 - Each runner gets the destinations of its own placement pool and of every pool
-  with a [spill rule](MULTINODE.md#spill) onto it (that pool's boxes may run
-  there), with every heartbeat acknowledgement: a change applies within seconds.
+  with a [spill rule](MULTINODE.md#spill) onto it that has room (`max_boxes` above
+  0: that pool's boxes may run there), with every heartbeat acknowledgement: a change applies within seconds.
   The runner's agent puts them into the worker's `private_egress` set in one nft
   transaction, again after a worker restart. All boxes on that runner share the
   set, so list only services whose own authentication protects them.
