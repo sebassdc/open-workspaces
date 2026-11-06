@@ -191,9 +191,11 @@ pub(crate) fn follow_controller(root: &Path) {
 pub(crate) fn chosen_times(db: &rusqlite::Connection) -> Result<Value> {
     use rusqlite::OptionalExtension;
     let stored: Option<String> = db
-        .query_row("SELECT value FROM settings WHERE key=?1", [CHOSEN_AT], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [CHOSEN_AT],
+            |r| r.get(0),
+        )
         .optional()?;
     let mut times = stored
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -252,7 +254,12 @@ pub(crate) fn status(settings: &Value, times: &Value, inventory: &Value) -> Valu
     let offer = json!({"upgrade_version":fleet,"runner_versions":settings["upgrade.runner_versions"],
         "upgrade_chosen_at":times["fleet"],"runner_chosen_at":times["runners"]});
     let at = std::iter::once(&times["fleet"])
-        .chain(times["runners"].as_object().into_iter().flat_map(|m| m.values()))
+        .chain(
+            times["runners"]
+                .as_object()
+                .into_iter()
+                .flat_map(|m| m.values()),
+        )
         .filter_map(Value::as_i64)
         .max()
         .unwrap_or(0);
@@ -410,7 +417,10 @@ mod tests {
         let mut last = None;
         assert!(follow(dir.path(), Some(("0.9.74".into(), 5)), None, &mut last).unwrap());
         assert!(follow(dir.path(), Some(("0.9.73".into(), 7)), None, &mut last).unwrap());
-        assert_eq!(read(&request_path(dir.path())).unwrap()["version"], "0.9.73");
+        assert_eq!(
+            read(&request_path(dir.path())).unwrap()["version"],
+            "0.9.73"
+        );
         // On a fresh agent with nothing recorded, the running release is recorded once.
         let other = host("0.9.73");
         assert!(follow(other.path(), Some(("0.9.73".into(), 7)), None, &mut None).unwrap());
@@ -425,7 +435,10 @@ mod tests {
             json!({"id":id,"online":online,"revoked":false,"capabilities":{"version":release,"host_release":release,
                 "host_release_since":since,"worker":{"version":release},"self_upgrade":report}})
         };
-        let inventory = json!([node("r2", "0.9.73", 50, true, Value::Null), node("r3", "0.9.73", 50, true, Value::Null)]);
+        let inventory = json!([
+            node("r2", "0.9.73", 50, true, Value::Null),
+            node("r3", "0.9.73", 50, true, Value::Null)
+        ]);
         let s = status(&settings, &times, &inventory);
         assert_eq!(s["chosen"]["chosen_at"], 100);
         assert_eq!(s["pending"], json!(["r2"]));
@@ -433,18 +446,33 @@ mod tests {
         assert_eq!(s["nodes"][1]["current"], true);
         // Switched but still verifying: not healthy yet.
         let running = json!({"version":"0.9.74","state":"running"});
-        let inventory = json!([node("r2", "0.9.74", 121, true, running), node("r3", "0.9.73", 50, true, Value::Null)]);
-        assert_eq!(status(&settings, &times, &inventory)["pending"], json!(["r2"]));
+        let inventory = json!([
+            node("r2", "0.9.74", 121, true, running),
+            node("r3", "0.9.73", 50, true, Value::Null)
+        ]);
+        assert_eq!(
+            status(&settings, &times, &inventory)["pending"],
+            json!(["r2"])
+        );
         let done = json!({"version":"0.9.74","state":"done","finished":130.4});
-        let inventory = json!([node("r2", "0.9.74", 121, true, done.clone()), node("r3", "0.9.73", 50, true, Value::Null)]);
+        let inventory = json!([
+            node("r2", "0.9.74", 121, true, done.clone()),
+            node("r3", "0.9.73", 50, true, Value::Null)
+        ]);
         let s = status(&settings, &times, &inventory);
         assert_eq!(s["pending"], json!([]));
         assert_eq!(s["healthy_s"], 31);
         // Offline at the chosen release is not healthy; a failed report neither.
         let inventory = json!([node("r2", "0.9.74", 131, false, done)]);
-        assert_eq!(status(&settings, &times, &inventory)["pending"], json!(["r2"]));
+        assert_eq!(
+            status(&settings, &times, &inventory)["pending"],
+            json!(["r2"])
+        );
         let failed = json!({"version":"0.9.74","state":"failed"});
         let inventory = json!([node("r2", "0.9.74", 131, true, failed)]);
-        assert_eq!(status(&settings, &times, &inventory)["pending"], json!(["r2"]));
+        assert_eq!(
+            status(&settings, &times, &inventory)["pending"],
+            json!(["r2"])
+        );
     }
 }
