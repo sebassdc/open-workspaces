@@ -40,6 +40,9 @@
           ]
         }
       },
+      "waivers": {
+        "worker": "crates/ow/src/host.rs lists only the new ow limits commands among those it never dispatches; the worker's own code is unchanged"
+      },
       "host_layout": 2,
       "in_place_from": "0.5.0",
       "notes": "Owner limits get an admin API: limits.owner.get and limits.owner.set (ow limits get|set EMAIL) read and set one owner's CPU, RAM, disk and box caps, written atomically into the controller's limits.json and audited. A deleted managed box whose files are gone was briefly charged the 16384 GiB unknown-disk maximum when the runner listed it without a disk size, refusing the owner's next create; such a report now keeps the box's admitted disk forecast. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 1: the controller and dashboard restart; boxes keep running."
