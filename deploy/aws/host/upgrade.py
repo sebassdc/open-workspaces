@@ -1247,6 +1247,11 @@ def self_upgrade(ops=None, wait=5, limit=3600):
         last = h.read_json(RESULT) or {}
         if last.get("request") == key and last.get("state") in ("done", "failed"):
             return 0
+        # Done for this choice already: a runner's agent, restarted by that upgrade, asks again
+        # with its controller's new release; only a failed run is worth retrying for that.
+        same = {k: v for k, v in (last.get("request") or {}).items() if k != "controller"}
+        if same == {k: v for k, v in key.items() if k != "controller"} and last.get("state") == "done":
+            return 0
         started = time.time()
         result = {"request": key, "version": req["version"], "state": "running", "started": round(started, 1),
                   "requested_at": req["requested_at"]}

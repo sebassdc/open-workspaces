@@ -43,7 +43,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "The controller's own host asks its upgrader for a chosen release at once (when the choice changes and when the controller starts) instead of waiting up to one heartbeat for its local runner's agent; it makes the same request that agent would, so the agent does not ask again; the self-upgrade service treats requests that differ only in the controller release as one on a host that is not a runner. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 1: the controller, agents and dashboard restart; boxes keep running."
+      "notes": "The controller's own host asks its upgrader for a chosen release at once (when the choice changes and when the controller starts) instead of waiting up to one heartbeat for its local runner's agent; it makes the same request that agent would, so the agent does not ask again; the self-upgrade service treats requests that differ only in the controller release as one on a host that is not a runner, and does not rerun a release a runner is already done with for the same decision. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 1: the controller, agents and dashboard restart; boxes keep running."
     },
     {
       "version": "0.9.76",

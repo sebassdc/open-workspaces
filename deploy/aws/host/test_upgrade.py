@@ -1202,6 +1202,15 @@ class ChosenRelease(unittest.TestCase):
             u.self_upgrade(wait=0)
         self.assertEqual(upgrade.call_count, 1)
 
+    def test_a_runner_done_for_a_choice_is_not_rerun_when_its_controller_moves(self):
+        self.ask(controller="0.5.0")
+        calls, result = self.run_self_upgrade(0)
+        self.assertEqual(result["state"], "done")
+        self.ask(controller="0.5.1")  # the agent the upgrade restarted asks with the new controller
+        calls, result = self.run_self_upgrade(0)
+        self.assertEqual(calls, [], "no second, empty run overwrites the measured one")
+        self.assertEqual(result["steps"], {"verify": 3.1})
+
     def test_it_waits_for_an_upgrade_already_running(self):
         self.ask()
         tries = iter([Refused("another upgrade or restart is running"), None])
