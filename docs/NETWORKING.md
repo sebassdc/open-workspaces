@@ -32,6 +32,35 @@ address, which answers as EC2 does for boxes with an attached role and with `404
 otherwise, and never forwards anything ([per-box AWS access](AWS_ACCESS.md#metadata-mode)).
 That listener's port is closed on every interface but the TAPs.
 
+### Private destinations
+
+Some private services are meant for boxes, such as a cloud provider's private
+endpoint for a container registry in the runner's own network: its DNS name
+resolves to a private address there, which the filter above drops. The controller
+setting `network.private_egress` lists, per placement pool, the exact private
+`ADDRESS:PORT` pairs (TCP) that pool's boxes may reach; nothing by default:
+
+```sh
+ow config set network.private_egress '[{"pool":"ci","to":["10.0.5.17:443","10.0.9.4:443"]}]'
+ow config set network.private_egress '[]'     # none again
+```
+
+- Only exact addresses in 10/8, 172.16/12, 192.168/16 or 100.64/10 with a port
+  are accepted (at most 64, all pools together): no ranges, no loopback, link-local or metadata
+  address, no guest-range or multicast address. The runner's own addresses stay
+  blocked even when listed. Nothing else private becomes reachable.
+- Each runner gets the destinations of its own placement pool and of every pool
+  with a [spill rule](MULTINODE.md#spill) onto it that has room (`max_boxes` above
+  0: that pool's boxes may run there), with every heartbeat acknowledgement: a change applies within seconds.
+  The runner's agent puts them into the worker's `private_egress` set in one nft
+  transaction, again after a worker restart. All boxes on that runner share the
+  set, so list only services whose own authentication protects them.
+  Turning a spill rule off (or to 0) closes its pool's destinations on that
+  runner at once, also for that pool's boxes still running there.
+- `ow nodes` shows `private_egress_v1` and how many destinations each runner
+  holds (`private_egress_count`); `ow config get network.private_egress` shows
+  the addresses.
+
 The supervisor owns both child processes and cleans them up together. An uplink
 exit causes worker shutdown; disks and existing checkpoints remain recoverable.
 Restart the worker to refresh the host-interface deny list after address changes.

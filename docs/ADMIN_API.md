@@ -195,7 +195,7 @@ A value equal to the stored one returns `"changed": false` and the current
 version: no version bump and no `config_changes` row (an `admin_audit` row with
 result `unchanged` is still written), so a retry after an uncertain answer is
 always safe. `effective` says when it applies: `next_create` for `limits.*` and `placement.*`,
-`next_ack` for `telemetry.*`, `alerts.*` and `upgrade.*` (runners get it with the next
+`next_ack` for `telemetry.*`, `alerts.*`, `upgrade.*` and `network.*` (runners get it with the next
 acknowledgement, a few seconds), `next_request` for `dashboard.ui_bundle`.
 `warnings` lists what is valid but will not do what it reads like.
 
@@ -238,6 +238,18 @@ pool cannot be `default`; its runners must be enrolled and in another pool.
 ```json
 {"ok": false, "op": "config.set", "error_code": "invalid_value", "error": "placement.spill: node n9 is not enrolled.",
   "details": {"key": "placement.spill", "reason": "node n9 is not enrolled"}}
+```
+
+`network.private_egress` takes its typed list (or the same list as a JSON string);
+destinations come back sorted, without duplicates.
+
+<!-- admin:example op=config.set -->
+```json
+{"op": "config.set", "key": "network.private_egress", "value": [{"pool": "ci", "to": ["10.0.5.17:443"]}]}
+```
+```json
+{"ok": true, "op": "config.set", "result": {"key": "network.private_egress", "value": [{"pool": "ci", "to": ["10.0.5.17:443"]}],
+  "previous": [], "changed": true, "version": 44, "effective": "next_ack", "warnings": [], "audit_id": 120}}
 ```
 
 ### config.history

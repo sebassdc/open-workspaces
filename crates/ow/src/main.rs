@@ -47,6 +47,7 @@ mod placement;
 mod preview;
 #[cfg(target_os = "linux")]
 mod remote;
+mod private_egress;
 #[cfg(any(target_os = "linux", test))]
 mod scaler;
 mod self_upgrade;

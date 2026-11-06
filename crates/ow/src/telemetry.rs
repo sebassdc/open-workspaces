@@ -72,7 +72,7 @@ fn now() -> i64 {
 // Controller-held settings (one source; read on every acknowledgement).
 
 /// Allowed keys and their defaults.
-pub const KEYS: [(&str, &str); 20] = [
+pub const KEYS: [(&str, &str); 21] = [
     ("telemetry.enabled", "true"),
     ("telemetry.interval_s", "15"),
     ("telemetry.forward_endpoint", ""),
@@ -108,6 +108,9 @@ pub const KEYS: [(&str, &str); 20] = [
     ("upgrade.runner_versions", "{}"),
     // The release `ow upgrade` installs on clients; empty: the release the controller runs.
     ("upgrade.client_version", ""),
+    // Per placement pool, the exact private ADDRESS:PORT destinations its boxes may reach
+    // (docs/NETWORKING.md#private-destinations); none by default.
+    (crate::private_egress::SETTING, "[]"),
 ];
 
 pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
@@ -154,6 +157,7 @@ pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
         crate::spill::KEEP_FREE_VCPUS => number(0..=1024),
         crate::spill::KEEP_FREE_DISK => number(0..=1_048_576),
         crate::actions::POOLS => crate::actions::typed(value),
+        crate::private_egress::SETTING => crate::private_egress::typed(value),
         crate::actions::APP_ID => number(0..=u64::from(u32::MAX)),
         crate::dashboard_ui::SETTING => {
             if value != "builtin" {
@@ -187,9 +191,9 @@ pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
 
 /// Current settings, typed, with defaults filled in, and their version.
 pub fn settings(db: &Connection) -> Result<Value> {
-    // One query: it also runs with every acknowledgement.
+    // One query: it runs with every acknowledgement (twice: telemetry and private destinations).
     let stored: BTreeMap<String, String> = db
-        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key LIKE 'limits.%' OR key LIKE 'placement.%' OR key LIKE 'actions.%' OR key LIKE 'upgrade.%' OR key='config_version'")?
+        .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key LIKE 'limits.%' OR key LIKE 'placement.%' OR key LIKE 'actions.%' OR key LIKE 'upgrade.%' OR key LIKE 'network.%' OR key='config_version'")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut out = json!({});
@@ -220,7 +224,11 @@ pub(crate) fn default(key: &str) -> Value {
 pub(crate) fn store_setting(db: &Connection, key: &str, typed: &Value, actor: &str) -> Result<i64> {
     let stored = match typed {
         Value::String(text) => text.clone(),
-        Value::Array(_) if key == crate::actions::POOLS => typed.to_string(),
+        Value::Array(_)
+            if key == crate::actions::POOLS || key == crate::private_egress::SETTING =>
+        {
+            typed.to_string()
+        }
         Value::Array(_) => crate::spill::text(typed),
         _ => typed.to_string(),
     };

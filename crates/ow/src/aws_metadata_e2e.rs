@@ -415,3 +415,72 @@ fn a_box_reads_its_role_at_the_metadata_address_and_loses_it_on_detach_and_trans
         "ip netns del {NS}-egress; ip netns del {NS}-g1; ip netns del {NS}-g2"
     ));
 }
+
+#[test]
+#[ignore = "root in a disposable Linux container with nft, iproute2 and curl"]
+fn private_destinations_open_exactly_what_the_controller_lists() {
+    const PE: &str = "owpe";
+    assert_eq!(
+        unsafe { libc::unshare(libc::CLONE_NEWNET) },
+        0,
+        "needs root"
+    );
+    ok("ip link set lo up");
+    ow_core::network::initialize().unwrap();
+    let _ = sh(&format!("ip netns del {PE}-egress; ip netns del {PE}-g1"));
+    // Behind the uplink: two private service addresses and a public one, all answering.
+    ok(&format!(
+        "ip netns add {PE}-egress && ip link add tap-egress type veth peer name eth0 netns {PE}-egress \
+         && ip addr add 10.0.2.100/24 dev tap-egress && ip link set tap-egress up \
+         && ip netns exec {PE}-egress sh -c 'ip link set lo up && ip link set eth0 up && ip addr add 10.0.2.2/24 dev eth0 \
+            && ip addr add 10.9.1.1/32 dev lo && ip addr add 10.9.1.2/32 dev lo && ip addr add 203.0.113.10/32 dev lo'"
+    ));
+    ow_core::network::enable(&json!([])).unwrap();
+    listen_in("owpe-egress", 443, "SERVICE");
+    listen_in("owpe-egress", 80, "OTHER-PORT");
+    ok(&format!(
+        "ip netns add {PE}-g1 && ip link add ow1 type veth peer name eth0 netns {PE}-g1 \
+         && ip addr add 198.18.0.5/30 dev ow1 && ip link set ow1 up \
+         && ip netns exec {PE}-g1 sh -c 'ip link set lo up && ip link set eth0 up \
+            && ip addr add 198.18.0.6/30 dev eth0 && ip route add default via 198.18.0.5'"
+    ));
+    ow_core::network::register(1).unwrap();
+    let get = |target: &str| {
+        let out = sh(&format!(
+            "ip netns exec {PE}-g1 curl -s --max-time 2 http://{target}/"
+        ));
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let dropped = |target: &str| assert_eq!(get(target).0, 28, "{target} must be dropped");
+
+    // By default every private address is dropped; public ones answer.
+    assert_eq!(get("203.0.113.10:443"), (0, "SERVICE".into()));
+    dropped("10.9.1.1:443");
+    assert!(ow_core::network::private_egress().is_empty());
+
+    // Exactly the listed address and port opens: not its other ports, not its neighbour.
+    assert_eq!(
+        ow_core::network::allow_private(&json!(["10.9.1.1:443"])).unwrap(),
+        ["10.9.1.1:443"]
+    );
+    assert_eq!(get("10.9.1.1:443"), (0, "SERVICE".into()));
+    dropped("10.9.1.1:80");
+    dropped("10.9.1.2:443");
+    // The worker's own address stays dropped even when listed (its input chain admits a box
+    // only to its own TAP address).
+    ow_core::network::allow_private(&json!(["10.0.2.100:443", "10.9.1.1:443"])).unwrap();
+    dropped("10.0.2.100:443");
+
+    // A refused list changes nothing; an empty one closes it again; so does a new table.
+    assert!(ow_core::network::allow_private(&json!(["169.254.169.254:80"])).is_err());
+    assert_eq!(get("10.9.1.1:443"), (0, "SERVICE".into()));
+    ow_core::network::allow_private(&json!([])).unwrap();
+    dropped("10.9.1.1:443");
+    ow_core::network::allow_private(&json!(["10.9.1.1:443"])).unwrap();
+    ow_core::network::initialize().unwrap();
+    assert!(ow_core::network::private_egress().is_empty());
+    let _ = sh(&format!("ip netns del {PE}-egress; ip netns del {PE}-g1"));
+}

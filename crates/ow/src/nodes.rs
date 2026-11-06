@@ -944,8 +944,8 @@ async fn session_loop(c: Controller, node: String, headers: HeaderMap, mut socke
                     tokio::task::spawn_blocking(move||{let _=crate::image_store::prefetch(&root,&node,&images);});
                 }
                 // Old native agents expect job IDs only; acknowledge only the guided agent's optional extension.
-                // Telemetry settings ride on every acknowledgement: a change on the controller reaches runners within one beat.
-                if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation,"extensions":["cache-inventory-v1","telemetry-v1"],"telemetry":offer}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break "acknowledgement not sent within 3 s".into();}}
+                // Telemetry settings and private destinations ride on every acknowledgement: a change on the controller reaches runners within one beat.
+                if v["ready_ack"]==true {let ack=json!({"type":"ready","node":node,"generation":generation,"extensions":["cache-inventory-v1","telemetry-v1"],"telemetry":offer["telemetry"],"private_egress":offer["private_egress"]}).to_string();if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(Message::Text(ack.into()))).await,Ok(Ok(()))) {break "acknowledgement not sent within 3 s".into();}}
             }
             id=rx.recv()=>{
                 let Some(id)=id else {break "dispatch closed".into();};
@@ -1028,10 +1028,12 @@ async fn record(
                 };
                 let (n, g, b) = (node.clone(), generation.clone(), beat.clone());
                 let catalog = catalog.clone();
-                // The telemetry settings for this beat's acknowledgement are read here too.
+                // The settings this beat's acknowledgement carries are read here too: telemetry,
+                // and the private destinations this runner's boxes may reach.
                 match blocking(db.clone(), move |db| {
                     let catalog = catalog.lock().unwrap_or_else(|e| e.into_inner());
-                    Ok((heartbeat(&catalog, db, &n, &g, &b)?, crate::telemetry::offer(&catalog)))
+                    let recorded = heartbeat(&catalog, db, &n, &g, &b)?;
+                    Ok((recorded, json!({"telemetry":crate::telemetry::offer(&catalog),"private_egress":crate::private_egress::for_node(&catalog, &n)})))
                 }).await {
                     Ok((1, offer)) => {
                         if verdicts.send(Ok((beat, offer))).await.is_err() {
@@ -1673,6 +1675,9 @@ fn build_beat(
         json!(status["managed_lifecycle_v1"] == true && common::placement_capable(status).is_ok());
     beat["aws_identity_v1"] = json!(status["aws_identity_v1"] == true);
     beat["aws_metadata_v1"] = json!(status["aws_metadata_v1"] == true);
+    // The private destinations the worker's set holds now (`ow nodes` shows them).
+    beat["private_egress_v1"] = json!(status["private_egress_v1"] == true);
+    beat["private_egress"] = status["private_egress"].clone();
     // A worker restarted under this agent may adopt VMMs where the old one could not.
     beat["worker_handover_v1"] = json!(status["worker_handover_v1"] == true);
     // Disk-only automatic recovery points from the worker, and this agent's reconnect when
@@ -1744,6 +1749,31 @@ const BEAT_STALE: Duration = Duration::from_secs(1500);
 /// frame for this long is dead (a lost controller or path), so the agent reconnects
 /// instead of waiting minutes for TCP to give up.
 const CONTROLLER_SILENT: Duration = Duration::from_secs(20);
+
+/// Makes the worker's private destinations (docs/NETWORKING.md#private-destinations) what the
+/// controller last said, once they differ; a worker without the set, or no word from the
+/// controller yet, is left alone. A failure is logged once and retried with the next status.
+pub(crate) fn apply_private_egress(
+    root: &Path,
+    status: &Value,
+    wanted: Option<&Value>,
+    error: &mut Option<String>,
+) {
+    let Some(wanted) = wanted else { return };
+    if status["private_egress_v1"] != true || &status["private_egress"] == wanted {
+        return;
+    }
+    match wire::request(root, json!({"op":"egress-allow","to":wanted})) {
+        Ok(_) => *error = None,
+        Err(e) => {
+            let message = format!("{e:#}");
+            if error.as_deref() != Some(&message) {
+                eprintln!("private destinations not applied: {message}");
+            }
+            *error = Some(message);
+        }
+    }
+}
 
 /// Stores the controller's `upgrade.*` settings from an acknowledgement for `ow-host
 /// upgrade` on this runner, which runs without a controller session of its own; written
@@ -1946,6 +1976,9 @@ pub fn agent(
     // restart (a runner upgrade) without the agent.
     let latest = Arc::new(std::sync::Mutex::new(Some(status.clone())));
     let first = build_beat(&hello, &status, root, guided, false)?;
+    // The private destinations the controller's last acknowledgement gave this runner; the
+    // status thread makes the worker's set match (again after a worker restart).
+    let private_egress: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let prepared = Arc::new(std::sync::Mutex::new(Some((
         std::time::Instant::now(),
         first,
@@ -1985,16 +2018,18 @@ pub fn agent(
         );
     }
     {
-        let (latest, prepared, negotiated, root, hello, telemetry) = (
+        let (latest, prepared, negotiated, root, hello, telemetry, private_egress) = (
             latest.clone(),
             prepared.clone(),
             cache_negotiated.clone(),
             root.to_owned(),
             hello.clone(),
             telemetry.clone(),
+            private_egress.clone(),
         );
         std::thread::spawn(move || {
             let mut refused = false;
+            let mut egress_error = None;
             loop {
                 let status = wire::connect_waiting(
                     &root,
@@ -2021,6 +2056,10 @@ pub fn agent(
                 };
                 telemetry.worker(status.as_ref().and_then(|s| s["worker_pid"].as_u64()));
                 *latest.lock().unwrap() = status.clone();
+                if let Some(status) = &status {
+                    let wanted = private_egress.lock().unwrap().clone();
+                    apply_private_egress(&root, status, wanted.as_ref(), &mut egress_error);
+                }
                 match status.map(|s| {
                     build_beat(&hello, &s, &root, guided, negotiated.load(Ordering::SeqCst))
                 }) {
@@ -2144,6 +2183,11 @@ pub fn agent(
                             );
                             telemetry.acknowledged(&v, connecting);
                             controller_settings(root, &v["telemetry"], &mut settings_written);
+                            // Absent (an older controller, or one that could not read it): keep the
+                            // worker's set as it is.
+                            if !v["private_egress"].is_null() {
+                                *private_egress.lock().unwrap() = Some(v["private_egress"].clone());
+                            }
                             if let Some(layout) = &self_upgrade_layout {
                                 let offer = &v["telemetry"];
                                 if let Err(error) = crate::self_upgrade::follow(

@@ -148,12 +148,12 @@ impl Status for Runtime {
     }
 }
 
-/// Accepts control connections on its own thread. `status` and `egress-enable` are
-/// answered here, so a long request on the worker thread (a snapshot hash holds the
-/// runtime for minutes) never hides the worker from the upgrader, the agent or the
+/// Accepts control connections on its own thread. `status`, `egress-enable` and
+/// `egress-allow` are answered here, so a long request on the worker thread (a snapshot
+/// hash holds the runtime for minutes) never hides the worker from the upgrader, the agent or the
 /// uplink; every other request goes to the worker thread in arrival order. While the
 /// runtime is held, `status` is the last one it answered, marked `busy`, with live
-/// `internet` (`disk_observed_unix_s` dates its disk figures).
+/// `internet` and `private_egress` (`disk_observed_unix_s` dates its disk figures).
 fn control<T: Status + Send + 'static>(
     listener: UnixListener,
     runtime: Arc<Mutex<T>>,
@@ -203,6 +203,7 @@ fn control<T: Status + Send + 'static>(
                     Err(std::sync::TryLockError::WouldBlock) => last.clone().map(|mut value| {
                         value["busy"] = json!(true);
                         value["internet"] = json!(network::enabled());
+                        value["private_egress"] = json!(network::private_egress());
                         wire::response(Ok(value))
                     }),
                     Err(std::sync::TryLockError::Poisoned(_)) => Some(wire::response(Err(
@@ -211,6 +212,9 @@ fn control<T: Status + Send + 'static>(
                 },
                 Some("egress-enable") => Some(wire::response(
                     network::enable(&request["host_addresses"]).map(|_| json!({"enabled":true})),
+                )),
+                Some("egress-allow") => Some(wire::response(
+                    network::allow_private(&request["to"]).map(|to| json!({"private_egress":to})),
                 )),
                 _ => None,
             };
