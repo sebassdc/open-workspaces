@@ -589,6 +589,18 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             expected_version,
         } => {
             known_key(&key)?;
+            if matches!(
+                key.as_str(),
+                "upgrade.version" | "upgrade.runner_versions" | "upgrade.client_version"
+            ) {
+                // One path for a release choice: it is dated and the controller's own host
+                // follows it (docs/UPGRADES.md#choosing-the-release).
+                return Err(failure(
+                    409,
+                    "rejected",
+                    format!("{key} is chosen with ow upgrade set (admin op upgrade.set)."),
+                ));
+            }
             // Read before the transaction: it opens its own connection.
             let inventory = if key.starts_with("placement.") {
                 crate::nodes::inventory(root)?
@@ -1052,7 +1064,7 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             // refused it or rolled it back.
             let chosen_at = now();
             if !client {
-                crate::self_upgrade::mark_chosen(&tx, chosen_at)?;
+                crate::self_upgrade::mark_chosen(&tx, runner.as_deref(), chosen_at)?;
             }
             let audit_id = audit(
                 &tx,
@@ -1082,7 +1094,7 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             let db = crate::nodes::db(root)?;
             Ok(crate::self_upgrade::status(
                 &crate::telemetry::settings(&db)?,
-                crate::self_upgrade::chosen_at(&db)?,
+                &crate::self_upgrade::chosen_times(&db)?,
                 &inventory,
             ))
         }

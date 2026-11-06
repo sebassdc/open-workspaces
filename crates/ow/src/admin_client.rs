@@ -265,12 +265,12 @@ pub(crate) fn https(
 }
 
 /// The release `ow upgrade` installs from the configured controller's `GET /api/version`:
-/// `client`, the release its operator chose for clients, else `server`, the one it runs.
+/// `client`, the release its operator chose for clients (true), else `server`, the one it runs.
 pub(crate) fn server_version(
     data_dir: Option<PathBuf>,
     server: Option<String>,
     local: bool,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let transport = transport(data_dir, server, local)?
         .context("no controller configured: run ow login <server>, or pass --version")?;
     let (status, body) = call(&transport, "GET", "/api/version", None)?;
@@ -278,10 +278,10 @@ pub(crate) fn server_version(
         .ok()
         .and_then(|v| {
             let result = &v["result"];
-            result["client"]
-                .as_str()
-                .or(result["server"].as_str())
-                .map(str::to_owned)
+            match result["client"].as_str() {
+                Some(client) => Some((client.to_owned(), true)),
+                None => result["server"].as_str().map(|s| (s.to_owned(), false)),
+            }
         })
         .with_context(|| {
             format!("the controller's /api/version has no server version (HTTP {status})")

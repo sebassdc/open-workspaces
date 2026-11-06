@@ -790,6 +790,12 @@ fn a_release_is_chosen_for_the_fleet_a_runner_or_the_clients() {
     let offer = crate::telemetry::offer(&crate::nodes::db(&root).unwrap());
     assert_eq!(offer["upgrade_version"], "0.9.74");
     assert_eq!(offer["upgrade_chosen_at"], at);
+    // Only through upgrade.set: config.set refuses the release settings.
+    let (_, refused) = call(
+        &root,
+        json!({"op":"config.set","key":"upgrade.version","value":"0.9.80"}),
+    );
+    assert_eq!(refused["error_code"], "rejected");
     assert_eq!(offer["controller_release"], env!("CARGO_PKG_VERSION"));
     // Chosen again: unchanged, but dated again so a host that refused it retries.
     let (_, again) = call(&root, json!({"op":"upgrade.set","version":"0.9.74"}));
@@ -801,9 +807,13 @@ fn a_release_is_chosen_for_the_fleet_a_runner_or_the_clients() {
     assert_eq!(status, 200, "{runner}");
     assert_eq!(runner["result"]["value"], json!({"n1":"0.9.75"}));
     let offer = crate::telemetry::offer(&crate::nodes::db(&root).unwrap());
+    let (version, runner_at) = crate::self_upgrade::chosen(&offer, Some("n1")).unwrap();
+    assert_eq!(version, "0.9.75");
+    assert!(runner_at >= at);
+    // The fleet's decision time is its own: a runner's choice retries nothing elsewhere.
     assert_eq!(
-        crate::self_upgrade::chosen(&offer, Some("n1")).as_deref(),
-        Some("0.9.75")
+        crate::self_upgrade::chosen(&offer, Some("other")).unwrap().1,
+        offer["upgrade_chosen_at"].as_i64().unwrap()
     );
     let (_, cleared) = call(
         &root,

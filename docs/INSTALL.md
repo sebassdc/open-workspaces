@@ -80,7 +80,8 @@ not the versioned GitHub Release download path.
 operator chose for clients (`ow upgrade set VERSION --client`, the setting
 `upgrade.client_version`), or, with none chosen, the release the controller runs
 (both from its `GET /api/version`: `client`, else `server`). A new release on
-GitHub is only available: it is installed once it is chosen, or when you opt in
+GitHub is only available: it is installed once it is chosen (a chosen client
+release must first pass its own `status` against the controller, as below), or when you opt in
 with `ow upgrade --latest`, so a timer that runs `ow upgrade` installs exactly what
 the operator chose, when they choose it ([UPGRADES.md](UPGRADES.md#choosing-the-release)).
 It never goes older than this client unless `--version` names that release.

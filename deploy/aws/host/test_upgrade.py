@@ -1162,7 +1162,8 @@ class ChosenRelease(unittest.TestCase):
                 raise outcome
             h.write_json(f"{h.SRV}/releases/0.5.1-bbbbbbbbbbbb/STAGED", {"version": "0.5.1", "seconds": 2})
             h.set_pin("current", "0.5.1-bbbbbbbbbbbb")
-            h.write_json(u.JOURNAL, {"started": "2999-01-01T00:00:00Z", "step": "done", "seconds": {"verify": 3.1}})
+            h.write_json(u.JOURNAL, {"started": "2999-01-01T00:00:00Z", "step": "done", "seconds": {"verify": 3.1},
+                                     "error": "not resumed: box-a"})
             return 0
 
         with mock.patch.object(u, "upgrade", side_effect=upgrade), mock.patch.object(u.h, "role", return_value="runner"):
@@ -1176,6 +1177,7 @@ class ChosenRelease(unittest.TestCase):
         self.assertEqual((result["state"], result["release"], result["error"]), ("done", "0.5.1", None))
         self.assertEqual(result["request"], {"version": "0.5.1", "controller": "0.5.0", "chosen_at": 100})
         self.assertEqual((result["requested_at"], result["staged_s"], result["steps"]), (101, 2, {"verify": 3.1}))
+        self.assertEqual(result["warning"], "not resumed: box-a", "what the upgrade could not keep is reported")
         self.assertGreaterEqual(result["finished"], result["started"])
         self.assertEqual(os.stat(h.p(u.RESULT)).st_mode & 0o777, 0o644)
         # The path unit fires again for the same request: nothing runs twice.

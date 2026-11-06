@@ -1218,10 +1218,11 @@ def write_result(value):
     (the directory is the ow user's, so no fixed name is ever followed)."""
     fd, tmp = tempfile.mkstemp(dir=p(h.SELF_UPGRADE), prefix=".result-")
     try:
+        # On the open descriptor: the name could be swapped for a symlink meanwhile.
+        os.fchmod(fd, 0o644)
         with os.fdopen(fd, "w") as out:
             json.dump(value, out, sort_keys=True)
             out.write("\n")
-        os.chmod(tmp, 0o644)
         os.replace(tmp, p(RESULT))
     except BaseException:
         with contextlib.suppress(OSError):
@@ -1271,6 +1272,8 @@ def self_upgrade(ops=None, wait=5, limit=3600):
                       staged_s=(h.staged(h.pin("current")) or {}).get("seconds"))
         if journal.get("started", "") >= time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)):
             result["steps"] = journal.get("seconds")
+            # Done with something to report (a box not resumed or not kept running).
+            result["warning"] = journal.get("error") if not error else None
         write_result(result)
         say(f"self-upgrade: {result['state']} in {result['seconds']} s" + (f": {error}" if error else ""))
 

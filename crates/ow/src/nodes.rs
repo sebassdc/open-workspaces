@@ -2150,7 +2150,6 @@ pub fn agent(
                                     layout,
                                     crate::self_upgrade::chosen(offer, Some(&node)),
                                     offer["controller_release"].as_str(),
-                                    offer["upgrade_chosen_at"].as_i64().unwrap_or(0),
                                     &mut self_upgrade_last,
                                 ) {
                                     eprintln!("self-upgrade request: {error:#}");

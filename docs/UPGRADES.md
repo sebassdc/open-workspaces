@@ -28,8 +28,9 @@ ow upgrade set 0.9.75 [--runner NAME]          admin op upgrade.set
 - **Settings** ([TELEMETRY.md](TELEMETRY.md#settings-controller-only)): `upgrade.version` (the
   fleet; empty: none chosen), `upgrade.runner_versions` (one runner instead of
   the fleet) and `upgrade.client_version` (what `ow upgrade` installs on
-  clients). Set them with `ow upgrade set` (admin op `upgrade.set`), which also
-  dates the decision; `ow config set` changes them too, without the date.
+  clients). Only `ow upgrade set` (admin op `upgrade.set`) sets them: it dates
+  the decision (the fleet's and each runner's apart) and a controller-only host
+  follows at once; `config.set` refuses them.
 - **Who asks**: a runner's agent, and on a host with a local runner that
   runner's agent. A controller-only host's controller asks for the fleet release
   when the choice changes and when it starts. The agent asks once per (release,
@@ -53,14 +54,21 @@ ow upgrade set 0.9.75 [--runner NAME]          admin op upgrade.set
   moves a host away from the controller's choice. Clearing the choice
   (`ow upgrade set none`) moves nothing and hands the hosts back to their
   config's ref.
-- **Clients**: `ow upgrade` installs `upgrade.client_version`, else the release
-  the controller runs; GitHub's latest release only with `--latest`
+- **Clients**: `ow upgrade` installs `upgrade.client_version` (after its own
+  `status` passes against the controller, over HTTPS), else the release the
+  controller runs; GitHub's latest release only with `--latest`
   ([INSTALL.md](INSTALL.md#keeping-the-cli-current)). A timer running `ow
   upgrade` therefore installs what was chosen, when it was chosen.
+- **Recorded even when running**: the agent records the chosen release in the
+  request even when its host already runs it, so a deploy or boot, which install
+  the recorded release, never return to an older request.
 - **Timing**: `ow upgrade status` gives each host's `since` (when its agent
-  first reported the release) and `healthy_s` (decision to the last chosen host
-  online at its release); each host's `self_upgrade` result has the request
-  time, the upgrader's total seconds, staging seconds and the journal's steps.
+  first reported the release) and `healthy_s`: from the last decision to the
+  last chosen host online at its release, verified (its upgrader's report for
+  that release says `done`, written after verify). Each host's `self_upgrade`
+  result has the request time, the upgrader's total seconds, staging seconds,
+  the journal's steps and a `warning` for what the upgrade could not keep (a box
+  not resumed or not kept running).
 - **First release**: 0.9.74 itself installs the old way (its hosts have no
   watch yet); every later release can be chosen.
 

@@ -485,7 +485,8 @@ heartbeat ([UPGRADES.md](UPGRADES.md#choosing-the-release)). `version` is
 `X.Y.Z` (or `vX.Y.Z`); empty or `none` clears the choice, which moves nothing.
 `chosen_at` dates the decision: `upgrade.status` measures from it, and choosing
 the same release again retries it on a host that refused it or rolled it back.
-An unknown or revoked runner is `not_found`.
+An unknown or revoked runner is `not_found`. These three settings are set only
+here: `config.set` refuses them.
 
 <!-- admin:example op=upgrade.set -->
 ```json
@@ -501,8 +502,9 @@ An unknown or revoked runner is `not_found`.
 What is chosen, what each host runs (`release`, its agent's and worker's
 releases, `since` when it first reported that release, and its upgrader's last
 report), the hosts still `pending`, and `healthy_s`: once every chosen host runs
-its release and is online, the seconds from `chosen_at` until the last one did
-(null while any is pending). `controller` is the controller's own host on a host
+its release, verified (its upgrader reported `done` for it) and online, the
+seconds from the last decision (`chosen_at`) until the last one did (null while
+any is pending). `controller` is the controller's own host on a host
 layout (null elsewhere).
 
 <!-- admin:example op=upgrade.status -->

@@ -257,7 +257,13 @@ pub(crate) fn offer(db: &Connection) -> Value {
         .map(|s| json!({"enabled":s["telemetry.enabled"],"interval_s":s["telemetry.interval_s"],"version":s["version"],"worker_handover":s["upgrade.worker_handover"],"running_boxes":s["upgrade.running_boxes"],
             // The chosen releases; each agent picks its own and asks its host's upgrader.
             "upgrade_version":s["upgrade.version"],"runner_versions":s["upgrade.runner_versions"],
-            "upgrade_chosen_at":crate::self_upgrade::chosen_at(db).unwrap_or(0),"controller_release":env!("CARGO_PKG_VERSION")}))
+            "controller_release":env!("CARGO_PKG_VERSION")}))
+        .map(|mut offer| {
+            let times = crate::self_upgrade::chosen_times(db).unwrap_or_default();
+            offer["upgrade_chosen_at"] = times["fleet"].clone();
+            offer["runner_chosen_at"] = times["runners"].clone();
+            offer
+        })
         .unwrap_or(json!({"enabled":true,"interval_s":15}))
 }
 
