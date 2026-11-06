@@ -2190,10 +2190,10 @@ pub fn agent(
                             }
                             if let Some(layout) = &self_upgrade_layout {
                                 let offer = &v["telemetry"];
-                                if let Err(error) = crate::self_upgrade::follow(
+                                if let Err(error) = crate::self_upgrade::follow_offer(
                                     layout,
-                                    crate::self_upgrade::chosen(offer, Some(&node)),
-                                    offer["controller_release"].as_str(),
+                                    offer,
+                                    Some(&node),
                                     &mut self_upgrade_last,
                                 ) {
                                     eprintln!("self-upgrade request: {error:#}");

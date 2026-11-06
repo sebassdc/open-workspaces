@@ -176,6 +176,27 @@ pub(crate) fn beat_fields(beat: &mut Value) {
     }
 }
 
+fn local_runner(layout: &Path) -> Option<String> {
+    read(&layout.join(".ow/runner/node.json")).and_then(|n| n["node"].as_str().map(str::to_owned))
+}
+
+pub(crate) fn follow_offer(
+    layout: &Path,
+    offer: &Value,
+    node: Option<&str>,
+    last: &mut Option<Value>,
+) -> Result<bool> {
+    if offer.get("upgrade_version").is_none() {
+        return Ok(false);
+    }
+    follow(
+        layout,
+        chosen(offer, node),
+        offer["controller_release"].as_str(),
+        last,
+    )
+}
+
 /// The controller's own host asks its upgrader at once, when the choice changes and when the
 /// controller starts, instead of waiting for an acknowledgement: a controller-only host for
 /// the fleet release, a host with its own runner for that runner's release. The request is the
@@ -186,18 +207,10 @@ pub(crate) fn follow_controller(root: &Path) {
         return;
     };
     // The local runner's name, for its own entry in `upgrade.runner_versions`.
-    let local = read(&layout.join(".ow/runner/node.json"))
-        .and_then(|n| n["node"].as_str().map(str::to_owned));
+    let local = local_runner(&layout);
     let outcome = crate::nodes::db(root)
         .and_then(|db| Ok(crate::telemetry::offer(&db)))
-        .and_then(|offer| {
-            follow(
-                &layout,
-                chosen(&offer, local.as_deref()),
-                offer["controller_release"].as_str(),
-                &mut None,
-            )
-        });
+        .and_then(|offer| follow_offer(&layout, &offer, local.as_deref(), &mut None));
     match outcome {
         Ok(true) => eprintln!("self-upgrade: asked this host's upgrader for the chosen release"),
         Ok(false) => {}
@@ -268,6 +281,15 @@ fn reached(want: &str, release: Option<&str>, since: &Value, report: &Value) -> 
 /// its release (verified, and online), how long that took from the last decision
 /// (`healthy_s`).
 pub(crate) fn status(settings: &Value, times: &Value, inventory: &Value) -> Value {
+    status_on(settings, times, inventory, layout().as_deref())
+}
+
+fn status_on(
+    settings: &Value,
+    times: &Value,
+    inventory: &Value,
+    host_layout: Option<&Path>,
+) -> Value {
     let fleet = settings["upgrade.version"].as_str().unwrap_or("");
     let offer = json!({"upgrade_version":fleet,"runner_versions":settings["upgrade.runner_versions"],
         "upgrade_chosen_at":times["fleet"],"runner_chosen_at":times["runners"]});
@@ -283,10 +305,11 @@ pub(crate) fn status(settings: &Value, times: &Value, inventory: &Value) -> Valu
         .unwrap_or(0);
     let mut pending = vec![];
     let mut done = vec![];
-    let controller = layout().map(|layout| {
-        let release = host_release(&layout);
-        let report = result(&layout);
-        let want = chosen(&offer, None);
+    let controller = host_layout.map(|layout| {
+        let release = host_release(layout);
+        let report = result(layout);
+        let local = local_runner(layout);
+        let want = chosen(&offer, local.as_deref());
         if let Some((want, _)) = &want {
             match reached(want, release.as_deref(), &Value::Null, &report) {
                 Some(t) => done.push(t),
@@ -393,6 +416,42 @@ mod tests {
         )
         .unwrap();
         Host(dir)
+    }
+
+    #[test]
+    fn missing_offer_preserves_the_saved_choice() {
+        let dir = host("0.9.73");
+        let mut last = None;
+        let offer = json!({"upgrade_version":"0.9.74", "upgrade_chosen_at":5});
+        assert!(follow_offer(dir.path(), &offer, Some("local"), &mut last).unwrap());
+        let before = fs::read(request_path(dir.path())).unwrap();
+        assert!(
+            !follow_offer(
+                dir.path(),
+                &json!({"enabled":true}),
+                Some("local"),
+                &mut last
+            )
+            .unwrap()
+        );
+        assert_eq!(fs::read(request_path(dir.path())).unwrap(), before);
+    }
+
+    #[test]
+    fn controller_status_uses_its_local_runner_choice() {
+        let dir = host("0.9.75");
+        fs::create_dir_all(dir.path().join(".ow/runner")).unwrap();
+        fs::write(
+            dir.path().join(".ow/runner/node.json"),
+            json!({"node":"local"}).to_string(),
+        )
+        .unwrap();
+        let settings =
+            json!({"upgrade.version":"0.9.74", "upgrade.runner_versions":{"local":"0.9.75"}});
+        let times = json!({"fleet":100, "runners":{"local":101}});
+        let s = status_on(&settings, &times, &json!([]), Some(dir.path()));
+        assert_eq!(s["controller"]["chosen"], "0.9.75");
+        assert_eq!(s["pending"], json!([]));
     }
 
     #[test]
