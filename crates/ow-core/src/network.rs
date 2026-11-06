@@ -28,15 +28,38 @@ pub fn initialize() -> Result<()> {
     if enabled() {
         std::fs::write("/proc/sys/net/ipv4/ip_forward", "0")?;
     }
+    let mut allowed = PRIVATE_EGRESS.lock().unwrap_or_else(|e| e.into_inner());
     nft(&format!(
         "table inet ow {{}}\ndelete table inet ow\n{}",
         policy()
-    ))
+    ))?;
+    // The new table's set is empty; the runner's agent applies the controller's list again.
+    allowed.clear();
+    Ok(())
+}
+/// The private destinations the set holds now (`crate::egress`), as the controller gave them.
+static PRIVATE_EGRESS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Replaces the private destinations boxes may reach with `to` (a list of `ADDRESS:PORT`),
+/// in one transaction; what the set holds afterwards.
+pub fn allow_private(to: &serde_json::Value) -> Result<Vec<String>> {
+    let list = crate::egress::destinations(to)?;
+    let mut allowed = PRIVATE_EGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    nft(&crate::egress::nft(&list))?;
+    *allowed = crate::egress::text(&list);
+    Ok(allowed.clone())
+}
+pub fn private_egress() -> Vec<String> {
+    PRIVATE_EGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 /// The worker namespace's whole policy. Guests reach the per-box AWS metadata endpoint
 /// (`crate::metadata`) at EC2's address: `prerouting` redirects it to the TAP's own host
 /// address, which `input` already accepts (on any port: the guest agent's installer uses an
 /// ephemeral one). The listener binds every address, so its port is closed to all but TAPs.
+/// `private_egress` holds the exact private `address . port` pairs the controller allows
+/// (TCP only), checked after the worker's own addresses and before the private ranges.
 fn policy() -> String {
     let port = crate::metadata::PORT;
     format!(
@@ -44,6 +67,7 @@ fn policy() -> String {
  set guests {{ type ifname . ipv4_addr; }}
  set hosts {{ type ifname . ipv4_addr; }}
  set local_addresses {{ type ipv4_addr; }}
+ set private_egress {{ type ipv4_addr . inet_service; }}
  set protected {{ type ipv4_addr; flags interval; elements = {{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }}; }}
  chain validate {{ iifname . ip saddr @guests return; drop; }}
  chain prerouting {{ type nat hook prerouting priority dstnat; policy accept;
@@ -59,6 +83,7 @@ fn policy() -> String {
   iifname "ow*" jump validate
   iifname "ow*" oifname "tap-egress" ip daddr 10.0.2.3 meta l4proto {{ tcp, udp }} th dport 53 accept
   iifname "ow*" ip daddr @local_addresses drop
+  iifname "ow*" oifname "tap-egress" ip daddr . tcp dport @private_egress accept
   iifname "ow*" ip daddr @protected drop
   iifname "ow*" oifname "tap-egress" meta l4proto {{ tcp, udp }} accept
   iifname "tap-egress" oifname "ow*" ct state established,related accept

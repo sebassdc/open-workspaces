@@ -517,6 +517,10 @@ fn value_text(key: &str, value: &Value) -> std::result::Result<String, Failure> 
         Value::Array(_) if key == crate::actions::POOLS => {
             crate::actions::from_json(value).map_err(|e| invalid_value(key, format!("{e:#}")))
         }
+        Value::Array(_) if key == crate::private_egress::SETTING => {
+            crate::private_egress::from_json(value)
+                .map_err(|e| invalid_value(key, format!("{e:#}")))
+        }
         Value::Array(_) if default.is_array() => {
             crate::spill::from_json(value).map_err(|e| invalid_value(key, e))
         }

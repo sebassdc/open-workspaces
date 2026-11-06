@@ -493,6 +493,29 @@ fn box_op(shared: &Shared, token: &str, op: Value) -> Result<Value> {
     crate::catalog::Catalog::operation_shared(&shared.catalog, user, op)
 }
 
+/// Attaches the pool's AWS role to a new box as the token's owner, through the same handler
+/// as `ow aws-role set`: the operator's allow-list for that owner applies, and a running box's
+/// credentials are on its runner before this returns.
+fn attach_role(shared: &Shared, token: &str, name: &str, role: &str) -> Result<()> {
+    let user = {
+        let mut catalog = shared
+            .catalog
+            .lock()
+            .map_err(|_| anyhow!("catalog lock poisoned"))?;
+        let (identity, _) = crate::tokens::by_name(&catalog.db, token)?
+            .with_context(|| format!("workload token {token} not found (ow token list)"))?;
+        catalog.user(&identity)?
+    };
+    crate::aws_metadata::role(
+        &shared.catalog,
+        user,
+        &json!({"op":"aws-role","id":name,"role_arn":role}),
+        false,
+        &mut crate::aws_metadata::Instance::default(),
+    )?;
+    Ok(())
+}
+
 /// Whether a launch still owns its box: the planner may have timed it out meanwhile.
 fn launching(shared: &Shared, name: &str) -> bool {
     shared
@@ -550,6 +573,10 @@ fn launch(shared: &Shared, pool: &Pool, name: &str, app_id: u64, spill: bool) {
             e.made = true;
             e.spilled = spilled;
         });
+        // Before the runner registers: no job runs in the box without its role.
+        if let Some(role) = &pool.aws_role {
+            attach_role(shared, &pool.token, &name, role).context("attaching its AWS role")?;
+        }
         timing(shared, &name, "ready_ms");
         ensure!(launching(shared, &name), "timed out while it was made");
         let (runner_id, jit) = shared

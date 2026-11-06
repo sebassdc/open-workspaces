@@ -2,6 +2,51 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.76",
+      "class": 2,
+      "changes": [
+        "controller",
+        "agent",
+        "worker",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "Private destinations per placement pool: the controller setting network.private_egress lists exact private ADDRESS:PORT pairs (TCP) a pool's boxes may reach, such as a private registry endpoint in the runner's own network; each runner gets its pool's list (and that of pools that spill onto it) with every acknowledgement, and the agent applies it to the worker's new private_egress nft set, again after a worker restart. ow nodes shows private_egress_v1 and private_egress_count. An Actions pool may name aws_role, attached to each box before its runner registers. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 2: the worker gains the set (with hand-over, boxes keep running); controller, dashboard and agent restart."
+    },
+    {
       "version": "0.9.75",
       "class": 1,
       "changes": [
