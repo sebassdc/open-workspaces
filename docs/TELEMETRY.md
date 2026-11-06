@@ -79,7 +79,7 @@ Infrastructure code carries no telemetry setting.
 | `upgrade.version` | empty | empty or `X.Y.Z` | The release every host runs, chosen by an operator (`ow upgrade set VERSION`); empty: none chosen, nothing moves. Each host's agent installs it within one heartbeat ([UPGRADES.md](UPGRADES.md#choosing-the-release)). |
 | `upgrade.runner_versions` | `{}` | a JSON object, runner name to `X.Y.Z` | One runner's release instead of the fleet's (`ow upgrade set VERSION --runner NAME`). |
 | `upgrade.client_version` | empty | empty or `X.Y.Z` | The release `ow upgrade` installs on clients (`ow upgrade set VERSION --client`); empty: the release the controller runs. |
-| `network.private_egress` | `[]` | a JSON list of `{"pool", "to": ["ADDRESS:PORT", ...]}`, at most 16 pools and 64 destinations in all | Exact private TCP destinations a placement pool's boxes may reach ([NETWORKING.md](NETWORKING.md#private-destinations)). Runners apply it within 3 s. |
+| `network.private_egress` | `[]` | a JSON list of `{"pool", "to": ["ADDRESS:PORT", ...]}`, at most 16 pools and 64 destinations in all | Exact private TCP destinations a placement pool's boxes may reach ([NETWORKING.md](NETWORKING.md#private-destinations)). Runners apply it within seconds (one acknowledgement and one worker status). |
 | `dashboard.ui_bundle` | `builtin` | `builtin` or an installed bundle version | UI bundle the dashboard serves; see [UI bundles](DASHBOARD.md#ui-bundles). Refused unless installed, intact and API-compatible. |
 
 ## What runners report

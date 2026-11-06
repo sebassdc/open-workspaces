@@ -191,7 +191,7 @@ pub(crate) fn typed(key: &str, value: &str) -> Result<Value> {
 
 /// Current settings, typed, with defaults filled in, and their version.
 pub fn settings(db: &Connection) -> Result<Value> {
-    // One query: it also runs with every acknowledgement.
+    // One query: it runs with every acknowledgement (twice: telemetry and private destinations).
     let stored: BTreeMap<String, String> = db
         .prepare_cached("SELECT key,value FROM settings WHERE key LIKE 'telemetry.%' OR key LIKE 'alerts.%' OR key LIKE 'dashboard.%' OR key LIKE 'limits.%' OR key LIKE 'placement.%' OR key LIKE 'actions.%' OR key LIKE 'upgrade.%' OR key LIKE 'network.%' OR key='config_version'")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
