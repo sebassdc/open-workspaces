@@ -1210,6 +1210,9 @@ class ChosenRelease(unittest.TestCase):
         calls, result = self.run_self_upgrade(0)
         self.assertEqual(calls, [], "no second, empty run overwrites the measured one")
         self.assertEqual(result["steps"], {"verify": 3.1})
+        self.ask(controller="0.5.1", at=200)  # chosen again: a new decision always runs
+        calls, result = self.run_self_upgrade(0)
+        self.assertEqual(calls, [("v0.5.1", "0.5.1")])
 
     def test_it_waits_for_an_upgrade_already_running(self):
         self.ask()
