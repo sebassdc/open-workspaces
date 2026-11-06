@@ -146,6 +146,8 @@ reissue. Keys live in `admin_operations`.
 | `ow actions app-key set --key-file FILE` | `actions.app_key.set` (`-` reads standard input) |
 | `ow limits get EMAIL` | `limits.owner.get` |
 | `ow limits set EMAIL [--cpus N] [--memory-mib N] [--disk-gib N] [--boxes N]` | `limits.owner.set` |
+| `ow upgrade set VERSION [--runner NAME \| --client]` | `upgrade.set` |
+| `ow upgrade status` | `upgrade.status` |
 
 The examples below are the contract: a test parses every request and response,
 and checks that the CLI builds each request exactly.
@@ -167,7 +169,8 @@ before any change).
   "dashboard.ui_bundle": "builtin", "limits.box_memory_mib": 0,
   "placement.spill": [], "placement.spill_keep_free_mib": 16384, "placement.spill_keep_free_vcpus": 0,
   "placement.spill_keep_free_disk_gib": 100, "upgrade.worker_handover": true,
-  "upgrade.running_boxes": "hibernate"}}}
+  "upgrade.running_boxes": "hibernate", "upgrade.version": "", "upgrade.runner_versions": {},
+  "upgrade.client_version": ""}}}
 ```
 
 ### config.get
@@ -470,6 +473,52 @@ restore. The same caps again return `"changed": false`.
   "caps": {"cpus": 26, "memory_mib": 53248, "disk_gib": 416, "boxes": 13},
   "previous": {"cpus": 16, "memory_mib": 32768, "disk_gib": 256, "boxes": 8},
   "changed": true, "effective": "next_create"}}
+```
+
+### upgrade.set
+
+Chooses the release the fleet runs (`upgrade.version`), one runner runs
+(`runner`: an entry in `upgrade.runner_versions`) or `ow upgrade` installs on
+clients (`client`: `upgrade.client_version`). A published release is only
+available until it is chosen; then each host's agent installs it within one
+heartbeat ([UPGRADES.md](UPGRADES.md#choosing-the-release)). `version` is
+`X.Y.Z` (or `vX.Y.Z`); empty or `none` clears the choice, which moves nothing.
+`chosen_at` dates the decision: `upgrade.status` measures from it, and choosing
+the same release again retries it on a host that refused it or rolled it back.
+An unknown or revoked runner is `not_found`. These three settings are set only
+here: `config.set` refuses them.
+
+<!-- admin:example op=upgrade.set -->
+```json
+{"op": "upgrade.set", "version": "0.9.74"}
+```
+```json
+{"ok": true, "op": "upgrade.set", "result": {"key": "upgrade.version", "value": "0.9.74",
+  "previous": "", "changed": true, "version": 43, "chosen_at": 1794000000, "audit_id": 12}}
+```
+
+### upgrade.status
+
+What is chosen, what each host runs (`release`, its agent's and worker's
+releases, `since` when it first reported that release, and its upgrader's last
+report), the hosts still `pending`, and `healthy_s`: once every chosen host runs
+its release, verified (its upgrader reported `done` for it) and online, the
+seconds from the last decision (`chosen_at`) until the last one did (null while
+any is pending). `controller` is the controller's own host on a host
+layout (null elsewhere).
+
+<!-- admin:example op=upgrade.status -->
+```json
+{"op": "upgrade.status"}
+```
+```json
+{"ok": true, "op": "upgrade.status", "result": {
+  "chosen": {"version": "0.9.74", "runner_versions": {}, "client_version": "", "chosen_at": 1794000000},
+  "controller": null,
+  "nodes": [{"id": "n1", "online": true, "chosen": "0.9.74", "release": "0.9.74", "agent": "0.9.74",
+    "worker": "0.9.73", "since": 1794000019, "current": true,
+    "self_upgrade": {"state": "done", "version": "0.9.74", "seconds": 14.2}}],
+  "pending": [], "healthy_s": 19}}
 ```
 
 ### host.revoke

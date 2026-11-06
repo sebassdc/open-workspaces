@@ -1115,6 +1115,104 @@ class Machine(unittest.TestCase):
         self.assertEqual(ops.calls, [])
 
 
+class ChosenRelease(unittest.TestCase):
+    """The release the controller chose, as the agent asked for it (docs/UPGRADES.md#choosing-the-release)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        h.ROOT = Path(self.tmp.name)
+        p = h.p(h.SELF_UPGRADE)
+        p.mkdir(parents=True)
+        h.write_json(f"{h.SRV}/releases/0.5.0-aaaaaaaaaaaa/STAGED", {"version": "0.5.0", "commit": "a" * 40})
+        h.set_pin("current", "0.5.0-aaaaaaaaaaaa")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ask(self, version="0.5.1", controller="0.5.0", at=100):
+        h.write_json(u.REQUEST, {"version": version, "controller": controller, "chosen_at": at, "requested_at": 101})
+
+    def test_only_an_exact_release_is_taken_from_the_agent(self):
+        self.assertIsNone(u.chosen_ref())
+        self.ask()
+        self.assertEqual(u.chosen_ref(), "v0.5.1")
+        self.assertEqual(u.chosen_request()["controller"], "0.5.0")
+        for bad in ("main", "v0.5.1", "0.5", "0.05.1", "0.5.1; rm -rf /", "../0.5.1", 5):
+            self.ask(version=bad)
+            self.assertIsNone(u.chosen_ref(), bad)
+        self.ask(controller="evil")
+        self.assertIsNone(u.chosen_request()["controller"])
+
+    def test_upgrades_without_a_ref_install_the_chosen_release(self):
+        config = {"release": {"repository": "https://example.invalid/ow.git", "ref": "v0.5.0"}}
+        refs = []
+        with mock.patch.object(u, "git", side_effect=lambda *a, **k: refs.append(a) or ""), \
+                mock.patch.object(u.h, "run"):
+            self.ask()
+            with self.assertRaises(Refused):  # the fake git knows no commit; the ref is what counts
+                u.fetch(config)
+        self.assertIn(("rev-parse", "--verify", "-q", "origin/v0.5.1^{commit}"), refs)
+
+    def run_self_upgrade(self, outcome):
+        calls = []
+
+        def upgrade(ref, ops=None, controller=None):
+            calls.append((ref, controller))
+            if isinstance(outcome, Exception):
+                raise outcome
+            h.write_json(f"{h.SRV}/releases/0.5.1-bbbbbbbbbbbb/STAGED", {"version": "0.5.1", "seconds": 2})
+            h.set_pin("current", "0.5.1-bbbbbbbbbbbb")
+            h.write_json(u.JOURNAL, {"started": "2999-01-01T00:00:00Z", "step": "done", "seconds": {"verify": 3.1},
+                                     "error": "not resumed: box-a"})
+            return 0
+
+        with mock.patch.object(u, "upgrade", side_effect=upgrade), mock.patch.object(u.h, "role", return_value="runner"):
+            self.assertEqual(u.self_upgrade(wait=0), 0)
+        return calls, h.read_json(u.RESULT)
+
+    def test_a_request_is_installed_once_and_reported_with_its_timings(self):
+        self.ask()
+        calls, result = self.run_self_upgrade(0)
+        self.assertEqual(calls, [("v0.5.1", "0.5.0")])
+        self.assertEqual((result["state"], result["release"], result["error"]), ("done", "0.5.1", None))
+        self.assertEqual(result["request"], {"version": "0.5.1", "controller": "0.5.0", "chosen_at": 100})
+        self.assertEqual((result["requested_at"], result["staged_s"], result["steps"]), (101, 2, {"verify": 3.1}))
+        self.assertEqual(result["warning"], "not resumed: box-a", "what the upgrade could not keep is reported")
+        self.assertGreaterEqual(result["finished"], result["started"])
+        self.assertEqual(os.stat(h.p(u.RESULT)).st_mode & 0o777, 0o644)
+        # The path unit fires again for the same request: nothing runs twice.
+        calls, _ = self.run_self_upgrade(0)
+        self.assertEqual(calls, [])
+
+    def test_a_refused_or_rolled_back_release_is_reported_and_retried_only_when_chosen_again(self):
+        self.ask()
+        calls, result = self.run_self_upgrade(Refused("the controller (0.5.0) accepts protocol 1..1"))
+        self.assertEqual((result["state"], result["release"]), ("failed", "0.5.0"))
+        self.assertIn("accepts protocol", result["error"])
+        self.assertEqual(self.run_self_upgrade(0)[0], [], "not retried by itself")
+        self.ask(controller="0.5.1")  # the controller moved: the agent asks again
+        calls, result = self.run_self_upgrade(0)
+        self.assertEqual((calls, result["state"]), ([("v0.5.1", "0.5.1")], "done"))
+
+    def test_it_waits_for_an_upgrade_already_running(self):
+        self.ask()
+        tries = iter([Refused("another upgrade or restart is running"), None])
+
+        def upgrade(ref, ops=None, controller=None):
+            error = next(tries)
+            if error:
+                raise error
+
+        with mock.patch.object(u, "upgrade", side_effect=upgrade), mock.patch.object(u.h, "role", return_value="host"):
+            u.self_upgrade(wait=0)
+        self.assertEqual(h.read_json(u.RESULT)["state"], "done")
+
+    def test_without_a_request_nothing_runs(self):
+        with mock.patch.object(u, "upgrade") as upgrade:
+            self.assertEqual(u.self_upgrade(), 0)
+        upgrade.assert_not_called()
+
+
 class KernelStaging(unittest.TestCase):
     """A release whose guest kernel pin changed gets that kernel in its own asset set,
     though the copied set already holds a base image and the old kernel."""

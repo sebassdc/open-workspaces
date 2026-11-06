@@ -76,6 +76,9 @@ Infrastructure code carries no telemetry setting.
 | `actions.github_app_id` | `0` | 0–4294967295 | The GitHub App the pools register runners with; `0`: none. |
 | `upgrade.worker_handover` | `true` | `true`, `false` | A worker upgrade or restart that keeps the VMM and guest kernel hands the running boxes to the new worker instead of hibernating them ([UPGRADES.md](UPGRADES.md#worker-hand-over-keeps-boxes-running)). Runners store it for `ow-host upgrade` within 3 s. |
 | `upgrade.running_boxes` | `hibernate` | `hibernate`, `stop` | What a worker upgrade or restart without hand-over does with the running boxes: hibernate them (RAM kept, minutes per large box) or stop them (seconds; RAM lost, disk kept, cold boot after verify) ([UPGRADES.md](UPGRADES.md#ow-host-upgrade)). Managed and ephemeral boxes keep their handling. Runners store it with `upgrade.worker_handover`. |
+| `upgrade.version` | empty | empty or `X.Y.Z` | The release every host runs, chosen by an operator (`ow upgrade set VERSION`); empty: none chosen, nothing moves. Each host's agent installs it within one heartbeat ([UPGRADES.md](UPGRADES.md#choosing-the-release)). |
+| `upgrade.runner_versions` | `{}` | a JSON object, runner name to `X.Y.Z` | One runner's release instead of the fleet's (`ow upgrade set VERSION --runner NAME`). |
+| `upgrade.client_version` | empty | empty or `X.Y.Z` | The release `ow upgrade` installs on clients (`ow upgrade set VERSION --client`); empty: the release the controller runs. |
 | `dashboard.ui_bundle` | `builtin` | `builtin` or an installed bundle version | UI bundle the dashboard serves; see [UI bundles](DASHBOARD.md#ui-bundles). Refused unless installed, intact and API-compatible. |
 
 ## What runners report

@@ -401,11 +401,24 @@ its data volumes outlive their instances. See [docs/RUNNER_POOL.md](../../docs/R
 
 ## Upgrades in place
 
-Run on the host as root (`ow-aws upgrade` and `ow-aws ci-post-up` do it over SSM):
+Choose the release on the controller; each host's agent installs it itself
+([docs/UPGRADES.md](../../docs/UPGRADES.md#choosing-the-release)):
+
+```bash
+ow upgrade set 0.9.74                  # the fleet: every host within one heartbeat
+ow upgrade set 0.9.75 --runner r2      # one runner only
+ow upgrade status                      # what each host runs; healthy_s once all run it
+```
+
+A published release moves nothing until it is chosen. The config's `release.ref`
+only bootstraps a new host: once a release is chosen, `ow-host upgrade` without
+a ref, `ow-aws ci-post-up` and a replaced instance's boot install the chosen one.
+
+By hand, on the host as root (`ow-aws upgrade` and `ow-aws ci-post-up` do it over SSM):
 
 ```bash
 sudo ow-host upgrade --plan          # what the configured release would do; changes nothing
-sudo ow-host upgrade                 # the config's release.ref
+sudo ow-host upgrade                 # the chosen release, else the config's release.ref
 sudo ow-host upgrade v0.5.1 --max-class 1
 sudo ow-host status                  # pins per unit, pending restarts, last journal
 sudo ow-host unchanged --image team=SHA256   # after apply: exit 0 when upgrade and image build have nothing to do

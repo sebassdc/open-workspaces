@@ -670,8 +670,10 @@ fn heartbeat(
     } else {
         None
     };
+    // `host_release_since`: when this runner first reported the release it runs now (how
+    // long a chosen upgrade took, in `upgrade.status`).
     let rows = db.execute(
-        "UPDATE health SET heartbeat=?1,capabilities=?2 WHERE singleton=1 AND session=?3",
+        "UPDATE health SET heartbeat=?1,capabilities=json_set(?2,'$.host_release_since',CASE WHEN json_extract(?2,'$.host_release') IS NULL THEN NULL WHEN json_valid(capabilities) AND json_extract(capabilities,'$.host_release') IS json_extract(?2,'$.host_release') THEN COALESCE(json_extract(capabilities,'$.host_release_since'),?1) ELSE ?1 END) WHERE singleton=1 AND session=?3",
         params![now(), cap.to_string(), generation],
     )?;
     #[cfg(test)]
@@ -1338,6 +1340,9 @@ pub fn controller(
         crate::telemetry::controller_started(&db)?;
     }
     reset_health(root)?;
+    // This host's own release choice: a controller restarted mid-choice (or after a refused
+    // or rolled-back upgrade) asks again only for a choice it has not asked for yet.
+    crate::self_upgrade::follow_controller(root);
     let c = Controller::new(root)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1704,6 +1709,8 @@ fn build_beat(
     }
     beat["version"] = json!(env!("CARGO_PKG_VERSION"));
     beat["worker"] = json!({"version":status["version"],"protocol":status["worker_protocol"]});
+    // The host's release and its upgrader's last report, on a host layout.
+    crate::self_upgrade::beat_fields(&mut beat);
     if let Some(golden) = status["images"].as_array() {
         beat["images"]
             .as_array_mut()
@@ -2037,6 +2044,9 @@ pub fn agent(
     };
     // What controller-settings.json last said (the upgrader reads it there).
     let mut settings_written = None;
+    // The chosen release this agent last asked its host's upgrader for (host layouts only).
+    let self_upgrade_layout = crate::self_upgrade::layout();
+    let mut self_upgrade_last = None;
     loop {
         let result = (|| -> Result<()> {
             if guided {
@@ -2134,6 +2144,17 @@ pub fn agent(
                             );
                             telemetry.acknowledged(&v, connecting);
                             controller_settings(root, &v["telemetry"], &mut settings_written);
+                            if let Some(layout) = &self_upgrade_layout {
+                                let offer = &v["telemetry"];
+                                if let Err(error) = crate::self_upgrade::follow(
+                                    layout,
+                                    crate::self_upgrade::chosen(offer, Some(&node)),
+                                    offer["controller_release"].as_str(),
+                                    &mut self_upgrade_last,
+                                ) {
+                                    eprintln!("self-upgrade request: {error:#}");
+                                }
+                            }
                             if guided {
                                 let (root, instance, generation) =
                                     (root.to_owned(), instance.clone(), generation.to_owned());
