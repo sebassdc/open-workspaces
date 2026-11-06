@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn only_exact_private_addresses_with_a_port_qualify() {
         for ok in [
-            "10.60.5.175:443",
+            "10.9.5.17:443",
             "172.16.0.1:5432",
             "172.31.255.1:1",
             "192.168.1.2:65535",
@@ -94,10 +94,10 @@ mod tests {
             assert!(destination(ok).is_ok(), "{ok}");
         }
         for bad in [
-            "10.60.5.175",        // no port
-            "10.60.5.175:0",      // port 0
-            "10.60.5.175:70000",  // not a port
-            "10.60.0.0/16:443",   // a range, not an address
+            "10.9.5.17",        // no port
+            "10.9.5.17:0",      // port 0
+            "10.9.5.17:70000",  // not a port
+            "10.9.0.0/16:443",   // a range, not an address
             "8.8.8.8:53",         // public: already allowed
             "127.0.0.1:80",       // loopback
             "169.254.169.254:80", // the runner's instance metadata

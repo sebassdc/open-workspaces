@@ -433,7 +433,7 @@ fn private_destinations_open_exactly_what_the_controller_lists() {
         "ip netns add {PE}-egress && ip link add tap-egress type veth peer name eth0 netns {PE}-egress \
          && ip addr add 10.0.2.100/24 dev tap-egress && ip link set tap-egress up \
          && ip netns exec {PE}-egress sh -c 'ip link set lo up && ip link set eth0 up && ip addr add 10.0.2.2/24 dev eth0 \
-            && ip addr add 10.60.1.1/32 dev lo && ip addr add 10.60.1.2/32 dev lo && ip addr add 203.0.113.10/32 dev lo'"
+            && ip addr add 10.9.1.1/32 dev lo && ip addr add 10.9.1.2/32 dev lo && ip addr add 203.0.113.10/32 dev lo'"
     ));
     ow_core::network::enable(&json!([])).unwrap();
     listen_in("owpe-egress", 443, "SERVICE");
@@ -458,28 +458,28 @@ fn private_destinations_open_exactly_what_the_controller_lists() {
 
     // By default every private address is dropped; public ones answer.
     assert_eq!(get("203.0.113.10:443"), (0, "SERVICE".into()));
-    dropped("10.60.1.1:443");
+    dropped("10.9.1.1:443");
     assert!(ow_core::network::private_egress().is_empty());
 
     // Exactly the listed address and port opens: not its other ports, not its neighbour.
     assert_eq!(
-        ow_core::network::allow_private(&json!(["10.60.1.1:443"])).unwrap(),
-        ["10.60.1.1:443"]
+        ow_core::network::allow_private(&json!(["10.9.1.1:443"])).unwrap(),
+        ["10.9.1.1:443"]
     );
-    assert_eq!(get("10.60.1.1:443"), (0, "SERVICE".into()));
-    dropped("10.60.1.1:80");
-    dropped("10.60.1.2:443");
+    assert_eq!(get("10.9.1.1:443"), (0, "SERVICE".into()));
+    dropped("10.9.1.1:80");
+    dropped("10.9.1.2:443");
     // The worker's own address stays dropped even when listed (its input chain admits a box
     // only to its own TAP address).
-    ow_core::network::allow_private(&json!(["10.0.2.100:443", "10.60.1.1:443"])).unwrap();
+    ow_core::network::allow_private(&json!(["10.0.2.100:443", "10.9.1.1:443"])).unwrap();
     dropped("10.0.2.100:443");
 
     // A refused list changes nothing; an empty one closes it again; so does a new table.
     assert!(ow_core::network::allow_private(&json!(["169.254.169.254:80"])).is_err());
-    assert_eq!(get("10.60.1.1:443"), (0, "SERVICE".into()));
+    assert_eq!(get("10.9.1.1:443"), (0, "SERVICE".into()));
     ow_core::network::allow_private(&json!([])).unwrap();
-    dropped("10.60.1.1:443");
-    ow_core::network::allow_private(&json!(["10.60.1.1:443"])).unwrap();
+    dropped("10.9.1.1:443");
+    ow_core::network::allow_private(&json!(["10.9.1.1:443"])).unwrap();
     ow_core::network::initialize().unwrap();
     assert!(ow_core::network::private_egress().is_empty());
     let _ = sh(&format!("ip netns del {PE}-egress; ip netns del {PE}-g1"));
