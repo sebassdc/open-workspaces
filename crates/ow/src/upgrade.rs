@@ -570,6 +570,7 @@ struct Github<F, H> {
     exe: Option<PathBuf>,
     memo: Option<PathBuf>,
     https: Option<H>,
+    https_answer: Option<bool>,
 }
 
 impl<F: FnOnce() -> Result<(String, bool)>, H: FnOnce() -> Result<bool>> Releases for Github<F, H> {
@@ -687,7 +688,13 @@ impl<F: FnOnce() -> Result<(String, bool)>, H: FnOnce() -> Result<bool>> Release
     }
 
     fn https(&mut self) -> Result<bool> {
-        (self.https.take().context("already asked")?)()
+        // Asked once; later calls (the --latest fallback) reuse the answer.
+        if let Some(answer) = self.https_answer {
+            return Ok(answer);
+        }
+        let answer = (self.https.take().context("already asked")?)()?;
+        self.https_answer = Some(answer);
+        Ok(answer)
     }
 }
 
@@ -724,6 +731,7 @@ pub(crate) fn run(
             .ok()
             .map(|config| config.with_file_name("upgrade-refused")),
         https: Some(https),
+        https_answer: None,
     };
     let outcome = choose(&mut github, current, version.as_deref(), check, latest)?;
     // A timer runs `--json` often: a no-op stays silent there.
@@ -857,6 +865,29 @@ mod tests {
     }
 
     const CURRENT: Version = (0, 9, 62);
+
+    #[test]
+    fn the_server_kind_is_asked_once_and_reused() {
+        let mut asked = 0;
+        let mut github = Github {
+            client: reqwest::blocking::Client::new(),
+            no_redirect: reqwest::blocking::Client::new(),
+            controller: None::<fn() -> Result<(String, bool)>>,
+            client_choice: false,
+            options: vec![],
+            exe: None,
+            memo: None,
+            https: Some(|| {
+                asked += 1;
+                Ok(true)
+            }),
+            https_answer: None,
+        };
+        assert!(github.https().unwrap());
+        assert!(github.https().unwrap(), "the --latest fallback asks again");
+        drop(github);
+        assert_eq!(asked, 1);
+    }
 
     #[test]
     fn a_new_release_waits_for_the_operator_or_latest() {
