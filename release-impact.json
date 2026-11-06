@@ -2,7 +2,7 @@
   "schema": 1,
   "releases": [
     {
-      "version": "0.9.74",
+      "version": "0.9.75",
       "class": 1,
       "changes": [
         "controller",
@@ -45,6 +45,49 @@
       "host_layout": 2,
       "in_place_from": "0.5.0",
       "notes": "Upgrades happen when an operator chooses them, and each host's own agent applies them. A published release is only available: the controller settings upgrade.version (the fleet), upgrade.runner_versions (one runner) and upgrade.client_version (clients), set with the admin op upgrade.set (ow upgrade set VERSION [--runner NAME | --client]), choose it. Each runner's agent sees its release in the next acknowledgement and writes a request that the new root path unit ow-self-upgrade.path hands to ow-host self-upgrade: the host's own upgrader downloads and verifies the release, hands the worker over and rolls back on failure, then reports its timings to the agent. upgrade.status (ow upgrade status) shows what each host runs and the decision-to-healthy time. Upgrades without an explicit ref, ci-post-up and a new instance's boot install the chosen release instead of the config's release.ref, which only bootstraps. ow upgrade on a client installs the controller's chosen client release (else the release it runs); GitHub's latest release only with --latest. This release itself installs the old way, once. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 1: the agent and dashboard restart for their new environment; boxes keep running."
+    },
+    {
+      "version": "0.9.74",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "GitHub Actions runner pools can register their runners on an organisation instead of one repository: a pool sets org (OWNER) in place of repo, optionally runner_group_id (default 1, GitHub's default group) and repos (up to 8 OWNER/NAME of that organisation whose queued jobs may spill). One warm set then serves every repository its runner group allows. Such a pool needs the GitHub App's organisation permission Self-hosted runners: read and write. Repository pools keep their box shape, so the upgrade replaces none of their idle boxes. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 1: the controller and dashboard restart; boxes keep running."
     },
     {
       "version": "0.9.73",

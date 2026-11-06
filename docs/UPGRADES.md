@@ -7,7 +7,7 @@ is in [deploy/aws/README.md](../deploy/aws/README.md#upgrades-in-place).
 
 ## Choosing the release
 
-From 0.9.74 a published release is only available: no host installs it until an
+From 0.9.75 a published release is only available: no host installs it until an
 operator chooses it on the controller, and then each host's own agent installs
 it. Nothing in between: no CI job, no SSM command, no per-host step.
 
@@ -69,7 +69,7 @@ ow upgrade set 0.9.75 [--runner NAME]          admin op upgrade.set
   result has the request time, the upgrader's total seconds, staging seconds,
   the journal's steps and a `warning` for what the upgrade could not keep (a box
   not resumed or not kept running).
-- **First release**: 0.9.74 itself installs the old way (its hosts have no
+- **First release**: 0.9.75 itself installs the old way (its hosts have no
   watch yet); every later release can be chosen.
 
 ## Change classes
