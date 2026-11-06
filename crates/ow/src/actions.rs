@@ -176,7 +176,14 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Pool>> {
                     "{}: at most {MAX_SPILL_REPOS} repos",
                     pool.name
                 );
+                // A repository listed twice would count each of its queued jobs twice.
+                let mut seen = HashSet::new();
                 for repo in &pool.repos {
+                    ensure!(
+                        seen.insert(repo.to_ascii_lowercase()),
+                        "{}: {repo} is listed twice in repos",
+                        pool.name
+                    );
                     ensure!(
                         full_name(repo) && repo.split_once('/').unwrap_or_default().0 == org,
                         "{}: each of repos is {org}/NAME",
@@ -629,6 +636,10 @@ mod tests {
             (
                 format!(r#"[{{"name":"ci","org":"acme","repos":[{nine}],"labels":["x"],"token":"t","image":"i","warm":1,"max":1}}]"#),
                 "at most 8 repos",
+            ),
+            (
+                r#"[{"name":"ci","org":"acme","repos":["acme/app","Acme/App"],"labels":["x"],"token":"t","image":"i","warm":1,"max":1}]"#.to_owned(),
+                "listed twice in repos",
             ),
             (
                 r#"[{"name":"ci","org":"acme","runner_group_id":0,"labels":["x"],"token":"t","image":"i","warm":1,"max":1}]"#.to_owned(),

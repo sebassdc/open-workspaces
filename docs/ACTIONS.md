@@ -23,7 +23,8 @@ in its settings store, and act through a [workload token](USERS.md#workload-toke
    built on those runners.
 3. A GitHub App installed on the repository, with **Administration: read and
    write** (self-hosted runners) on it; for an [organisation pool](#organisation-pools),
-   installed on the organisation with **Self-hosted runners: read and write**.
+   installed on the organisation with **Self-hosted runners: read and write**, and
+   **Actions: read** on every repository in its `repos` (spill reads their queued jobs).
    Store its key and id:
 
    ```sh

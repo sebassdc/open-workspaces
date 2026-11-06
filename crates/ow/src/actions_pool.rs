@@ -1065,20 +1065,32 @@ impl GitHub {
     /// them (as GitHub matches), in the queued and running workflow runs of `repos`, read
     /// with the installation token of `scope` (the repository, or their organisation).
     fn queued(&self, app_id: u64, scope: &str, repos: &[String], labels: &[String]) -> Result<u32> {
-        // Never at the cost of what the pool itself needs (runner lists, registrations).
-        let left = *self.remaining.lock().unwrap();
-        if left.is_some_and(|n| n < QUEUED_FLOOR) {
+        // Never at the cost of what the pool itself needs (runner lists, registrations):
+        // checked before every call, as several repositories' scans add up.
+        let low = || {
+            self.remaining
+                .lock()
+                .unwrap()
+                .is_some_and(|n| n < QUEUED_FLOOR)
+        };
+        if low() {
+            let left = *self.remaining.lock().unwrap();
             // Expected under load, not a fault: no spill until the limit refills.
-            eprintln!("actions pools: GitHub rate limit low ({left:?} left): not asking for queued jobs");
+            eprintln!(
+                "actions pools: GitHub rate limit low ({left:?} left): not asking for queued jobs"
+            );
             return Ok(0);
         }
         let token = self.token(app_id, scope)?;
         let ours: Vec<String> = labels.iter().map(|l| l.to_ascii_lowercase()).collect();
         let mut count = 0;
-        for (repo, status) in repos
+        'scan: for (repo, status) in repos
             .iter()
             .flat_map(|r| ["queued", "in_progress"].map(|s| (r, s)))
         {
+            if low() {
+                break 'scan;
+            }
             let (code, runs) = self.call(
                 "GET",
                 &format!("/repos/{repo}/actions/runs?status={status}&per_page={QUEUED_RUNS}"),
@@ -1090,6 +1102,9 @@ impl GitHub {
                 let Some(id) = run["id"].as_u64() else {
                     continue;
                 };
+                if low() {
+                    break 'scan;
+                }
                 let (code, jobs) = self.call(
                     "GET",
                     &format!("/repos/{repo}/actions/runs/{id}/jobs?filter=latest&per_page=100"),
