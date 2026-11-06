@@ -31,13 +31,20 @@ ow upgrade set 0.9.75 [--runner NAME]          admin op upgrade.set
   clients). Only `ow upgrade set` (admin op `upgrade.set`) sets them: it dates
   the decision (the fleet's and each runner's apart) and a controller-only host
   follows at once; `config.set` refuses them.
-- **Who asks**: a runner's agent, and on a host with a local runner that
-  runner's agent. A controller-only host's controller asks for the fleet release
-  when the choice changes and when it starts. The agent asks once per (release,
-  controller release, decision time) and remembers it across restarts, so a host
+- **Who asks**: a runner's agent, from its next acknowledgement (within 3 s).
+  The controller's own host does not wait for one: the controller asks when the
+  choice changes and when it starts (a controller-only host for the fleet
+  release, a host with its own runner for that runner's release), with the same
+  request that runner's agent would make; the agent, finding it on file, does
+  not ask again. The agent asks once per (release, controller release, decision
+  time) and remembers it across restarts, so a host
   that refused a release or rolled it back does not try again by itself: choosing
   the release again (a new decision time) retries it, and so does the
   controller moving (a runner refused because its controller had to go first).
+  On a host that is not a runner the upgrader runs a request once per (release,
+  decision time): the controller release it names does not matter there. A
+  runner already done for a decision is not run again when its restarted agent
+  asks with the controller's new release; only a failed run is retried for that.
   An agent outside a host layout (no `OW_HOST_LAYOUT`) never asks.
 - **Order**: every chosen host starts at once. A runner passes its controller's
   release as `--controller-version`; a release whose protocol the old controller
@@ -71,6 +78,29 @@ ow upgrade set 0.9.75 [--runner NAME]          admin op upgrade.set
   not resumed or not kept running).
 - **First release**: 0.9.75 itself installs the old way (its hosts have no
   watch yet); every later release can be chosen.
+
+### Fleet check: choosing a release (2026-11-06)
+
+Observed on a three-host AWS fleet (one host with the controller and its own
+runner, two runners; m8i-flex, Ubuntu 24.04), all on 0.9.75. Release 0.9.76
+(class 2: controller, agent, worker, dashboard) was published and, as expected,
+moved nothing, neither a host nor a client running the `ow upgrade` timer. Then
+`ow upgrade set 0.9.76` was run from a laptop; `ow upgrade status` was read once
+a second. One run (n = 1), so no p50/p95.
+
+| Step | Time from the decision |
+| --- | --- |
+| Request written by each host's agent | 1.9 s, 2.7 s, 3.2 s |
+| Upgrader done per host (fetch, verified released binaries, staging, drain, hand-over, switch, start, verify) | 9.1 s, 9.2 s, 10.0 s after its request |
+| Journal steps per host | drain 0.2 s, stop 1.1 s, switch 0.1 s, start 1.1-1.2 s, verify 3.1 s, hand-over 0.0 s |
+| Last host done | 13.2 s |
+| `healthy_s` (every host online at 0.9.76, verified) | 15 s |
+
+Every running box was handed over and kept (`adoption: kept`): the same four
+boxes ran before and after. Found and fixed afterwards: a runner's agent,
+restarted by the upgrade, asked again with the controller's new release, and
+the upgrader ran the release a second time ("nothing to do", 0.2 s), which
+replaced the measured result with an empty one.
 
 ## Change classes
 

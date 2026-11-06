@@ -138,6 +138,15 @@ pub(crate) fn follow(
     if last.as_ref() == Some(&request) {
         return Ok(false);
     }
+    // Another writer (the controller, for its own host) may have made it already.
+    let on_file = read(&path).map(|mut old| {
+        old.as_object_mut().map(|o| o.remove("requested_at"));
+        old
+    });
+    if on_file.as_ref() == Some(&request) {
+        *last = on_file;
+        return Ok(false);
+    }
     // Already running it, recorded as the release to keep, and not left failed or
     // unfinished by its upgrader (a re-choice then retries it): nothing to ask for.
     let report = result(layout);
@@ -167,21 +176,27 @@ pub(crate) fn beat_fields(beat: &mut Value) {
     }
 }
 
-/// A controller-only host follows the fleet release (runners can be chosen one by one; the
-/// controller cannot). Called when the controller starts and when the choice changes. A host
-/// with its own runner leaves it to that runner's agent, which asks within one heartbeat.
+/// The controller's own host asks its upgrader at once, when the choice changes and when the
+/// controller starts, instead of waiting for an acknowledgement: a controller-only host for
+/// the fleet release, a host with its own runner for that runner's release. The request is the
+/// one that runner's agent makes from its next acknowledgement (same release, controller
+/// release and decision time), so the agent does not ask a second time.
 pub(crate) fn follow_controller(root: &Path) {
     let Some(layout) = layout() else {
         return;
     };
-    if layout.join(".ow/runner/node.json").exists() {
-        return;
-    }
+    // The local runner's name, for its own entry in `upgrade.runner_versions`.
+    let local = read(&layout.join(".ow/runner/node.json"))
+        .and_then(|n| n["node"].as_str().map(str::to_owned));
     let outcome = crate::nodes::db(root)
-        .and_then(|db| Ok((crate::telemetry::settings(&db)?, chosen_times(&db)?)))
-        .and_then(|(settings, times)| {
-            let offer = json!({"upgrade_version":settings["upgrade.version"],"upgrade_chosen_at":times["fleet"]});
-            follow(&layout, chosen(&offer, None), None, &mut None)
+        .and_then(|db| Ok(crate::telemetry::offer(&db)))
+        .and_then(|offer| {
+            follow(
+                &layout,
+                chosen(&offer, local.as_deref()),
+                offer["controller_release"].as_str(),
+                &mut None,
+            )
         });
     match outcome {
         Ok(true) => eprintln!("self-upgrade: asked this host's upgrader for the chosen release"),
@@ -411,6 +426,46 @@ mod tests {
         )
         .unwrap();
         assert!(!follow(dir.path(), want(9), Some("0.9.75"), &mut last).unwrap());
+    }
+
+    #[test]
+    fn the_agent_does_not_ask_again_after_the_controller_asked_for_its_host() {
+        let dir = host("0.9.75");
+        let offer =
+            json!({"upgrade_version":"0.9.76","upgrade_chosen_at":5,"controller_release":"0.9.75"});
+        // The controller (no memory of its own) asks first ...
+        assert!(
+            follow(
+                dir.path(),
+                chosen(&offer, Some("local")),
+                offer["controller_release"].as_str(),
+                &mut None
+            )
+            .unwrap()
+        );
+        // ... and the local runner's agent, from the same acknowledgement content, does not.
+        let mut agent = None;
+        assert!(
+            !follow(
+                dir.path(),
+                chosen(&offer, Some("local")),
+                offer["controller_release"].as_str(),
+                &mut agent
+            )
+            .unwrap()
+        );
+        // A running agent that remembers an older request does not rewrite it either.
+        let mut running = Some(json!({"version":"0.9.75","controller":"0.9.75","chosen_at":1}));
+        assert!(
+            !follow(
+                dir.path(),
+                chosen(&offer, Some("local")),
+                offer["controller_release"].as_str(),
+                &mut running
+            )
+            .unwrap()
+        );
+        assert_eq!(running.unwrap()["version"], "0.9.76");
     }
 
     #[test]
