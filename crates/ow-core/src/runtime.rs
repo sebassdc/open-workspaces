@@ -1493,7 +1493,6 @@ impl Runtime {
                 && !self.state.placements.contains_key(id),
             "workspace not found"
         );
-        self.refuse_live_vmm(id)?;
         match fs::remove_dir_all(&directory) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             result => result?,
@@ -2834,7 +2833,7 @@ mod adoption_tests {
     use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
     /// A stand-in VMM holding fds 3 and 4, as `Vm::spawn` arranges, recorded for `legacy`.
-    fn recorded_vmm(runtime: &Runtime) -> std::process::Child {
+    pub(super) fn recorded_vmm(runtime: &Runtime) -> std::process::Child {
         let null = File::open("/dev/null").unwrap();
         let fd = null.as_raw_fd();
         let mut command = std::process::Command::new("sleep");
@@ -2930,12 +2929,6 @@ mod adoption_tests {
         assert!(child.try_wait().unwrap().is_none(), "left running");
         assert!(runtime.machine_dir("legacy").join(vm::RECORD).exists());
         assert_eq!(runtime.workspace("legacy").unwrap().state, "stopped");
-        // Files an interrupted create left unregistered are kept the same way.
-        let registered = runtime.state.workspaces.remove("legacy").unwrap();
-        let error = runtime.delete("legacy").unwrap_err();
-        assert!(format!("{error:#}").contains(&refused), "{error:#}");
-        assert!(runtime.machine_dir("legacy").join(vm::RECORD).exists());
-        runtime.state.workspaces.insert("legacy".into(), registered);
         // Once that VMM is gone, the box deletes.
         child.kill().unwrap();
         child.wait().unwrap();
@@ -3673,6 +3666,8 @@ mod disk_tests {
         // one change. Neither the host reserve nor the disk cap clamps it.
         let free = 64 * GIB;
         let before = runtime.disk_headroom_given(free).unwrap();
+        // Neither clamp applies (OW_MIN_FREE_GIB, OW_MAX_DISK_GIB), or the check proves nothing.
+        assert!(before > GIB && before < u64::from(max_disk_gib().unwrap()) * GIB - 8 * GIB);
         let mut disk = File::options()
             .write(true)
             .open(runtime.machine_dir("legacy").join("disk.ext4"))

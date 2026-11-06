@@ -41,7 +41,7 @@
       },
       "host_layout": 2,
       "in_place_from": "0.5.0",
-      "notes": "A box whose recorded VMM still runs (a failed adoption leaves it running) refuses to be deleted, as it already refuses to start: a delete dropped the record of a VMM that kept holding CPU, RAM and the disk with no worker managing it. Files an interrupted create left unregistered are kept the same way. A disk accounting test no longer depends on the free space of a filesystem other tests share. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel, hand-over format and host layout 2 are unchanged. Class 2: the worker hands its boxes over and they keep running."
+      "notes": "A box whose recorded VMM still runs (a failed adoption leaves it running) refuses to be deleted, as it already refuses to start: a delete dropped the record of a VMM that kept holding CPU, RAM and the disk with no worker managing it. A move's source cleanup refuses the same way. A disk accounting test no longer depends on the free space of a filesystem other tests share. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel, hand-over format and host layout 2 are unchanged. Class 2: the worker hands its boxes over and they keep running."
     },
     {
       "version": "0.9.71",
