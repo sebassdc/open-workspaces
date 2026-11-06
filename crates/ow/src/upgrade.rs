@@ -419,7 +419,9 @@ fn select(
         None => releases.controller()?,
     };
     let target = parse(&controller).context("the controller's /api/version")?;
-    let mut outcome = attempt(releases, current, target, Source::Controller, check, false)?;
+    // An operator's client release is checked like a latest one (it may be the same release).
+    let against = releases.chosen_client() && releases.https()?;
+    let mut outcome = attempt(releases, current, target, Source::Controller, check, against)?;
     outcome.reason = Some(match outcome.reason {
         Some(also) => format!("{reason}; {also}"),
         None => reason,
@@ -882,6 +884,13 @@ mod tests {
         (r.client, r.https) = (true, false);
         choose(&mut r, CURRENT, None, false, false).unwrap();
         assert_eq!(r.installed, [((0, 9, 63), false)], "over the local socket it cannot be");
+        // --latest refused as incompatible, falling back to the same chosen client release:
+        // still checked, never installed unchecked.
+        let mut r = fake("v0.9.63", "0.9.63");
+        r.client = true;
+        r.broken = vec![((0, 9, 63), "not compatible with the controller: status asks first")];
+        assert!(choose(&mut r, CURRENT, None, false, true).is_ok());
+        assert!(r.installed.is_empty());
         // The owner opts in: the latest compatible release.
         let mut r = fake("v0.9.64", "0.9.62");
         let o = choose(&mut r, CURRENT, None, false, true).unwrap();

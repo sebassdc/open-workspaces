@@ -770,10 +770,13 @@ fn node_pool_and_tokens() {
 #[test]
 fn a_release_is_chosen_for_the_fleet_a_runner_or_the_clients() {
     let root = temp_root();
-    call(
+    crate::limits::free_pool(&root);
+    drop(crate::catalog::Catalog::open(&root, "issuer", None).unwrap());
+    let (status, invited) = call(
         &root,
         json!({"op":"host.invite","node":"n1","operation_key":"setup"}),
     );
+    assert_eq!(status, 200, "{invited}");
     let (status, set) = call(&root, json!({"op":"upgrade.set","version":"v0.9.74"}));
     assert_eq!(status, 200, "{set}");
     assert_eq!(

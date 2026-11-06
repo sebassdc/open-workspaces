@@ -138,9 +138,12 @@ pub(crate) fn follow(
     if last.as_ref() == Some(&request) {
         return Ok(false);
     }
-    // Already running it, and recorded as the release to keep: nothing to ask for.
+    // Already running it, recorded as the release to keep, and not left failed or
+    // unfinished by its upgrader (a re-choice then retries it): nothing to ask for.
+    let report = result(layout);
     if host_release(layout).as_deref() == Some(want.as_str())
         && last.as_ref().is_some_and(|l| l["version"] == want.as_str())
+        && (report["version"] != want.as_str() || report["state"] == "done")
     {
         return Ok(false);
     }
@@ -425,6 +428,13 @@ mod tests {
         let other = host("0.9.73");
         assert!(follow(other.path(), Some(("0.9.73".into(), 7)), None, &mut None).unwrap());
         assert!(!follow(other.path(), Some(("0.9.73".into(), 8)), None, &mut None).unwrap());
+        // Left on the release by an upgrade whose report failed: choosing it again retries.
+        fs::write(
+            other.path().join(".ow/self-upgrade/result.json"),
+            json!({"version":"0.9.73","state":"failed"}).to_string(),
+        )
+        .unwrap();
+        assert!(follow(other.path(), Some(("0.9.73".into(), 9)), None, &mut None).unwrap());
     }
 
     #[test]
