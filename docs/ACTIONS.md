@@ -59,6 +59,7 @@ Each pool:
 | `memory_mib`, `vcpu_count`, `disk_gib` | Box size; default 4096, 2 and the create default. |
 | `warm` | Runners kept idle (starting or online). |
 | `max` | Boxes at most, busy included. `warm <= max <= 64`. |
+| `aws_role` | Optional. A [per-box AWS role](AWS_ACCESS.md) (`arn:aws:iam::ACCOUNT:role/ow-box/NAME`) attached to each box right after it is made, before its runner registers, as `ow aws-role set` would for the token's owner: the role must be on the operator's allow-list for that owner. Jobs then reach AWS through the standard credential chain, with no key in the repository or the box. |
 
 **Changes apply live.** A new image, size, labels or repository: idle boxes of
 the old shape are replaced, and busy ones finish their job first. A lower `warm`
@@ -75,6 +76,7 @@ gets its boxes in parallel.
 
 1. **Create** the box through the pool's token (ephemeral, in the token's pool).
    A full runner then costs no GitHub call.
+   With `aws_role`, the role is attached now; a refusal fails the launch.
 2. **Register**: a single-use runner registration (JIT config) from the App.
 3. **Hand off**: put the registration at `/home/dev/.ow-ci/jitconfig` and run
    `ow-ci-runner-start` in the box.

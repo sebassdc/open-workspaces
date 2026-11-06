@@ -52,19 +52,24 @@ pub(crate) struct Pool {
     pub disk_gib: Option<u32>,
     pub warm: u32,
     pub max: u32,
+    /// A per-box AWS role (docs/AWS_ACCESS.md) attached to each box before its runner
+    /// registers; it must be on the operator's allow-list for the token's owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_role: Option<String>,
 }
 
 impl Pool {
     /// What a box's shape depends on: an idle box with another one is replaced.
     pub(crate) fn spec(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{:?}|{}",
+            "{}|{}|{}|{}|{:?}|{}|{}",
             self.repo,
             self.labels.join(","),
             self.image,
             self.memory_mib,
             self.disk_gib,
-            self.vcpu_count
+            self.vcpu_count,
+            self.aws_role.as_deref().unwrap_or_default()
         )
     }
 }
@@ -88,7 +93,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Pool>> {
         return Ok(Vec::new());
     }
     let pools: Vec<Pool> = serde_json::from_str(text).context(
-        "expected a list of {\"name\", \"repo\", \"labels\", \"token\", \"image\", \"warm\", \"max\"} (optional memory_mib, vcpu_count, disk_gib)",
+        "expected a list of {\"name\", \"repo\", \"labels\", \"token\", \"image\", \"warm\", \"max\"} (optional memory_mib, vcpu_count, disk_gib, aws_role)",
     )?;
     ensure!(pools.len() <= 16, "at most 16 pools");
     let mut names = std::collections::HashSet::new();
@@ -152,6 +157,23 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Pool>> {
             "{}: warm <= max <= 64",
             pool.name
         );
+        if let Some(role) = &pool.aws_role {
+            let name = role
+                .strip_prefix("arn:aws:iam::")
+                .and_then(|r| r.split_once(":role/ow-box/"))
+                .filter(|(account, _)| {
+                    account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit())
+                })
+                .map(|(_, name)| name);
+            ensure!(
+                name.is_some_and(|n| !n.is_empty()
+                    && n.len() <= 64
+                    && n.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b))),
+                "{}: aws_role is a role ARN under /ow-box/ (arn:aws:iam::ACCOUNT:role/ow-box/NAME)",
+                pool.name
+            );
+        }
     }
     Ok(pools)
 }
@@ -473,10 +495,40 @@ mod tests {
                 r#"[{"name":"ci","repo":"acme/app","labels":["x"],"token":"t","image":"i","warm":1,"max":1,"extra":1}]"#,
                 "expected a list",
             ),
+            (
+                r#"[{"name":"ci","repo":"acme/app","labels":["x"],"token":"t","image":"i","warm":1,"max":1,"aws_role":"arn:aws:iam::111122223333:role/reader"}]"#,
+                "/ow-box/",
+            ),
+            (
+                r#"[{"name":"ci","repo":"acme/app","labels":["x"],"token":"t","image":"i","warm":1,"max":1,"aws_role":"arn:aws:iam::1111:role/ow-box/reader"}]"#,
+                "/ow-box/",
+            ),
+            (
+                r#"[{"name":"ci","repo":"acme/app","labels":["x"],"token":"t","image":"i","warm":1,"max":1,"aws_role":"arn:aws:iam::111122223333:role/ow-box/"}]"#,
+                "/ow-box/",
+            ),
         ] {
             let error = format!("{:#}", parse(bad).unwrap_err());
             assert!(error.contains(why), "{bad}: {error}");
         }
+        // A role changes the boxes' shape: idle ones are replaced.
+        let role = parse(
+            r#"[{"name":"ci","repo":"acme/app","labels":["x"],"token":"t","image":"i","warm":1,"max":1,"aws_role":"arn:aws:iam::111122223333:role/ow-box/build-cache"}]"#,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            role.aws_role.as_deref(),
+            Some("arn:aws:iam::111122223333:role/ow-box/build-cache")
+        );
+        assert_ne!(
+            role.spec(),
+            Pool {
+                aws_role: None,
+                ..role.clone()
+            }
+            .spec()
+        );
         let twice = format!("[{0},{0}]", serde_json::to_string(&pool(1, 1)).unwrap());
         assert!(format!("{:#}", parse(&twice).unwrap_err()).contains("twice"));
         // The typed value round-trips through config.set's JSON form.

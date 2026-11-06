@@ -55,8 +55,13 @@ pub fn node(inventory: &Value, reserved: Value, now: u64) -> Value {
         "telemetry_v1",
         "telemetry_logs_v1",
         "worker_handover_v1",
+        "private_egress_v1",
     ] {
         capabilities[key] = json!(cap[key].as_bool());
+    }
+    // How many private destinations the runner's set holds; the addresses stay with the admin.
+    if let Some(list) = cap["private_egress"].as_array() {
+        capabilities["private_egress_count"] = json!(list.len());
     }
     if cap.get("operations").is_some() {
         capabilities["operations"] = cap["operations"]

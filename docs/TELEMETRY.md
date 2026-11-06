@@ -76,6 +76,7 @@ Infrastructure code carries no telemetry setting.
 | `actions.github_app_id` | `0` | 0–4294967295 | The GitHub App the pools register runners with; `0`: none. |
 | `upgrade.worker_handover` | `true` | `true`, `false` | A worker upgrade or restart that keeps the VMM and guest kernel hands the running boxes to the new worker instead of hibernating them ([UPGRADES.md](UPGRADES.md#worker-hand-over-keeps-boxes-running)). Runners store it for `ow-host upgrade` within 3 s. |
 | `upgrade.running_boxes` | `hibernate` | `hibernate`, `stop` | What a worker upgrade or restart without hand-over does with the running boxes: hibernate them (RAM kept, minutes per large box) or stop them (seconds; RAM lost, disk kept, cold boot after verify) ([UPGRADES.md](UPGRADES.md#ow-host-upgrade)). Managed and ephemeral boxes keep their handling. Runners store it with `upgrade.worker_handover`. |
+| `network.private_egress` | `[]` | a JSON list of `{"pool", "to": ["ADDRESS:PORT", ...]}`, at most 16 pools and 64 destinations each | Exact private TCP destinations a placement pool's boxes may reach ([NETWORKING.md](NETWORKING.md#private-destinations)). Runners apply it within 3 s. |
 | `dashboard.ui_bundle` | `builtin` | `builtin` or an installed bundle version | UI bundle the dashboard serves; see [UI bundles](DASHBOARD.md#ui-bundles). Refused unless installed, intact and API-compatible. |
 
 ## What runners report
