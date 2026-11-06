@@ -43,8 +43,10 @@ ow limits set ci@example.com --cpus 26 --memory-mib 53248 --disk-gib 416 --boxes
 ```
 
 `set` writes the owner's override into `limits.json` below (flags left out keep
-their current value), audited like every admin change. Defaults and pool pricing
-are still edited in the file.
+their current value), audited like every admin change. An override pins all four
+caps: later changes to `owner_defaults` no longer reach that owner. Defaults and
+pool pricing are still edited in the file; don't edit it by hand while a `set`
+runs, since `set` replaces the whole file.
 
 ## Private operator configuration
 

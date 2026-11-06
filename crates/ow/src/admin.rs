@@ -1040,7 +1040,7 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 tx.commit()?;
                 return Ok(result(false));
             }
-            crate::limits::set_owner(root, id, caps)?;
+            // Audit row first: a failed file write rolls it back with the transaction.
             audit(
                 &tx,
                 "limits.owner.set",
@@ -1050,6 +1050,7 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 None,
                 Some(&json!({"value":caps,"previous":previous})),
             )?;
+            crate::limits::set_owner(root, id, caps)?;
             tx.commit()?;
             changed("limits.owner.set", &ctx.actor, json!({"owner":email}));
             Ok(result(true))
