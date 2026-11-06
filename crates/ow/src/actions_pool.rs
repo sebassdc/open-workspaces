@@ -491,7 +491,7 @@ fn box_op(shared: &Shared, token: &str, op: Value) -> Result<Value> {
 /// credentials are on its runner before this returns.
 fn attach_role(shared: &Shared, token: &str, name: &str, role: &str) -> Result<()> {
     let user = {
-        let catalog = shared
+        let mut catalog = shared
             .catalog
             .lock()
             .map_err(|_| anyhow!("catalog lock poisoned"))?;
