@@ -35,8 +35,9 @@ ow upgrade set 0.9.75 [--runner NAME]          admin op upgrade.set
   The controller's own host does not wait for one: the controller asks when the
   choice changes and when it starts (a controller-only host for the fleet
   release, a host with its own runner for that runner's release), with the same
-  request that runner's agent would make, so the agent does not ask again. The agent asks once per (release,
-  controller release, decision time) and remembers it across restarts, so a host
+  request that runner's agent would make; the agent, finding it on file, does
+  not ask again. The agent asks once per (release, controller release, decision
+  time) and remembers it across restarts, so a host
   that refused a release or rolled it back does not try again by itself: choosing
   the release again (a new decision time) retries it, and so does the
   controller moving (a runner refused because its controller had to go first).

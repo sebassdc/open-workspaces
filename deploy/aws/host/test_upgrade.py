@@ -1194,6 +1194,14 @@ class ChosenRelease(unittest.TestCase):
         calls, result = self.run_self_upgrade(0)
         self.assertEqual((calls, result["state"]), ([("v0.5.1", "0.5.1")], "done"))
 
+    def test_a_controller_hosts_request_differing_only_in_the_controller_release_is_not_run_twice(self):
+        self.ask(controller="0.5.0")
+        with mock.patch.object(u.h, "role", return_value="host"), mock.patch.object(u, "upgrade") as upgrade:
+            u.self_upgrade(wait=0)
+            self.ask(controller="0.5.1")  # the restarted controller asks with its new release
+            u.self_upgrade(wait=0)
+        self.assertEqual(upgrade.call_count, 1)
+
     def test_it_waits_for_an_upgrade_already_running(self):
         self.ask()
         tries = iter([Refused("another upgrade or restart is running"), None])

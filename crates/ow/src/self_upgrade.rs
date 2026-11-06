@@ -138,6 +138,15 @@ pub(crate) fn follow(
     if last.as_ref() == Some(&request) {
         return Ok(false);
     }
+    // Another writer (the controller, for its own host) may have made it already.
+    let on_file = read(&path).map(|mut old| {
+        old.as_object_mut().map(|o| o.remove("requested_at"));
+        old
+    });
+    if on_file.as_ref() == Some(&request) {
+        *last = on_file;
+        return Ok(false);
+    }
     // Already running it, recorded as the release to keep, and not left failed or
     // unfinished by its upgrader (a re-choice then retries it): nothing to ask for.
     let report = result(layout);
@@ -445,6 +454,18 @@ mod tests {
             )
             .unwrap()
         );
+        // A running agent that remembers an older request does not rewrite it either.
+        let mut running = Some(json!({"version":"0.9.75","controller":"0.9.75","chosen_at":1}));
+        assert!(
+            !follow(
+                dir.path(),
+                chosen(&offer, Some("local")),
+                offer["controller_release"].as_str(),
+                &mut running
+            )
+            .unwrap()
+        );
+        assert_eq!(running.unwrap()["version"], "0.9.76");
     }
 
     #[test]

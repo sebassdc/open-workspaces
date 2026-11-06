@@ -1240,7 +1240,10 @@ def self_upgrade(ops=None, wait=5, limit=3600):
         req = chosen_request()
         if req is None:
             return 0
-        key = {k: req[k] for k in ("version", "controller", "chosen_at")}
+        # The controller release matters only to a runner's plan: elsewhere it is left out, so a
+        # request that differs only there (the controller restarted mid-upgrade) is the same one.
+        key = {"version": req["version"], "controller": req["controller"] if h.role() == "runner" else None,
+               "chosen_at": req["chosen_at"]}
         last = h.read_json(RESULT) or {}
         if last.get("request") == key and last.get("state") in ("done", "failed"):
             return 0
