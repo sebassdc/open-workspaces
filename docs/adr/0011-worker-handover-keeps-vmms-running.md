@@ -123,11 +123,10 @@ Not covered: an unreadable record, a `pidfd_open` failing for lack of fds or
 memory, or a kill that fails leave that VMM running with its record and TAP, and
 the next worker tries again. While a readable record names a VMM that still runs,
 the box's start refuses, so no second VMM opens its disk, and its delete and a
-move's source cleanup refuse, so the record that names the VMM is never dropped;
-with an unreadable
-record only the TAP the VMM still holds stops one; a
-worker that dies between spawning a VMM and writing its record leaves that VMM
-unrecorded. An adopted box keeps the in-guest setup it was started with (network,
+move's source cleanup refuse, so the record that names the VMM is never dropped.
+With an unreadable record only the TAP the VMM still holds stops a second start,
+and delete and cleanup do not see the VMM either; a worker that dies between
+spawning a VMM and writing its record leaves that VMM unrecorded. An adopted box keeps the in-guest setup it was started with (network,
 tools bundle): a worker release that changes that setup reaches it at its next
 cold boot or wake.
 
