@@ -185,7 +185,12 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Pool>> {
                         pool.name
                     );
                     ensure!(
-                        full_name(repo) && repo.split_once('/').unwrap_or_default().0 == org,
+                        full_name(repo)
+                            && repo
+                                .split_once('/')
+                                .unwrap_or_default()
+                                .0
+                                .eq_ignore_ascii_case(org),
                         "{}: each of repos is {org}/NAME",
                         pool.name
                     );
@@ -591,6 +596,8 @@ mod tests {
         .remove(0);
         assert_eq!((org.scope(), org.group()), ("acme", 1));
         assert_eq!(org.queue_repos(), ["acme/app", "acme/api"]);
+        // GitHub names are case-insensitive.
+        assert!(parse(r#"[{"name":"ci","org":"Acme","repos":["acme/app"],"labels":["app-ci"],"token":"t","image":"i","warm":1,"max":2}]"#).is_ok());
         assert!(org.spec().starts_with("acme|app-ci|"));
         // Without repos it still keeps warm runners; it only never spills.
         let grouped = parse(

@@ -1055,10 +1055,11 @@ impl GitHub {
                 }
             }
             if list.len() < 100 {
-                break;
+                return Ok(out);
             }
         }
-        Ok(out)
+        // A runner missing from a cut-off list would look gone and have its box removed.
+        bail!("runner list: more than 2000 runners, the list would be incomplete")
     }
 
     /// Jobs queued for runners with `labels`: every label a queued job asks for is one of
