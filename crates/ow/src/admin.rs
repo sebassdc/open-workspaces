@@ -3,6 +3,7 @@
 //! the host's root or controller user on `<controller data dir>/admin.sock`. Both call
 //! [`handle`], so they answer the same. The `ow` admin commands only build the request, send
 //! it and print the result (`admin_client.rs`); no CLI code opens the controller database.
+use crate::limits::Caps;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
@@ -73,6 +74,7 @@ pub(crate) const OPS: &[OpSpec] = &[
     op("limits.owner.set", &[&["limits", "set"]], true),
     op("upgrade.set", &[&["upgrade", "set"]], true),
     op("upgrade.status", &[&["upgrade", "status"]], false),
+    op("limits.owner.clear", &[&["limits", "clear"]], true),
 ];
 
 pub(crate) fn spec(name: &str) -> Option<&'static OpSpec> {
@@ -151,6 +153,7 @@ pub(crate) enum AdminRequest {
         memory_mib: Option<u64>,
         disk_gib: Option<u64>,
         boxes: Option<u64>,
+        unlimited: Option<bool>,
     },
     #[serde(rename = "upgrade.set")]
     UpgradeSet {
@@ -160,6 +163,8 @@ pub(crate) enum AdminRequest {
     },
     #[serde(rename = "upgrade.status")]
     UpgradeStatus {},
+    #[serde(rename = "limits.owner.clear")]
+    LimitsOwnerClear { owner: String },
 }
 
 /// Who made a request, as the gateway or the socket verified it.
@@ -1011,7 +1016,7 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
         AdminRequest::LimitsOwnerGet { owner } => {
             let db = crate::nodes::db(root)?;
             let (email, id) = owner_id(&db, &owner)?;
-            let (caps, overridden) = crate::limits::owner_caps(root, id)?;
+            let (caps, overridden) = crate::limits::load(root)?.owner(id);
             Ok(
                 json!({"owner":email,"owner_id":id,"caps":caps,"override":overridden,"usage":crate::limits::usage(&db,id,"")?}),
             )
@@ -1108,13 +1113,13 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             memory_mib,
             disk_gib,
             boxes,
+            unlimited,
         } => {
-            if [cpus, memory_mib, disk_gib, boxes]
-                .iter()
-                .all(Option::is_none)
-            {
+            let numbers = [cpus, memory_mib, disk_gib, boxes];
+            let unlimited = unlimited == Some(true);
+            if unlimited == numbers.iter().any(Option::is_some) {
                 return Err(invalid_request(
-                    "give at least one of cpus, memory_mib, disk_gib, boxes",
+                    "give unlimited, or at least one of cpus, memory_mib, disk_gib, boxes",
                 ));
             }
             for (field, n) in [
@@ -1131,12 +1136,22 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
             let mut db = crate::nodes::db(root)?;
             let tx = immediate(&mut db)?;
             let (email, id) = owner_id(&tx, &owner)?;
-            let (previous, overridden) = crate::limits::owner_caps(root, id)?;
-            let caps = crate::limits::Resources {
-                cpus: cpus.unwrap_or(previous.cpus),
-                memory_mib: memory_mib.unwrap_or(previous.memory_mib),
-                disk_gib: disk_gib.unwrap_or(previous.disk_gib),
-                boxes: boxes.unwrap_or(previous.boxes),
+            let config = crate::limits::load(root)?;
+            let (previous, overridden) = config.owner(id);
+            let caps = if unlimited {
+                Caps::Unlimited(crate::limits::Unlimited::Unlimited)
+            } else {
+                // Leaving unlimited, fields left out start from the defaults.
+                let base = match previous {
+                    Caps::Limited(r) => r,
+                    Caps::Unlimited(_) => config.owner_defaults,
+                };
+                Caps::Limited(crate::limits::Resources {
+                    cpus: cpus.unwrap_or(base.cpus),
+                    memory_mib: memory_mib.unwrap_or(base.memory_mib),
+                    disk_gib: disk_gib.unwrap_or(base.disk_gib),
+                    boxes: boxes.unwrap_or(base.boxes),
+                })
             };
             let result = |changed: bool| json!({"owner":email,"owner_id":id,"caps":caps,"previous":previous,"changed":changed,"effective":"next_create"});
             if overridden && caps == previous {
@@ -1162,10 +1177,38 @@ fn run(ctx: &Context, raw: &Value, request: AdminRequest) -> Answer {
                 None,
                 Some(&json!({"value":caps,"previous":previous})),
             )?;
-            crate::limits::set_owner(root, id, caps)?;
+            crate::limits::set_owner(root, id, Some(caps))?;
             tx.commit()?;
             changed("limits.owner.set", &ctx.actor, json!({"owner":email}));
             Ok(result(true))
+        }
+        AdminRequest::LimitsOwnerClear { owner } => {
+            let mut db = crate::nodes::db(root)?;
+            let tx = immediate(&mut db)?;
+            let (email, id) = owner_id(&tx, &owner)?;
+            let config = crate::limits::load(root)?;
+            let (previous, overridden) = config.owner(id);
+            let caps = Caps::Limited(config.owner_defaults);
+            let result = json!({"owner":email,"owner_id":id,"caps":caps,"previous":previous,"changed":overridden,"effective":"next_create"});
+            let outcome = if overridden { "ok" } else { "unchanged" };
+            let values = overridden.then(|| json!({"value":caps,"previous":previous}));
+            audit(
+                &tx,
+                "limits.owner.clear",
+                &ctx.actor,
+                raw,
+                outcome,
+                None,
+                values.as_ref(),
+            )?;
+            if overridden {
+                crate::limits::set_owner(root, id, None)?;
+            }
+            tx.commit()?;
+            if overridden {
+                changed("limits.owner.clear", &ctx.actor, json!({"owner":email}));
+            }
+            Ok(result)
         }
         AdminRequest::HostRevoke { node } => {
             crate::common::identifier(&node).map_err(|e| invalid_value("node", e))?;

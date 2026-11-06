@@ -92,8 +92,14 @@ function renderState() {
   $('metric-memory').textContent = mib((stats.total_pss_kib || 0) / 1024);
   // Owner caps refuse a create; pool-wide totals are shared and change as hosts join.
   const {caps = {}, usage = {}} = data.owner_limits || {};
-  $('metric-reserved').textContent = `${mib(usage.memory_mib || 0)} of ${mib(caps.memory_mib || 0)}`;
-  $('metric-limit').textContent = `${usage.boxes || 0} of ${caps.boxes || 0} machines · ${usage.cpus || 0} of ${caps.cpus || 0} vCPU · ${usage.disk_gib || 0} of ${caps.disk_gib || 0} GiB disk`;
+  // An unlimited owner has no caps to show; runner capacity still bounds them.
+  if (caps === 'unlimited') {
+    $('metric-reserved').textContent = 'No limit';
+    $('metric-limit').textContent = `${mib(usage.memory_mib || 0)} · ${usage.boxes || 0} machines · ${usage.cpus || 0} vCPU · ${usage.disk_gib || 0} GiB disk in use`;
+  } else {
+    $('metric-reserved').textContent = `${mib(usage.memory_mib || 0)} of ${mib(caps.memory_mib || 0)}`;
+    $('metric-limit').textContent = `${usage.boxes || 0} of ${caps.boxes || 0} machines · ${usage.cpus || 0} of ${caps.cpus || 0} vCPU · ${usage.disk_gib || 0} of ${caps.disk_gib || 0} GiB disk`;
+  }
   $('nav-count').textContent = data.workspaces.length; $('machine-total').textContent = data.workspaces.length;
   $('capacity').hidden = capacity === 0; $('capacity').max = capacity || 1; $('capacity').value = stats.reserved_memory_mib || 0; $('capacity-text').textContent = `${mib(stats.reserved_memory_mib || 0)} / ${mib(capacity)}`;
   $('machine-grid').replaceChildren(); $('shared-grid').replaceChildren(); $('pool-grid').replaceChildren(); $('shared-view').hidden = !(data.shared || []).length; $('pool-view').hidden = !(data.pool || []).length;

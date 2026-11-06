@@ -11,7 +11,9 @@ job.
 
 Nothing runs on a runner host: the pools are part of the controller, configured
 in its settings store, and act through a [workload token](USERS.md#workload-tokens)
-(so its owner's limits and its placement pool apply).
+(so its owner's limits and its placement pool apply). To bound a pool by its
+`max` and its runners alone, make the token's owner unlimited
+(`ow limits set OWNER --unlimited`, [LIMITS.md](LIMITS.md#setting-an-owners-limits)).
 
 ## Set up
 

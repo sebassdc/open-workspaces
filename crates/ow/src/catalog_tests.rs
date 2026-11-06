@@ -1835,6 +1835,48 @@ fn owner_quota_growth_and_lowered_caps_leave_existing_boxes_usable() {
     assert_eq!(c.state(a).unwrap()["owner_limits"]["usage"]["boxes"], 0);
 }
 #[test]
+fn owner_quota_unlimited_owner_skips_caps_but_is_still_counted() {
+    let mut fake = Fake::new();
+    let mut c = Catalog::open(&fake.root, "test", None).unwrap();
+    fake.worker("alpha");
+    quota_node(&fake);
+    let a = c.user(&identity("alice")).unwrap();
+    let b = c.user(&identity("bob")).unwrap();
+    let one = json!({"cpus":1,"memory_mib":256,"disk_gib":8,"boxes":1});
+    quota_config(&fake.root, one.clone());
+    let mut file: Value =
+        serde_json::from_slice(&std::fs::read(fake.root.join("limits.json")).unwrap()).unwrap();
+    file["owners"] = json!({a.to_string():"unlimited"});
+    std::fs::write(fake.root.join("limits.json"), file.to_string()).unwrap();
+    let create =
+        |id: &str| json!({"op":"create","id":id,"memory_mib":256,"vcpu_count":1,"disk_gib":8});
+    for id in ["one", "two", "three"] {
+        c.operation(a, create(id)).unwrap();
+    }
+    let state = c.state(a).unwrap();
+    assert_eq!(state["owner_limits"]["caps"], "unlimited");
+    assert_eq!(
+        state["owner_limits"]["usage"],
+        json!({"cpus":3,"memory_mib":768,"disk_gib":24,"boxes":3})
+    );
+    // The defaults still bind everyone else.
+    c.operation(b, create("four")).unwrap();
+    assert!(
+        c.operation(b, create("five"))
+            .unwrap_err()
+            .to_string()
+            .contains("limit exceeded")
+    );
+    // Back on caps, the usage counted while unlimited refuses more growth.
+    quota_config(&fake.root, one);
+    assert!(
+        c.operation(a, create("six"))
+            .unwrap_err()
+            .to_string()
+            .contains("owner CPU limit exceeded: requested total 4, limit 1")
+    );
+}
+#[test]
 fn owner_quota_failed_create_releases_but_uncertain_survives_restart() {
     let mut fake = Fake::new();
     let mut c = Catalog::open(&fake.root, "test", None).unwrap();
