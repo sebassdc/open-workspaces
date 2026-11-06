@@ -31,9 +31,11 @@ ow upgrade set 0.9.75 [--runner NAME]          admin op upgrade.set
   clients). Only `ow upgrade set` (admin op `upgrade.set`) sets them: it dates
   the decision (the fleet's and each runner's apart) and a controller-only host
   follows at once; `config.set` refuses them.
-- **Who asks**: a runner's agent, and on a host with a local runner that
-  runner's agent. A controller-only host's controller asks for the fleet release
-  when the choice changes and when it starts. The agent asks once per (release,
+- **Who asks**: a runner's agent, from its next acknowledgement (within 3 s).
+  The controller's own host does not wait for one: the controller asks when the
+  choice changes and when it starts (a controller-only host for the fleet
+  release, a host with its own runner for that runner's release), with the same
+  request that runner's agent would make, so the agent does not ask again. The agent asks once per (release,
   controller release, decision time) and remembers it across restarts, so a host
   that refused a release or rolled it back does not try again by itself: choosing
   the release again (a new decision time) retries it, and so does the
