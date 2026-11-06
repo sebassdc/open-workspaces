@@ -84,7 +84,6 @@ const LOCAL: &[(&str, &str)] = &[
         "disaster recovery with the gateway down",
     ),
     ("login", "client-side sign-in"),
-    ("upgrade", "replaces this machine's own client"),
 ];
 
 /// Admin commands not yet ops; each gets its contract in its own change.
@@ -302,6 +301,8 @@ fn the_cli_builds_the_documented_request() {
                 "13",
             ],
         ),
+        ("upgrade.set", &["upgrade", "set", "0.9.74"]),
+        ("upgrade.status", &["upgrade", "status"]),
     ];
     // The documented key, in the file `--key-file` reads when the command is parsed.
     const KEY_FILE: &str = "/tmp/ow-admin-tests-app-key.pem";
@@ -763,6 +764,83 @@ fn node_pool_and_tokens() {
         (status, never["error_code"].as_str()),
         (404, Some("not_found"))
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_release_is_chosen_for_the_fleet_a_runner_or_the_clients() {
+    let root = temp_root();
+    call(
+        &root,
+        json!({"op":"host.invite","node":"n1","operation_key":"setup"}),
+    );
+    let (status, set) = call(&root, json!({"op":"upgrade.set","version":"v0.9.74"}));
+    assert_eq!(status, 200, "{set}");
+    assert_eq!(
+        (
+            &set["result"]["key"],
+            &set["result"]["value"],
+            &set["result"]["changed"]
+        ),
+        (&json!("upgrade.version"), &json!("0.9.74"), &json!(true))
+    );
+    let at = set["result"]["chosen_at"].as_i64().unwrap();
+    assert!(at > 0);
+    // What every acknowledgement carries to the agents.
+    let offer = crate::telemetry::offer(&crate::nodes::db(&root).unwrap());
+    assert_eq!(offer["upgrade_version"], "0.9.74");
+    assert_eq!(offer["upgrade_chosen_at"], at);
+    assert_eq!(offer["controller_release"], env!("CARGO_PKG_VERSION"));
+    // Chosen again: unchanged, but dated again so a host that refused it retries.
+    let (_, again) = call(&root, json!({"op":"upgrade.set","version":"0.9.74"}));
+    assert_eq!(again["result"]["changed"], false);
+    let (status, runner) = call(
+        &root,
+        json!({"op":"upgrade.set","version":"0.9.75","runner":"n1"}),
+    );
+    assert_eq!(status, 200, "{runner}");
+    assert_eq!(runner["result"]["value"], json!({"n1":"0.9.75"}));
+    let offer = crate::telemetry::offer(&crate::nodes::db(&root).unwrap());
+    assert_eq!(
+        crate::self_upgrade::chosen(&offer, Some("n1")).as_deref(),
+        Some("0.9.75")
+    );
+    let (_, cleared) = call(
+        &root,
+        json!({"op":"upgrade.set","version":"none","runner":"n1"}),
+    );
+    assert_eq!(cleared["result"]["value"], json!({}));
+    let (_, client) = call(
+        &root,
+        json!({"op":"upgrade.set","version":"0.9.74","client":true}),
+    );
+    assert_eq!(client["result"]["key"], "upgrade.client_version");
+    assert_eq!(client["result"]["chosen_at"], Value::Null);
+    assert_eq!(
+        crate::admin::client_release(Some(&root)).as_deref(),
+        Some("0.9.74")
+    );
+    for (request, code) in [
+        (
+            json!({"op":"upgrade.set","version":"latest"}),
+            "invalid_value",
+        ),
+        (
+            json!({"op":"upgrade.set","version":"0.9.74","runner":"ghost"}),
+            "not_found",
+        ),
+        (
+            json!({"op":"upgrade.set","version":"0.9.74","runner":"n1","client":true}),
+            "invalid_request",
+        ),
+    ] {
+        let (_, refused) = call(&root, request.clone());
+        assert_eq!(refused["error_code"], code, "{request}");
+    }
+    let (status, report) = call(&root, json!({"op":"upgrade.status"}));
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["result"]["chosen"]["version"], "0.9.74");
+    assert_eq!(report["result"]["chosen"]["client_version"], "0.9.74");
     std::fs::remove_dir_all(root).unwrap();
 }
 

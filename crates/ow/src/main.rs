@@ -49,6 +49,7 @@ mod preview;
 mod remote;
 #[cfg(any(target_os = "linux", test))]
 mod scaler;
+mod self_upgrade;
 #[cfg(target_os = "linux")]
 mod selfhost;
 mod actions;
@@ -98,6 +99,23 @@ enum ConfigAction {
         #[arg(long)]
         limit: Option<i64>,
     },
+}
+
+#[derive(Subcommand)]
+enum UpgradeAction {
+    /// Admin: choose the release the fleet runs; each host's agent installs it within seconds.
+    /// An empty VERSION (or "none") clears the choice.
+    Set {
+        version: String,
+        /// Only this runner (overrides the fleet's release for it).
+        #[arg(long, conflicts_with = "client")]
+        runner: Option<String>,
+        /// The release `ow upgrade` installs on clients instead.
+        #[arg(long)]
+        client: bool,
+    },
+    /// Admin: the chosen releases, what each host runs, and once all run it, how long it took.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -282,11 +300,18 @@ enum Action {
         #[arg(long)]
         tailnet: bool,
     },
-    /// Replace this client with the latest release its controller accepts (or --version), verified first.
+    /// Replace this client with the release its controller chose for clients (else the one it
+    /// runs), verified first; `set` and `status` choose the fleet's release (admin).
+    #[command(args_conflicts_with_subcommands = true)]
     Upgrade {
+        #[command(subcommand)]
+        command: Option<UpgradeAction>,
         /// Install exactly this release (vX.Y.Z), even an older one.
         #[arg(long)]
         version: Option<String>,
+        /// Opt in to GitHub's latest release, when it is newer and compatible with the controller.
+        #[arg(long)]
+        latest: bool,
         /// Only compare: exit 0 when current, 10 when an upgrade is available.
         #[arg(long)]
         check: bool,
@@ -1155,7 +1180,9 @@ fn main_result() -> anyhow::Result<i32> {
         }
     }
     if let Action::Upgrade {
+        command: None,
         version,
+        latest,
         check,
         json,
     } = cli.command
@@ -1173,6 +1200,7 @@ fn main_result() -> anyhow::Result<i32> {
         let (data_dir, server) = (cli.data_dir.clone(), cli.server.clone());
         return upgrade::run(
             version,
+            latest,
             check,
             json,
             || admin_client::server_version(cli.data_dir, cli.server, cli.local_mode),

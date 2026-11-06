@@ -2,8 +2,8 @@
 //! builds one op's request, sends it over HTTPS or the controller's admin.sock, and prints
 //! the result. Nothing here reads or writes the controller database.
 use crate::{
-    Action, AppKeyAction, ConfigAction, HostAction, LimitsAction, PlacementAction, ActionsAction,
-    TokenAction, admin,
+    Action, ActionsAction, AppKeyAction, ConfigAction, HostAction, LimitsAction, PlacementAction,
+    TokenAction, UpgradeAction, admin,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -41,6 +41,19 @@ pub(crate) fn request(action: &Action, key: &str) -> Option<Value> {
             }
         },
         Action::Health => json!({"op":"health.get"}),
+        Action::Upgrade {
+            command: Some(command),
+            ..
+        } => match command {
+            UpgradeAction::Set {
+                version,
+                runner,
+                client,
+            } => {
+                json!({"op":"upgrade.set","version":version,"runner":runner,"client":client.then_some(true)})
+            }
+            UpgradeAction::Status => json!({"op":"upgrade.status"}),
+        },
         Action::Placement {
             command: PlacementAction::Status { pool },
         } => json!({"op":"placement.status","pool":pool}),
@@ -251,7 +264,8 @@ pub(crate) fn https(
     ))
 }
 
-/// The release the configured controller runs: `server` from its `GET /api/version`.
+/// The release `ow upgrade` installs from the configured controller's `GET /api/version`:
+/// `client`, the release its operator chose for clients, else `server`, the one it runs.
 pub(crate) fn server_version(
     data_dir: Option<PathBuf>,
     server: Option<String>,
@@ -262,7 +276,13 @@ pub(crate) fn server_version(
     let (status, body) = call(&transport, "GET", "/api/version", None)?;
     serde_json::from_slice::<Value>(&body)
         .ok()
-        .and_then(|v| v["result"]["server"].as_str().map(str::to_owned))
+        .and_then(|v| {
+            let result = &v["result"];
+            result["client"]
+                .as_str()
+                .or(result["server"].as_str())
+                .map(str::to_owned)
+        })
         .with_context(|| {
             format!("the controller's /api/version has no server version (HTTP {status})")
         })

@@ -423,6 +423,24 @@ fn select(
     Ok(outcome)
 }
 
+/// What `ow upgrade` installs: the release the controller chose for its clients (or, with
+/// none chosen, the one it runs), or exactly `--version`. A new release on GitHub is only
+/// available: it is installed when the owner opts in with `--latest`, or once the operator
+/// chooses it (docs/UPGRADES.md#choosing-the-release).
+fn choose(
+    releases: &mut impl Releases,
+    current: Version,
+    version: Option<&str>,
+    check: bool,
+    latest: bool,
+) -> Result<Outcome> {
+    if latest || version.is_some() {
+        return select(releases, current, version, check);
+    }
+    let target = parse(&releases.controller()?).context("the controller's /api/version")?;
+    attempt(releases, current, target, Source::Controller, check)
+}
+
 /// The latest release's outcome, or why the controller's release is the target instead.
 /// Asks the controller first (into `controller`) when it will install: no controller, no
 /// compatibility check, so no download.
@@ -660,6 +678,7 @@ impl<F: FnOnce() -> Result<String>, H: FnOnce() -> Result<bool>> Releases for Gi
 /// controller is an HTTPS server (not the local socket); it is asked only without `--version`.
 pub(crate) fn run(
     version: Option<String>,
+    latest: bool,
     check: bool,
     json: bool,
     controller: impl FnOnce() -> Result<String>,
@@ -687,7 +706,7 @@ pub(crate) fn run(
             .map(|config| config.with_file_name("upgrade-refused")),
         https: Some(https),
     };
-    let outcome = select(&mut github, current, version.as_deref(), check)?;
+    let outcome = choose(&mut github, current, version.as_deref(), check, latest)?;
     // A timer runs `--json` often: a no-op stays silent there.
     if outcome.step == Step::Current && json && !check {
         return Ok(0);
@@ -813,6 +832,31 @@ mod tests {
     }
 
     const CURRENT: Version = (0, 9, 62);
+
+    #[test]
+    fn a_new_release_waits_for_the_operator_or_latest() {
+        // GitHub has 0.9.64; the controller chose (or runs) 0.9.62: nothing to install.
+        let mut r = fake("v0.9.64", "0.9.62");
+        let o = choose(&mut r, CURRENT, None, false, false).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            (CURRENT, Source::Controller, Step::Current)
+        );
+        assert!(r.installed.is_empty());
+        // The operator chose 0.9.63: installed, without asking GitHub for its latest.
+        let mut r = fake("v0.9.64", "0.9.63");
+        r.latest = Err("not asked");
+        let o = choose(&mut r, CURRENT, None, false, false).unwrap();
+        assert_eq!((o.to, o.step), ((0, 9, 63), Step::Upgraded));
+        assert_eq!(r.installed, [((0, 9, 63), false)]);
+        // The owner opts in: the latest compatible release.
+        let mut r = fake("v0.9.64", "0.9.62");
+        let o = choose(&mut r, CURRENT, None, false, true).unwrap();
+        assert_eq!(
+            (o.to, o.source, o.step),
+            ((0, 9, 64), Source::Latest, Step::Upgraded)
+        );
+    }
 
     #[test]
     fn a_newer_compatible_latest_release_is_installed() {
