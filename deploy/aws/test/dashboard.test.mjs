@@ -65,4 +65,8 @@ test("dashboard counter shows owner usage against owner limits", () => {
     assert.equal(elements.get("metric-reserved").textContent, "1.0 GiB of 2.0 GiB");
     assert.equal(elements.get("metric-limit").textContent, "1 of 2 machines · 1 of 2 vCPU · 40 of 64 GiB disk");
     assert.equal(elements.get("capacity-text").textContent, "512 MiB / 64.0 GiB");
+    context.fixture.owner_limits.caps = "unlimited";
+    vm.runInContext("data = fixture; render()", context);
+    assert.equal(elements.get("metric-reserved").textContent, "No limit");
+    assert.equal(elements.get("metric-limit").textContent, "1.0 GiB · 1 machines · 1 vCPU · 40 GiB disk in use");
 });

@@ -106,8 +106,8 @@ Responses carry `cache-control: no-store`.
 Every mutating op that passed the gate writes one `admin_audit` row, success or
 failure: time, op, actor, `via` (`https` or `local`), the request, the result
 (`ok`, `unchanged` or the error code), the configuration version after a
-`config.set`, and for `config.set`, `node.pool.set` and `limits.owner.set` the value
-and the previous one. A change and its row commit in one transaction. Reads write nothing.
+`config.set`, and for `config.set`, `node.pool.set`, `limits.owner.set` and
+`limits.owner.clear` the value and the previous one. A change and its row commit in one transaction. Reads write nothing.
 `ow config history` and the idempotent `token.revoke` read this table, so they
 know only changes made through the API (from v0.9.54): a token revoked before
 then is `not_found`. The
@@ -148,6 +148,8 @@ reissue. Keys live in `admin_operations`.
 | `ow limits set EMAIL [--cpus N] [--memory-mib N] [--disk-gib N] [--boxes N]` | `limits.owner.set` |
 | `ow upgrade set VERSION [--runner NAME \| --client]` | `upgrade.set` |
 | `ow upgrade status` | `upgrade.status` |
+| `ow limits set EMAIL --unlimited` | `limits.owner.set` with `"unlimited": true` |
+| `ow limits clear EMAIL` | `limits.owner.clear` |
 
 The examples below are the contract: a test parses every request and response,
 and checks that the CLI builds each request exactly.
@@ -453,7 +455,7 @@ again returns `"changed": false`.
 ### limits.owner.get
 
 One owner's [limits](LIMITS.md): `caps` (their override, or the defaults when
-`override` is false) and `usage`, the same four fields counted the way admission
+`override` is false; `"unlimited"` for an owner with no caps) and `usage`, the same four fields counted the way admission
 counts them. `owner` is the login email of a user the catalog knows; an unknown
 one is `not_found`.
 
@@ -475,6 +477,11 @@ current value (from the override, or the defaults); at least one is required.
 Each is a whole number; zero denies new demand in that dimension. Lowering a cap
 never stops or shrinks a box. It applies from the next create, fork, resize or
 restore. The same caps again return `"changed": false`.
+
+`"unlimited": true`, alone, instead of the numbers, removes the owner's caps: `caps`
+becomes `"unlimited"`. Runner capacity, spill reserves and an Actions pool's `max`
+still bound where and how many boxes go, and their usage is still counted. Numbers given to an
+unlimited owner start from the defaults for the fields left out.
 
 <!-- admin:example op=limits.owner.set -->
 ```json
@@ -531,6 +538,25 @@ layout (null elsewhere).
     "worker": "0.9.73", "since": 1794000019, "current": true,
     "self_upgrade": {"state": "done", "version": "0.9.74", "seconds": 14.2}}],
   "pending": [], "healthy_s": 19}}
+```
+
+### limits.owner.clear
+
+Removes one owner's override from `limits.json` (written the same way as
+`limits.owner.set`), so the defaults apply to them again from the next create,
+fork, resize or restore. `caps` is what now applies and `previous` what the
+override was (a number set or `"unlimited"`). An owner with no override returns
+`"changed": false`.
+
+<!-- admin:example op=limits.owner.clear -->
+```json
+{"op": "limits.owner.clear", "owner": "someone@example.com"}
+```
+```json
+{"ok": true, "op": "limits.owner.clear", "result": {"owner": "someone@example.com", "owner_id": 1,
+  "caps": {"cpus": 16, "memory_mib": 32768, "disk_gib": 256, "boxes": 8},
+  "previous": {"cpus": 26, "memory_mib": 53248, "disk_gib": 416, "boxes": 13},
+  "changed": true, "effective": "next_create"}}
 ```
 
 ### host.revoke

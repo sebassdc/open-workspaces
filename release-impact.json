@@ -2,6 +2,49 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.77",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "An owner can have no caps: limits.owner.set with unlimited (ow limits set EMAIL --unlimited) stores \"unlimited\" for them in the controller's limits.json, so only runner capacity, spill reserves, an Actions pool's max and the pool spend cap bound them; their usage is still counted. limits.owner.clear (ow limits clear EMAIL) removes an owner's override so the defaults apply again; both are audited. The dashboard shows \"No limit\" and the usage for an unlimited owner. Before downgrading below 0.9.77, clear or set numbers for every unlimited owner: older controllers cannot read an unlimited entry and refuse every create and state request. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 1: the controller and dashboard restart; boxes keep running."
+    },
+    {
       "version": "0.9.76",
       "class": 2,
       "changes": [

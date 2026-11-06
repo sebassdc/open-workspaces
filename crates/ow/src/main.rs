@@ -148,6 +148,14 @@ enum LimitsAction {
         disk_gib: Option<u64>,
         #[arg(long)]
         boxes: Option<u64>,
+        /// No owner caps: only runner capacity and pool rules bound this owner.
+        #[arg(long, conflicts_with_all = ["cpus", "memory_mib", "disk_gib", "boxes"])]
+        unlimited: bool,
+    },
+    /// Remove an owner's override, so the defaults apply again.
+    Clear {
+        /// Owner login email.
+        owner: String,
     },
 }
 

@@ -43,8 +43,26 @@ ow limits set ci@example.com --cpus 26 --memory-mib 53248 --disk-gib 416 --boxes
 ```
 
 `set` writes the owner's override into `limits.json` below (flags left out keep
-their current value), audited like every admin change. An override pins all four
-caps: later changes to `owner_defaults` no longer reach that owner. Defaults and
+their current value, or start from the defaults when the owner was unlimited), audited like every admin change. An override pins all four
+caps: later changes to `owner_defaults` no longer reach that owner.
+
+An owner can also have no caps at all, for a trusted service account such as a CI
+runner pool that should use whatever the runners can hold:
+
+```sh
+ow limits set ci@example.com --unlimited   # caps: "unlimited"
+ow limits clear ci@example.com             # back to the defaults
+```
+
+Owner caps are skipped for them; everything else still applies: each runner's
+physical capacity, spill reserves ([MULTINODE.md](MULTINODE.md#spill)), an Actions
+pool's `max` ([ACTIONS.md](ACTIONS.md)) and the pool spend cap.
+Their boxes are still counted, so `get` shows real usage and a later cap sees it.
+`clear` removes any override, numbers or `"unlimited"`.
+
+Controllers before 0.9.77 cannot read an `"unlimited"` entry and refuse every
+create and state request until it is gone. Before going back to an older release,
+run `ow limits clear` (or `ow limits set` with numbers) for every unlimited owner. Defaults and
 pool pricing are still edited in the file; don't edit it by hand while a `set`
 runs, since `set` replaces the whole file.
 
@@ -89,7 +107,7 @@ The operator must keep declared types/rates aligned with actual capacity.
 
 `owners` keys are positive durable catalog user IDs, not emails or caller-supplied
 IDs. Each entry replaces all four default caps; zero denies new demand in that
-dimension. A local administrator can inspect bindings with a read-only query:
+dimension. An entry may instead be the string `"unlimited"` (no owner caps). A local administrator can inspect bindings with a read-only query:
 
 ```sh
 sqlite3 -readonly /path/to/controller/catalog.sqlite3 'SELECT id,issuer,email FROM users;'

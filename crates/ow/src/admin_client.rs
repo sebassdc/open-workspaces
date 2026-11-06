@@ -78,13 +78,20 @@ pub(crate) fn request(action: &Action, key: &str) -> Option<Value> {
             LimitsAction::Get { owner } => json!({"op":"limits.owner.get","owner":owner}),
             LimitsAction::Set {
                 owner,
+                unlimited: true,
+                ..
+            } => json!({"op":"limits.owner.set","owner":owner,"unlimited":true}),
+            LimitsAction::Set {
+                owner,
                 cpus,
                 memory_mib,
                 disk_gib,
                 boxes,
+                unlimited: false,
             } => {
                 json!({"op":"limits.owner.set","owner":owner,"cpus":cpus,"memory_mib":memory_mib,"disk_gib":disk_gib,"boxes":boxes})
             }
+            LimitsAction::Clear { owner } => json!({"op":"limits.owner.clear","owner":owner}),
         },
         Action::Host {
             command:
