@@ -600,7 +600,7 @@ pub fn share_unlocked(root: &Path, identity: &Identity, request: &Value) -> Resu
     let path = root.join("catalog.sqlite3");
     nodes::private(&path)?;
     let mut db = Connection::open(path)?;
-    db.busy_timeout(Duration::from_secs(5))?;
+    db.busy_timeout(nodes::CATALOG_BUSY)?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
     nodes::readable(&db)?;
     let user = user_on(&mut db, identity)?;
@@ -681,7 +681,7 @@ impl Catalog {
             "catalog must be an owned private regular file"
         );
         let db = Connection::open(&path)?;
-        db.busy_timeout(Duration::from_secs(5))?;
+        db.busy_timeout(nodes::CATALOG_BUSY)?;
         db.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
