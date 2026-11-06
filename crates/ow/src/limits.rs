@@ -55,12 +55,34 @@ impl Resources {
         }
     }
 }
+/// An owner's caps: explicit numbers, or `"unlimited"` (no owner caps; runner capacity,
+/// runner reserves and pool rules still bound what they can place).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum Caps {
+    Limited(Resources),
+    Unlimited(Unlimited),
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Unlimited {
+    Unlimited,
+}
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Config {
-    owner_defaults: Resources,
-    owners: BTreeMap<String, Resources>,
+    pub owner_defaults: Resources,
+    owners: BTreeMap<String, Caps>,
     pool: Pool,
+}
+impl Config {
+    /// An owner's caps and whether they are an override rather than the defaults.
+    pub(crate) fn owner(&self, owner: i64) -> (Caps, bool) {
+        match self.owners.get(&owner.to_string()) {
+            Some(caps) => (*caps, true),
+            None => (Caps::Limited(self.owner_defaults), false),
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -110,7 +132,11 @@ fn parse(bytes: Option<&[u8]>) -> Result<Config> {
         }
         None => Config::default(),
     };
-    for caps in std::iter::once(&c.owner_defaults).chain(c.owners.values()) {
+    let limited = c.owners.values().filter_map(|caps| match caps {
+        Caps::Limited(r) => Some(r),
+        Caps::Unlimited(_) => None,
+    });
+    for caps in std::iter::once(&c.owner_defaults).chain(limited) {
         ensure!(
             caps.values().iter().all(|n| *n <= i64::MAX as u64 / 4),
             "owner limit out of range"
@@ -131,17 +157,10 @@ fn parse(bytes: Option<&[u8]>) -> Result<Config> {
 pub(crate) fn load(root: &Path) -> Result<Config> {
     parse(read(&root.join("limits.json"))?.as_deref())
 }
-/// An owner's caps and whether they are an override rather than the defaults.
-pub(crate) fn owner_caps(root: &Path, owner: i64) -> Result<(Resources, bool)> {
-    let c = load(root)?;
-    Ok(match c.owners.get(&owner.to_string()) {
-        Some(caps) => (*caps, true),
-        None => (c.owner_defaults, false),
-    })
-}
-/// Writes one owner's override into limits.json, keeping every other field. The caller
-/// serializes writers; readers see the old or the new file, never a partial one.
-pub(crate) fn set_owner(root: &Path, owner: i64, caps: Resources) -> Result<()> {
+/// Writes one owner's override into limits.json (None removes it), keeping every other
+/// field. The caller serializes writers; readers see the old or the new file, never a
+/// partial one.
+pub(crate) fn set_owner(root: &Path, owner: i64, caps: Option<Caps>) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let path = root.join("limits.json");
@@ -153,7 +172,11 @@ pub(crate) fn set_owner(root: &Path, owner: i64, caps: Resources) -> Result<()> 
     if !text["owners"].is_object() {
         text["owners"] = json!({});
     }
-    text["owners"][owner.to_string()] = json!(caps);
+    let owners = text["owners"].as_object_mut().expect("owners is an object");
+    match caps {
+        Some(caps) => owners.insert(owner.to_string(), json!(caps)),
+        None => owners.remove(&owner.to_string()),
+    };
     let bytes = serde_json::to_vec_pretty(&text)?;
     parse(Some(&bytes))?;
     let temporary = root.join(".limits.json.new");
@@ -273,7 +296,7 @@ pub(crate) fn absent(db: &Connection, physical: &str) -> Result<()> {
 pub(crate) fn state(root: &Path, db: &Connection, user: i64) -> Result<Value> {
     let c = load(root)?;
     Ok(
-        json!({"caps":c.owners.get(&user.to_string()).unwrap_or(&c.owner_defaults),"usage":usage(db,user,"")?,"accounting":"provisioned; stopped and hibernated boxes included"}),
+        json!({"caps":c.owner(user).0,"usage":usage(db,user,"")?,"accounting":"provisioned; stopped and hibernated boxes included"}),
     )
 }
 /// Called inside the catalog's BEGIN IMMEDIATE, before dispatch. Quotas belong to the
@@ -344,11 +367,11 @@ pub(crate) fn admit(
         }
     }
     let wanted = Resources::shape(&shape);
+    // An unlimited owner is still accounted for, so a later cap sees their real usage.
+    let Caps::Limited(caps) = c.owner(owner).0 else {
+        return save(db, target, wanted, true);
+    };
     let used = usage(db, owner, target)?;
-    let caps = c
-        .owners
-        .get(&owner.to_string())
-        .unwrap_or(&c.owner_defaults);
     for (name, next, old, used, cap) in [
         ("CPU", wanted.cpus, prior.cpus, used.cpus, caps.cpus),
         (
@@ -384,16 +407,14 @@ pub(crate) fn admit_owner(
     owner: i64,
     email: &str,
 ) -> Result<()> {
-    let c = load(root)?;
+    let Caps::Limited(caps) = load(root)?.owner(owner).0 else {
+        return Ok(());
+    };
     let wanted = Resources {
         boxes: 1,
         ..allocation(db, physical)?
     };
     let used = usage(db, owner, physical)?;
-    let caps = c
-        .owners
-        .get(&owner.to_string())
-        .unwrap_or(&c.owner_defaults);
     for ((name, next), (used, cap)) in ["CPU", "RAM MiB", "disk GiB", "boxes"]
         .into_iter()
         .zip(wanted.values())

@@ -303,6 +303,10 @@ fn the_cli_builds_the_documented_request() {
         ),
         ("upgrade.set", &["upgrade", "set", "0.9.74"]),
         ("upgrade.status", &["upgrade", "status"]),
+        (
+            "limits.owner.clear",
+            &["limits", "clear", "someone@example.com"],
+        ),
     ];
     // The documented key, in the file `--key-file` reads when the command is parsed.
     const KEY_FILE: &str = "/tmp/ow-admin-tests-app-key.pem";
@@ -896,7 +900,10 @@ fn owner_limits_are_read_and_set_through_the_api() {
     let file: Value =
         serde_json::from_slice(&std::fs::read(root.join("limits.json")).unwrap()).unwrap();
     assert_eq!(file["pool"]["default_type"], "test-self-hosted");
-    assert_eq!(crate::limits::owner_caps(&root, id).unwrap().0.boxes, 13);
+    assert_eq!(
+        json!(crate::limits::load(&root).unwrap().owner(id).0)["boxes"],
+        13
+    );
     let (_, again) = call(
         &root,
         json!({"op":"limits.owner.set","owner":"ci@example.com","boxes":13}),
@@ -949,6 +956,150 @@ fn owner_limits_are_read_and_set_through_the_api() {
             "invalid_request",
             "invalid_value",
             "invalid_value"
+        ]
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn the_cli_sets_an_owner_unlimited() {
+    let built = |args: &[&str]| {
+        Cli::try_parse_from([&["ow"], args].concat())
+            .map(|cli| admin_client::request(&cli.command, "unused").unwrap())
+    };
+    assert_eq!(
+        built(&["limits", "set", "ci@example.com", "--unlimited"]).unwrap(),
+        json!({"op":"limits.owner.set","owner":"ci@example.com","unlimited":true})
+    );
+    assert!(
+        built(&[
+            "limits",
+            "set",
+            "ci@example.com",
+            "--unlimited",
+            "--cpus",
+            "2"
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn an_owner_is_made_unlimited_and_cleared_through_the_api() {
+    let root = temp_root();
+    crate::limits::free_pool(&root);
+    let mut catalog = crate::catalog::Catalog::open(&root, "issuer", None).unwrap();
+    let id = catalog
+        .user(&crate::catalog::Identity {
+            issuer: "issuer".into(),
+            subject: "s".into(),
+            email: "ci@example.com".into(),
+        })
+        .unwrap();
+    drop(catalog);
+    let defaults = json!({"cpus":16,"memory_mib":32768,"disk_gib":256,"boxes":8});
+    call(
+        &root,
+        json!({"op":"limits.owner.set","owner":"ci@example.com","cpus":26}),
+    );
+    let (status, set) = call(
+        &root,
+        json!({"op":"limits.owner.set","owner":"ci@example.com","unlimited":true}),
+    );
+    assert_eq!(status, 200, "{set}");
+    assert_eq!(set["result"]["caps"], "unlimited");
+    assert_eq!(set["result"]["previous"]["cpus"], 26);
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(root.join("limits.json")).unwrap()).unwrap();
+    assert_eq!(file["owners"][id.to_string()], "unlimited");
+    assert_eq!(file["pool"]["default_type"], "test-self-hosted");
+    let (_, got) = call(
+        &root,
+        json!({"op":"limits.owner.get","owner":"ci@example.com"}),
+    );
+    assert_eq!(
+        (&got["result"]["caps"], &got["result"]["override"]),
+        (&json!("unlimited"), &json!(true))
+    );
+    let (_, again) = call(
+        &root,
+        json!({"op":"limits.owner.set","owner":"ci@example.com","unlimited":true}),
+    );
+    assert_eq!(again["result"]["changed"], false);
+    // Leaving unlimited, fields left out start from the defaults.
+    let (_, capped) = call(
+        &root,
+        json!({"op":"limits.owner.set","owner":"ci@example.com","boxes":20}),
+    );
+    assert_eq!(
+        capped["result"]["caps"],
+        json!({"cpus":16,"memory_mib":32768,"disk_gib":256,"boxes":20})
+    );
+    let (status, cleared) = call(
+        &root,
+        json!({"op":"limits.owner.clear","owner":"ci@example.com"}),
+    );
+    assert_eq!(status, 200, "{cleared}");
+    assert_eq!(cleared["result"]["caps"], defaults);
+    assert_eq!(cleared["result"]["changed"], true);
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(root.join("limits.json")).unwrap()).unwrap();
+    assert_eq!(file["owners"], json!({}));
+    assert_eq!(file["pool"]["default_type"], "test-self-hosted");
+    let (_, got) = call(
+        &root,
+        json!({"op":"limits.owner.get","owner":"ci@example.com"}),
+    );
+    assert_eq!(
+        (&got["result"]["caps"], &got["result"]["override"]),
+        (&defaults, &json!(false))
+    );
+    let (_, again) = call(
+        &root,
+        json!({"op":"limits.owner.clear","owner":"ci@example.com"}),
+    );
+    assert_eq!(again["result"]["changed"], false);
+    for (request, status, code) in [
+        (
+            json!({"op":"limits.owner.set","owner":"ci@example.com","unlimited":true,"cpus":1}),
+            400,
+            "invalid_request",
+        ),
+        (
+            json!({"op":"limits.owner.set","owner":"ci@example.com","unlimited":false}),
+            400,
+            "invalid_request",
+        ),
+        (
+            json!({"op":"limits.owner.clear","owner":"nobody@example.com"}),
+            404,
+            "not_found",
+        ),
+    ] {
+        let (s, answer) = call(&root, request);
+        assert_eq!(
+            (s, answer["error_code"].as_str()),
+            (status, Some(code)),
+            "{answer}"
+        );
+    }
+    let rows = |op: &str| {
+        audit_rows(&root)
+            .into_iter()
+            .filter(|(o, ..)| o == op)
+            .map(|(_, result, _)| result)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows("limits.owner.clear"), ["ok", "unchanged", "not_found"]);
+    assert_eq!(
+        rows("limits.owner.set"),
+        [
+            "ok",
+            "ok",
+            "unchanged",
+            "ok",
+            "invalid_request",
+            "invalid_request"
         ]
     );
     std::fs::remove_dir_all(root).unwrap();
