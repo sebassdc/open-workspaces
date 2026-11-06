@@ -1,6 +1,7 @@
 # GitHub Actions runner pools
 
-The controller can keep GitHub Actions runners ready for a repository: `warm`
+The controller can keep GitHub Actions runners ready for a repository, or for
+every repository of an organisation that a runner group allows: `warm`
 single-use runners, each in its own [ephemeral](AGENT_CLI.md) box, registered
 with GitHub and idle before any job is queued. GitHub hands a queued job to an
 idle runner as it does to its own hosted runners, so a job starts in the time
@@ -21,7 +22,9 @@ in its settings store, and act through a [workload token](USERS.md#workload-toke
 2. An image with the GitHub runner and the start command (see [Image](#image)),
    built on those runners.
 3. A GitHub App installed on the repository, with **Administration: read and
-   write** (self-hosted runners) on it. Store its key and id:
+   write** (self-hosted runners) on it; for an [organisation pool](#organisation-pools),
+   installed on the organisation with **Self-hosted runners: read and write**.
+   Store its key and id:
 
    ```sh
    ow actions app-key set --key-file app.private-key.pem   # "-" reads standard input
@@ -53,6 +56,9 @@ Each pool:
 | --- | --- |
 | `name` | 1 to 16 lowercase letters, digits or `-`; it prefixes each box's name. |
 | `repo` | `OWNER/NAME`: runners are registered on this repository. |
+| `org` | `OWNER`, in place of `repo`: runners are registered on this organisation (see [Organisation pools](#organisation-pools)). |
+| `runner_group_id` | The runner group they join; default 1, GitHub's default group. |
+| `repos` | Organisation pools only: up to 8 `OWNER/NAME` of the organisation whose queued jobs may [spill](#spill); none: no spill. |
 | `labels` | The runners' labels (1 to 16). |
 | `token` | The workload token the pool's boxes are made with (by name). |
 | `image` | The box image. |
@@ -60,10 +66,35 @@ Each pool:
 | `warm` | Runners kept idle (starting or online). |
 | `max` | Boxes at most, busy included. `warm <= max <= 64`. |
 
-**Changes apply live.** A new image, size, labels or repository: idle boxes of
+**Changes apply live.** A new image, size, labels, repository, organisation or runner group: idle boxes of
 the old shape are replaced, and busy ones finish their job first. A lower `warm`
 or `max` makes no new boxes until the pool is under it; a removed pool's idle
 boxes are deleted and its busy ones finish. `[]` turns every pool off.
+
+## Organisation pools
+
+A pool with `org` in place of `repo` registers its runners on the organisation,
+so one warm set serves every repository its runner group lets use them, instead
+of one pool, with its own idle boxes, per repository. Each job still gets a
+fresh single-use box, deleted after it.
+
+```sh
+ow config set actions.pools '[{"name":"ci","org":"acme","runner_group_id":3,"repos":["acme/app","acme/api"],
+  "labels":["self-hosted","Linux","X64","acme-ci"],"token":"ci-runners","image":"ci-runner","warm":10,"max":12}]'
+```
+
+- **Which repositories.** GitHub decides from the runner group: the default
+  group (1) lets every private repository of the organisation use the runners;
+  a group of their own, limited to selected repositories, keeps the rest out.
+  Repositories still reach the runners only by asking for the pool's labels.
+- **Spill** asks about the queued jobs of the repositories in `repos` (each
+  one adds its calls, see [Spill](#spill)); without `repos` the pool keeps
+  its warm runners and never spills.
+- **Fairness.** Repositories share the warm runners first come, first served.
+  To guarantee each one a share instead, give each its own repository pool.
+- **Usage by repository.** The controller sees boxes, not repositories: each
+  job's runner name (`POOL-<12 hex>`) is in the repository's job list on
+  GitHub, which gives the jobs and runner minutes per repository.
 
 ## How a box is made and removed
 
@@ -102,7 +133,7 @@ making or removing and keeps the started ones. A pool's boxes are removed with
 the workload token they were made with: revoke a token only after its pool's
 boxes are gone.
 
-**GitHub calls.** One list of the repository's runners per pass (`ETag`, so an
+**GitHub calls.** One list of the repository's (or organisation's) runners per pass (`ETag`, so an
 unchanged list costs no rate limit), one registration per box, and one
 unregister only when an idle runner is removed. With spill, the queued-job
 lists in [Spill](#spill), only while the pool is saturated. The App key lives in a 0600 file
@@ -124,7 +155,7 @@ without keeping anything warm there:
   under `max`, the controller asks GitHub, at most every 10 s, how many of the
   repository's queued jobs ask only for the pool's labels: one list of queued
   and one of running workflow runs (the newest 10 of each) and one job list per
-  run, at most 22 calls, and none while fewer than 1000 calls of the App's rate
+  run, at most 22 calls per repository (an organisation pool: per entry of `repos`), and none while fewer than 1000 calls of the App's rate
   limit are left, so the pool's own calls always have room. Each queued job no
   idle or starting runner will take gets a box that may spill, within `max`.
 - **Spilled boxes are single-use and short-lived.** Like every pool box, one is

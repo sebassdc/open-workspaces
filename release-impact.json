@@ -2,6 +2,49 @@
   "schema": 1,
   "releases": [
     {
+      "version": "0.9.74",
+      "class": 1,
+      "changes": [
+        "controller",
+        "dashboard"
+      ],
+      "protocol": {
+        "speaks": 1,
+        "accepts": [
+          1,
+          1
+        ]
+      },
+      "worker_protocol": {
+        "speaks": 3,
+        "accepts": [
+          1,
+          3
+        ]
+      },
+      "catalog": {
+        "schema": 7,
+        "min_reader": 7
+      },
+      "runtime": {
+        "vmm": "firecracker-v1.17.0",
+        "guest_kernel_sha256": "ea0e55d03dbaebc79a58644308e0517b7a33f1530a84848d9edf47ffa61f69c8",
+        "resumes": [
+          "firecracker-v1.17.0"
+        ],
+        "handover": {
+          "speaks": 1,
+          "accepts": [
+            1,
+            1
+          ]
+        }
+      },
+      "host_layout": 2,
+      "in_place_from": "0.5.0",
+      "notes": "GitHub Actions runner pools can register their runners on an organisation instead of one repository: a pool sets org (OWNER) in place of repo, optionally runner_group_id (default 1, GitHub's default group) and repos (up to 8 OWNER/NAME of that organisation whose queued jobs may spill). One warm set then serves every repository its runner group allows. Such a pool needs the GitHub App's organisation permission Self-hosted runners: read and write. Repository pools keep their box shape, so the upgrade replaces none of their idle boxes. Protocol, worker interface 3, catalog schema 7, runtime, guest kernel and host layout 2 are unchanged. Class 1: the controller and dashboard restart; boxes keep running."
+    },
+    {
       "version": "0.9.73",
       "class": 1,
       "changes": [

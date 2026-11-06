@@ -34,13 +34,26 @@ fn default_cpus() -> u32 {
     2
 }
 
-/// One pool: `warm` idle runners for `repo` with `labels`, at most `max` boxes, made with the
-/// workload token `token` (its owner's limits and its placement pool apply).
+/// Spill asks GitHub about at most this many repositories of an organisation pool.
+pub(crate) const MAX_SPILL_REPOS: usize = 8;
+
+/// One pool: `warm` idle runners with `labels` for one repository (`repo`) or for every
+/// repository an organisation's runner group allows (`org`), at most `max` boxes, made with
+/// the workload token `token` (its owner's limits and its placement pool apply).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pool {
     pub name: String,
-    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+    /// The runner group the runners join (GitHub's default group: 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_group_id: Option<u64>,
+    /// An organisation pool's repositories (OWNER/NAME) whose queued jobs may spill.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
     pub labels: Vec<String>,
     pub token: String,
     pub image: String,
@@ -55,17 +68,54 @@ pub(crate) struct Pool {
 }
 
 impl Pool {
-    /// What a box's shape depends on: an idle box with another one is replaced.
+    /// Where its runners are registered: OWNER/NAME for a repository, OWNER for an
+    /// organisation.
+    pub(crate) fn scope(&self) -> &str {
+        self.org
+            .as_deref()
+            .or(self.repo.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// The runner group its runners join.
+    pub(crate) fn group(&self) -> u64 {
+        self.runner_group_id.unwrap_or(1)
+    }
+
+    /// The repositories whose queued jobs it may spill for: its own, or an organisation
+    /// pool's `repos`.
+    pub(crate) fn queue_repos(&self) -> Vec<String> {
+        match &self.repo {
+            Some(repo) => vec![repo.clone()],
+            None => self.repos.clone(),
+        }
+    }
+
+    /// What a box's shape depends on: an idle box with another one is replaced. Starts with
+    /// the scope; a pool in the default runner group keeps the shape it had before groups.
     pub(crate) fn spec(&self) -> String {
+        let group = match self.group() {
+            1 => String::new(),
+            id => format!("|group={id}"),
+        };
         format!(
-            "{}|{}|{}|{}|{:?}|{}",
-            self.repo,
+            "{}|{}|{}|{}|{:?}|{}{group}",
+            self.scope(),
             self.labels.join(","),
             self.image,
             self.memory_mib,
             self.disk_gib,
             self.vcpu_count
         )
+    }
+}
+
+/// The GitHub API path of a scope: `/repos/OWNER/NAME` or `/orgs/OWNER`.
+pub(crate) fn api_base(scope: &str) -> String {
+    if scope.contains('/') {
+        format!("/repos/{scope}")
+    } else {
+        format!("/orgs/{scope}")
     }
 }
 
@@ -88,7 +138,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Pool>> {
         return Ok(Vec::new());
     }
     let pools: Vec<Pool> = serde_json::from_str(text).context(
-        "expected a list of {\"name\", \"repo\", \"labels\", \"token\", \"image\", \"warm\", \"max\"} (optional memory_mib, vcpu_count, disk_gib)",
+        "expected a list of {\"name\", \"repo\" or \"org\", \"labels\", \"token\", \"image\", \"warm\", \"max\"} (optional memory_mib, vcpu_count, disk_gib, runner_group_id, and for org: repos)",
     )?;
     ensure!(pools.len() <= 16, "at most 16 pools");
     let mut names = std::collections::HashSet::new();
@@ -100,16 +150,45 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Pool>> {
             "pool {} is listed twice",
             pool.name
         );
-        let (owner, repo) = pool.repo.split_once('/').unwrap_or_default();
         let part = |s: &str, extra: &[u8]| {
             !s.is_empty()
                 && s.len() <= 100
                 && s.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || extra.contains(&b))
         };
+        let full_name = |s: &str| {
+            let (owner, repo) = s.split_once('/').unwrap_or_default();
+            part(owner, b"") && part(repo, b"_.")
+        };
+        match (&pool.repo, &pool.org) {
+            (Some(repo), None) => {
+                ensure!(full_name(repo), "{}: repo is OWNER/NAME", pool.name);
+                ensure!(
+                    pool.repos.is_empty(),
+                    "{}: repos is only for an org pool",
+                    pool.name
+                );
+            }
+            (None, Some(org)) => {
+                ensure!(part(org, b""), "{}: org is OWNER", pool.name);
+                ensure!(
+                    pool.repos.len() <= MAX_SPILL_REPOS,
+                    "{}: at most {MAX_SPILL_REPOS} repos",
+                    pool.name
+                );
+                for repo in &pool.repos {
+                    ensure!(
+                        full_name(repo) && repo.split_once('/').unwrap_or_default().0 == org,
+                        "{}: each of repos is {org}/NAME",
+                        pool.name
+                    );
+                }
+            }
+            _ => bail!("{}: exactly one of repo and org", pool.name),
+        }
         ensure!(
-            part(owner, b"") && part(repo, b"_."),
-            "{}: repo is OWNER/NAME",
+            pool.runner_group_id != Some(0),
+            "{}: runner_group_id is a group id (1 is GitHub's default group)",
             pool.name
         );
         ensure!(
@@ -482,6 +561,83 @@ mod tests {
         // The typed value round-trips through config.set's JSON form.
         let typed = typed(&twice.replacen("\"ci\"", "\"cj\"", 1)).unwrap();
         assert_eq!(parse(&from_json(&typed).unwrap()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_pool_registers_on_a_repository_or_an_organisation() {
+        // A repository pool's shape is the one it had before organisation pools, so an
+        // upgrade replaces none of its idle boxes.
+        let p = pool(1, 1);
+        assert_eq!((p.scope(), p.group()), ("acme/app", 1));
+        assert_eq!(p.queue_repos(), ["acme/app"]);
+        assert_eq!(
+            p.spec(),
+            "acme/app|self-hosted,Linux,X64,app-ci|ci-runner|4096|None|2"
+        );
+        assert_eq!(api_base("acme/app"), "/repos/acme/app");
+        assert_eq!(api_base("acme"), "/orgs/acme");
+
+        let org = parse(
+            r#"[{"name":"ci","org":"acme","repos":["acme/app","acme/api"],"labels":["app-ci"],"token":"t","image":"i","warm":1,"max":2}]"#,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!((org.scope(), org.group()), ("acme", 1));
+        assert_eq!(org.queue_repos(), ["acme/app", "acme/api"]);
+        assert!(org.spec().starts_with("acme|app-ci|"));
+        // Without repos it still keeps warm runners; it only never spills.
+        let grouped = parse(
+            r#"[{"name":"ci","org":"acme","runner_group_id":7,"labels":["app-ci"],"token":"t","image":"i","warm":1,"max":2}]"#,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(grouped.queue_repos().is_empty());
+        assert_eq!(grouped.group(), 7);
+        // Another group is another shape: its idle boxes are replaced.
+        assert!(grouped.spec().ends_with("|group=7"));
+        assert_ne!(grouped.spec(), org.spec());
+        // Round-trips without the fields it does not use.
+        let text = serde_json::to_string(&grouped).unwrap();
+        assert!(!text.contains("\"repo\"") && !text.contains("\"repos\""));
+        assert_eq!(parse(&format!("[{text}]")).unwrap()[0], grouped);
+
+        let nine = (0..9)
+            .map(|i| format!("\"acme/r{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (bad, why) in [
+            (
+                r#"[{"name":"ci","repo":"acme/app","org":"acme","labels":["x"],"token":"t","image":"i","warm":1,"max":1}]"#.to_owned(),
+                "exactly one of repo and org",
+            ),
+            (
+                r#"[{"name":"ci","labels":["x"],"token":"t","image":"i","warm":1,"max":1}]"#.to_owned(),
+                "exactly one of repo and org",
+            ),
+            (
+                r#"[{"name":"ci","org":"acme/app","labels":["x"],"token":"t","image":"i","warm":1,"max":1}]"#.to_owned(),
+                "org is OWNER",
+            ),
+            (
+                r#"[{"name":"ci","repo":"acme/app","repos":["acme/api"],"labels":["x"],"token":"t","image":"i","warm":1,"max":1}]"#.to_owned(),
+                "only for an org pool",
+            ),
+            (
+                r#"[{"name":"ci","org":"acme","repos":["other/api"],"labels":["x"],"token":"t","image":"i","warm":1,"max":1}]"#.to_owned(),
+                "acme/NAME",
+            ),
+            (
+                format!(r#"[{{"name":"ci","org":"acme","repos":[{nine}],"labels":["x"],"token":"t","image":"i","warm":1,"max":1}}]"#),
+                "at most 8 repos",
+            ),
+            (
+                r#"[{"name":"ci","org":"acme","runner_group_id":0,"labels":["x"],"token":"t","image":"i","warm":1,"max":1}]"#.to_owned(),
+                "runner_group_id",
+            ),
+        ] {
+            let error = format!("{:#}", parse(&bad).unwrap_err());
+            assert!(error.contains(why), "{bad}: {error}");
+        }
     }
 
     #[test]
