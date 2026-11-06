@@ -364,6 +364,7 @@ impl Runtime {
                     !self.machines.contains_key(id),
                     "exported source still has a VMM"
                 );
+                self.refuse_live_vmm(id)?;
                 match fs::remove_dir_all(self.machine_dir(id)) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     result => result?,
@@ -1233,6 +1234,28 @@ mod tests {
         );
         fs::remove_dir_all(runtime.root).unwrap();
     }
+    #[test]
+    fn cleanup_never_drops_the_record_of_a_vmm_that_still_runs() {
+        let mut runtime = fixture();
+        register(&mut runtime);
+        runtime.request(&export()).unwrap();
+        // The worker died after the capture and the next one failed to adopt the VMM.
+        let mut child = super::super::adoption_tests::recorded_vmm(&runtime);
+        let mut cleanup = export();
+        cleanup["op"] = json!("export-cleanup");
+        let error = runtime.request(&cleanup).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&format!("VMM (PID {}) still runs", child.id())),
+            "{error:#}"
+        );
+        assert!(runtime.machine_dir("legacy").join(vm::RECORD).exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        runtime.request(&cleanup).unwrap();
+        assert!(!runtime.machine_dir("legacy").exists());
+        fs::remove_dir_all(runtime.root).unwrap();
+    }
+
     #[test]
     fn cleanup_is_source_only_keeps_all_captures_and_rejects_stale_results() {
         let mut runtime = fixture();

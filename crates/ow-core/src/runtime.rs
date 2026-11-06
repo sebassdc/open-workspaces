@@ -1151,10 +1151,15 @@ impl Runtime {
     }
 
     fn disk_headroom(&self) -> Result<u64> {
+        self.disk_headroom_given(self.storage_available()?)
+    }
+
+    /// What `available` free bytes leave for new disks.
+    fn disk_headroom_given(&self, available: u64) -> Result<u64> {
         Ok((u64::from(max_disk_gib()?) * GIB)
             .saturating_sub(self.disk_reserved()?)
             .min(
-                self.storage_available()?
+                available
                     .saturating_sub(minimum_free_bytes()?)
                     .saturating_sub(crate::cache::staging_bytes(&self.root)?)
                     .saturating_sub(crate::cache::unwritten_disks(&self.root)?),
@@ -1432,6 +1437,7 @@ impl Runtime {
             !self.machines.contains_key(id),
             "workspace is running; stop or hibernate it first"
         );
+        self.refuse_live_vmm(id)?;
         crate::metadata::clear(id);
         // Its snapshots go too: a later workspace reusing this ID must not fork them.
         let mut snapshots = Vec::new();
@@ -1499,6 +1505,17 @@ impl Runtime {
         Ok(json!({"deleted":id,"snapshots":snapshots,"registered":false}))
     }
 
+    /// A failed adoption leaves its VMM running on the box's disk; the next worker adopts or
+    /// ends it (ADR 0011). Starting a second VMM, or deleting the record, would orphan it.
+    fn refuse_live_vmm(&self, id: &str) -> Result<()> {
+        if let Some(pid) = vm::recorded_live_pid(&self.machine_dir(id)) {
+            bail!(
+                "{id}'s previous VMM (PID {pid}) still runs; restart the worker to adopt or end it"
+            );
+        }
+        Ok(())
+    }
+
     fn cleanup_fork_capture(&mut self, child: &str) -> Result<Option<String>> {
         let Some(name) = self.state.pending_forks.get(child).cloned() else {
             return Ok(None);
@@ -1562,13 +1579,7 @@ impl Runtime {
         if self.machines.contains_key(id) {
             return Ok(json!(workspace));
         }
-        // A failed adoption leaves its VMM running on this disk; the next worker adopts or
-        // ends it (ADR 0011).
-        if let Some(pid) = vm::recorded_live_pid(&self.machine_dir(id)) {
-            bail!(
-                "{id}'s previous VMM (PID {pid}) still runs; restart the worker to adopt or end it"
-            );
-        }
+        self.refuse_live_vmm(id)?;
         // A box hibernated on another host kernel or CPU (a replaced host) cannot
         // resume its RAM; it boots its hibernated disk cold instead.
         let mut resume = true;
@@ -2822,7 +2833,7 @@ mod adoption_tests {
     use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
     /// A stand-in VMM holding fds 3 and 4, as `Vm::spawn` arranges, recorded for `legacy`.
-    fn recorded_vmm(runtime: &Runtime) -> std::process::Child {
+    pub(super) fn recorded_vmm(runtime: &Runtime) -> std::process::Child {
         let null = File::open("/dev/null").unwrap();
         let fd = null.as_raw_fd();
         let mut command = std::process::Command::new("sleep");
@@ -2905,6 +2916,25 @@ mod adoption_tests {
         assert_eq!(runtime.workspace("legacy").unwrap().state, "stopped");
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_box_whose_vmm_still_runs_is_never_deleted_from_under_it() {
+        // As a failed adoption leaves it: the VMM runs on, its box `stopped`.
+        let mut runtime = super::disk_tests::fixture();
+        let mut child = recorded_vmm(&runtime);
+        let refused = format!("VMM (PID {}) still runs", child.id());
+        let error = runtime.delete("legacy").unwrap_err();
+        assert!(format!("{error:#}").contains(&refused), "{error:#}");
+        assert!(child.try_wait().unwrap().is_none(), "left running");
+        assert!(runtime.machine_dir("legacy").join(vm::RECORD).exists());
+        assert_eq!(runtime.workspace("legacy").unwrap().state, "stopped");
+        // Once that VMM is gone, the box deletes.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        runtime.delete("legacy").unwrap();
+        assert!(!runtime.machine_dir("legacy").exists());
+        fs::remove_dir_all(&runtime.root).unwrap();
     }
 
     #[test]
@@ -3632,7 +3662,12 @@ mod disk_tests {
     fn written_disk_bytes_are_not_subtracted_from_free_space_twice() {
         use std::io::{Seek, Write};
         let mut runtime = fixture();
-        let before = runtime.disk_headroom().unwrap();
+        // A set free space: the real one is the filesystem's, which tests running beside this
+        // one change. Neither the host reserve nor the disk cap clamps it.
+        let free = 64 * GIB;
+        let before = runtime.disk_headroom_given(free).unwrap();
+        // Neither clamp applies (OW_MIN_FREE_GIB, OW_MAX_DISK_GIB), or the check proves nothing.
+        assert!(before > GIB && before < u64::from(max_disk_gib().unwrap()) * GIB - 8 * GIB);
         let mut disk = File::options()
             .write(true)
             .open(runtime.machine_dir("legacy").join("disk.ext4"))
@@ -3642,12 +3677,11 @@ mod disk_tests {
         disk.sync_all().unwrap();
         // Free space fell by the 64 MiB written and the unwritten reservation by as much:
         // headroom holds (old accounting lost the 64 MiB a second time).
-        let after = runtime.disk_headroom().unwrap();
+        let after = runtime.disk_headroom_given(free - (64 << 20)).unwrap();
         assert!(before.abs_diff(after) < 16 << 20, "{before} -> {after}");
         let status = runtime.request(&json!({"op":"status"})).unwrap();
         assert_eq!(status["reserved_disk_bytes"], 8 * GIB);
         assert!(status["unwritten_disk_bytes"].as_u64().unwrap() <= 8 * GIB - (60 << 20));
-        assert!(status["free_disk_bytes"].as_u64().unwrap() >= after);
         fs::remove_dir_all(&runtime.root).unwrap();
     }
 
