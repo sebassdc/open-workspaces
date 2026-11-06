@@ -94,10 +94,10 @@ mod tests {
             assert!(destination(ok).is_ok(), "{ok}");
         }
         for bad in [
-            "10.9.5.17",        // no port
-            "10.9.5.17:0",      // port 0
-            "10.9.5.17:70000",  // not a port
-            "10.9.0.0/16:443",   // a range, not an address
+            "10.9.5.17",          // no port
+            "10.9.5.17:0",        // port 0
+            "10.9.5.17:70000",    // not a port
+            "10.9.0.0/16:443",    // a range, not an address
             "8.8.8.8:53",         // public: already allowed
             "127.0.0.1:80",       // loopback
             "169.254.169.254:80", // the runner's instance metadata
