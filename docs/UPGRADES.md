@@ -41,6 +41,8 @@ ow upgrade set 0.9.75 [--runner NAME]          admin op upgrade.set
   that refused a release or rolled it back does not try again by itself: choosing
   the release again (a new decision time) retries it, and so does the
   controller moving (a runner refused because its controller had to go first).
+  On a host that is not a runner the upgrader runs a request once per (release,
+  decision time): the controller release it names does not matter there.
   An agent outside a host layout (no `OW_HOST_LAYOUT`) never asks.
 - **Order**: every chosen host starts at once. A runner passes its controller's
   release as `--controller-version`; a release whose protocol the old controller
